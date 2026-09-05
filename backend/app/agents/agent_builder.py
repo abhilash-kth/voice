@@ -70,6 +70,70 @@ def _resolve_tts_voice(language: str, raw_voice: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Raw LLM response logging (diagnostics)
+# ---------------------------------------------------------------------------
+class _LoggingStream:
+    """Transparent wrapper around the OpenAI SDK's streaming response.
+
+    Counts chunks / content chars / finish reason / tool calls as the consumer
+    iterates, and logs a summary when the stream ends (including early aborts).
+    It must behave EXACTLY like the original stream: LiveKit's plugin uses it as
+    an async context manager (`async with stream:`) AND as an async iterator,
+    and may touch other attributes — so anything not implemented here is
+    forwarded to the wrapped stream via ``__getattr__``.
+    """
+
+    def __init__(self, stream, model: str):
+        self._stream = stream
+        self._model = model
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    async def __aenter__(self):
+        aenter = getattr(self._stream, "__aenter__", None)
+        if aenter is not None:
+            await aenter()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        aexit = getattr(self._stream, "__aexit__", None)
+        if aexit is not None:
+            return await aexit(exc_type, exc, tb)
+        return None
+
+    def __aiter__(self):
+        return self._count()
+
+    async def _count(self):
+        n_chunks, n_chars, n_tool, finish = 0, 0, 0, None
+        try:
+            async for chunk in self._stream:
+                n_chunks += 1
+                try:
+                    choice = chunk.choices[0]
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr:
+                        finish = fr
+                    delta = getattr(choice, "delta", None)
+                    piece = getattr(delta, "content", None)
+                    if piece:
+                        n_chars += len(piece)
+                    tcs = getattr(delta, "tool_calls", None)
+                    if tcs:
+                        n_tool += len(tcs)
+                except Exception:
+                    pass
+                yield chunk
+        finally:
+            logger.info(
+                f"🧾 LLM stream ({self._model}): {n_chunks} chunks, "
+                f"content_chars={n_chars}, finish={finish}, "
+                f"tool_call_deltas={n_tool}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Provider → plugin construction
 # ---------------------------------------------------------------------------
 def build_llm(cfg: AgentConfig) -> Any:
@@ -184,33 +248,9 @@ def build_llm(cfg: AgentConfig) -> Any:
             resp = await _orig_create(*_args, **_kwargs)
             try:
                 if _kwargs.get("stream"):
-                    async def _counting(stream):
-                        n_chunks, n_chars, n_tool, finish = 0, 0, 0, None
-                        try:
-                            async for chunk in stream:
-                                n_chunks += 1
-                                try:
-                                    choice = chunk.choices[0]
-                                    fr = getattr(choice, "finish_reason", None)
-                                    if fr:
-                                        finish = fr
-                                    delta = getattr(choice, "delta", None)
-                                    piece = getattr(delta, "content", None)
-                                    if piece:
-                                        n_chars += len(piece)
-                                    tcs = getattr(delta, "tool_calls", None)
-                                    if tcs:
-                                        n_tool += len(tcs)
-                                except Exception:
-                                    pass
-                                yield chunk
-                        finally:
-                            logger.info(
-                                f"🧾 LLM stream ({model}): {n_chunks} chunks, "
-                                f"content_chars={n_chars}, finish={finish}, "
-                                f"tool_call_deltas={n_tool}"
-                            )
-                    return _counting(resp)
+                    # NOTE: must be an async context manager (LiveKit does
+                    # `async with stream:`) — a bare async generator breaks it.
+                    return _LoggingStream(resp, model)
                 choice = resp.choices[0]
                 content = getattr(choice.message, "content", None) or ""
                 tcs = getattr(choice.message, "tool_calls", None)
