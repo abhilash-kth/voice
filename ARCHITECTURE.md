@@ -56,9 +56,20 @@ When the caller joins, LiveKit spawns the worker for `agent_name="voice-agent-sa
 DB, and builds a LiveKit **v1** `AgentSession` + `Agent` via `agent_builder.py` (the
 successor to the removed `VoicePipelineAgent`). Then:
 
-- **RAG** on every user turn: the agent's `on_user_turn_completed(turn_ctx, msg)`
-  injects `rag.py` context (BM25-scored chunks from `knowledge.text` + uploaded
-  documents) into the turn; `faq` items are baked into the system prompt.
+- **Context sizing + RAG** on every user turn: the static system prompt carries
+  only a CAPPED summary of the knowledge base (`VOICE_KB_BUDGET_CHARS` /
+  `VOICE_FAQ_BUDGET_CHARS` / `VOICE_OWNER_PROMPT_BUDGET_CHARS`) — an uncapped
+  prompt 429s Groq's free tier (8k TPM) and silently drops turns. The agent's
+  `on_user_turn_completed(turn_ctx, msg)` then injects the question-specific
+  `rag.py` chunks (BM25-scored, from `knowledge.text` + uploaded documents) into
+  the turn, pruning the previous turn's RAG message. RAG stands down when
+  `VOICE_PREEMPTIVE=1` (per-turn context mutation would invalidate preemptive
+  generation).
+- **Silence watchdog**: if no assistant reply lands within
+  `VOICE_LLM_FALLBACK_DELAY` (default 12s) of a user turn — e.g. the LLM 429'd
+  and the fail-fast retries gave up, or the model returned an empty completion —
+  the worker speaks a fallback line instead of leaving the caller in dead air.
+  Tool-call items are excluded from reply tracking.
 - **Memory**: if `memory_enabled`, the initial `chat_ctx` is seeded with prior
   exchanges for this phone/room (`memory.py`) and the new ones are saved at the end.
 - **Recording**: if `recording_enabled`, calls `start_egress()` (LiveKit Egress via
