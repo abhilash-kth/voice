@@ -1,0 +1,79 @@
+# # ----- Management / API layer (always install) -----
+# fastapi>=0.110
+# uvicorn[standard]>=0.29
+# python-multipart>=0.0.9
+# pydantic>=2.6
+# aiohttp>=3.9
+# rank-bm25>=0.2.2        # knowledge-base RAG scoring
+# pypdf>=4.0              # optional PDF extraction for knowledge base
+
+# # ----- Database (Prisma → Neon/Postgres, or SQLite to demo locally) -----
+# # Generated client: run `python -m prisma db push` + `python -m prisma generate`
+# # after ANY change to schema.prisma. Requires the Prisma CLI (auto-installed).
+# prisma>=0.15.0
+
+# # ----- Auth -----
+# passlib>=1.7
+# python-jose[cryptography]>=3.3
+
+# # ----- LiveKit / voice runtime (agent worker + call dispatch) -----
+# # LiveKit v1.x. Notes:
+# #   * There is NO package named "livekit-plugins" or "livekit-server-sdk" on PyPI.
+# #     The server SDK is now the plain "livekit" package; each STT/TTS/LLM plugin
+# #     ships as its own "livekit-plugins-<provider>" package.
+# #   * The "livekit-plugins-*" versions are locked to livekit-agents 1.x (start at
+# #     1.0.0), so use >=1.7.1 — NOT the old 0.1.0 line (that's the pre-v1 release).
+# #   * Each plugin pulls its own provider SDK (onnxruntime+numpy, google-cloud-tts,
+# #     openai[realtime]...), so you only need the plugin package itself.
+# # Alternative one-liner (installs all four plugins + SDKs in lockstep):
+# #   livekit-agents[openai,deepgram,google,silero]>=1.7.1
+# livekit-agents>=1.7.1
+# livekit>=1.1.0                 # server SDK: AccessToken, LiveKitAPI, SIP + Egress services
+# livekit-plugins-deepgram>=1.7.1
+# livekit-plugins-openai>=1.7.1
+# livekit-plugins-google>=1.7.1
+# livekit-plugins-silero>=1.7.1
+# # livekit-plugins-elevenlabs>=1.7.1   # optional premium TTS (uncomment to enable)
+# # Explicit provider SDKs (auto-installed by the plugins above, listed for clarity):
+# openai>=1.30
+# google-cloud-texttospeech>=2.22
+# ----- Management / API layer (always install) -----
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pydantic>=2.6
+openpyxl>=3.1          # bulk-call lead file (.xlsx) parsing
+aiohttp>=3.9
+rank-bm25>=0.2.2        # knowledge-base RAG scoring
+pypdf>=4.0              # optional PDF extraction for knowledge base
+
+# ----- Database (Prisma → Neon/Postgres, or SQLite to demo locally) -----
+# Generated client: run `python -m prisma db push` + `python -m prisma generate`
+# after ANY change to schema.prisma. Requires the Prisma CLI (auto-installed).
+prisma>=0.15.0
+
+# ----- Auth -----
+passlib>=1.7
+python-jose[cryptography]>=3.3
+
+# ----- LiveKit / voice runtime (agent worker + call dispatch) -----
+# LiveKit v1.x. Notes:
+#   * There is NO package named "livekit-plugins" or "livekit-server-sdk" on PyPI.
+#     The server SDK is now the plain "livekit" package; each STT/TTS/LLM plugin
+#     ships as its own "livekit-plugins-<provider>" package.
+#   * The "livekit-plugins-*" versions are locked to livekit-agents 1.x (start at
+#     1.0.0), so use >=1.7.1 — NOT the old 0.1.0 line (that's the pre-v1 release).
+#   * Each plugin pulls its own provider SDK (onnxruntime+numpy, google-cloud-tts,
+#     openai[realtime]...), so you only need the plugin package itself.
+# Alternative one-liner (installs all four plugins + SDKs in lockstep):
+#   livekit-agents[openai,deepgram,google,silero]>=1.7.1
+livekit-agents>=1.7.1
+livekit>=1.1.0                 # server SDK: AccessToken, LiveKitAPI, SIP + Egress services
+livekit-plugins-deepgram>=1.7.1
+livekit-plugins-openai>=1.7.1
+livekit-plugins-google>=1.7.1
+livekit-plugins-silero>=1.7.1
+# livekit-plugins-elevenlabs>=1.7.1   # optional premium TTS (uncomment to enable)
+# Explicit provider SDKs (auto-installed by the plugins above, listed for clarity):
+openai>=1.30
+google-cloud-texttospeech>=2.22

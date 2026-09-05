@@ -1,0 +1,18 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: false
+  node_ip: "127.0.0.1"
+keys:
+  APIVXWGm6U8jdB2: CHAhA7ZTOtZj770TUMSOBwnLYEKXnByAQO3IblGbena
+logging:
+  level: info
+room:
+  auto_create: true
+# --- SIP (needed only for real outbound phone calls) ---
+# Register a Telnyx / Twilio SIP trunk and point its "LiveKit SIP URI" here.
+# sip:
+#   # trunks are created via the LiveKit API/CLI; see ARCHITECTURE.md
+#   egress_port: 5080

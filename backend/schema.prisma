@@ -1,0 +1,117 @@
+// ============================================================================
+// Voice Agent SaaS — Prisma schema
+//
+// DATABASE = Neon / Postgres (target), or SQLite for a local demo.
+// Run from backend/ :
+//
+//   Neon (production):
+//     DATABASE_URL="postgresql+..."  -> actually Prisma wants a plain
+//                                        postgresql://... URL (no "+psycopg2").
+//     python -m prisma db push --schema schema.prisma
+//     python -m prisma generate --schema schema.prisma
+//
+//   Local demo (zero setup):
+//     Change `provider` to "sqlite" and `url` to "file:./data/app.db"
+//     python -m prisma db push --schema schema.prisma
+//     python -m prisma generate --schema schema.prisma
+//
+// NOTE: Prisma's `Json` type is Postgres-only, so JSON blobs are stored as
+// `String` and (de)serialized in app/repo.py. This keeps the schema portable
+// across SQLite and Postgres/Neon.
+// ============================================================================
+
+generator client {
+  provider             = "prisma-client-py"
+  output               = "./prisma_client"
+  recursive_type_depth = -1
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------------------
+// Users
+// --------------------------------------------------------------------------
+model User {
+  id            String        @id @default(cuid())
+  email         String        @unique
+  name          String        @default("")
+  passwordHash  String
+  walletBalance Float         @default(0)
+  createdAt     String        @default("")
+
+  agents        Agent[]
+  calls         Call[]
+  transactions  Transaction[]
+}
+
+// --------------------------------------------------------------------------
+// Agents (per-tenant, user-owned)
+// --------------------------------------------------------------------------
+model Agent {
+  id                String  @id @default(cuid())
+  userId            String
+  name              String
+  description       String  @default("")
+  greeting          String  @default("")
+  language          String  @default("hi")
+  voicePersonality  String  @default("friendly")
+  clientRatePerMin  Float   @default(2.5)
+  memoryEnabled     Boolean @default(true)
+  recordingEnabled  Boolean @default(true)
+  maxConcurrency    Int     @default(1)
+  enabled           Boolean @default(true)
+  // "assistant" (STT+LLM+TTS) | "announcement" (fixed-script only, no STT/LLM)
+  agentMode         String  @default("assistant")
+  announceText      String  @default("")
+  // Serialized JSON: {"llm":{id,config},"stt":...,"tts":...,"telephony":...}
+  providers         String  @default("{}")
+  // Serialized JSON: {"text","documents[]","system_prompt","faq[]"}
+  knowledge         String  @default("{}")
+  createdAt         String  @default("")
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  calls Call[]
+}
+
+// --------------------------------------------------------------------------
+// Calls
+// --------------------------------------------------------------------------
+model Call {
+  id              String  @id @default(cuid())
+  userId          String
+  agentId         String
+  mode            String  @default("browser")
+  room            String  @default("")
+  phone           String?
+  status          String  @default("planned")  // planned | in-progress | completed | failed
+  startedAt       String  @default("")
+  endedAt         String  @default("")
+  durationSeconds Int     @default(0)
+  // Serialized JSON: [{role, text}]
+  transcripts     String  @default("[]")
+  recordingUrl    String?
+  // Serialized JSON: {stt_seconds, tts_chars, llm_input_tokens, llm_output_tokens, user_speech_seconds}
+  usage           String  @default("{}")
+  // Serialized JSON: cost breakdown from billing.py
+  cost            String  @default("{}")
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+}
+
+// --------------------------------------------------------------------------
+// Wallet transactions
+// --------------------------------------------------------------------------
+model Transaction {
+  id     String @id @default(cuid())
+  userId String
+  kind   String @default("")   // recharge | spend
+  amount Float  @default(0)
+  note   String @default("")
+  ts     String @default("")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}

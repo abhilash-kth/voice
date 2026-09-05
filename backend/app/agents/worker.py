@@ -1,0 +1,709 @@
+"""
+LiveKit worker — the runtime that turns a customer-saved AgentConfig into a
+live phone/browser call for a logged-in user.
+
+It:
+  * reads the dispatched room metadata to find user_id + agent_id + call_id,
+  * loads the agent + call record from the DB (SQLite or Neon via DATABASE_URL),
+  * builds a LiveKit **v1** ``AgentSession``+``Agent`` for that config,
+  * respects per-agent toggles: conversation memory on/off, recording on/off,
+  * runs RAG (text + documents + FAQ) against the customer's knowledge base,
+  * records transcripts + usage, and
+  * POSTs the per-component cost breakdown + recording URL back to FastAPI.
+
+Run with:
+    python -m app.agents.worker
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+import asyncio
+import logging
+import time
+import json
+import aiohttp
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Thread limits. Cap the BLAS/math libs to 1 thread (avoids per-thread pool
+# thrashing), but leave ONNX runtime UNTHROTTLED so the local silero VAD can use
+# all cores — throttling it to 1 thread is what made "inference is slower than
+# realtime" worse on a multi-core machine. Set VOICE_THREAD_LIMITS=0 to disable.
+# MUST run before numpy/onnx/livekit are imported so the runtimes pick them up.
+# ---------------------------------------------------------------------------
+if os.getenv("VOICE_THREAD_LIMITS", "1") == "1":
+    for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+               "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+    # Let onnxruntime auto-size its intra-op threads (silero VAD) instead of 1.
+    os.environ.setdefault("ONNXRUNTIME_NUM_THREADS", "0")
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from app.config import (  # noqa: E402
+    LIVEKIT_URL,
+    LIVEKIT_API_KEY,
+    LIVEKIT_API_SECRET,
+    EGRESS_ENABLED,
+    EGRESS_S3_BUCKET,
+    EGRESS_S3_ENDPOINT,
+    EGRESS_S3_REGION,
+    EGRESS_PUBLIC_BASE_URL,
+    BILLING_INTERNAL_TOKEN,
+)
+from app.db import init as db_init  # noqa: E402
+from app import repo  # noqa: E402
+from app.models import AgentConfig  # noqa: E402
+from app.billing import calculate_call_cost  # noqa: E402
+from app import memory  # noqa: E402
+from app import leadfile  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Register LiveKit plugins on the MAIN THREAD.
+#
+# livekit.plugins.* call `Plugin.register_plugin(...)` at import time, and that
+# refuses to run off the main thread (`RuntimeError: Plugins must be registered
+# on the main thread`). The worker runs each job in a background thread on
+# Windows (job_proc_lazy_main.thread_main), so a lazy import inside
+# prewarm()/entrypoint()/agent_builder would crash the job before the agent can
+# join the room. Importing them here (module top-level = main thread, when you
+# run `python -m app.agents.worker`) registers them once, safely.
+from livekit.plugins import silero    # noqa: E402,F401  (VAD)
+from livekit.plugins import google    # noqa: E402,F401  (STT/TTS)
+from livekit.plugins import deepgram  # noqa: E402,F401  (STT)
+from livekit.plugins import openai    # noqa: E402,F401  (LLM)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("voice-agent-saas-worker")
+
+FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
+
+BILLING_BACKEND_URL = os.getenv("BILLING_BACKEND_URL", "http://127.0.0.1:8000")
+WORKER_AGENT_NAME = "voice-agent-saas"
+
+# A call is only a real conversation if it ran for more than this many seconds
+# OR the customer actually said something. Otherwise we mark it "failed".
+_FAIL_THRESHOLD_SECONDS = 3
+
+
+def clean_reply_text(raw: str) -> str:
+    if not raw:
+        return FALLBACK_REPLY
+    text = raw
+
+    # 1. Drop reasoning blocks. Qwen3/Gemini-style models wrap their chain of
+    #    thought in <think>...</think> (and it is sometimes unclosed). Keep only
+    #    the content AFTER the last closing tag; if there is no closing tag,
+    #    strip the tags themselves.
+    for tag in ("</think>", "</reasoning>"):
+        if tag in text:
+            text = text.split(tag)[-1]
+    text = re.sub(r"</?(?:think|reasoning)>", "", text, flags=re.IGNORECASE)
+
+    # 2. Prefer an explicitly-labelled final answer if the model emitted one.
+    m = re.search(
+        r"(?:Final\s+Output|Spoken\s+(?:sentence|reply|answer)|Final\s+answer|Response|Reply|Answer)"
+        r"\s*:\s*[\"']?([^\n\"']+)",
+        text, flags=re.IGNORECASE,
+    )
+    if m:
+        text = m.group(1)
+
+    # 3. Keep only lines that look like spoken content; drop reasoning/format lines.
+    drop_re = re.compile(
+        r"^(Here'?s a thinking|Analyze|Identify|Formulate|Draft|Check Constraints|"
+        r"Key\s+(points|Details|Constraints)|Language:|Questions:|Role:|Output:|"
+        r"NO\s|DO\s+NOT\s|The\s+user|I\s+should|I\s+need|I\s+will|Mental|Refine|"
+        r"Self-Correction|Final\s+Polish|Wait,|Or\s+simpler|Let's\s+|Proceed|"
+        r"(?:Reasoning|Thought|Step)\s*\d*\s*[:.]|^\d+\.|^[-*#•])",
+        re.I,
+    )
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if drop_re.match(s):
+            continue
+        lines.append(s)
+    text = " ".join(lines).strip()
+    text = re.sub(r"[*#_`~]", "", text).strip(" \n\t-\"'")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # 4. If the model is pointing back at its own reasoning, bail.
+    if re.search(r"\b(thinking process|analyze user|chain of thought)\b", text, re.I):
+        return FALLBACK_REPLY
+
+    # 5. Empty or implausibly short => fallback. A bare name/entity such as
+    #    "Kapil Gautam" or "2014" is a legitimate short spoken answer, so only
+    #    reject text that is essentially empty (< 4 chars).
+    if not text or len(text) < 4:
+        return FALLBACK_REPLY
+    return text
+
+
+def _msg_text(item) -> str:
+    """Extract display text from a v1 ``ChatMessage`` (or any object with
+    ``text_content``), falling back to plain strings."""
+    if item is None:
+        return ""
+    if hasattr(item, "text_content"):
+        txt = item.text_content
+        if txt:
+            return str(txt)
+        txt = item.raw_text_content
+        if txt:
+            return str(txt)
+        content = getattr(item, "content", None)
+        if isinstance(content, list):
+            return " ".join(str(c) for c in content if isinstance(c, str))
+        return ""
+    if isinstance(item, str):
+        return item
+    return str(item)
+
+
+# ---------------------------------------------------------------------------
+# Session builders (assistant vs announcement "fixed-script" mode)
+# ---------------------------------------------------------------------------
+def _build_conn_options():
+    """Capped connect/retry budgets for LLM/STT/TTS.
+
+    LiveKit's default is ``APIConnectOptions(max_retry=3, retry_interval=2.0,
+    timeout=10.0)`` — 3 retries with backoff. On a Groq 429 (rate-limit, ~20 min),
+    a transient ``getaddrinfo`` DNS blip, or a Deepgram ``1006`` disconnect, those
+    3 retries are what produced the 16–19s "thinking"/silent stalls.
+
+    We cut retries to 1 with a short 0.5s interval so a brief blip recovers but a
+    persistent rate-limit fails in well under a second instead of freezing the caller.
+    """
+    from livekit.agents.llm.llm import APIConnectOptions
+    from livekit.agents.voice.agent_session import SessionConnectOptions
+
+    _conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=8.0)
+    # STT/TTS also get their own bound so a provider hiccup never stacks.
+    _media_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=6.0)
+    return SessionConnectOptions(
+        llm_conn_options=_conn,
+        stt_conn_options=_media_conn,
+        tts_conn_options=_media_conn,
+    )
+
+
+def build_assistant_session(cfg: AgentConfig):
+    """Full conversational session: STT + VAD + LLM + TTS, low-latency config."""
+    from livekit.agents import AgentSession
+    from app.agents.agent_builder import build_vad, build_stt, build_llm, build_tts
+
+    return AgentSession(
+        stt=build_stt(cfg),
+        vad=build_vad(),
+        llm=build_llm(cfg),
+        tts=build_tts(cfg),
+        # Fail FAST on any LLM/STT/TTS provider error (see _build_conn_options).
+        conn_options=_build_conn_options(),
+        # Turn-handling is set here (the session). This is the SIMPLE, LOCAL, stable
+        # configuration that makes a self-hosted worker feel human:
+        #   * turn_detection = "vad"  -> end-of-turn from the local silero VAD, so STT
+        #     and VAD stop fighting (that fight was re-feeding audio into VAD and
+        #     backing its buffer up -> "inference is slower than realtime").
+        #   * interruption mode="vad" -> local VAD barge-in. Do NOT use the default
+        #     (adaptive): it calls LiveKit Cloud's barge-in service, which 401s on a
+        #     self-hosted worker and then falls back (adds lag + noise).
+        turn_handling={
+            "turn_detection": "vad",
+            "endpointing": {"min_delay": 0.6, "max_delay": 1.2},
+            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 0},
+            # Preemptive generation (LLM answers while the user is still speaking) is
+            # great for latency, BUT here it was being invalidated almost every turn and
+            # adding speculative LLM work that starved the loop. Keep it OFF by default;
+            # re-enable with VOICE_PREEMPTIVE=1 only after the VAD backlog is gone.
+            "preemptive_generation": {
+                "enabled": os.getenv("VOICE_PREEMPTIVE", "0") == "1",
+                "preemptive_tts": False,
+            },
+        },
+    )
+
+
+def build_announcement_session(cfg: AgentConfig):
+    """Fixed-script "reminder" session: TTS only. No STT, no VAD, no LLM."""
+    from livekit.agents import AgentSession
+    from app.agents.agent_builder import build_tts
+
+    return AgentSession(
+        stt=None,
+        vad=None,
+        llm=None,
+        tts=build_tts(cfg),
+        conn_options=_build_conn_options(),
+        turn_handling={
+            "endpointing": {"min_delay": 0.2, "max_delay": 0.5},
+            "interruption": {"enabled": False},          # the script must not be cut off
+            "preemptive_generation": {"enabled": False},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recording (LiveKit Egress) — best-effort, only if enabled
+# ---------------------------------------------------------------------------
+async def start_egress(room: str) -> Optional[str]:
+    """Start a room-composite egress for `room`, return a public recording URL
+    (or None if egress isn't configured). Requires the livekit-egress service."""
+    if not EGRESS_ENABLED:
+        return None
+    if not (EGRESS_S3_BUCKET and EGRESS_PUBLIC_BASE_URL):
+        logger.info("🎙️ Recording enabled but Egress storage not configured — skipping.")
+        return None
+    try:
+        from livekit import api
+
+        client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        try:
+            req = api.RoomCompositeEgressRequest(
+                room_name=room,
+                layout="speaker",
+                audio_only=True,
+                file_outputs=[api.EncodedFileOutput(
+                    file_type=api.EncodedFileType.MP4,
+                    filepath=f"recordings/{room}-{int(time.time())}.mp4",
+                    s3=api.S3Upload(
+                        access_key=os.getenv("EGRESS_S3_ACCESS_KEY", ""),
+                        secret=os.getenv("EGRESS_S3_SECRET", ""),
+                        bucket=EGRESS_S3_BUCKET,
+                        endpoint=EGRESS_S3_ENDPOINT or None,
+                        region=EGRESS_S3_REGION,
+                    ),
+                )],
+            )
+            res = await client.egress.start_room_composite_egress(req)
+            egress_id = getattr(res, "egress_id", "")
+            file_results = list(getattr(res, "file_results", []) or [])
+            filename = file_results[0].filename if file_results else f"recordings/{room}.mp4"
+            logger.info(f"🎙️ Egress started: {egress_id} (status={res.status}) → {filename}")
+            return f"{EGRESS_PUBLIC_BASE_URL.rstrip('/')}/{filename}"
+        finally:
+            await client.aclose()
+    except Exception as e:
+        logger.warning(f"⚠️ Could not start egress: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+async def entrypoint(ctx):
+    from livekit.agents import AgentSession
+    from app.agents.agent_builder import (
+        build_vad,
+        build_stt,
+        build_llm,
+        build_tts,
+        build_voice_agent,
+        build_announce_agent,
+    )
+
+    call_start = time.time()
+
+    await db_init()
+
+    try:
+        meta = json.loads(ctx.job.metadata or "{}")
+    except Exception:
+        meta = {}
+    agent_id = meta.get("agent_id")
+    mode = meta.get("mode", "browser")
+    phone = meta.get("phone")
+    call_id = meta.get("call_id", "")
+    user_id = meta.get("user_id", "")
+    # Per-lead data for dynamic scripts (bulk-call campaigns). Every lead's columns
+    # can be referenced in the greeting/announcement text as {column_name}.
+    lead_data = meta.get("lead_data") or {}
+
+    rec = None
+    if agent_id and user_id:
+        rec = await repo.get_agent(agent_id, user_id)
+
+    if rec is None:
+        # fall back to the default demo agent so the worker never crashes
+        from app.sample import default_config
+        cfg = default_config()
+        agent_id = agent_id or "demo"
+    else:
+        cfg = AgentConfig(**rec)
+
+    logger.info(f"📞 agent={cfg.name} mode={mode} phone={phone} call={call_id}")
+
+    # Ensure the call record exists / is in-progress.
+    call_record = None
+    if call_id and user_id:
+        call_record = await repo.get_call(call_id, user_id)
+    if call_record is None:
+        call_record = await repo.create_call({
+            "user_id": user_id or "demo",
+            "agent_id": agent_id or "demo",
+            "mode": mode,
+            "phone": phone or None,
+            "room": ctx.room.name,
+            "status": "in-progress",
+            "started_at": time.strftime("%Y-%m-%d %H:%M"),
+        })
+    else:
+        await repo.update_call(call_record["id"], {"status": "in-progress", "room": ctx.room.name})
+
+    usage = {"tts_chars": 0, "llm_input_tokens": 0, "llm_output_tokens": 0,
+             "user_speech_seconds": 0.0, "transcripts": []}
+
+    # Dedupe identical user transcripts (STT can emit the same phrase twice) and
+    # track how long the agent stays in each state so we can flag slow turns.
+    last_user_transcript = {"text": "", "ts": 0.0}
+    state_tracker = {"state": None, "since": time.time()}
+
+    # Cross-call memory (ONLY if the agent enabled it).
+    # Cross-call memory key. SIP calls are keyed by the phone number (the person's
+    # real identity). Browser calls have no phone, so key them by the logged-in
+    # user + agent — otherwise a brand-new randomised room name per call means the
+    # agent NEVER remembers a browser caller between calls.
+    if phone:
+        customer_key = phone
+    elif user_id:
+        customer_key = f"user:{user_id}:{agent_id}"
+    else:
+        customer_key = ctx.room.name
+    memory_enabled = bool(getattr(cfg, "memory_enabled", True))
+    prior_memory = memory.load(customer_key) if memory_enabled else ""
+
+    greeting = cfg.greeting or f"Namaste! Main {cfg.name} hoon. Aap kaise madad kar sakta hoon?"
+    # Dynamic script: substitute {column} placeholders with this lead's values
+    # (used by bulk-call campaigns so every call is personalized).
+    greeting = leadfile.render_template(greeting, lead_data)
+
+    # ------------------------------------------------------------------
+    # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
+    # ------------------------------------------------------------------
+    agent_mode = getattr(cfg, "agent_mode", "assistant") or "assistant"
+    if agent_mode == "announcement":
+        session = build_announcement_session(cfg)
+    else:
+        session = build_assistant_session(cfg)
+
+    def on_item_added(ev):
+        item = getattr(ev, "item", None)
+        role = getattr(item, "role", None)
+        text = _msg_text(item)
+        if not text:
+            return
+        if role == "user":
+            # Skip the SAME phrase re-emitted within 2.5s (STT/endpointing dupes),
+            # otherwise the same speech is billed and shown multiple times.
+            now = time.time()
+            if text == last_user_transcript["text"] and (now - last_user_transcript["ts"]) < 2.5:
+                return
+            last_user_transcript["text"] = text
+            last_user_transcript["ts"] = now
+            words = max(len(text.split()), 1)
+            usage["llm_input_tokens"] += int(words * 1.3)
+            usage["user_speech_seconds"] += (words / 150.0) * 60.0
+            usage["transcripts"].append({"role": "user", "text": text})
+            logger.info(f"👂 User: {text}")
+        elif role == "assistant":
+            cleaned = clean_reply_text(text)
+            if cleaned == FALLBACK_REPLY and text.strip() != FALLBACK_REPLY:
+                # The model returned something but we flagged it as a fallback —
+                # surface the raw text so we can see WHY.
+                logger.warning(f"🧮 LLM reply flagged as fallback. RAW: {text!r}")
+            usage["tts_chars"] += len(cleaned)
+            # Only count LLM output in assistant mode; announcement plays a fixed
+            # script with no LLM, so it must not be billed for LLM tokens.
+            if agent_mode != "announcement":
+                words = max(len(cleaned.split()), 1)
+                usage["llm_output_tokens"] += int(words * 1.3)
+            usage["transcripts"].append({"role": "agent", "text": cleaned})
+            logger.info(f"🗣️ TTS: {cleaned}")
+
+    session.on("conversation_item_added", on_item_added)
+
+    def _on_state(ev):
+        now = time.time()
+        prev = state_tracker["state"]
+        elapsed = now - state_tracker["since"]
+        if prev == "thinking" and elapsed > 2.5:
+            logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
+        logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        state_tracker["state"] = ev.new_state
+        state_tracker["since"] = now
+
+    session.on("agent_state_changed", _on_state)
+
+    # Start recording if the agent has it on — but DO NOT block the call from
+    # connecting. A missing/unavailable Egress service used to add ~21s before
+    # session.start(), delaying every call. Now it runs in the background and the
+    # recording URL is filled in before billing finalizes (or skipped if Egress
+    # isn't reachable).
+    recording_url = None
+    egress_task = None
+    if getattr(cfg, "recording_enabled", True):
+        async def _start_egress_later():
+            nonlocal recording_url
+            try:
+                recording_url = await asyncio.wait_for(start_egress(ctx.room.name), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Egress timed out after 10s — recording disabled for this call.")
+            except Exception as e:
+                logger.warning(f"⚠️ Egress unavailable; continuing without recording: {e}")
+        egress_task = asyncio.create_task(_start_egress_later())
+
+    if agent_mode == "announcement":
+        script = getattr(cfg, "announce_text", "") or greeting
+        script = leadfile.render_template(script, lead_data)
+        agent = build_announce_agent(cfg, announce_text=script)
+        logger.info("📢 mode=announcement (fixed-script only, no STT/LLM)")
+    else:
+        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data)
+        logger.info("💬 mode=assistant (STT+LLM+TTS)")
+
+    # Server-side noise cancellation. Two tiers:
+    #   * NOISE_CANCELLATION=krisp -> server-side Krisp (BVC) filter. Only works on
+    #     LiveKit Cloud WITH the `livekit-krisp-noise-cancellation` package installed
+    #     (it's a closed-source binary; it does NOT run on a plain self-hosted SFU).
+    #   * default (browser calls) -> the browser already applies WebRTC
+    #     noiseSuppression/echoCancellation/autoGainControl (see CallPanel.tsx),
+    #     and Deepgram STT uses its built-in VAD (`vad_events=True`), which rejects
+    #     non-speech/noise frames before they reach the LLM.
+    room_options = None
+    nc_mode = os.getenv("NOISE_CANCELLATION", "").strip().lower()
+    if nc_mode == "krisp":
+        try:
+            from livekit import rtc
+            from livekit.agents.voice import room_io
+            room_options = room_io.RoomOptions(
+                input_options=room_io.RoomInputOptions(
+                    noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
+                )
+            )
+            logger.info("🎤 Krisp noise cancellation enabled.")
+        except Exception as e:
+            logger.warning(
+                "Krisp noise cancellation unavailable (%s). To enable it on LiveKit "
+                "Cloud: pip install livekit-krisp-noise-cancellation and set "
+                "NOISE_CANCELLATION=krisp. For a self-hosted demo, leave it unset — "
+                "browser calls get WebRTC noise suppression and Deepgram VAD filters "
+                "non-speech.", e,
+            )
+    elif nc_mode:
+        logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
+
+    # ------------------------------------------------------------------
+    # Finalization (idempotent) + call-end watchdog.
+    #
+    # LiveKit's built-in `close_on_disconnect` only ends a session when the
+    # disconnect reason is CLIENT_INITIATED / ROOM_DELETED / USER_REJECTED.
+    # Closing the browser tab or a network drop uses a different reason, so the
+    # session never closes and the call stays "in-progress" forever. We fix that
+    # with a watchdog that ends the job (which runs `finalize_billing`) as soon
+    # as the caller leaves for ANY reason.
+    # ------------------------------------------------------------------
+    _finalized = {"done": False}
+
+    async def finalize_billing(reason=None):
+        if _finalized["done"]:
+            return
+        _finalized["done"] = True
+        try:
+            duration = int(time.time() - call_start)
+            costs = calculate_call_cost(
+                duration_seconds=duration,
+                stt_seconds=usage["user_speech_seconds"],
+                llm_input_tokens=usage["llm_input_tokens"],
+                llm_output_tokens=usage["llm_output_tokens"],
+                tts_chars=usage["tts_chars"],
+                llm_provider_id=cfg.providers.llm.id,
+                stt_provider_id=cfg.providers.stt.id,
+                tts_provider_id=cfg.providers.tts.id,
+                client_rate_per_min=cfg.client_rate_per_min,
+            )
+            if memory_enabled:
+                memory.save(customer_key, usage["transcripts"])
+
+            # Only treat it as a real call if something was said or it ran long
+            # enough. Otherwise mark it failed so it isn't billed.
+            real_call = (duration >= _FAIL_THRESHOLD_SECONDS) or (usage["user_speech_seconds"] > 0)
+            status = "completed" if real_call else "failed"
+
+            await repo.update_call(call_record["id"], {
+                "status": status,
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                "duration_seconds": duration,
+                "transcripts": usage["transcripts"][-60:],
+                "usage": usage,
+                "cost": costs if real_call else {},
+                "recording_url": recording_url,
+            })
+            print(_billing_report(costs, usage, duration))
+            if real_call:
+                await _post_billing(call_record["id"], user_id, agent_id, mode, phone,
+                                    duration, costs, usage, recording_url, status)
+        except Exception as e:
+            logger.exception(f"finalize_billing error: {e}")
+
+    # Register the shutdown callback BEFORE the session starts, so finalization is
+    # always wired even if setup/session errors out or the room closes instantly.
+    try:
+        ctx.add_shutdown_callback(finalize_billing)
+    except Exception:
+        pass
+
+    # Watchdog: end the call when the caller leaves for any reason (closing the
+    # tab, network drop, or clicking "Leave"). Closing the session unblocks
+    # session.start(), which lets the job shut down and run finalize_billing.
+    async def watch_call_end():
+        room = ctx.room
+        caller_joined = asyncio.Event()
+        caller_left = asyncio.Event()
+
+        def _on_connected(participant):
+            if participant != room.local_participant:
+                caller_joined.set()
+
+        def _on_disconnected(participant):
+            # "remote participants" = the caller(s). When there are none left and
+            # we previously saw at least one caller, the call is over.
+            if not room.remote_participants:
+                caller_left.set()
+
+        room.on("participant_connected", _on_connected)
+        room.on("participant_disconnected", _on_disconnected)
+        try:
+            # The caller may already be in the room before this watcher attaches.
+            if room.remote_participants:
+                caller_joined.set()
+            await caller_joined.wait()
+            await caller_left.wait()
+            logger.info("👋 Caller hang up — ending call.")
+        finally:
+            room.off("participant_connected", _on_connected)
+            room.off("participant_disconnected", _on_disconnected)
+        # Close the agent session so the job can wind down and finalize.
+        try:
+            session.shutdown(drain=False)
+        except Exception as e:
+            logger.warning(f"session.shutdown failed: {e}")
+        try:
+            ctx.shutdown()
+        except Exception as e:
+            logger.warning(f"could not trigger job shutdown: {e}")
+
+    watchdog = asyncio.create_task(watch_call_end())
+
+    # session.start connects to the room (calls ctx.connect() internally) and
+    # keeps the job alive until the room disconnects (call ends).
+    # NOTE: only pass room_options when it's a real RoomOptions — livekit 1.7.1
+    # rejects an explicit None (room_options defaults to NOT_GIVEN, so omitting
+    # it makes the session build its own default options).
+    start_kwargs: dict = {"agent": agent, "room": ctx.room}
+    if room_options is not None:
+        start_kwargs["room_options"] = room_options
+    try:
+        await session.start(**start_kwargs)
+    finally:
+        watchdog.cancel()
+        if egress_task is not None:
+            egress_task.cancel()
+
+
+def _billing_report(costs, usage, duration) -> str:
+    return (
+        "\n" + "=" * 64 + "\n"
+        f"📊 BILLING  duration={duration}s ({costs['duration_mins']} min)\n"
+        f"👂 STT {round(usage['user_speech_seconds'],1)}s -> ₹{costs['stt_cost_inr']}\n"
+        f"🧠 LLM {usage['llm_input_tokens']}in/{usage['llm_output_tokens']}out -> ₹{costs['llm_cost_inr']}\n"
+        f"🗣️ TTS {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}\n"
+        f"🖥️ Server -> ₹{costs['server_cost_inr']}\n"
+        f"💸 YOUR COST ₹{costs['total_cost_inr']}   💳 BILL ₹{costs['client_price_inr']}\n"
+        f"🤑 PROFIT ₹{costs['your_profit_inr']} [{'PROFIT ✅' if costs['is_profit'] else 'LOSS ⚠️'}]\n"
+        + "=" * 64
+    )
+
+
+async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs, usage,
+                       recording_url, status="completed"):
+    headers = {"Content-Type": "application/json"}
+    if BILLING_INTERNAL_TOKEN:
+        headers["X-Internal-Token"] = BILLING_INTERNAL_TOKEN
+    payload = {
+        "id": call_id,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "mode": mode,
+        "phone": phone,
+        "room": "",
+        "date": time.strftime("%Y-%m-%d %H:%M"),
+        "recording_url": recording_url,
+        "durationSeconds": duration,
+        "durationMins": costs["duration_mins"],
+        "sttSeconds": round(usage["user_speech_seconds"], 1),
+        "ttsChars": usage["tts_chars"],
+        "llmInputTokens": usage["llm_input_tokens"],
+        "llmOutputTokens": usage["llm_output_tokens"],
+        "costToUser": f"₹{costs['client_price_inr']}",
+        "costToUserNumber": costs["client_price_inr"],
+        "clientRatePerMin": costs["client_rate_per_min"],
+        "providerCost": costs["total_cost_inr"],
+        "costPerMin": costs["your_cost_per_min"],
+        "billPerMin": costs["client_bill_per_min"],
+        "profit": costs["your_profit_inr"],
+        "isProfit": costs["is_profit"],
+        "sttCost": costs["stt_cost_inr"],
+        "llmCost": costs["llm_cost_inr"],
+        "ttsCost": costs["tts_cost_inr"],
+        "serverCost": costs["server_cost_inr"],
+        "status": status.title(),
+        "transcripts": usage["transcripts"][-30:],
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{BILLING_BACKEND_URL}/api/billing/log",
+                                    json=payload, headers=headers, timeout=5) as resp:
+                logger.info(f"✅ Billing posted HTTP {resp.status}")
+    except Exception as e:
+        logger.warning(f"⚠️ Billing POST failed: {e}")
+
+
+def prewarm(proc):
+    # silero was imported at module top-level (main thread), so the plugin is
+    # already registered; this only loads the VAD model weights into memory.
+    silero.VAD.load(
+        min_speech_duration=0.1,
+        min_silence_duration=0.5,
+        prefix_padding_duration=0.2,
+        activation_threshold=0.45,
+    )
+    logger.info("🔥 Prewarm: VAD hot")
+
+
+if __name__ == "__main__":
+    from livekit.agents import WorkerOptions, cli
+
+    # livekit-agents v1 ships a Typer CLI that requires a subcommand
+    # (start / dev / console). Default to `start` so that
+    # `python -m app.agents.worker` boots a production worker out of the box.
+    if len(sys.argv) == 1:
+        sys.argv.append("start")
+
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            # Pre-warm one idle worker process so the first call connects fast
+            # instead of paying the plugin-import + VAD-load cost on every call.
+            # Bump this for more concurrent calls; set 0 to never pre-warm.
+            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "1")),
+            agent_name=WORKER_AGENT_NAME,
+            # Windows doesn't support the default "forkserver" context; "spawn"
+            # is portable and works on Windows/macOS/Linux alike.
+            multiprocessing_context="spawn",
+        )
+    )
