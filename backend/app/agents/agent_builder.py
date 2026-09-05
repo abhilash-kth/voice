@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from typing import Any, Optional
 
 from ..models import AgentConfig, KnowledgeBase
@@ -311,16 +313,92 @@ def build_vad() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Context-size budgets
+#
+# Groq's free ("on_demand") tier caps each model at ~8k tokens/minute, and every
+# voice turn re-sends the ENTIRE system prompt + chat history. Baking the whole
+# knowledge base into the static prompt (the old behaviour) made each LLM request
+# 6-7k tokens, so a single turn used most of the minute's budget and back-to-back
+# turns / concurrent calls got HTTP 429 — which, with fail-fast retries, silently
+# dropped the reply (the caller heard dead air). These char budgets keep the
+# static prompt small (~1-2k tokens), and per-turn RAG (see
+# on_user_turn_completed) pulls in the specific chunks a question needs.
+# Raise the budgets only if you've upgraded the Groq tier or moved to a
+# higher-limit provider.
+# ---------------------------------------------------------------------------
+_KB_BUDGET_CHARS = int(os.getenv("VOICE_KB_BUDGET_CHARS", "2500"))
+_FAQ_BUDGET_CHARS = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", "1500"))
+_OWNER_PROMPT_BUDGET_CHARS = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", "1000"))
+
+# Marker for the per-turn RAG system message (used to prune the previous turn's).
+_RAG_PREFIX = "[RAG]"
+
+
+def _truncate(text: str, budget: int) -> str:
+    """Clip `text` to `budget` chars, preferring a sentence/line boundary."""
+    text = (text or "").strip()
+    if budget <= 0 or len(text) <= budget:
+        return text
+    cut = text[:budget]
+    best = -1
+    for m in re.finditer(r"[.!?\n]", cut):
+        best = m.end()
+    if best > budget * 0.5:
+        cut = text[:best]
+    return cut.rstrip() + " …"
+
+
+def _rag_per_turn_enabled() -> bool:
+    v = (os.getenv("VOICE_RAG_PER_TURN") or "").strip().lower()
+    if v in ("0", "false", "off"):
+        return False
+    if v in ("1", "true", "on"):
+        return True
+    # Default: on — UNLESS preemptive generation is on, because mutating the
+    # chat context per turn would invalidate preemptive generation (see
+    # on_user_turn_completed).
+    return os.getenv("VOICE_PREEMPTIVE", "0") != "1"
+
+
+def _chat_msg_text(item) -> str:
+    """Best-effort text of a v1 ChatMessage (or a plain string)."""
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        return item
+    if hasattr(item, "text_content") and item.text_content:
+        return str(item.text_content)
+    content = getattr(item, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(c) for c in content if isinstance(c, str))
+    return ""
+
+
+def _find_chat_ctx(obj) -> Any:
+    """Return the mutable ChatContext from a v1 turn context (defensively)."""
+    candidates = [obj]
+    for attr in ("chat_ctx", "llm_ctx", "context"):
+        v = getattr(obj, attr, None)
+        if v is not None:
+            candidates.append(v)
+    for c in candidates:
+        if c is not None and hasattr(c, "add_message"):
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
 # System prompt builder (persona + business facts + FAQ)
 # ---------------------------------------------------------------------------
 def _flatten_knowledge(kb: KnowledgeBase) -> list[str]:
     """Flatten every knowledge source into a list of bullet lines.
 
-    Unlike ``build_context`` (which retrieves *only the relevant* chunks for a
-    single query), this returns the whole knowledge base so it can be baked into
-    the static system prompt once. That keeps the chat context identical on every
-    turn, which lets LiveKit's preemptive generation survive (see the note on
-    ``on_user_turn_completed``) and is what makes replies fast.
+    Returns the WHOLE knowledge base; ``build_instructions`` then applies the
+    context-size budgets to it (the capped static part), while the question-
+    specific chunks are retrieved per-turn by ``rag.build_context`` inside
+    ``on_user_turn_completed``.
     """
     blocks = []
     manual = (kb.text or "").strip()
@@ -354,17 +432,48 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "conversation. Never mention being an AI, a robot, or a bot."
     )
 
-    extra = cfg.knowledge.system_prompt
+    extra = (cfg.knowledge.system_prompt or "").strip()
     if extra:
+        if len(extra) > _OWNER_PROMPT_BUDGET_CHARS:
+            extra = _truncate(extra, _OWNER_PROMPT_BUDGET_CHARS)
+            logger.warning(
+                "⚠️ Owner system prompt truncated to fit the LLM context budget "
+                f"({len(cfg.knowledge.system_prompt)} -> {_OWNER_PROMPT_BUDGET_CHARS} chars; "
+                "raise VOICE_OWNER_PROMPT_BUDGET_CHARS to keep more)."
+            )
         lines.append("")
         lines.append("Instructions from the business owner:")
-        lines.append(extra.strip())
+        lines.append(extra)
 
+    # Business facts are CAPPED (see context-size budgets above). The full KB is
+    # still available per-turn via RAG in on_user_turn_completed.
     facts = _flatten_knowledge(cfg.knowledge)
     if facts:
-        lines.append("")
-        lines.append("Business facts you know (use these when answering):")
-        lines.extend(f"- {f}" for f in facts)
+        kept: list[str] = []
+        used = 0
+        truncated_any = False
+        for f in facts:
+            room = _KB_BUDGET_CHARS - used
+            if room <= 40:
+                truncated_any = True
+                break
+            if len(f) > room:
+                f = _truncate(f, room)
+                truncated_any = True
+            kept.append(f)
+            used += len(f) + 2
+        if truncated_any:
+            logger.warning(
+                "⚠️ Knowledge base truncated to fit the LLM context budget "
+                f"({sum(len(f) for f in facts)} -> {used} chars; Groq's free tier is "
+                "8k TPM, and an oversized prompt is what causes 429s → silent dropped "
+                "turns). Raise VOICE_KB_BUDGET_CHARS only if you've upgraded the "
+                "Groq tier or switched to a higher-limit provider."
+            )
+        if kept:
+            lines.append("")
+            lines.append("Business facts you know (use these when answering):")
+            lines.extend(f"- {f}" for f in kept)
 
     if query_context:
         lines.append("")
@@ -373,17 +482,38 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
 
     faq = getattr(cfg.knowledge, "faq", None) or []
     if faq:
-        lines.append("")
-        lines.append(
-            "Frequently asked questions. When the caller asks something that "
-            "matches one of these, answer with its official answer VERBATIM "
-            "(do not paraphrase or add extra info):"
-        )
+        faq_lines: list[str] = []
+        used = 0
+        faq_truncated = False
         for item in faq:
             q = item.get("q", "")
             a = item.get("a", "")
-            if q and a:
-                lines.append(f"- Q: {q}\n  A: {a}")
+            if not (q and a):
+                continue
+            block = f"- Q: {q}\n  A: {a}"
+            room = _FAQ_BUDGET_CHARS - used
+            if room <= 40:
+                faq_truncated = True
+                break
+            if len(block) > room:
+                # Keep the question, clip the answer to fit.
+                block = f"- Q: {q}\n  A: {_truncate(a, max(room - len(q) - 12, 40))}"
+                faq_truncated = True
+            faq_lines.append(block)
+            used += len(block) + 2
+        if faq_truncated:
+            logger.warning(
+                "⚠️ FAQ truncated to fit the LLM context budget "
+                f"(VOICE_FAQ_BUDGET_CHARS={_FAQ_BUDGET_CHARS})."
+            )
+        if faq_lines:
+            lines.append("")
+            lines.append(
+                "Frequently asked questions. When the caller asks something that "
+                "matches one of these, answer with its official answer VERBATIM "
+                "(do not paraphrase or add extra info):"
+            )
+            lines.extend(faq_lines)
 
     return "\n".join(lines)
 
@@ -402,21 +532,28 @@ def build_voice_agent(
 
     The returned agent:
       * speaks ``greeting`` when the session enters (LiveKit's ``on_enter``),
-      * has the full knowledge base baked into its static system prompt, and
+      * has a CAPPED summary of the knowledge base in its static system prompt
+        (full-KB prompts 429 Groq's free tier; relevant chunks are injected
+        per-turn via RAG in on_user_turn_completed), and
       * seeds the conversation with ``prior_memory`` (cross-call memory).
 
-    The knowledge base is NOT injected per-turn: mutating the chat context in
-    ``on_user_turn_completed`` would invalidate LiveKit's preemptive generation
-    (the fast path that starts the LLM while you are still speaking), doubling
-    latency. Baking it in once keeps the context stable so replies stay fast.
+    The KB is split: a capped summary stays static (fast, stable), and the
+    question-specific chunks are added in ``on_user_turn_completed`` (per-turn
+    RAG). Per-turn mutation would invalidate preemptive generation, so RAG is
+    skipped when ``VOICE_PREEMPTIVE=1`` (only the capped static facts are used
+    then). See the context-size budgets comment above for why the static part
+    is capped.
     """
     from livekit.agents import Agent, llm
     from livekit.agents import get_job_context
 
-    # The FULL knowledge base is baked into the static system prompt so the model
-    # always has every fact. This keeps the chat context byte-identical on every
-    # turn, which is what lets LiveKit's preemptive generation survive — the
-    # single biggest latency win. (Do NOT mutate the context per-turn.)
+    # A CAPPED summary of the knowledge base is baked into the static system
+    # prompt (see context-size budgets above). Baking in the FULL KB made every
+    # LLM request 6-7k tokens, which 429s Groq's free tier (8k TPM) and silently
+    # dropped turns. The specific chunks a question needs are injected per turn
+    # by on_user_turn_completed (lightweight RAG) — safe because preemptive
+    # generation is off by default; when VOICE_PREEMPTIVE=1 the hook stands down
+    # and only the capped static facts are used.
     instructions = build_instructions(cfg)
 
     # Auto hang-up: when the conversation is finished the LLM calls `end_call`,
@@ -483,6 +620,7 @@ def build_voice_agent(
         def __init__(self):
             self.cfg = cfg
             self.greeting = greeting
+            self._last_rag = ""  # per-turn RAG injection (see on_user_turn_completed)
             super().__init__(
                 instructions=instructions,
                 chat_ctx=chat_ctx,
@@ -515,13 +653,52 @@ def build_voice_agent(
             """Hook that runs after the user finishes speaking.
 
             LiveKit's ``AgentSession`` ``await``s this hook, so it must be a
-            coroutine (``async def``). We deliberately do NOT add anything to
-            ``turn_ctx`` here: the knowledge base is already baked into the static
-            system prompt, and mutating ``turn_ctx`` would invalidate LiveKit's
-            preemptive generation and force a slow second LLM call. Keeping this a
-            no-op is what makes replies feel instant.
+            coroutine (``async def``).
+
+            We inject ONLY the knowledge-base chunks relevant to this specific
+            question (lightweight RAG), instead of relying on the whole KB in the
+            static system prompt. The static prompt is deliberately capped (see
+            the context-size budgets above): sending the full KB on every turn is
+            what pushed each LLM request to 6-7k tokens and 429'd Groq's free
+            tier, silently dropping the caller's turn.
+
+            NOTE: mutating the chat context per turn invalidates LiveKit's
+            preemptive generation, so when VOICE_PREEMPTIVE=1 this hook is a
+            no-op and only the capped static facts are available.
             """
-            return
+            if not _rag_per_turn_enabled():
+                return
+            try:
+                user_text = _chat_msg_text(new_message).strip()
+                if not user_text:
+                    return
+                from .. import rag  # local import: keep this module light
+                hits = (rag.build_context(cfg.knowledge, user_text, top_k=3) or "").strip()
+                if not hits or hits == self._last_rag:
+                    return  # nothing new, or same facts as last turn
+                target = _find_chat_ctx(turn_ctx)
+                if target is None:
+                    return
+                # Drop the previous turn's RAG message so the context does not
+                # grow one system message per turn.
+                try:
+                    items = getattr(target, "items", None)
+                    if isinstance(items, list):
+                        target.items = [m for m in items if _RAG_PREFIX not in _chat_msg_text(m)]
+                except Exception:
+                    pass  # not prunable; add_message below still bounds growth via _last_rag
+                target.add_message(
+                    role="system",
+                    content=(
+                        f"{_RAG_PREFIX} Relevant business facts for THIS specific "
+                        f"question:\n{hits}"
+                    ),
+                )
+                self._last_rag = hits
+            except Exception as e:
+                # RAG must never take a live call down — fall back to the
+                # static (capped) facts.
+                logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
 
     return _VoiceAgent()
 

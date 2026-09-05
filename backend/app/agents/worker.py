@@ -79,6 +79,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("voice-agent-saas-worker")
 
 FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
+# Spoken when a user turn gets NO LLM reply at all (provider 429 after the
+# fail-fast retries, or a failed/empty generation) so the caller is never left
+# in dead air — that silence is what made callers hang up.
+FALLBACK_SILENCE = "Sorry, thoda technical glitch hua. Aap dobara pooch sakte hain?"
+# How long to wait for the LLM to answer a user turn before speaking
+# FALLBACK_SILENCE. Groq's 429 backoff can be 7-45s, so 12s is a good balance:
+# a normal fast turn never gets here, but a rate-limited one does.
+LLM_FALLBACK_DELAY = float(os.getenv("VOICE_LLM_FALLBACK_DELAY", "12"))
 
 BILLING_BACKEND_URL = os.getenv("BILLING_BACKEND_URL", "http://127.0.0.1:8000")
 WORKER_AGENT_NAME = "voice-agent-saas"
@@ -142,6 +150,25 @@ def clean_reply_text(raw: str) -> str:
     if not text or len(text) < 4:
         return FALLBACK_REPLY
     return text
+
+
+def _item_is_tool_related(item) -> bool:
+    """True if this conversation item is a tool call / tool result / function
+    message — i.e. NOT a spoken reply.
+
+    These items have no speakable text; without this guard they fall through as
+    "empty assistant replies" (bogus ``🗣️ TTS: Sorry...`` lines and, worse, a
+    fallback line spoken right before ``end_call`` hangs up)."""
+    for attr in ("function_call", "function_call_output", "tool_call"):
+        if getattr(item, attr, None):
+            return True
+    if getattr(item, "role", None) == "tool":
+        return True
+    content = getattr(item, "content", None)
+    # A text message's content is strings; a function message carries objects.
+    if isinstance(content, list) and any(not isinstance(c, str) for c in content):
+        return True
+    return False
 
 
 def _msg_text(item) -> str:
@@ -390,13 +417,77 @@ async def entrypoint(ctx):
     else:
         session = build_assistant_session(cfg)
 
+    # ------------------------------------------------------------------
+    # Silence watchdog.
+    #
+    # When the LLM 429s (Groq free-tier TPM limit) the fail-fast retry budget in
+    # _build_conn_options gives up in <1s and LiveKit logs the error but speaks
+    # NOTHING — the caller is left in dead air and hangs up. Same symptom when a
+    # model returns an empty completion. So: arm a timer on every user turn, and
+    # if no assistant reply lands within LLM_FALLBACK_DELAY, speak
+    # FALLBACK_SILENCE and let the caller retry (by then the rate-limit window
+    # has usually rolled over).
+    # ------------------------------------------------------------------
+    reply_tracker = {
+        "last_user_ts": 0.0,
+        "last_assistant_ts": 0.0,
+        "empty_spoken": False,  # already spoke a fallback for the current turn
+        "pending": None,        # pending silence-fallback task
+    }
+
+    def _cancel_pending():
+        t = reply_tracker["pending"]
+        if t is not None:
+            t.cancel()
+            reply_tracker["pending"] = None
+
+    def _mark_reply(ts: float):
+        reply_tracker["last_assistant_ts"] = ts
+        _cancel_pending()
+
+    def _spawn_say(text_to_say: str):
+        async def _say():
+            try:
+                await asyncio.wait_for(session.say(text_to_say, allow_interruptions=True), timeout=15)
+            except Exception as e:
+                logger.warning(f"🛟 fallback say failed: {e}")
+        try:
+            asyncio.ensure_future(_say())
+        except Exception as e:
+            logger.warning(f"🛟 could not schedule fallback reply: {e}")
+
+    async def _silence_fallback(turn_ts: float):
+        try:
+            await asyncio.sleep(LLM_FALLBACK_DELAY)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if reply_tracker["pending"] is asyncio.current_task():
+                reply_tracker["pending"] = None
+        if reply_tracker["last_assistant_ts"] >= turn_ts:
+            return  # the LLM did answer this turn (late, but it answered)
+        logger.warning(
+            f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
+            "(rate-limited 429 or failed generation) — speaking a fallback line "
+            "so the call is not silent."
+        )
+        _spawn_say(FALLBACK_SILENCE)
+
+    def _schedule_silence_fallback(turn_ts: float):
+        _cancel_pending()
+        try:
+            reply_tracker["pending"] = asyncio.ensure_future(_silence_fallback(turn_ts))
+        except Exception as e:
+            reply_tracker["pending"] = None
+            logger.warning(f"🛟 could not arm silence watchdog: {e}")
+
     def on_item_added(ev):
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
         text = _msg_text(item)
-        if not text:
-            return
         if role == "user":
+            if not text:
+                return
             # Skip the SAME phrase re-emitted within 2.5s (STT/endpointing dupes),
             # otherwise the same speech is billed and shown multiple times.
             now = time.time()
@@ -409,7 +500,28 @@ async def entrypoint(ctx):
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
             usage["transcripts"].append({"role": "user", "text": text})
             logger.info(f"👂 User: {text}")
+            # A fresh turn starts: arm the silence watchdog so a 429'd or empty
+            # LLM turn never leaves the caller in dead air.
+            reply_tracker["last_user_ts"] = now
+            reply_tracker["empty_spoken"] = False
+            _schedule_silence_fallback(now)
         elif role == "assistant":
+            # Tool-call / tool-result items are not spoken replies. Skip them —
+            # otherwise they show up as bogus "🗣️ TTS:" lines and, on the
+            # end_call turn, trigger a fallback line right before the hang-up.
+            if _item_is_tool_related(item):
+                return
+            now = time.time()
+            if not text.strip():
+                # The LLM produced an empty completion — LiveKit has nothing to
+                # speak. Without this the caller hears dead air and hangs up.
+                logger.warning("🧮 LLM returned an empty reply — speaking fallback line.")
+                _mark_reply(now)
+                if not reply_tracker["empty_spoken"]:
+                    reply_tracker["empty_spoken"] = True
+                    _spawn_say(FALLBACK_REPLY)
+                return
+            _mark_reply(now)
             cleaned = clean_reply_text(text)
             if cleaned == FALLBACK_REPLY and text.strip() != FALLBACK_REPLY:
                 # The model returned something but we flagged it as a fallback —
