@@ -415,7 +415,12 @@ def build_vad() -> Any:
     from livekit.plugins import silero
     return silero.VAD.load(
         min_speech_duration=0.1,
-        min_silence_duration=0.5,
+        # Silence required before the caller's turn is considered complete.
+        # The old 0.5s default cut long Hinglish sentences at mid-sentence
+        # pauses: the LLM would start answering a partial question, and when
+        # the caller continued, the in-flight reply got orphaned/dropped
+        # (the "silent turn"). 0.9s tolerates natural mid-sentence pauses.
+        min_silence_duration=float(os.getenv("VOICE_VAD_MIN_SILENCE", "0.9")),
         prefix_padding_duration=0.2,
         activation_threshold=0.45,
     )
