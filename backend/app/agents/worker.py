@@ -241,7 +241,14 @@ def build_assistant_session(cfg: AgentConfig):
         #     self-hosted worker and then falls back (adds lag + noise).
         turn_handling={
             "turn_detection": "vad",
-            "endpointing": {"min_delay": 0.6, "max_delay": 1.2},
+            # Endpointing delays were raised (0.6/1.2 -> 0.9/1.8) for the same
+            # reason as the VAD silence bump: turn-end must wait long enough
+            # that a mid-sentence pause isn't mistaken for the end of the
+            # question. Tune via env if a trade-off with latency is needed.
+            "endpointing": {
+                "min_delay": float(os.getenv("VOICE_EP_MIN_DELAY", "0.9")),
+                "max_delay": float(os.getenv("VOICE_EP_MAX_DELAY", "1.8")),
+            },
             "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 0},
             # Preemptive generation (LLM answers while the user is still speaking) is
             # great for latency, BUT here it was being invalidated almost every turn and
@@ -504,11 +511,25 @@ async def entrypoint(ctx):
             # into silence (the "hello? hello?" loop). The 12s window would never
             # fire because every new user turn resets it — so answer NOW instead
             # of waiting another full window.
+            # Guard: only when the session has sat IDLE in 'listening' for 3s+.
+            # A shorter gap means the caller is mid-sentence (the VAD split a
+            # long question in two) and this new turn is already processing —
+            # speaking a fallback here would stack a "glitch" line on top of
+            # the real answer that is about to be spoken.
             prev_user_ts = reply_tracker["last_user_ts"]
-            if prev_user_ts > 0 and reply_tracker["last_assistant_ts"] < prev_user_ts:
+            idle_s = (
+                now - state_tracker["since"]
+                if state_tracker["state"] == "listening"
+                else 0.0
+            )
+            if (
+                prev_user_ts > 0
+                and reply_tracker["last_assistant_ts"] < prev_user_ts
+                and idle_s >= 3.0
+            ):
                 logger.warning(
-                    "🛟 Previous turn got no LLM reply and the caller spoke again — "
-                    "speaking fallback immediately."
+                    "🛟 Previous turn got no LLM reply and the caller spoke again "
+                    f"(after {idle_s:.1f}s of silence) — speaking fallback immediately."
                 )
                 _spawn_say(FALLBACK_SILENCE)
             # A fresh turn starts: arm the silence watchdog so a 429'd or empty
@@ -563,6 +584,12 @@ async def entrypoint(ctx):
         # thinking -> listening WITHOUT any assistant item since the user's turn
         # means the LLM produced nothing speakable (empty completion, tool-call-
         # only response, or a silently failed reruest). Log it loudly so these
+        # The LLM HAS answered — the agent is now speaking the reply. Cancel the
+        # silence watchdog HERE (the TTS transcript item lands only after playback
+        # completes; keying on it false-fired the 12s fallback on long answers).
+        # A genuinely 429'd turn never reaches 'speaking', so it's still caught.
+        if prev == "thinking" and ev.new_state == "speaking":
+            _mark_reply(now)
         # turns are diagnosable — previously they vanished without a trace.
         if (
             prev == "thinking"
