@@ -670,17 +670,22 @@ def build_voice_agent(
     # and only the capped static facts are used.
     instructions = build_instructions(cfg)
 
-    # Auto hang-up: when the conversation is finished the LLM calls `end_call`,
-    # which shuts the job down so the call is cut AND the billing is finalized.
-    # We make the trigger explicit so the model reliably hangs up on its own and
-    # doesn't leave the caller in a silent, open call.
+    # Auto hang-up: the LLM calls `end_call`, which deletes the room (caller is
+    # cut) AND finalizes billing. The trigger is deliberately caller-driven —
+    # only an explicit goodbye/thanks from the caller — so the agent NEVER
+    # hangs up mid-conversation (e.g. right after collecting the budget).
+    # An open call is safe either way: when the caller disconnects,
+    # `_on_disconnected` closes the session and `finalize_billing` still runs.
     instructions += (
-        "\n\nAUTOMATIC HANG-UP: You must call the `end_call` tool (once) at the point "
-        "the conversation is over — as soon as the caller says goodbye / thanks you "
-        "clearly, has had their question answered, or has nothing left to ask. Say a "
-        "short closing line (e.g. \"Dhanyavaad, good day!\") and then call `end_call` "
-        "immediately. Never end the call mid-answer — only once the exchange is "
-        "genuinely finished, and never ask follow-up questions after ending."
+        "\n\nAUTOMATIC HANG-UP: Call the `end_call` tool (once) ONLY when the caller "
+        "themselves ends the conversation — they say goodbye / thank you / "
+        "'bas itna hi tha' / clearly have nothing more to ask. NEVER call it just "
+        "because a question was answered, or because you collected their "
+        "requirement or budget: in that case state the next step (e.g. 'hamari "
+        "team aapse jald contact karegi') and WAIT for their response. When "
+        "ending, say a short closing line (e.g. \"Dhanyavaad, good day!\") and "
+        "then call `end_call` immediately. Never end the call mid-answer, and "
+        "never ask follow-up questions after ending."
     )
 
     async def _end_call() -> str:
@@ -705,7 +710,10 @@ def build_voice_agent(
     end_call_tool = llm.function_tool(
         _end_call,
         name="end_call",
-        description="End the call and hang up. Call this once the conversation is finished.",
+        description="End the call and hang up. Call this only when the caller has "
+                    "explicitly ended the conversation (goodbye / thanks / nothing "
+                    "more to ask) — never just because a question was answered or "
+                    "a budget was collected.",
     )
 
     # Cross-call memory becomes part of the initial conversation history, so it
