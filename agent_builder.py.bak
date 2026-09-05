@@ -162,80 +162,11 @@ def build_llm(cfg: AgentConfig) -> Any:
     # `conn_options`, see worker.py) so a transient DNS blip or provider 429 fails
     # fast instead of stacking retries and freezing the call for ~20s.
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-
-    # ------------------------------------------------------------------
-    # Raw-response logger (diagnostics).
-    #
-    # Some turns came back SILENT with no error (0.2-0.5s of "thinking", no
-    # TTS, no exception). This wraps chat.completions.create and logs, for
-    # EVERY request: how many stream chunks arrived, how many characters of
-    # actual content they carried, the finish reason, and any tool calls.
-    # When a turn is silent, the 🧾 line right before it shows exactly what
-    # the model returned:
-    #   * 0 chunks                          -> the API returned nothing
-    #   * chunks but content_chars=0        -> model answered with reasoning/
-    #                                          tool-calls only, no text
-    #   * content_chars>0 but still silent  -> the drop is downstream (plugin
-    #                                          filtered it, or state race)
-    if os.getenv("VOICE_LLM_LOG_RESPONSES", "1") != "0":
-        _orig_create = client.chat.completions.create
-
-        async def _logged_create(*_args, **_kwargs):
-            resp = await _orig_create(*_args, **_kwargs)
-            try:
-                if _kwargs.get("stream"):
-                    async def _counting(stream):
-                        n_chunks, n_chars, n_tool, finish = 0, 0, 0, None
-                        try:
-                            async for chunk in stream:
-                                n_chunks += 1
-                                try:
-                                    choice = chunk.choices[0]
-                                    fr = getattr(choice, "finish_reason", None)
-                                    if fr:
-                                        finish = fr
-                                    delta = getattr(choice, "delta", None)
-                                    piece = getattr(delta, "content", None)
-                                    if piece:
-                                        n_chars += len(piece)
-                                    tcs = getattr(delta, "tool_calls", None)
-                                    if tcs:
-                                        n_tool += len(tcs)
-                                except Exception:
-                                    pass
-                                yield chunk
-                        finally:
-                            logger.info(
-                                f"🧾 LLM stream ({model}): {n_chunks} chunks, "
-                                f"content_chars={n_chars}, finish={finish}, "
-                                f"tool_call_deltas={n_tool}"
-                            )
-                    return _counting(resp)
-                choice = resp.choices[0]
-                content = getattr(choice.message, "content", None) or ""
-                tcs = getattr(choice.message, "tool_calls", None)
-                logger.info(
-                    f"🧾 LLM response ({model}): finish={choice.finish_reason}, "
-                    f"content_chars={len(content)}, "
-                    f"tool_calls={len(tcs) if tcs else 0}"
-                )
-            except Exception as e:
-                logger.warning(f"LLM response logging failed: {e}")
-            return resp
-
-        client.chat.completions.create = _logged_create
-
     return LLM(
         client=client,
         model=model,
         temperature=float(overrides.get("temperature", 0.1)),
-        # 600 (not 300): with reasoning_effort="low" the model spends part of the
-        # completion budget on chain-of-thought; with only 300 tokens some turns
-        # came back with EMPTY content (fast, no error, caller heard silence).
-        # A one-sentence spoken reply needs far less, so 600 is a safety margin.
-        max_completion_tokens=int(
-            overrides.get("max_tokens") or _os.getenv("VOICE_LLM_MAX_TOKENS", "600")
-        ),
+        max_completion_tokens=int(overrides.get("max_tokens", 300)),
         # See `reasoning` above. For gpt-oss keep it low so the model doesn't spend
         # time on a long chain-of-thought that also risks leaking into the spoken
         # reply (the worker's clean_reply_text strips <think>/<reasoning> anyway).
@@ -764,10 +695,6 @@ def build_voice_agent(
                     ),
                 )
                 self._last_rag = hits
-                logger.info(
-                    f"🔎 RAG: injected {len(hits)} chars of KB chunks for "
-                    f"question {user_text[:60]!r}"
-                )
             except Exception as e:
                 # RAG must never take a live call down — fall back to the
                 # static (capped) facts.

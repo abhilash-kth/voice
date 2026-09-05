@@ -500,17 +500,6 @@ async def entrypoint(ctx):
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
             usage["transcripts"].append({"role": "user", "text": text})
             logger.info(f"👂 User: {text}")
-            # If the PREVIOUS turn went unanswered, the caller is talking again
-            # into silence (the "hello? hello?" loop). The 12s window would never
-            # fire because every new user turn resets it — so answer NOW instead
-            # of waiting another full window.
-            prev_user_ts = reply_tracker["last_user_ts"]
-            if prev_user_ts > 0 and reply_tracker["last_assistant_ts"] < prev_user_ts:
-                logger.warning(
-                    "🛟 Previous turn got no LLM reply and the caller spoke again — "
-                    "speaking fallback immediately."
-                )
-                _spawn_say(FALLBACK_SILENCE)
             # A fresh turn starts: arm the silence watchdog so a 429'd or empty
             # LLM turn never leaves the caller in dead air.
             reply_tracker["last_user_ts"] = now
@@ -521,11 +510,6 @@ async def entrypoint(ctx):
             # otherwise they show up as bogus "🗣️ TTS:" lines and, on the
             # end_call turn, trigger a fallback line right before the hang-up.
             if _item_is_tool_related(item):
-                fn = getattr(item, "function_call", None)
-                logger.info(
-                    f"🔧 tool item (not spoken): "
-                    f"{getattr(fn, 'name', getattr(item, 'role', 'tool'))}"
-                )
                 return
             now = time.time()
             if not text.strip():
@@ -560,23 +544,6 @@ async def entrypoint(ctx):
         elapsed = now - state_tracker["since"]
         if prev == "thinking" and elapsed > 2.5:
             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
-        # thinking -> listening WITHOUT any assistant item since the user's turn
-        # means the LLM produced nothing speakable (empty completion, tool-call-
-        # only response, or a silently failed reruest). Log it loudly so these
-        # turns are diagnosable — previously they vanished without a trace.
-        if (
-            prev == "thinking"
-            and ev.new_state == "listening"
-            and reply_tracker["last_user_ts"] > 0
-            and reply_tracker["last_assistant_ts"] < reply_tracker["last_user_ts"]
-        ):
-            logger.warning(
-                "🤐 thinking -> listening with NO assistant reply — the LLM "
-                "returned nothing speakable (or the request failed silently). "
-                "If the caller repeats themselves, an immediate fallback line is "
-                "spoken; otherwise the watchdog fires after "
-                f"{LLM_FALLBACK_DELAY:.0f}s."
-            )
         logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
         state_tracker["state"] = ev.new_state
         state_tracker["since"] = now
