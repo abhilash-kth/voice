@@ -402,7 +402,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               </label>
               <textarea
                 value={knowledgeText}
-                disabled={!!file || existingDocuments.length > 0}
+                disabled={!!file || (existingDocuments.length > 0 && !removeDocument)}
                 onChange={(e) => setKnowledgeText(e.target.value)}
                 rows={5}
                 placeholder="Company facts, FAQs, product info..."
