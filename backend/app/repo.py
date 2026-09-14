@@ -87,6 +87,7 @@ def _agent_dict(a: Any) -> dict:
         "enabled": bool(a.enabled),
         "agent_mode": a.agentMode or "assistant",
         "announce_text": a.announceText or "",
+        "fallback_response": getattr(a, "fallbackResponse", "") or "Sorry, there is a temporary technical problem. Please try again shortly.",
         "providers": _load_dict(a.providers),
         "knowledge": _load_dict(a.knowledge),
         "created_at": a.createdAt,
@@ -122,6 +123,7 @@ async def create_agent(user_id: str, data: dict) -> dict:
             "enabled": bool(data.get("enabled", True)),
             "agentMode": data.get("agent_mode", "assistant"),
             "announceText": data.get("announce_text", ""),
+            "fallbackResponse": data.get("fallback_response", "Sorry, there is a temporary technical problem. Please try again shortly."),
             "providers": _dump(data.get("providers", {})),
             "knowledge": _dump(data.get("knowledge", {})),
         }
@@ -136,7 +138,7 @@ async def update_agent(agent_id: str, user_id: str, patch: dict) -> Optional[dic
         "language": "language", "voice_personality": "voicePersonality",
         "client_rate_per_min": "clientRatePerMin", "memory_enabled": "memoryEnabled",
         "recording_enabled": "recordingEnabled", "max_concurrency": "maxConcurrency",
-        "enabled": "enabled", "agent_mode": "agentMode", "announce_text": "announceText",
+        "enabled": "enabled", "agent_mode": "agentMode", "announce_text": "announceText", "fallback_response": "fallbackResponse",
     }
     for k, v in patch.items():
         if k in mapping:
@@ -172,6 +174,8 @@ async def set_agent_knowledge(agent_id: str, user_id: str, kb: dict) -> Optional
         current["system_prompt"] = kb.get("system_prompt") or ""
     if "faq" in kb:
         current["faq"] = kb.get("faq") or []
+    if "documents" in kb:
+        current["documents"] = kb.get("documents") or []
     a = await get_prisma().agent.update(where={"id": agent_id}, data={"knowledge": _dump(current)})
     return _agent_dict(a)
 

@@ -75,6 +75,8 @@ class AgentConfig(BaseModel):
     agent_mode: str = "assistant"
     # The fixed script spoken in "announcement" mode; falls back to `greeting`.
     announce_text: str = ""
+    # Spoken message used when the LLM/provider cannot produce a reply.
+    fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
 
 
 class AgentCreate(BaseModel):
@@ -92,6 +94,7 @@ class AgentCreate(BaseModel):
     enabled: bool = True
     agent_mode: str = "assistant"
     announce_text: str = ""
+    fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
 
 
 class AgentUpdate(BaseModel):
@@ -109,6 +112,7 @@ class AgentUpdate(BaseModel):
     enabled: Optional[bool] = None
     agent_mode: Optional[str] = None
     announce_text: Optional[str] = None
+    fallback_response: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

@@ -82,7 +82,7 @@ FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?
 # Spoken when a user turn gets NO LLM reply at all (provider 429 after the
 # fail-fast retries, or a failed/empty generation) so the caller is never left
 # in dead air — that silence is what made callers hang up.
-FALLBACK_SILENCE = "Sorry, thoda technical glitch hua. Aap dobara pooch sakte hain?"
+DEFAULT_FALLBACK_RESPONSE = "Sorry, there is a temporary technical problem. Please try again shortly."
 # How long to wait for the LLM to answer a user turn before speaking
 # FALLBACK_SILENCE. Groq's 429 backoff can be 7-45s, so 12s is a good balance:
 # a normal fast turn never gets here, but a rate-limited one does.
@@ -481,7 +481,7 @@ async def entrypoint(ctx):
             "(rate-limited 429 or failed generation) — speaking a fallback line "
             "so the call is not silent."
         )
-        _spawn_say(FALLBACK_SILENCE)
+        _spawn_say(getattr(cfg, "fallback_response", "").strip() or DEFAULT_FALLBACK_RESPONSE)
 
     def _schedule_silence_fallback(turn_ts: float):
         _cancel_pending()

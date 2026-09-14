@@ -33,6 +33,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const kinds = ["llm", "stt", "tts", "telephony"] as const;
   const [name, setName] = useState(editing?.name || "");
   const [greeting, setGreeting] = useState(editing?.greeting || "");
+  const [fallbackResponse, setFallbackResponse] = useState(editing?.fallback_response || "Sorry, there is a temporary technical problem. Please try again shortly.");
   const [mode, setMode] = useState(editing?.agent_mode || "assistant");
   const [announceText, setAnnounceText] = useState(
     editing?.announce_text || "",
@@ -76,6 +77,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     Record<string, Record<string, string>>
   >({});
   const [file, setFile] = useState<File | null>(null);
+  const [removeDocument, setRemoveDocument] = useState(false);
+  const existingDocuments = editing?.knowledge?.documents || [];
+  const hasText = knowledgeText.trim().length > 0;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -155,6 +159,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         voice_personality: personality,
         agent_mode: mode,
         announce_text: mode === "announcement" ? announceText : "",
+        fallback_response: fallbackResponse.trim(),
         // Client-facing per-minute price is no longer set here — it is derived
         // on the backend from the actual provider costs (LLM + STT + TTS +
         // telephony) plus a margin configured in `.env`.
@@ -171,10 +176,12 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       // conversational assistant. Announcement mode just plays a fixed script.
       if (mode === "assistant") {
         await setKnowledge(agent.id, {
-          text: knowledgeText,
+          text: file ? "" : knowledgeText,
           system_prompt: systemPrompt,
           faq: buildFaq(),
+          documents: removeDocument ? [] : (file ? [] : existingDocuments),
         });
+        // A newly selected file replaces the previous document, rather than appending.
         if (file) await addKnowledge(agent.id, { file });
       }
       onDone(editing ? "Agent updated ✅" : "Agent created ✅");
@@ -252,6 +259,14 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               below is left empty.
             </p>
           )}
+        </div>
+
+        <div>
+          <label className="text-xs text-gray-400 font-medium">Fallback response</label>
+          <textarea value={fallbackResponse} onChange={(e) => setFallbackResponse(e.target.value)} rows={2}
+            placeholder="Please hold on, I am having a temporary issue."
+            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1" />
+          <p className="text-[11px] text-gray-500 mt-1">Spoken when there is a temporary network, provider, or server problem.</p>
         </div>
 
         {/* Agent mode: full assistant vs fixed-script announcement */}
@@ -387,6 +402,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               </label>
               <textarea
                 value={knowledgeText}
+                disabled={!!file || existingDocuments.length > 0}
                 onChange={(e) => setKnowledgeText(e.target.value)}
                 rows={5}
                 placeholder="Company facts, FAQs, product info..."
@@ -470,8 +486,15 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               <label className="text-xs text-gray-400 font-medium">
                 Upload knowledge file (.txt/.md/.csv/.json/.pdf)
               </label>
+              {existingDocuments.length > 0 && !removeDocument && (
+                <div className="mb-2 rounded-lg border border-blue-500/30 bg-blue-500/10 p-2 text-xs">
+                  <div className="font-medium">Saved knowledge file</div>
+                  {existingDocuments.map((d) => <div key={d.name} className="flex justify-between text-gray-300"><span>{d.name}</span><button type="button" onClick={() => setRemoveDocument(true)} className="text-red-400">Delete</button></div>)}
+                </div>
+              )}
               <input
                 type="file"
+                disabled={hasText}
                 onChange={(e) => setFile(e.target.files?.[0] || null)}
                 className="block w-full text-sm text-gray-400 mt-1 file:mr-3 file:rounded-lg file:border-0 file:bg-gray-700 file:px-3 file:py-2 file:text-white"
               />

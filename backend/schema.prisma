@@ -66,6 +66,7 @@ model Agent {
   // "assistant" (STT+LLM+TTS) | "announcement" (fixed-script only, no STT/LLM)
   agentMode         String  @default("assistant")
   announceText      String  @default("")
+  fallbackResponse  String  @default("Sorry, there is a temporary technical problem. Please try again shortly.")
   // Serialized JSON: {"llm":{id,config},"stt":...,"tts":...,"telephony":...}
   providers         String  @default("{}")
   // Serialized JSON: {"text","documents[]","system_prompt","faq[]"}
