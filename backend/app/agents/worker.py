@@ -159,10 +159,20 @@ def _item_is_tool_related(item) -> bool:
     These items have no speakable text; without this guard they fall through as
     "empty assistant replies" (bogus ``🗣️ TTS: Sorry...`` lines and, worse, a
     fallback line spoken right before ``end_call`` hangs up)."""
-    for attr in ("function_call", "function_call_output", "tool_call"):
-        if getattr(item, attr, None):
+    # Depending on the LiveKit version, a tool invocation is exposed as
+    # ``tool_calls`` (ChatMessage), ``function_call`` or ``tool_call``.  In
+    # particular, an assistant item can have *no text* and still be a perfectly
+    # valid tool-call item.  Treat all of these as non-spoken items before the
+    # empty-text handling below.
+    for attr in ("function_call", "function_call_output", "tool_call", "tool_calls"):
+        value = getattr(item, attr, None)
+        if value:
             return True
     if getattr(item, "role", None) == "tool":
+        return True
+    # Some SDK releases put the calls in ``content`` as typed objects, while
+    # others use a dict. Neither form is speakable.
+    if isinstance(getattr(item, "content", None), dict):
         return True
     content = getattr(item, "content", None)
     # A text message's content is strings; a function message carries objects.
@@ -513,13 +523,14 @@ async def entrypoint(ctx):
                 return
             now = time.time()
             if not text.strip():
-                # The LLM produced an empty completion — LiveKit has nothing to
-                # speak. Without this the caller hears dead air and hangs up.
-                logger.warning("🧮 LLM returned an empty reply — speaking fallback line.")
-                _mark_reply(now)
-                if not reply_tracker["empty_spoken"]:
-                    reply_tracker["empty_spoken"] = True
-                    _spawn_say(FALLBACK_REPLY)
+                # Empty assistant items are emitted by LiveKit for tool calls and
+                # for failed/aborted generations.  They are not proof that the
+                # turn is complete.  Never speak immediately here: doing so races
+                # the real reply (or end_call) and produces the characteristic
+                # "Sorry, thoda technical glitch hua" after a normal answer.
+                # The per-turn silence watchdog is the single place that may
+                # speak FALLBACK_SILENCE, and only after its delay.
+                logger.warning("🧮 LLM produced an empty assistant item; waiting for a speakable reply")
                 return
             _mark_reply(now)
             cleaned = clean_reply_text(text)
