@@ -176,6 +176,12 @@ async def set_agent_knowledge(agent_id: str, user_id: str, kb: dict) -> Optional
         current["faq"] = kb.get("faq") or []
     if "documents" in kb:
         current["documents"] = kb.get("documents") or []
+    # Keep the knowledge source unambiguous even for non-UI/API callers.
+    if current.get("text", "").strip() and current.get("documents"):
+        if "documents" in kb:
+            current["text"] = ""
+        else:
+            current["documents"] = []
     a = await get_prisma().agent.update(where={"id": agent_id}, data={"knowledge": _dump(current)})
     return _agent_dict(a)
 

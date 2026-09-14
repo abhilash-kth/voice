@@ -219,12 +219,20 @@ async def add_knowledge(
     if not await repo.get_agent(agent_id, user.id):
         raise HTTPException(404, "Agent not found")
 
+    if file is not None and text and text.strip():
+        raise HTTPException(400, "Choose either a knowledge file or pasted text, not both")
+
     if file is not None:
         doc_name = file.filename or "uploaded-doc"
         raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(413, "Knowledge file must be 10 MB or smaller")
         content = _parse_file(doc_name, raw)
-        await repo.append_agent_document(agent_id, user.id, {"name": doc_name, "content": content})
-        return {"ok": True, "appended": "document"}
+        if len(content) > 2_000_000:
+            raise HTTPException(413, "Extracted knowledge content is too large")
+        # File upload is a replacement operation: never accumulate stale files.
+        await repo.set_agent_knowledge(agent_id, user.id, {"text": "", "documents": [{"name": doc_name, "content": content}]})
+        return {"ok": True, "replaced": "document"}
 
     if text:
         await repo.set_agent_knowledge(agent_id, user.id, {"text": text})
@@ -443,6 +451,10 @@ async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(No
     rec = None
     if call_id:
         rec = await get_call_for_billing(call_id, payload.get("user_id", ""))
+    # Billing callbacks may be retried by the worker or a proxy. A completed
+    # call is immutable for charging purposes; return success without charging it again.
+    if rec and rec.get("status") == "completed":
+        return {"ok": True, "call_id": call_id, "already_processed": True}
     if not rec:
         raise HTTPException(404, "Call record not found")
 

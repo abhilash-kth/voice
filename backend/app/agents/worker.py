@@ -86,7 +86,7 @@ DEFAULT_FALLBACK_RESPONSE = "Sorry, there is a temporary technical problem. Plea
 # How long to wait for the LLM to answer a user turn before speaking
 # FALLBACK_SILENCE. Groq's 429 backoff can be 7-45s, so 12s is a good balance:
 # a normal fast turn never gets here, but a rate-limited one does.
-LLM_FALLBACK_DELAY = float(os.getenv("VOICE_LLM_FALLBACK_DELAY", "12"))
+LLM_FALLBACK_DELAY = float(os.getenv("VOICE_LLM_FALLBACK_DELAY", "8"))
 
 BILLING_BACKEND_URL = os.getenv("BILLING_BACKEND_URL", "http://127.0.0.1:8000")
 WORKER_AGENT_NAME = "voice-agent-saas"
