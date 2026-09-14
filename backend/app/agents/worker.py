@@ -219,7 +219,7 @@ def _build_conn_options():
     from livekit.agents.llm.llm import APIConnectOptions
     from livekit.agents.voice.agent_session import SessionConnectOptions
 
-    _conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=8.0)
+    _conn = APIConnectOptions(max_retry=0, retry_interval=0.5, timeout=8.0)
     # STT/TTS also get their own bound so a provider hiccup never stacks.
     _media_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=6.0)
     return SessionConnectOptions(
@@ -443,6 +443,7 @@ async def entrypoint(ctx):
         "last_assistant_ts": 0.0,
         "empty_spoken": False,  # already spoke a fallback for the current turn
         "pending": None,        # pending silence-fallback task
+        "fallback_say": None,   # current fallback speech task
     }
 
     def _cancel_pending():
@@ -454,15 +455,24 @@ async def entrypoint(ctx):
     def _mark_reply(ts: float):
         reply_tracker["last_assistant_ts"] = ts
         _cancel_pending()
+        fallback_task = reply_tracker.get("fallback_say")
+        if fallback_task is not None and not fallback_task.done():
+            fallback_task.cancel()
+        reply_tracker["fallback_say"] = None
 
     def _spawn_say(text_to_say: str):
         async def _say():
             try:
                 await asyncio.wait_for(session.say(text_to_say, allow_interruptions=True), timeout=15)
+            except asyncio.CancelledError:
+                return
             except Exception as e:
                 logger.warning(f"🛟 fallback say failed: {e}")
         try:
-            asyncio.ensure_future(_say())
+            old = reply_tracker.get("fallback_say")
+            if old is not None and not old.done():
+                old.cancel()
+            reply_tracker["fallback_say"] = asyncio.ensure_future(_say())
         except Exception as e:
             logger.warning(f"🛟 could not schedule fallback reply: {e}")
 
@@ -510,6 +520,12 @@ async def entrypoint(ctx):
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
             usage["transcripts"].append({"role": "user", "text": text})
             logger.info(f"👂 User: {text}")
+            # A fresh turn supersedes any fallback still speaking from the
+            # previous failed turn; never let it bleed into this reply.
+            old_fallback = reply_tracker.get("fallback_say")
+            if old_fallback is not None and not old_fallback.done():
+                old_fallback.cancel()
+            reply_tracker["fallback_say"] = None
             # A fresh turn starts: arm the silence watchdog so a 429'd or empty
             # LLM turn never leaves the caller in dead air.
             reply_tracker["last_user_ts"] = now

@@ -166,7 +166,7 @@ def build_llm(cfg: AgentConfig) -> Any:
         client=client,
         model=model,
         temperature=float(overrides.get("temperature", 0.1)),
-        max_completion_tokens=int(overrides.get("max_tokens", 300)),
+        max_completion_tokens=int(overrides.get("max_tokens", 180)),
         # See `reasoning` above. For gpt-oss keep it low so the model doesn't spend
         # time on a long chain-of-thought that also risks leaking into the spoken
         # reply (the worker's clean_reply_text strips <think>/<reasoning> anyway).
@@ -326,8 +326,8 @@ def build_vad() -> Any:
 # Raise the budgets only if you've upgraded the Groq tier or moved to a
 # higher-limit provider.
 # ---------------------------------------------------------------------------
-_KB_BUDGET_CHARS = int(os.getenv("VOICE_KB_BUDGET_CHARS", "2500"))
-_FAQ_BUDGET_CHARS = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", "1500"))
+_KB_BUDGET_CHARS = int(os.getenv("VOICE_KB_BUDGET_CHARS", "1200"))
+_FAQ_BUDGET_CHARS = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", "800"))
 _OWNER_PROMPT_BUDGET_CHARS = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", "1000"))
 
 # Marker for the per-turn RAG system message (used to prune the previous turn's).
@@ -673,7 +673,7 @@ def build_voice_agent(
                 if not user_text:
                     return
                 from .. import rag  # local import: keep this module light
-                hits = (rag.build_context(cfg.knowledge, user_text, top_k=3) or "").strip()
+                hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
                 if not hits or hits == self._last_rag:
                     return  # nothing new, or same facts as last turn
                 target = _find_chat_ctx(turn_ctx)
