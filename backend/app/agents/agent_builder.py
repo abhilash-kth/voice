@@ -568,12 +568,13 @@ def build_voice_agent(
     # We make the trigger explicit so the model reliably hangs up on its own and
     # doesn't leave the caller in a silent, open call.
     instructions += (
-        "\n\nAUTOMATIC HANG-UP: You must call the `end_call` tool (once) at the point "
-        "the conversation is over — as soon as the caller says goodbye / thanks you "
-        "clearly, has had their question answered, or has nothing left to ask. Say a "
-        "short closing line (e.g. \"Dhanyavaad, good day!\") and then call `end_call` "
-        "immediately. Never end the call mid-answer — only once the exchange is "
-        "genuinely finished, and never ask follow-up questions after ending."
+        "\n\nAUTOMATIC HANG-UP: Call the `end_call` tool only after the caller explicitly "
+        "says they want to end the call, such as goodbye, thank you goodbye, please "
+        "disconnect, or call cut. Do NOT end the call merely because a question was "
+        "answered, because the caller pauses, or because you asked for contact details. "
+        "After answering, remain available and ask whether the caller needs anything "
+        "else. Say a short closing line only after an explicit goodbye, then call "
+        "`end_call` once. Never end the call mid-answer."
     )
 
     async def _end_call() -> str:
