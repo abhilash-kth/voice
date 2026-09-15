@@ -235,7 +235,15 @@ async def get_call(call_id: str, user_id: str) -> Optional[dict]:
     return _call_dict(c)
 
 
-async def create_call(data: dict) -> dict:
+async def delete_call(call_id: str, user_id: str) -> bool:
+    existing = await get_call(call_id, user_id)
+    if not existing:
+        return False
+    await get_prisma().call.delete(where={"id": call_id})
+    return True
+
+
+async def create_call(data: dict):
     db = get_prisma()
     c = await db.call.create(
         data={

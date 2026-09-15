@@ -181,6 +181,7 @@ export const startCall = (body: {
   }>("/api/calls", { method: "POST", body: JSON.stringify(body) });
 export const listCalls = () => req<{ calls: CallRecord[] }>("/api/calls");
 export const getCall = (id: string) => req<CallRecord>(`/api/calls/${id}`);
+export const deleteCall = (id: string) => req<void>(`/api/calls/${id}`, { method: "DELETE" });
 
 // ------ campaigns (bulk calling) ------------------------------------------
 export interface CampaignLead {

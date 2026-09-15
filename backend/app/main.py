@@ -350,6 +350,21 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
     return rec
 
 
+@app.delete("/api/calls/{call_id}", status_code=204)
+async def delete_call(call_id: str, user=Depends(auth.get_current_user)):
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    # If the selected row is still live, close its room before deleting the row.
+    if rec.get("status") in ("planned", "in-progress") and rec.get("room"):
+        try:
+            await telephony.end_active_room(rec["room"])
+        except Exception as e:
+            logger.warning(f"Could not close room before deleting call {call_id}: {e}")
+    if not await repo.delete_call(call_id, user.id):
+        raise HTTPException(404, "Call not found")
+
+
 # ---------------------------------------------------------------------------
 # Bulk-call campaigns (upload leads -> dial up to concurrency)
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CallRecord, getCall, listCalls } from "@/lib/api";
+import { CallRecord, deleteCall, getCall, listCalls } from "@/lib/api";
 
 const COST_LABELS: Record<string, string> = {
   stt_cost_inr: "STT",
@@ -19,6 +19,8 @@ export default function CallsPanel() {
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [detail, setDetail] = useState<CallRecord | null>(null);
   const [err, setErr] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [deleting, setDeleting] = useState(false);
 
   const load = async () => {
     try {
@@ -40,14 +42,36 @@ export default function CallsPanel() {
 
   const costRows = detail?.cost as Record<string, number> | undefined;
 
+  const deleteSelected = async () => {
+    if (!selected.length || !window.confirm(`Delete ${selected.length} selected call record(s)? This cannot be undone.`)) return;
+    setDeleting(true);
+    try {
+      await Promise.all(selected.map((id) => deleteCall(id)));
+      if (detail && selected.includes(detail.id)) setDetail(null);
+      setCalls((items) => items.filter((c) => !selected.includes(c.id)));
+      setSelected([]);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="bg-gray-900 p-5 rounded-2xl border border-gray-800 overflow-x-auto">
-        <h2 className="text-xl font-bold mb-4">📞 Call Log</h2>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-xl font-bold">📞 Call Log</h2>
+          <button type="button" onClick={deleteSelected} disabled={!selected.length || deleting}
+            className="rounded-lg bg-red-600/80 px-3 py-2 text-xs font-semibold disabled:opacity-40">
+            {deleting ? "Deleting..." : `Delete selected${selected.length ? ` (${selected.length})` : ""}`}
+          </button>
+        </div>
         {err && <p className="text-red-400 text-sm mb-3">{err}</p>}
         <table className="w-full text-left text-sm text-gray-300">
           <thead className="bg-gray-800 text-gray-400 uppercase text-xs">
             <tr>
+              <th className="p-3"><input aria-label="Select all calls" type="checkbox" checked={calls.length > 0 && selected.length === calls.length} onChange={(e) => setSelected(e.target.checked ? calls.map((c) => c.id) : [])} /></th>
               <th className="p-3">Call</th>
               <th className="p-3">Mode</th>
               <th className="p-3">Status</th>
@@ -57,9 +81,10 @@ export default function CallsPanel() {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-800">
-            {calls.length === 0 && <tr><td colSpan={6} className="p-3 text-gray-500">No calls yet.</td></tr>}
+            {calls.length === 0 && <tr><td colSpan={7} className="p-3 text-gray-500">No calls yet.</td></tr>}
             {calls.map((c) => (
               <tr key={c.id} className="hover:bg-gray-800/50">
+                <td className="p-3"><input aria-label={`Select call ${c.id}`} type="checkbox" checked={selected.includes(c.id)} onChange={(e) => setSelected((ids) => e.target.checked ? [...ids, c.id] : ids.filter((id) => id !== c.id))} /></td>
                 <td className="p-3 font-mono text-blue-400">{c.id}</td>
                 <td className="p-3">{c.mode}</td>
                 <td className="p-3">
