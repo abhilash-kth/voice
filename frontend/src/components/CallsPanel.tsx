@@ -42,6 +42,21 @@ export default function CallsPanel() {
 
   const costRows = detail?.cost as Record<string, number> | undefined;
 
+  const deleteOne = async (id: string) => {
+    if (!window.confirm("Delete this call record? This cannot be undone.")) return;
+    setDeleting(true);
+    try {
+      await deleteCall(id);
+      setCalls((items) => items.filter((c) => c.id !== id));
+      setSelected((ids) => ids.filter((x) => x !== id));
+      if (detail?.id === id) setDetail(null);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const deleteSelected = async () => {
     if (!selected.length || !window.confirm(`Delete ${selected.length} selected call record(s)? This cannot be undone.`)) return;
     setDeleting(true);
@@ -99,8 +114,9 @@ export default function CallsPanel() {
                 <td className="p-3 font-bold text-green-400">
                   ₹{(c.cost as any)?.client_price_inr ?? 0}
                 </td>
-                <td className="p-3">
-                  <button onClick={() => open(c.id)} className="text-blue-400 hover:underline text-xs">view</button>
+                <td className="p-3 whitespace-nowrap">
+                  <button onClick={() => open(c.id)} className="text-blue-400 hover:underline text-xs mr-3">view</button>
+                  <button onClick={() => deleteOne(c.id)} disabled={deleting} className="text-red-400 hover:underline text-xs disabled:opacity-40">delete</button>
                 </td>
               </tr>
             ))}
