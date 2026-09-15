@@ -568,10 +568,15 @@ def build_voice_agent(
     # We make the trigger explicit so the model reliably hangs up on its own and
     # doesn't leave the caller in a silent, open call.
     instructions += (
-        "\n\nCALL LIFECYCLE: Never end or hang up the call yourself. Continue the conversation "
-        "after answering questions, after pauses, and after collecting contact details. "
-        "The caller or the application controls when the call ends. If the caller says "
-        "goodbye, respond with a brief polite closing sentence but do not disconnect."
+        "\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
+        "collection. End the call only when the caller clearly and explicitly asks to "
+        "disconnect, hang up, cut the call, or says goodbye/bye as a standalone final "
+        "utterance. Phrases such as 'no more help', 'that's all for this question', "
+        "or 'okay' are NOT goodbye, especially when followed by another question. "
+        "When the caller explicitly says goodbye, first speak exactly one short polite "
+        "closing sentence, such as 'Thank you for calling us. Aapse baat karke achha laga. "
+        "Goodbye.' Then call the end_call tool once. Never call the tool before the "
+        "closing sentence, and never call it for an ambiguous phrase."
     )
 
     async def _end_call() -> str:
@@ -579,6 +584,12 @@ def build_voice_agent(
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
+        # Allow the closing sentence's TTS audio to finish before deleting the
+        # room. Without this small grace period, the tool can cut the closing
+        # audio mid-sentence. Keep this short so successful calls have no extra
+        # latency; it only runs on explicit hang-up.
+        import asyncio
+        await asyncio.sleep(1.5)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
         room = getattr(ctx.room, "name", None)
@@ -629,14 +640,9 @@ def build_voice_agent(
             super().__init__(
                 instructions=instructions,
                 chat_ctx=chat_ctx,
-                # Registered tools let the LLM hang up the call once the
-                # conversation concludes (auto-cut).
-                # Do not expose hang-up as an LLM tool. A voice model can
-                # interpret phrases such as "no more help" as goodbye even
-                # when the caller continues with another question. The browser
-                # or telephony layer owns call termination; this prevents the
-                # model from deleting an active room mid-conversation.
-                tools=[],
+                # The tool is gated by the explicit goodbye instructions above.
+                # It is used only after the closing sentence has been generated.
+                tools=[end_call_tool],
                 # NOTE: turn-handling (endpointing / interruption / preemptive
                 # generation) is set on the AgentSession (build_assistant_session),
                 # where LiveKit actually reads the interruption min_duration/window.
