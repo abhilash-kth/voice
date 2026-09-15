@@ -117,7 +117,7 @@ def build_llm(cfg: AgentConfig) -> Any:
         default_model = _cat_model or "google/gemma-4-31b-it:free"
     elif sel.id.startswith("groq"):
         env_model = _os.getenv("GROQ_MODEL")
-        default_model = _cat_model or "openai/gpt-oss-120b"
+        default_model = _cat_model or "openai/gpt-oss-20b"
     else:
         env_model = _os.getenv("OPENAI_MODEL")
         default_model = _cat_model or "gpt-4o-mini"
@@ -133,8 +133,8 @@ def build_llm(cfg: AgentConfig) -> Any:
     # Groq removed qwen/qwen3.6-27b from the serving catalog. Migrate old
     # saved agent configurations automatically instead of letting every turn
     # fail with a 404 until the user edits the agent.
-    if sel.id.startswith("groq") and low == "qwen/qwen3.6-27b":
-        logger.warning("⚠️ Migrating unavailable qwen/qwen3.6-27b to openai/gpt-oss-20b for voice reliability")
+    if sel.id.startswith("groq") and (low == "qwen/qwen3.6-27b" or low == "openai/gpt-oss-120b"):
+        logger.warning("⚠️ Migrating high-token Groq model to openai/gpt-oss-20b for voice reliability")
         model = "openai/gpt-oss-20b"
         low = model.lower()
     if "qwen" in low or "gemma" in low:
