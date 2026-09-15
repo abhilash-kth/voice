@@ -345,7 +345,12 @@ async def entrypoint(ctx):
 
     call_start = time.time()
 
-    await db_init()
+    try:
+        await asyncio.wait_for(db_init(), timeout=12)
+    except Exception as exc:
+        # Calls should still be answerable if the persistence service is
+        # temporarily unavailable; billing/metadata paths are best-effort.
+        logger.error("database initialization unavailable; continuing voice call: %s", exc)
 
     try:
         meta = json.loads(ctx.job.metadata or "{}")
@@ -362,7 +367,18 @@ async def entrypoint(ctx):
 
     rec = None
     if agent_id and user_id:
-        rec = await repo.get_agent(agent_id, user_id)
+        # Database availability must not prevent the caller from reaching the
+        # voice agent. Prisma's engine can briefly time out when two LiveKit
+        # jobs initialize simultaneously; retry with bounded backoff and use
+        # the safe demo configuration if the lookup remains unavailable.
+        for attempt in range(3):
+            try:
+                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=8)
+                break
+            except Exception as exc:
+                logger.warning("agent lookup attempt %s/3 failed: %s", attempt + 1, exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1))
 
     if rec is None:
         # fall back to the default demo agent so the worker never crashes

@@ -12,6 +12,7 @@ Run once after any schema change (from backend/):
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Optional
 
@@ -36,6 +37,7 @@ except ImportError as e:  # pragma: no cover - surface a friendly message
 
 # Singleton across the process (FastAPI + worker share this module).
 prisma: Optional[Prisma] = None
+_connect_lock = asyncio.Lock()
 
 
 def get_prisma() -> Prisma:
@@ -54,8 +56,13 @@ def is_connected() -> bool:
 async def init() -> None:
     """Connect (called on FastAPI startup / worker start)."""
     client = get_prisma()
-    if not client.is_connected():
-        await client.connect()
+    if client.is_connected():
+        return
+    # Multiple LiveKit jobs can start together. Serialize initialization so
+    # concurrent Prisma engine startup does not leave one request hanging.
+    async with _connect_lock:
+        if not client.is_connected():
+            await client.connect()
 
 
 async def shutdown() -> None:
