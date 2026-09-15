@@ -699,6 +699,7 @@ def build_voice_agent(
                 explicit_goodbye = bool(
                     normalized in {"bye", "goodbye", "ok bye", "okay bye", "good bye", "good bye bye"}
                     or any(p in normalized for p in ("cut the call", "hang up", "disconnect the call", "end the call"))
+                    or ("thank you" in normalized and "?" not in user_text and len(normalized.split()) <= 12)
                 )
             except Exception:
                 explicit_goodbye = False
