@@ -597,7 +597,7 @@ def build_voice_agent(
         # audio mid-sentence. Keep this short so successful calls have no extra
         # latency; it only runs on explicit hang-up.
         import asyncio
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(5.0)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
         room = getattr(ctx.room, "name", None)
