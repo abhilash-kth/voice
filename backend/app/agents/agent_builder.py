@@ -130,6 +130,13 @@ def build_llm(cfg: AgentConfig) -> Any:
     #   * OpenRouter free models -> default off so we don't spend the tiny free
     #     quota on chain-of-thought.
     low = model.lower()
+    # Groq removed qwen/qwen3.6-27b from the serving catalog. Migrate old
+    # saved agent configurations automatically instead of letting every turn
+    # fail with a 404 until the user edits the agent.
+    if sel.id.startswith("groq") and low == "qwen/qwen3.6-27b":
+        logger.warning("⚠️ Migrating unavailable qwen/qwen3.6-27b to openai/gpt-oss-20b for voice reliability")
+        model = "openai/gpt-oss-20b"
+        low = model.lower()
     if "qwen" in low or "gemma" in low:
         default_reasoning = "none"
     elif "gpt-oss" in low:

@@ -71,14 +71,14 @@ CATALOG: dict[str, Any] = {
             "display_name": "Groq Qwen3 (⚠️ reasoning, burns free-tier quota)",
             "provider": "openai",
             "base_url": "https://api.groq.com/openai/v1",
-            "model": "qwen/qwen3.6-27b",
+            "model": "openai/gpt-oss-20b",
             "tier": "free",
             "requires_key": True,
             "key_env": "GROQ_API_KEY",
             "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
             # LiveKit retries a rate-limit 3x with backoff -> 15-20s "thinking" stalls.
             "notes": "Reasoning model: hits Groq's 200k tokens/day quota in a few calls, then 429s. Prefer Groq GPT-OSS for voice.",
-            "options": {"model": ["qwen/qwen3.6-27b", "qwen/qwen3-32b"]},
+            "options": {"model": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]},
         },
         "openrouter_gemma": {
             "kind": "llm",

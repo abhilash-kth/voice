@@ -572,6 +572,11 @@ async def entrypoint(ctx):
         if prev == "thinking" and elapsed > 2.5:
             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
         logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        # A real assistant speech transition proves the turn has produced audio.
+        # Cancel the watchdog before it can enqueue a fallback behind a slow TTS
+        # stream (the old race caused valid answers followed by "technical problem").
+        if ev.new_state == "speaking":
+            _cancel_pending()
         state_tracker["state"] = ev.new_state
         state_tracker["since"] = now
 
