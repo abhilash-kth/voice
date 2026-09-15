@@ -568,13 +568,10 @@ def build_voice_agent(
     # We make the trigger explicit so the model reliably hangs up on its own and
     # doesn't leave the caller in a silent, open call.
     instructions += (
-        "\n\nAUTOMATIC HANG-UP: Call the `end_call` tool only after the caller explicitly "
-        "says they want to end the call, such as goodbye, thank you goodbye, please "
-        "disconnect, or call cut. Do NOT end the call merely because a question was "
-        "answered, because the caller pauses, or because you asked for contact details. "
-        "After answering, remain available and ask whether the caller needs anything "
-        "else. Say a short closing line only after an explicit goodbye, then call "
-        "`end_call` once. Never end the call mid-answer."
+        "\n\nCALL LIFECYCLE: Never end or hang up the call yourself. Continue the conversation "
+        "after answering questions, after pauses, and after collecting contact details. "
+        "The caller or the application controls when the call ends. If the caller says "
+        "goodbye, respond with a brief polite closing sentence but do not disconnect."
     )
 
     async def _end_call() -> str:
@@ -634,7 +631,12 @@ def build_voice_agent(
                 chat_ctx=chat_ctx,
                 # Registered tools let the LLM hang up the call once the
                 # conversation concludes (auto-cut).
-                tools=[end_call_tool],
+                # Do not expose hang-up as an LLM tool. A voice model can
+                # interpret phrases such as "no more help" as goodbye even
+                # when the caller continues with another question. The browser
+                # or telephony layer owns call termination; this prevents the
+                # model from deleting an active room mid-conversation.
+                tools=[],
                 # NOTE: turn-handling (endpointing / interruption / preemptive
                 # generation) is set on the AgentSession (build_assistant_session),
                 # where LiveKit actually reads the interruption min_duration/window.
