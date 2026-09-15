@@ -77,8 +77,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     Record<string, Record<string, string>>
   >({});
   const [file, setFile] = useState<File | null>(null);
-  const [removeDocument, setRemoveDocument] = useState(false);
-  const existingDocuments = editing?.knowledge?.documents || [];
+  const [savedDocuments, setSavedDocuments] = useState(
+    editing?.knowledge?.documents || [],
+  );
   const hasText = knowledgeText.trim().length > 0;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -179,7 +180,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           text: file ? "" : knowledgeText,
           system_prompt: systemPrompt,
           faq: buildFaq(),
-          documents: removeDocument ? [] : (file ? [] : existingDocuments),
+          documents: file ? [] : savedDocuments,
         });
         // A newly selected file replaces the previous document, rather than appending.
         if (file) await addKnowledge(agent.id, { file });
@@ -402,7 +403,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               </label>
               <textarea
                 value={knowledgeText}
-                disabled={!!file || (existingDocuments.length > 0 && !removeDocument)}
+                disabled={!!file || savedDocuments.length > 0}
                 onChange={(e) => setKnowledgeText(e.target.value)}
                 rows={5}
                 placeholder="Company facts, FAQs, product info..."
@@ -486,10 +487,15 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               <label className="text-xs text-gray-400 font-medium">
                 Upload knowledge file (.txt/.md/.csv/.json/.pdf)
               </label>
-              {existingDocuments.length > 0 && !removeDocument && (
+              {savedDocuments.length > 0 && (
                 <div className="mb-2 rounded-lg border border-blue-500/30 bg-blue-500/10 p-2 text-xs">
                   <div className="font-medium">Saved knowledge file</div>
-                  {existingDocuments.map((d) => <div key={d.name} className="flex justify-between text-gray-300"><span>{d.name}</span><button type="button" onClick={() => setRemoveDocument(true)} className="text-red-400">Delete</button></div>)}
+                  {savedDocuments.map((d, i) => (
+                    <div key={`${d.name}-${i}`} className="flex justify-between text-gray-300">
+                      <span>{d.name}</span>
+                      <button type="button" onClick={() => setSavedDocuments((docs) => docs.filter((_, j) => j !== i))} className="text-red-400">Delete</button>
+                    </div>
+                  ))}
                 </div>
               )}
               <input
