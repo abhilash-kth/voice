@@ -703,6 +703,20 @@ def build_voice_agent(
                 )
             except Exception:
                 explicit_goodbye = False
+            # Keep the rolling conversation bounded. Groq accounts the entire
+            # prompt against TPM; an unbounded voice call eventually turns every
+            # request into a 429 even with the 20b model. Preserve system facts
+            # and only the latest few conversational messages.
+            try:
+                target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
+                items = getattr(target_ctx, "items", None)
+                if isinstance(items, list) and len(items) > 10:
+                    system_items = [m for m in items if getattr(m, "role", "") == "system"]
+                    dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
+                    target_ctx.items = system_items + dialogue_items[-8:]
+                    logger.info("🧹 Trimmed conversation context to %s messages", len(target_ctx.items))
+            except Exception as exc:
+                logger.debug("conversation context trim skipped: %s", exc)
             if not _rag_per_turn_enabled():
                 return
             try:
