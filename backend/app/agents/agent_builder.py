@@ -563,6 +563,11 @@ def build_voice_agent(
     # and only the capped static facts are used.
     instructions = build_instructions(cfg)
 
+    # The model may request the tool, but only a deterministic transcript check
+    # may authorize room deletion. This prevents phrases such as "no more help,
+    # thank you" from being mistaken for a final goodbye.
+    explicit_goodbye = False
+
     # Auto hang-up: when the conversation is finished the LLM calls `end_call`,
     # which shuts the job down so the call is cut AND the billing is finalized.
     # We make the trigger explicit so the model reliably hangs up on its own and
@@ -581,6 +586,9 @@ def build_voice_agent(
 
     async def _end_call() -> str:
         """End this call and hang up. Call it once the conversation is finished."""
+        if not explicit_goodbye:
+            logger.warning("end_call rejected: caller did not give an explicit final goodbye")
+            return "Keep the call open; the caller has not explicitly ended it."
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
@@ -682,6 +690,18 @@ def build_voice_agent(
             preemptive generation, so when VOICE_PREEMPTIVE=1 this hook is a
             no-op and only the capped static facts are available.
             """
+            nonlocal explicit_goodbye
+            try:
+                user_text = _chat_msg_text(new_message).strip()
+                normalized = " ".join(user_text.lower().replace(".", " ").replace(",", " ").split())
+                # Require a clear final intent. Do not treat "no more help" or
+                # "thank you" as a hang-up request because callers often continue.
+                explicit_goodbye = bool(
+                    normalized in {"bye", "goodbye", "ok bye", "okay bye", "good bye", "good bye bye"}
+                    or any(p in normalized for p in ("cut the call", "hang up", "disconnect the call", "end the call"))
+                )
+            except Exception:
+                explicit_goodbye = False
             if not _rag_per_turn_enabled():
                 return
             try:
