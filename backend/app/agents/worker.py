@@ -251,7 +251,7 @@ def build_assistant_session(cfg: AgentConfig):
         #     self-hosted worker and then falls back (adds lag + noise).
         turn_handling={
             "turn_detection": "vad",
-            "endpointing": {"min_delay": 0.35, "max_delay": 0.75},
+            "endpointing": {"min_delay": 0.6, "max_delay": 1.2},
             "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 0},
             # Preemptive generation (LLM answers while the user is still speaking) is
             # great for latency, BUT here it was being invalidated almost every turn and
