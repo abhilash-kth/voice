@@ -547,13 +547,22 @@ async def entrypoint(ctx):
             logger.info(f"👂 User: {text}")
             normalized_user = " ".join(text.lower().replace(".", " ").replace(",", " ").split())
             closing_requested["done"] = (
-                normalized_user in {"bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye", "thank you", "thanks"}
+                normalized_user in {
+                    "bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye",
+                    "thank you", "thanks", "और तो मुझे कुछ नहीं जानना",
+                    "अब मुझे कुछ नहीं जानना", "मुझे और कुछ नहीं जानना", "बस इतना ही",
+                    "बस इतना ही पूछना था", "no more questions", "no more help",
+                    "that's all", "that is all",
+                }
                 or ("thank you" in normalized_user and "?" not in text and len(normalized_user.split()) <= 12)
                 or ("thanks" in normalized_user and "?" not in text and len(normalized_user.split()) <= 12)
                 or any(phrase in normalized_user for phrase in (
                     "cut the call", "hang up", "disconnect", "end the call", "call cut",
                     "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
                     "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                    "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                    "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                    "no more questions", "no more help", "that's all", "that is all",
                 ))
             )
             if closing_requested["done"]:

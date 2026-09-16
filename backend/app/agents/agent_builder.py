@@ -588,9 +588,10 @@ def build_voice_agent(
         "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
         "collection. End the call only when the caller clearly and explicitly asks to "
         "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
-        "or a mixed Hindi/English request such as 'call cut kar dijiye' as a standalone final "
-        "utterance. Phrases such as 'no more help', 'that's all for this question', "
-        "or 'okay' are NOT goodbye, especially when followed by another question. "
+        "that's all, no more help, or no more questions, or a mixed Hindi/English request "
+        "such as 'call cut kar dijiye' or 'और तो मुझे कुछ नहीं जानना' as a standalone final "
+        "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
+        "especially when followed by another question. "
         "When the caller explicitly says goodbye, first speak exactly one short polite "
         "closing sentence, such as 'Thank you for calling us. Aapse baat karke achha laga. "
         "Goodbye.' Then call the end_call tool once. Never call the tool before the "
@@ -719,12 +720,18 @@ def build_voice_agent(
                 closing_phrases = {
                     "bye", "bye bye", "goodbye", "good bye", "ok bye",
                     "okay bye", "good bye bye", "thank you", "thanks",
+                    "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                    "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                    "no more questions", "no more help", "that's all", "that is all",
                 }
                 disconnect_phrases = (
                     "cut the call", "hang up", "disconnect", "disconnect the call",
                     "end the call", "call cut", "कॉल कट", "call काट",
                     "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
                     "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                    "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                    "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                    "no more questions", "no more help", "that's all", "that is all",
                 )
                 explicit_goodbye = bool(
                     normalized in closing_phrases
