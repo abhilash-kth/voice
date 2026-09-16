@@ -793,7 +793,8 @@ def _billing_report(costs, usage, duration) -> str:
         f"🧠 LLM {usage['llm_input_tokens']}in/{usage['llm_output_tokens']}out -> ₹{costs['llm_cost_inr']}\n"
         f"🗣️ TTS {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}\n"
         f"🖥️ Server -> ₹{costs['server_cost_inr']}\n"
-        f"💸 YOUR COST ₹{costs['total_cost_inr']}   💳 BILL ₹{costs['client_price_inr']}\n"
+        f"💸 YOUR COST ₹{costs['total_cost_inr']} (₹{costs['your_cost_per_min']}/min)\n"
+        f"💳 CUSTOMER BILL ₹{costs['client_price_inr']} (₹{costs['client_bill_per_min']}/min)\n"
         f"🤑 PROFIT ₹{costs['your_profit_inr']} [{'PROFIT ✅' if costs['is_profit'] else 'LOSS ⚠️'}]\n"
         + "=" * 64
     )
