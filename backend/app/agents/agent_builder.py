@@ -435,7 +435,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
         "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
-        "Keep replies to 1 or 2 short spoken sentences. No analysis, markdown, lists, or emojis.",
+        "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
     # Natural, human-like behaviour: concise, non-repetitive, never salesy, and
