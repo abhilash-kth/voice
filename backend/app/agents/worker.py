@@ -759,7 +759,32 @@ async def entrypoint(ctx):
             if room.remote_participants:
                 caller_joined.set()
             await caller_joined.wait()
-            await caller_left.wait()
+            idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 60) or 60))
+            try:
+                await asyncio.wait_for(caller_left.wait(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                # Keep this deterministic and customer-configurable. Do not run
+                # the LLM for an idle caller; speak the saved line once, then hang up.
+                message = (getattr(cfg, "no_response_message", "") or
+                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+                _cancel_pending()
+                fallback_task = reply_tracker.get("fallback_say")
+                if fallback_task is not None and not fallback_task.done():
+                    fallback_task.cancel()
+                try:
+                    await session.say(message, allow_interruptions=False)
+                except Exception as exc:
+                    logger.info("Idle timeout message could not be played because the session closed: %s", exc)
+                logger.info("⏱️ Caller inactive for %ss — ending call.", idle_timeout)
+                try:
+                    session.shutdown(drain=False)
+                except Exception:
+                    pass
+                try:
+                    ctx.shutdown()
+                except Exception:
+                    pass
+                return
             logger.info("👋 Caller hang up — ending call.")
         finally:
             room.off("participant_connected", _on_connected)

@@ -34,6 +34,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [name, setName] = useState(editing?.name || "");
   const [greeting, setGreeting] = useState(editing?.greeting || "");
   const [fallbackResponse, setFallbackResponse] = useState(editing?.fallback_response || "Sorry, there is a temporary technical problem. Please try again shortly.");
+  const [noResponseTimeout, setNoResponseTimeout] = useState(editing?.no_response_timeout_seconds ?? 60);
+  const [noResponseMessage, setNoResponseMessage] = useState(editing?.no_response_message || "I did not hear a response, so I will end the call now. Thank you for calling.");
   const [mode, setMode] = useState(editing?.agent_mode || "assistant");
   const [announceText, setAnnounceText] = useState(
     editing?.announce_text || "",
@@ -163,6 +165,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         agent_mode: mode,
         announce_text: mode === "announcement" ? announceText : "",
         fallback_response: fallbackResponse.trim(),
+        no_response_timeout_seconds: Math.max(15, Number(noResponseTimeout) || 60),
+        no_response_message: noResponseMessage.trim(),
         // Client-facing per-minute price is no longer set here — it is derived
         // on the backend from the actual provider costs (LLM + STT + TTS +
         // telephony) plus a margin configured in `.env`.
@@ -270,6 +274,19 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             placeholder="Please hold on, I am having a temporary issue."
             className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1" />
           <p className="text-[11px] text-gray-500 mt-1">Spoken when there is a temporary network, provider, or server problem.</p>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs text-gray-400 font-medium">No-response timeout (seconds)</label>
+            <input type="number" min={15} value={noResponseTimeout} onChange={(e) => setNoResponseTimeout(Number(e.target.value))}
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1" />
+            <p className="text-[11px] text-gray-500 mt-1">Recommended: 60 seconds.</p>
+          </div>
+          <div>
+            <label className="text-xs text-gray-400 font-medium">No-response closing message</label>
+            <textarea value={noResponseMessage} onChange={(e) => setNoResponseMessage(e.target.value)} rows={2}
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1" />
+          </div>
         </div>
 
         {/* Agent mode: full assistant vs fixed-script announcement */}
