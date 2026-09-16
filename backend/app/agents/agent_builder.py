@@ -587,7 +587,8 @@ def build_voice_agent(
         "partial, interrupted, or unclear first user utterance. Acknowledge briefly and "
         "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
         "collection. End the call only when the caller clearly and explicitly asks to "
-        "disconnect, hang up, cut the call, or says goodbye/bye as a standalone final "
+        "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
+        "or a mixed Hindi/English request such as 'call cut kar dijiye' as a standalone final "
         "utterance. Phrases such as 'no more help', 'that's all for this question', "
         "or 'okay' are NOT goodbye, especially when followed by another question. "
         "When the caller explicitly says goodbye, first speak exactly one short polite "
@@ -705,13 +706,31 @@ def build_voice_agent(
             nonlocal explicit_goodbye
             try:
                 user_text = _chat_msg_text(new_message).strip()
-                normalized = " ".join(user_text.lower().replace(".", " ").replace(",", " ").split())
-                # Require a clear final intent. Do not treat "no more help" or
-                # "thank you" as a hang-up request because callers often continue.
+                normalized = " ".join(
+                    user_text.lower()
+                    .replace(".", " ")
+                    .replace(",", " ")
+                    .split()
+                )
+                # This is deliberately transcript-level (rather than an LLM
+                # decision): short, natural closings must authorize the tool
+                # even when STT returns "bye bye" or Hindi mixed with English.
+                # Do not require the literal word "goodbye".
+                closing_phrases = {
+                    "bye", "bye bye", "goodbye", "good bye", "ok bye",
+                    "okay bye", "good bye bye", "thank you", "thanks",
+                }
+                disconnect_phrases = (
+                    "cut the call", "hang up", "disconnect", "disconnect the call",
+                    "end the call", "call cut", "कॉल कट", "call काट",
+                    "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
+                    "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                )
                 explicit_goodbye = bool(
-                    normalized in {"bye", "goodbye", "ok bye", "okay bye", "good bye", "good bye bye"}
-                    or any(p in normalized for p in ("cut the call", "hang up", "disconnect the call", "end the call"))
-                    or ("thank you" in normalized and "?" not in user_text and len(normalized.split()) <= 12)
+                    normalized in closing_phrases
+                    or any(p in normalized for p in disconnect_phrases)
+                    or ("thank you" in normalized and "?" not in user_text
+                        and len(normalized.split()) <= 12)
                 )
             except Exception:
                 explicit_goodbye = False

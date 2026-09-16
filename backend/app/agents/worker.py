@@ -455,6 +455,10 @@ async def entrypoint(ctx):
     # has usually rolled over).
     # ------------------------------------------------------------------
     call_closed = {"done": False}
+    # Set from the final user transcript before generation.  Closing intent is
+    # not the same as disconnected: the one closing sentence still needs to be
+    # played, but watchdog fallbacks and later generations must be suppressed.
+    closing_requested = {"done": False}
     reply_tracker = {
         "last_user_ts": 0.0,
         "last_assistant_ts": 0.0,
@@ -501,8 +505,8 @@ async def entrypoint(ctx):
         finally:
             if reply_tracker["pending"] is asyncio.current_task():
                 reply_tracker["pending"] = None
-        if reply_tracker["last_assistant_ts"] >= turn_ts:
-            return  # the LLM did answer this turn (late, but it answered)
+        if reply_tracker["last_assistant_ts"] >= turn_ts or closing_requested["done"]:
+            return  # closing turns must never receive a delayed fallback
         logger.warning(
             f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
             "(rate-limited 429 or failed generation) — speaking a fallback line "
@@ -541,6 +545,19 @@ async def entrypoint(ctx):
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
             usage["transcripts"].append({"role": "user", "text": text})
             logger.info(f"👂 User: {text}")
+            normalized_user = " ".join(text.lower().replace(".", " ").replace(",", " ").split())
+            closing_requested["done"] = (
+                normalized_user in {"bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye", "thank you", "thanks"}
+                or any(phrase in normalized_user for phrase in (
+                    "cut the call", "hang up", "disconnect", "end the call", "call cut",
+                    "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
+                    "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                ))
+            )
+            if closing_requested["done"]:
+                # Never let the generic provider-timeout fallback speak after a
+                # caller has already asked to leave.
+                _cancel_pending()
             # A fresh turn supersedes any fallback still speaking from the
             # previous failed turn; never let it bleed into this reply.
             old_fallback = reply_tracker.get("fallback_say")
@@ -577,7 +594,10 @@ async def entrypoint(ctx):
             latest_user = last_user_transcript["text"].lower()
             explicit_end = any(term in latest_user for term in (
                 "goodbye", "good bye", "bye", "hang up", "cut the call",
-                "disconnect", "end the call", "thank you", "thankyou"
+                "disconnect", "end the call", "thank you", "thankyou", "bye bye",
+                "ok bye", "okay bye", "कॉल कट", "call काट", "कॉल काट",
+                "call cut कर दीजिए", "call काट दीजिए", "कॉल बंद कर दीजिए",
+                "फोन काट दीजिए"
             ))
             if not explicit_end and any(term in cleaned.lower() for term in ("goodbye", "good bye", "thank you for calling")):
                 logger.warning("🛡️ Suppressed model farewell without explicit caller goodbye")
