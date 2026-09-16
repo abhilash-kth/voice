@@ -454,6 +454,7 @@ async def entrypoint(ctx):
     # FALLBACK_SILENCE and let the caller retry (by then the rate-limit window
     # has usually rolled over).
     # ------------------------------------------------------------------
+    call_closed = {"done": False}
     reply_tracker = {
         "last_user_ts": 0.0,
         "last_assistant_ts": 0.0,
@@ -518,6 +519,10 @@ async def entrypoint(ctx):
             logger.warning(f"🛟 could not arm silence watchdog: {e}")
 
     def on_item_added(ev):
+        # LiveKit can flush a late assistant item while the room is already
+        # closing. Never log, bill, or try to speak that stale item.
+        if call_closed["done"]:
+            return
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
         text = _msg_text(item)
@@ -740,6 +745,7 @@ async def entrypoint(ctx):
                 caller_joined.set()
 
         def _on_disconnected(participant):
+            call_closed["done"] = True
             # Cancel pending fallback speech immediately when the caller leaves.
             # Otherwise the watchdog can try to speak into a closed AgentSession.
             _cancel_pending()
