@@ -45,7 +45,7 @@ CATALOG: dict[str, Any] = {
             # 08/16/26); their replacement is the openai/gpt-oss family.
             "notes": "Groq's current default. Reasoning model — keep 'reasoning_effort' = low for fast voice replies.",
             "options": {
-                "model": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"],
+                "model": ["openai/gpt-oss-120b"],
                 "reasoning_effort": ["low", "medium", "high"],
                 "temperature": [0.0, 0.1, 0.3, 0.7],
             },
@@ -66,9 +66,9 @@ CATALOG: dict[str, Any] = {
                 "temperature": [0.0, 0.1, 0.3, 0.7],
             },
         },
-        "groq_qwen": {
+        "groq_gpt_oss_20b": {
             "kind": "llm",
-            "display_name": "Groq Qwen3 (⚠️ reasoning, burns free-tier quota)",
+            "display_name": "Groq GPT-OSS 20B (free-tier)",
             "provider": "openai",
             "base_url": "https://api.groq.com/openai/v1",
             "model": "openai/gpt-oss-20b",
@@ -78,7 +78,24 @@ CATALOG: dict[str, Any] = {
             "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
             # LiveKit retries a rate-limit 3x with backoff -> 15-20s "thinking" stalls.
             "notes": "Reasoning model: hits Groq's 200k tokens/day quota in a few calls, then 429s. Prefer Groq GPT-OSS for voice.",
-            "options": {"model": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]},
+            "options": {"model": ["openai/gpt-oss-20b"]},
+        },
+        "groq_qwen_3_8_27b": {
+            "kind": "llm",
+            "display_name": "Groq Qwen3.8 27B (free-tier)",
+            "provider": "openai",
+            "base_url": "https://api.groq.com/openai/v1",
+            "model": "qwen/qwen3.8-27b",
+            "tier": "free",
+            "requires_key": True,
+            "key_env": "GROQ_API_KEY",
+            "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
+            "notes": "Qwen3.8 27B on Groq. Use low reasoning effort for responsive voice calls.",
+            "options": {
+                "model": ["qwen/qwen3.8-27b"],
+                "reasoning_effort": ["low", "medium", "high"],
+                "temperature": [0.0, 0.1, 0.3, 0.7],
+            },
         },
         "openrouter_gemma": {
             "kind": "llm",
@@ -143,7 +160,7 @@ CATALOG: dict[str, Any] = {
             # low (build_llm's default for gpt-oss) for human latency.
             "notes": "Uses OPENAI_API_KEY (not Groq). Keep 'reasoning_effort' = low for fast voice replies.",
             "options": {
-                "model": ["gpt-oss-120b", "gpt-oss-20b"],
+                "model": ["gpt-oss-120b"],
                 "reasoning_effort": ["low", "medium", "high"],
             },
         },
