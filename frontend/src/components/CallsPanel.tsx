@@ -98,8 +98,8 @@ export default function CallsPanel() {
           <tbody className="divide-y divide-gray-800">
             {calls.length === 0 && <tr><td colSpan={7} className="p-3 text-gray-500">No calls yet.</td></tr>}
             {calls.map((c) => (
-              <tr key={c.id} className="hover:bg-gray-800/50">
-                <td className="p-3"><input aria-label={`Select call ${c.id}`} type="checkbox" checked={selected.includes(c.id)} onChange={(e) => setSelected((ids) => e.target.checked ? [...ids, c.id] : ids.filter((id) => id !== c.id))} /></td>
+              <tr key={c.id} onClick={() => open(c.id)} className="hover:bg-gray-800/50 cursor-pointer transition-colors">
+                <td className="p-3"><input aria-label={`Select call ${c.id}`} type="checkbox" onClick={(e) => e.stopPropagation()} checked={selected.includes(c.id)} onChange={(e) => setSelected((ids) => e.target.checked ? [...ids, c.id] : ids.filter((id) => id !== c.id))} /></td>
                 <td className="p-3 font-mono text-blue-400">{c.id}</td>
                 <td className="p-3">{c.mode}</td>
                 <td className="p-3">
@@ -126,7 +126,8 @@ export default function CallsPanel() {
 
       {/* Transcript + cost detail */}
       <div className="bg-gray-900 p-5 rounded-2xl border border-gray-800">
-        <h2 className="text-xl font-bold mb-4">📝 Transcript & Cost</h2>
+        <h2 className="text-xl font-bold mb-1">📝 Call Summary</h2>
+        <p className="text-xs text-gray-400 mb-4">Transcript, call duration, total charge, and per-minute rate</p>
         {detail ? (
           <div className="space-y-4">
             <div className="flex items-center gap-2 text-xs text-gray-400">
