@@ -573,7 +573,10 @@ def build_voice_agent(
     # We make the trigger explicit so the model reliably hangs up on its own and
     # doesn't leave the caller in a silent, open call.
     instructions += (
-        "\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
+        "\n\nCONVERSATION OPENING: The initial greeting has already been spoken by the application. "
+        "Never greet again, introduce yourself again, or say 'Namaste' in response to a "
+        "partial, interrupted, or unclear first user utterance. Acknowledge briefly and "
+        "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
         "collection. End the call only when the caller clearly and explicitly asks to "
         "disconnect, hang up, cut the call, or says goodbye/bye as a standalone final "
         "utterance. Phrases such as 'no more help', 'that's all for this question', "
