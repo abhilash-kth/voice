@@ -169,16 +169,17 @@ def build_llm(cfg: AgentConfig) -> Any:
     # `conn_options`, see worker.py) so a transient DNS blip or provider 429 fails
     # fast instead of stacking retries and freezing the call for ~20s.
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-    return LLM(
-        client=client,
-        model=model,
-        temperature=float(overrides.get("temperature", 0.1)),
-        max_completion_tokens=int(overrides.get("max_tokens", 180)),
-        # See `reasoning` above. For gpt-oss keep it low so the model doesn't spend
-        # time on a long chain-of-thought that also risks leaking into the spoken
-        # reply (the worker's clean_reply_text strips <think>/<reasoning> anyway).
-        reasoning_effort=reasoning,
-    )
+    llm_kwargs = {
+        "client": client,
+        "model": model,
+        "temperature": float(overrides.get("temperature", 0.1)),
+        "max_completion_tokens": int(overrides.get("max_tokens", 180)),
+    }
+    # Standard OpenAI chat models reject reasoning_effort. Only send it to
+    # models whose API supports it.
+    if "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
+        llm_kwargs["reasoning_effort"] = reasoning
+    return LLM(**llm_kwargs)
 
 
 def build_stt(cfg: AgentConfig) -> Any:
