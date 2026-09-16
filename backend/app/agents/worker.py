@@ -566,6 +566,17 @@ async def entrypoint(ctx):
                 return
             _mark_reply(now)
             cleaned = clean_reply_text(text)
+            # Never let the LLM close a call on its own. Models sometimes emit
+            # a farewell after ambiguous STT fragments such as "company go".
+            # Only transcript-level explicit intent may produce a closing TTS.
+            latest_user = last_user_transcript["text"].lower()
+            explicit_end = any(term in latest_user for term in (
+                "goodbye", "good bye", "bye", "hang up", "cut the call",
+                "disconnect", "end the call", "thank you", "thankyou"
+            ))
+            if not explicit_end and any(term in cleaned.lower() for term in ("goodbye", "good bye", "thank you for calling")):
+                logger.warning("🛡️ Suppressed model farewell without explicit caller goodbye")
+                cleaned = "Ji, batayiye, aapko kis tarah ki madad chahiye?"
             if cleaned == FALLBACK_REPLY and text.strip() != FALLBACK_REPLY:
                 # The model returned something but we flagged it as a fallback —
                 # surface the raw text so we can see WHY.
