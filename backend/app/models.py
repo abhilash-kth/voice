@@ -77,6 +77,8 @@ class AgentConfig(BaseModel):
     announce_text: str = ""
     # Spoken message used when the LLM/provider cannot produce a reply.
     fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
+    no_response_timeout_seconds: int = 60
+    no_response_message: str = "I did not hear a response, so I will end the call now. Thank you for calling."
 
 
 class AgentCreate(BaseModel):
@@ -95,6 +97,8 @@ class AgentCreate(BaseModel):
     agent_mode: str = "assistant"
     announce_text: str = ""
     fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
+    no_response_timeout_seconds: int = 60
+    no_response_message: str = "I did not hear a response, so I will end the call now. Thank you for calling."
 
 
 class AgentUpdate(BaseModel):
@@ -113,6 +117,8 @@ class AgentUpdate(BaseModel):
     agent_mode: Optional[str] = None
     announce_text: Optional[str] = None
     fallback_response: Optional[str] = None
+    no_response_timeout_seconds: Optional[int] = None
+    no_response_message: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
