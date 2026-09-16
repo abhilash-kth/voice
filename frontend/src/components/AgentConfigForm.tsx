@@ -115,7 +115,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           >
             {optVals.map((o) => (
               <option key={o} value={o}>
-                {o}
+                {optName === "model" && (p as any).cost?.per_1k_in != null
+                    ? `${o} — ₹${(p as any).cost.per_1k_in}/1K in · ₹${(p as any).cost.per_1k_out}/1K out`
+                    : o}
               </option>
             ))}
           </select>

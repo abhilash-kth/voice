@@ -740,6 +740,13 @@ async def entrypoint(ctx):
                 caller_joined.set()
 
         def _on_disconnected(participant):
+            # Cancel pending fallback speech immediately when the caller leaves.
+            # Otherwise the watchdog can try to speak into a closed AgentSession.
+            _cancel_pending()
+            fallback_task = reply_tracker.get("fallback_say")
+            if fallback_task is not None and not fallback_task.done():
+                fallback_task.cancel()
+            reply_tracker["fallback_say"] = None
             # "remote participants" = the caller(s). When there are none left and
             # we previously saw at least one caller, the call is over.
             if not room.remote_participants:
