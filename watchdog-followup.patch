@@ -1,0 +1,155 @@
+diff --git a/backend/app/agents/agent_builder.py b/backend/app/agents/agent_builder.py
+index f15209b..28871b2 100644
+--- a/backend/app/agents/agent_builder.py
++++ b/backend/app/agents/agent_builder.py
+@@ -162,11 +162,80 @@ def build_llm(cfg: AgentConfig) -> Any:
+     # `conn_options`, see worker.py) so a transient DNS blip or provider 429 fails
+     # fast instead of stacking retries and freezing the call for ~20s.
+     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
++
++    # ------------------------------------------------------------------
++    # Raw-response logger (diagnostics).
++    #
++    # Some turns came back SILENT with no error (0.2-0.5s of "thinking", no
++    # TTS, no exception). This wraps chat.completions.create and logs, for
++    # EVERY request: how many stream chunks arrived, how many characters of
++    # actual content they carried, the finish reason, and any tool calls.
++    # When a turn is silent, the 🧾 line right before it shows exactly what
++    # the model returned:
++    #   * 0 chunks                          -> the API returned nothing
++    #   * chunks but content_chars=0        -> model answered with reasoning/
++    #                                          tool-calls only, no text
++    #   * content_chars>0 but still silent  -> the drop is downstream (plugin
++    #                                          filtered it, or state race)
++    if os.getenv("VOICE_LLM_LOG_RESPONSES", "1") != "0":
++        _orig_create = client.chat.completions.create
++
++        async def _logged_create(*_args, **_kwargs):
++            resp = await _orig_create(*_args, **_kwargs)
++            try:
++                if _kwargs.get("stream"):
++                    async def _counting(stream):
++                        n_chunks, n_chars, n_tool, finish = 0, 0, 0, None
++                        try:
++                            async for chunk in stream:
++                                n_chunks += 1
++                                try:
++                                    choice = chunk.choices[0]
++                                    fr = getattr(choice, "finish_reason", None)
++                                    if fr:
++                                        finish = fr
++                                    delta = getattr(choice, "delta", None)
++                                    piece = getattr(delta, "content", None)
++                                    if piece:
++                                        n_chars += len(piece)
++                                    tcs = getattr(delta, "tool_calls", None)
++                                    if tcs:
++                                        n_tool += len(tcs)
++                                except Exception:
++                                    pass
++                                yield chunk
++                        finally:
++                            logger.info(
++                                f"🧾 LLM stream ({model}): {n_chunks} chunks, "
++                                f"content_chars={n_chars}, finish={finish}, "
++                                f"tool_call_deltas={n_tool}"
++                            )
++                    return _counting(resp)
++                choice = resp.choices[0]
++                content = getattr(choice.message, "content", None) or ""
++                tcs = getattr(choice.message, "tool_calls", None)
++                logger.info(
++                    f"🧾 LLM response ({model}): finish={choice.finish_reason}, "
++                    f"content_chars={len(content)}, "
++                    f"tool_calls={len(tcs) if tcs else 0}"
++                )
++            except Exception as e:
++                logger.warning(f"LLM response logging failed: {e}")
++            return resp
++
++        client.chat.completions.create = _logged_create
++
+     return LLM(
+         client=client,
+         model=model,
+         temperature=float(overrides.get("temperature", 0.1)),
+-        max_completion_tokens=int(overrides.get("max_tokens", 300)),
++        # 600 (not 300): with reasoning_effort="low" the model spends part of the
++        # completion budget on chain-of-thought; with only 300 tokens some turns
++        # came back with EMPTY content (fast, no error, caller heard silence).
++        # A one-sentence spoken reply needs far less, so 600 is a safety margin.
++        max_completion_tokens=int(
++            overrides.get("max_tokens") or _os.getenv("VOICE_LLM_MAX_TOKENS", "600")
++        ),
+         # See `reasoning` above. For gpt-oss keep it low so the model doesn't spend
+         # time on a long chain-of-thought that also risks leaking into the spoken
+         # reply (the worker's clean_reply_text strips <think>/<reasoning> anyway).
+@@ -695,6 +764,10 @@ def build_voice_agent(
+                     ),
+                 )
+                 self._last_rag = hits
++                logger.info(
++                    f"🔎 RAG: injected {len(hits)} chars of KB chunks for "
++                    f"question {user_text[:60]!r}"
++                )
+             except Exception as e:
+                 # RAG must never take a live call down — fall back to the
+                 # static (capped) facts.
+diff --git a/backend/app/agents/worker.py b/backend/app/agents/worker.py
+index 604c85a..7688c12 100644
+--- a/backend/app/agents/worker.py
++++ b/backend/app/agents/worker.py
+@@ -500,6 +500,17 @@ async def entrypoint(ctx):
+             usage["user_speech_seconds"] += (words / 150.0) * 60.0
+             usage["transcripts"].append({"role": "user", "text": text})
+             logger.info(f"👂 User: {text}")
++            # If the PREVIOUS turn went unanswered, the caller is talking again
++            # into silence (the "hello? hello?" loop). The 12s window would never
++            # fire because every new user turn resets it — so answer NOW instead
++            # of waiting another full window.
++            prev_user_ts = reply_tracker["last_user_ts"]
++            if prev_user_ts > 0 and reply_tracker["last_assistant_ts"] < prev_user_ts:
++                logger.warning(
++                    "🛟 Previous turn got no LLM reply and the caller spoke again — "
++                    "speaking fallback immediately."
++                )
++                _spawn_say(FALLBACK_SILENCE)
+             # A fresh turn starts: arm the silence watchdog so a 429'd or empty
+             # LLM turn never leaves the caller in dead air.
+             reply_tracker["last_user_ts"] = now
+@@ -510,6 +521,11 @@ async def entrypoint(ctx):
+             # otherwise they show up as bogus "🗣️ TTS:" lines and, on the
+             # end_call turn, trigger a fallback line right before the hang-up.
+             if _item_is_tool_related(item):
++                fn = getattr(item, "function_call", None)
++                logger.info(
++                    f"🔧 tool item (not spoken): "
++                    f"{getattr(fn, 'name', getattr(item, 'role', 'tool'))}"
++                )
+                 return
+             now = time.time()
+             if not text.strip():
+@@ -544,6 +560,23 @@ async def entrypoint(ctx):
+         elapsed = now - state_tracker["since"]
+         if prev == "thinking" and elapsed > 2.5:
+             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
++        # thinking -> listening WITHOUT any assistant item since the user's turn
++        # means the LLM produced nothing speakable (empty completion, tool-call-
++        # only response, or a silently failed reruest). Log it loudly so these
++        # turns are diagnosable — previously they vanished without a trace.
++        if (
++            prev == "thinking"
++            and ev.new_state == "listening"
++            and reply_tracker["last_user_ts"] > 0
++            and reply_tracker["last_assistant_ts"] < reply_tracker["last_user_ts"]
++        ):
++            logger.warning(
++                "🤐 thinking -> listening with NO assistant reply — the LLM "
++                "returned nothing speakable (or the request failed silently). "
++                "If the caller repeats themselves, an immediate fallback line is "
++                "spoken; otherwise the watchdog fires after "
++                f"{LLM_FALLBACK_DELAY:.0f}s."
++            )
+         logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+         state_tracker["state"] = ev.new_state
+         state_tracker["since"] = now
