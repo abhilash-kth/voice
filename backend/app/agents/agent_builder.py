@@ -122,6 +122,12 @@ def build_llm(cfg: AgentConfig) -> Any:
         env_model = _os.getenv("OPENAI_MODEL")
         default_model = _cat_model or "gpt-4o-mini"
     model = overrides.get("model") or env_model or default_model
+    logger.info(
+        "🤖 LLM selected provider=%s model=%s base_url=%s",
+        provider_id,
+        model,
+        base_url or "https://api.openai.com/v1",
+    )
 
     # Reasoning control, model-aware. Some reasoning models have no "none" level:
     #   * gpt-oss -> "low"  (valid on Groq, minimal chain-of-thought)
