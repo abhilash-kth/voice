@@ -227,7 +227,9 @@ def build_tts(cfg: AgentConfig) -> Any:
         from livekit.plugins.google import TTS
         # Google's streaming endpoint only accepts Chirp 3: HD voices; any legacy
         # Wavenet/Standard/Neural2 voice is remapped to Chirp 3 HD automatically.
-        language = overrides.get("language", "hi-IN")
+        configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
+        default_language = "en-IN" if configured_language.startswith("en") else "hi-IN"
+        language = overrides.get("language", default_language)
         voice = _resolve_tts_voice(language, overrides.get("voice"))
         return TTS(
             voice_name=voice,
@@ -240,7 +242,7 @@ def build_tts(cfg: AgentConfig) -> Any:
         return TTS(
             voice_id=overrides.get("voice", "pNInz6obpgDQGcFmaJgB"),
             model=overrides.get("model", "eleven_multilingual_v2"),
-            language=overrides.get("language", "hi"),
+            language=overrides.get("language", "en" if (getattr(cfg, "language", "hi") or "hi").lower().startswith("en") else "hi"),
         )
 
     if sel.id.startswith("openrouter"):
