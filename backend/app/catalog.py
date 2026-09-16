@@ -80,6 +80,23 @@ CATALOG: dict[str, Any] = {
             "notes": "Reasoning model: hits Groq's 200k tokens/day quota in a few calls, then 429s. Prefer Groq GPT-OSS for voice.",
             "options": {"model": ["openai/gpt-oss-20b"]},
         },
+        "groq_qwen_3_8_27b": {
+            "kind": "llm",
+            "display_name": "Groq Qwen3.8 27B (free-tier)",
+            "provider": "openai",
+            "base_url": "https://api.groq.com/openai/v1",
+            "model": "qwen/qwen3.8-27b",
+            "tier": "free",
+            "requires_key": True,
+            "key_env": "GROQ_API_KEY",
+            "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
+            "notes": "Qwen3.8 27B on Groq. Use low reasoning effort for responsive voice calls.",
+            "options": {
+                "model": ["qwen/qwen3.8-27b"],
+                "reasoning_effort": ["low", "medium", "high"],
+                "temperature": [0.0, 0.1, 0.3, 0.7],
+            },
+        },
         "openrouter_gemma": {
             "kind": "llm",
             "display_name": "OpenRouter Gemma 4 31B (free, tool-calling)",
