@@ -425,9 +425,9 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
 
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
-        "Speak only 1 short Hindi or Hinglish sentence per reply.",
-        "No English analysis. No markdown. No lists. No emojis.",
-        f"Language: {lang}.",
+        "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
+        "Keep replies to 1 or 2 short spoken sentences. No analysis, markdown, lists, or emojis.",
+        f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
     # Natural, human-like behaviour: concise, non-repetitive, never salesy, and
     # conversational rather than scripted. This is what makes calls feel human.
