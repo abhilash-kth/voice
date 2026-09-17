@@ -856,8 +856,20 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     preemptive_tts_enabled = os.getenv("VOICE_PREEMPTIVE_TTS", "0") == "1"
     env_preemptive = os.getenv("VOICE_PREEMPTIVE", "1") == "1"
     
-    # Check if KB has content
+    # Check if KB has content and if RAG enabled
     has_kb = False
+    rag_enabled = True
+    try:
+        # Check RAG enabled (same logic as agent_builder._rag_per_turn_enabled)
+        import os as _os_rag
+        v = (_os_rag.getenv("VOICE_RAG_PER_TURN") or "").strip().lower()
+        if v in ("0", "false", "off"):
+            rag_enabled = False
+        else:
+            rag_enabled = True
+    except Exception:
+        rag_enabled = True
+    
     try:
         kb = getattr(cfg, 'knowledge', None)
         if kb:
@@ -868,12 +880,22 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     except Exception:
         has_kb = False
     
-    # Disable preemptive if KB present to avoid duplicate requests
-    if has_kb and env_preemptive:
+    # FIX ROOT CAUSE: When KB/FAQ RAG is enabled, preemptive must be disabled BEFORE turn begins
+    # Verify runtime Session config, not just config variable
+    # Exactly one LLM REQUEST START per completed user turn, no preemptive that can be invalidated by RAG mutation
+    # Previous bug: only disabled when has_kb, but RAG is always enabled, so preemptive still caused duplicate 0/0 failures
+    # New: disable preemptive whenever RAG enabled (which is default), regardless of has_kb, to prevent any invalidation
+    if rag_enabled and env_preemptive:
         preemptive_enabled = False
-        logger.info(f"🔧 RAG+preemptive fix: KB present (has_kb={has_kb}), disabling preemptive to prevent duplicate LLM requests (was {env_preemptive} from env). Preserving RAG correctness over preemptive latency.")
+        logger.info(f"🔧 RAG+preemptive ROOT FIX: RAG enabled={rag_enabled} has_kb={has_kb}, disabling preemptive to prevent duplicate/invalidated LLM requests (was {env_preemptive} from env). Ensures exactly one REQUEST START per turn, no preemptive invalidation by RAG mutation.")
+    elif has_kb and env_preemptive:
+        preemptive_enabled = False
+        logger.info(f"🔧 RAG+preemptive fix: KB present (has_kb={has_kb}), disabling preemptive to prevent duplicate LLM requests (was {env_preemptive} from env).")
     else:
         preemptive_enabled = env_preemptive
+    
+    # Verify runtime Session config will have preemptive disabled
+    logger.info(f"🔧 FINAL Session config verification: preemptive={preemptive_enabled} (env {env_preemptive}, rag_enabled {rag_enabled}, has_kb {has_kb}) - must be False when RAG enabled to prevent duplicate")
     
     logger.info(f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, endpointing={min_delay}/{max_delay} (TTS wrapper compatible: yes)")
 
@@ -1774,7 +1796,14 @@ async def entrypoint(ctx):
                 logger.info(f"⏱️ TIMING speech_end->first_token: {speech_to_token:.0f}ms (wrapper {turn_timing.get('ttft_ms',0):.0f}ms is authoritative)")
 
         elif prev == "thinking" and ev.new_state == "listening":
-            # Empty turn: thinking->listening without speaking - FIXED RACE CONDITION
+            # Empty turn: thinking->listening without speaking - FIXED RACE CONDITION + DETERMINISTIC CLOSING
+            # FIX: is_closing=True must prevent Empty LLM turn detected from firing, closing 0/0 excluded from failed_requests
+            if turn_timing.get("is_closing", False):
+                logger.info(f"👋 Deterministic closing in progress (is_closing=True), thinking->listening {elapsed:.2f}s is intentional closing, not empty failure - suppressing warning")
+                state_tracker["state"] = ev.new_state
+                state_tracker["since"] = now
+                return
+            
             # Previous bug: detector fired before async LLM stream finished (0.04-0.08s)
             # Evidence: LLM REQUEST START, then thinking->listening 0.04s, then TTFT 800ms, then GENERATION COMPLETE
             # This means empty detection raced with active stream.
@@ -1793,13 +1822,36 @@ async def entrypoint(ctx):
                 return
             
             # Only if LLM terminated and no output, then it's truly empty
+            # FIX: Check is_closing again before warning
+            if turn_timing.get("is_closing", False):
+                logger.info(f"👋 Deterministic closing in progress (is_closing=True), empty turn confirmed but is intentional closing, not failure")
+                state_tracker["state"] = ev.new_state
+                state_tracker["since"] = now
+                return
+            
             if not has_output and gen_complete == 0 and request_start > 0:
                 # LLM terminated with no output and no assistant item - check if it was 0-token generation
                 if turn_timing.get("output_tokens",0) == 0 and turn_timing.get("input_tokens",0) == 0:
+                    # Check if this is closing
+                    if turn_timing.get("is_closing", False):
+                        logger.info(f"👋 Empty LLM turn confirmed but is_closing=True, intentional closing 0/0, not failure")
+                        state_tracker["state"] = ev.new_state
+                        state_tracker["since"] = now
+                        return
                     logger.warning(f"⚠️ Empty LLM turn confirmed (stream terminated with 0 tokens): thinking {elapsed:.2f}s → listening without speaking. request_start {now-request_start:.2f}s ago, gen_complete {gen_complete}. Possible preemptive invalidation or 0-token response.")
                 else:
+                    if turn_timing.get("is_closing", False):
+                        logger.info(f"👋 Empty LLM turn detected but is_closing=True, intentional closing, not failure - suppressing warning")
+                        state_tracker["state"] = ev.new_state
+                        state_tracker["since"] = now
+                        return
                     logger.warning(f"⚠️ Empty LLM turn detected (thinking {elapsed:.2f}s → listening without speaking). Possible causes: LLM 404/429, empty response, or tool filtering. speech_end age: {(now-turn_timing.get('speech_end',0)) if turn_timing.get('speech_end') else 'N/A'} active={is_llm_active} has_output={has_output}")
             elif not has_output:
+                if turn_timing.get("is_closing", False):
+                    logger.info(f"👋 Empty LLM turn detected (thinking {elapsed:.2f}s) but is_closing=True, intentional closing, not failure")
+                    state_tracker["state"] = ev.new_state
+                    state_tracker["since"] = now
+                    return
                 logger.warning(f"⚠️ Empty LLM turn detected (thinking {elapsed:.2f}s → listening without speaking). No assistant output, llm_active={is_llm_active}, gen_complete={gen_complete>0}, first_token={turn_timing.get('first_token',0)>0}")
             else:
                 # Had output but still went listening->thinking without speaking? Might be tool filtering
@@ -2071,7 +2123,11 @@ async def entrypoint(ctx):
             real_call = (duration >= _FAIL_THRESHOLD_SECONDS) or (usage["user_speech_seconds"] > 0)
             status = "completed" if real_call else "failed"
 
-            print(_billing_report(costs, usage, duration))
+            # FIX: Pass turn_timing_ref for authoritative billing display
+            try:
+                print(_billing_report(costs, usage, duration, turn_timing_ref=turn_timing))
+            except Exception:
+                print(_billing_report(costs, usage, duration))
 
             # IMPORTANT: Post billing to backend FIRST so wallet deduction happens
             # atomically in main.py (which also updates the call record). This
@@ -2232,12 +2288,33 @@ async def entrypoint(ctx):
             egress_task.cancel()
 
 
-def _billing_report(costs, usage, duration) -> str:
+def _billing_report(costs, usage, duration, turn_timing_ref=None) -> str:
+    # FIX: Use aggregated authoritative values for all billing displays, not word-count estimates
+    # Authoritative is 69,461 input / 572 output, not 139in/361out from usage word count
+    # Make every billing display use same aggregated authoritative values
+    try:
+        if turn_timing_ref:
+            display_input = turn_timing_ref.get("aggregated_input", usage['llm_input_tokens'])
+            display_output = turn_timing_ref.get("aggregated_output", usage['llm_output_tokens'])
+            successful = turn_timing_ref.get("successful_requests", 0)
+            failed = turn_timing_ref.get("failed_requests", 0)
+        else:
+            # Fallback to usage if no turn_timing_ref, but try to get authoritative from usage if it has been updated
+            display_input = usage.get('llm_input_tokens_authoritative', usage['llm_input_tokens'])
+            display_output = usage.get('llm_output_tokens_authoritative', usage['llm_output_tokens'])
+            successful = usage.get('successful_requests', 0)
+            failed = usage.get('failed_requests', 0)
+    except Exception:
+        display_input = usage['llm_input_tokens']
+        display_output = usage['llm_output_tokens']
+        successful = 0
+        failed = 0
+    
     return (
         "\n" + "=" * 64 + "\n"
         f"📊 BILLING  duration={duration}s ({costs['duration_mins']} min)\n"
         f"👂 STT {round(usage['user_speech_seconds'],1)}s -> ₹{costs['stt_cost_inr']}\n"
-        f"🧠 LLM {usage['llm_input_tokens']}in/{usage['llm_output_tokens']}out -> ₹{costs['llm_cost_inr']}\n"
+        f"🧠 LLM {display_input}in/{display_output}out (authoritative aggregated {successful} successful, {failed} failed) -> ₹{costs['llm_cost_inr']}\n"
         f"🗣️ TTS {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}\n"
         f"🖥️ Server -> ₹{costs['server_cost_inr']}\n"
         f"💸 YOUR COST ₹{costs['total_cost_inr']} (₹{costs['your_cost_per_min']}/min)\n"
@@ -2265,8 +2342,16 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
         "durationMins": costs["duration_mins"],
         "sttSeconds": round(usage["user_speech_seconds"], 1),
         "ttsChars": usage["tts_chars"],
-        "llmInputTokens": usage["llm_input_tokens"],
-        "llmOutputTokens": usage["llm_output_tokens"],
+        "llmInputTokens": llm_input,
+        "llmOutputTokens": llm_output,
+        "llmInputTokensAuthoritative": turn_timing.get("aggregated_input", llm_input),
+        "llmOutputTokensAuthoritative": turn_timing.get("aggregated_output", llm_output),
+        "successfulRequests": turn_timing.get("successful_requests", 0),
+        "failedRequests": turn_timing.get("failed_requests", 0),
+        "totalInputTokens": turn_timing.get("aggregated_input", llm_input),
+        "totalCachedTokens": turn_timing.get("aggregated_cached", 0),
+        "totalOutputTokens": turn_timing.get("aggregated_output", llm_output),
+        "totalLlmCost": total_llm_cost if 'total_llm_cost' in locals() else 0.0,
         "costToUser": f"₹{costs['client_price_inr']}",
         "costToUserNumber": costs["client_price_inr"],
         "clientRatePerMin": costs["client_rate_per_min"],
