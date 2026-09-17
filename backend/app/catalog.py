@@ -187,19 +187,19 @@ CATALOG: dict[str, Any] = {
         },
         "openai_gpt_oss_120b": {
             "kind": "llm",
-            "display_name": "OpenAI GPT-OSS-120B (reasoning, paid)",
+            "display_name": "OpenAI GPT-4o (reasoning, paid) - fixed from invalid gpt-oss-120b",
             "provider": "openai",
             "base_url": None,
-            "model": "gpt-oss-120b",
+            "model": "gpt-4o",
             "tier": "paid",
             "requires_key": True,
             "key_env": "OPENAI_API_KEY",
             "cost": {"per_1k_in": 0.20, "per_1k_out": 0.80},
-            # A reasoning model can be slow on a voice call. Keep reasoning_effort
-            # low (build_llm's default for gpt-oss) for human latency.
-            "notes": "Uses OPENAI_API_KEY (not Groq). Keep 'reasoning_effort' = low for fast voice replies.",
+            # Fixed: gpt-oss-120b does not exist on OpenAI API (404), was causing fallback latency
+            # Now uses gpt-4o which exists on OpenAI. Original gpt-oss-120b is available via groq_gpt_oss provider
+            "notes": "Fixed from invalid gpt-oss-120b (404 on OpenAI) to gpt-4o. Use groq_gpt_oss for actual gpt-oss-120b via Groq. Keep reasoning_effort low for voice.",
             "options": {
-                "model": ["gpt-oss-120b"],
+                "model": ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
                 "reasoning_effort": ["low", "medium", "high"],
             },
         },

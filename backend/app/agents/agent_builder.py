@@ -121,12 +121,24 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     )
 
     low = model.lower()
-    # Fix: Don't auto-migrate gpt-oss-120b to 20b — user explicitly wants 120b as fallback.
-    # Only migrate truly problematic qwen models. 120b is valid and higher quality, just higher TPM cost.
-    if sel.id.startswith("groq") and low == "qwen/qwen3.6-27b":
-        logger.warning("⚠️ Migrating Groq qwen model to openai/gpt-oss-20b for voice reliability")
+    # Fix invalid models that cause 404 - observed in real call logs
+    # OpenAI provider (base_url None) cannot handle models with "/" like "openai/gpt-oss-120b" or "gpt-oss-120b"
+    # Those are Groq models, not OpenAI. Map to valid OpenAI model to avoid 404 + fallback latency
+    if not base_url and "/" in model:
+        logger.warning(f"⚠️ Invalid model '{model}' for OpenAI provider (contains '/'), mapping to gpt-4o to avoid 404")
+        model = "gpt-4o"
+        low = model.lower()
+    if not base_url and low == "gpt-oss-120b":
+        logger.warning(f"⚠️ Invalid model 'gpt-oss-120b' for OpenAI provider (does not exist on OpenAI, causes 404), mapping to gpt-4o")
+        model = "gpt-4o"
+        low = model.lower()
+    # Groq qwen models have low quota and cause 429, also some variants don't exist
+    if sel.id.startswith("groq") and low in ("qwen/qwen3.6-27b", "qwen/qwen3.8-27b", "qwen/qwen3-8b-27b"):
+        logger.warning(f"⚠️ Migrating Groq qwen model '{model}' to openai/gpt-oss-20b for voice reliability (qwen 429 + possible 404)")
         model = "openai/gpt-oss-20b"
         low = model.lower()
+    # Fix: Don't auto-migrate gpt-oss-120b to 20b — user explicitly wants 120b as fallback.
+    # Only migrate truly problematic qwen models. 120b is valid and higher quality, just higher TPM cost.
     if "qwen" in low or "gemma" in low:
         default_reasoning = "none"
     elif "gpt-oss" in low:
@@ -1059,20 +1071,11 @@ def build_voice_agent(
                 except Exception as exc:
                     logger.debug("conversation context trim skipped: %s", exc)
             else:
-                # Preemptive ON: skip trimming to preserve preemptive generation
-                # Log that we are preserving preemptive
-                try:
-                    target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
-                    items = getattr(target_ctx, "items", None)
-                    if isinstance(items, list) and len(items) > 12:
-                        # Only trim when very long (12+ messages) even with preemptive, to avoid unbounded growth
-                        # But do it in a way that minimizes invalidation: keep more messages
-                        system_items = [m for m in items if getattr(m, "role", "") == "system"]
-                        dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
-                        target_ctx.items = system_items + dialogue_items[-10:]
-                        logger.info("🧹 Trimmed conversation context to %s messages (preemptive ON, lenient 10 dialogue max to preserve preemptive)", len(target_ctx.items))
-                except Exception as exc:
-                    logger.debug("conversation context trim skipped (preemptive ON): %s", exc)
+                # Preemptive ON: DO NOT mutate chat_ctx at all — any mutation invalidates preemptive
+                # Previous lenient trim (10 msgs when >12) still changed chat_ctx → is_equivalent False → invalidation
+                # So when preemptive ON, skip trimming entirely to preserve preemptive generation
+                # This eliminates "preemptive generation invalidated after on_user_turn_completed" warning
+                logger.debug("Preemptive ON: skipping chat_ctx trim to preserve preemptive generation")
             # Log timing for STT_final->LLM_start path
             try:
                 _elapsed_goodbye = (_time.time() - _rag_t0) * 1000

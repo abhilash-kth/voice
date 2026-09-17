@@ -1010,24 +1010,23 @@ async def entrypoint(ctx):
             # FIX: Always start fresh timing for each user turn, don't reuse previous speech_end
             # Previous bug: if LLM returned empty (thinking->listening without speaking), speech_end not reset,
             # next turn measured from old speech_end → 4712ms outlier artifact
-            # Now: always overwrite speech_end with fresh approximation for this turn
-            # Also reset other timings if they were stale (>5s old) from previous empty turn
+            # Also bug: first_token from previous turn persisted when speech_end only 3s old, causing
+            # tts_request 2099ms artifact (first_token from old turn + new tts_request)
+            # Now: always reset ALL timing for fresh turn, then set speech_end and stt_final
             if turn_timing["speech_end"] != 0:
                 stale_age = now - turn_timing["speech_end"]
                 if stale_age > 5.0:
                     logger.info(f"🔄 Resetting stale turn_timing (speech_end {stale_age:.1f}s old from empty turn) for fresh turn")
-                    turn_timing["speech_end"] = 0.0
-                    turn_timing["stt_final"] = 0.0
-                    turn_timing["turn_detected"] = 0.0
-                    turn_timing["llm_start"] = 0.0
-                    turn_timing["first_token"] = 0.0
-                    turn_timing["first_audio"] = 0.0
-                    # Keep tts_request and audio_published if they exist, reset them too
-                    if "tts_request" in turn_timing:
-                        turn_timing["tts_request"] = 0.0
-                    if "first_tts_audio" in turn_timing:
-                        turn_timing["first_tts_audio"] = 0.0
-            # Fresh timing for this turn
+            # Fresh timing for this turn - reset everything except speech_end/stt_final which we set below
+            # This ensures no stale first_token/tts_request from previous turn leaks into new turn
+            turn_timing["turn_detected"] = 0.0
+            turn_timing["llm_start"] = 0.0
+            turn_timing["first_token"] = 0.0
+            turn_timing["tts_request"] = 0.0
+            turn_timing["first_tts_audio"] = 0.0
+            turn_timing["llm_complete"] = 0.0
+            turn_timing["first_audio"] = 0.0
+            # Fresh speech_end and stt_final for this turn
             turn_timing["speech_end"] = now - 0.25  # approximate speech end 250ms before final
             turn_timing["stt_final"] = now
             # Calculate speech_end->STT_final
