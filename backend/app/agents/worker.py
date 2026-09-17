@@ -502,12 +502,15 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 self._timing["llm_active"] = False
                 prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                 model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                # Only consider successful if output>0 or assistant_output_received
-                is_success = self._output_tokens > 0 or self._timing.get("assistant_output_received", False)
+                # FIX: Separate deterministic closing (intentional 0/0) from genuine empty LLM turns
+                # Do not report intentional closing request as LLM failure
+                is_closing = self._timing.get("is_closing", False)
+                is_deterministic_closing = is_closing and self._input_tokens == 0 and self._output_tokens == 0
+                # Only consider successful if output>0 or assistant_output_received, and not closing
+                is_success = (self._output_tokens > 0 or self._timing.get("assistant_output_received", False)) and not is_deterministic_closing
                 if is_success:
                     # Update last_successful_metrics for billing preservation
                     try:
-                        # Access outer scope last_successful_metrics via timing dict hack: store in timing as well
                         self._timing["last_ttft"] = self._timing.get("ttft_ms", 0)
                         self._timing["last_gen_time"] = gen_time
                         self._timing["last_input"] = self._input_tokens
@@ -515,13 +518,63 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                         self._timing["last_cached"] = self._cached_tokens
                     except Exception:
                         pass
-                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False")
+                
+                # FIX: Aggregated billing using actual successful provider usage
+                # Ensure aggregated fields exist
+                if "aggregated_input" not in self._timing:
+                    self._timing["aggregated_input"] = 0
+                    self._timing["aggregated_output"] = 0
+                    self._timing["aggregated_cached"] = 0
+                    self._timing["successful_requests"] = 0
+                    self._timing["failed_requests"] = 0
+                    self._timing["all_requests"] = []
+                
+                request_record = {
+                    "input": self._input_tokens,
+                    "cached": self._cached_tokens,
+                    "output": self._output_tokens,
+                    "success": is_success,
+                    "ttft": self._timing.get("ttft_ms", 0),
+                    "gen_time": gen_time,
+                    "provider": prov,
+                    "model": model,
+                    "is_closing": is_deterministic_closing,
+                }
+                self._timing["all_requests"].append(request_record)
+                
+                if is_success:
+                    self._timing["aggregated_input"] += self._input_tokens
+                    self._timing["aggregated_output"] += self._output_tokens
+                    self._timing["aggregated_cached"] += self._cached_tokens
+                    self._timing["successful_requests"] += 1
+                    _logger.info(f"💰 AGGREGATED BILLING +{self._input_tokens}in +{self._output_tokens}out total {self._timing['aggregated_input']}in {self._timing['aggregated_output']}out across {self._timing['successful_requests']} successful, {self._timing['failed_requests']} failed")
+                elif is_deterministic_closing:
+                    _logger.info(f"👋 Deterministic closing 0/0 not counted as failure (is_closing={is_closing}) - excluded from billing, successful={self._timing.get('successful_requests',0)} failed={self._timing.get('failed_requests',0)}")
+                else:
+                    self._timing["failed_requests"] += 1
+                    _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
+                
+                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
                     from app.llm_catalog import get_llm_model, calculate_llm_cost
                     model_meta = get_llm_model(prov, model) if prov and model else None
                     if model_meta:
                         costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
-                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${costs['total_llm_cost']:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success}")
+                        total_cost = costs['total_llm_cost']
+                        # Calculate total aggregated cost
+                        total_agg_cost = 0.0
+                        try:
+                            # Sum cost of all successful requests
+                            for req in self._timing.get("all_requests", []):
+                                if req.get("success"):
+                                    m = get_llm_model(req.get("provider",""), req.get("model",""))
+                                    if m:
+                                        c = calculate_llm_cost(m, req["input"], req["cached"], req["output"])
+                                        total_agg_cost += c['total_llm_cost']
+                        except Exception:
+                            total_agg_cost = total_cost
+                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${total_cost:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success} aggregated_successful={self._timing.get('successful_requests',0)} total_agg_cost=${total_agg_cost:.6f} is_closing={is_deterministic_closing}")
+                        _logger.info(f"📊 BILLING SUMMARY successful={self._timing.get('successful_requests',0)} failed={self._timing.get('failed_requests',0)} total_input={self._timing.get('aggregated_input',0)} total_cached={self._timing.get('aggregated_cached',0)} total_output={self._timing.get('aggregated_output',0)} total_cost=${total_agg_cost:.6f}")
                 except Exception as e:
                     _logger.debug(f"Could not calculate LLM cost: {e}")
 
@@ -1002,6 +1055,14 @@ async def entrypoint(ctx):
         "generation_time_ms": 0.0,
         "llm_active": False,
         "assistant_output_received": False,
+        # FIX: Aggregated billing for actual successful provider usage
+        "aggregated_input": 0,
+        "aggregated_output": 0,
+        "aggregated_cached": 0,
+        "successful_requests": 0,
+        "failed_requests": 0,
+        "all_requests": [],  # list of {input, cached, output, success, ttft, gen_time, provider, model, is_closing}
+        "is_closing": False,  # True when deterministic closing in progress
     }
     
     # Preserve last successful metrics for final billing (fix 0ms telemetry)
@@ -1442,6 +1503,9 @@ async def entrypoint(ctx):
                 # Never let the generic provider-timeout fallback speak after a
                 # caller has already asked to leave. Speak deterministic closing
                 # and hang up (bb393dd fix).
+                # FIX: Mark as closing to separate intentional 0/0 closing from genuine empty turns
+                turn_timing["is_closing"] = True
+                logger.info(f"👋 Deterministic closing requested, marking is_closing=True to exclude 0/0 from failure count")
                 _cancel_pending()
                 old_fallback = reply_tracker.get("fallback_say")
                 if old_fallback is not None and not old_fallback.done():
@@ -1485,12 +1549,16 @@ async def entrypoint(ctx):
                 return
             now = time.time()
             if not text.strip():
+                # FIX: Don't treat deterministic closing as empty failure
+                if turn_timing.get("is_closing", False):
+                    logger.info(f"👋 Deterministic closing in progress, empty assistant item is intentional (is_closing=True), not failure")
+                    return
                 # Check if LLM still active - if so, don't treat as empty yet
                 if turn_timing.get("llm_active", False):
                     logger.info(f"⏳ LLM still active (request_start {now-turn_timing.get('request_start',now):.2f}s ago), empty assistant item ignored, waiting for stream")
                     return
                 # Detailed logging for empty LLM turn root cause - only when stream terminated
-                logger.warning(f"🧮 LLM produced an empty assistant item after stream terminated (raw_len={len(raw_text)}, role={role}, text_content={getattr(item,'text_content',None)}, content={getattr(item,'content',None)}); waiting for speakable reply. Possible 404/429 or filtered. llm_active={turn_timing.get('llm_active')} gen_complete={turn_timing.get('generation_complete')}")
+                logger.warning(f"🧮 LLM produced an empty assistant item after stream terminated (raw_len={len(raw_text)}, role={role}, text_content={getattr(item,'text_content',None)}, content={getattr(item,'content',None)}); waiting for speakable reply. Possible 404/429 or filtered. llm_active={turn_timing.get('llm_active')} gen_complete={turn_timing.get('generation_complete')} is_closing={turn_timing.get('is_closing',False)}")
                 # Also log timing for empty turn diagnostics
                 if turn_timing.get("llm_start",0) > 0:
                     logger.warning(f"⏱️ Empty turn timing: llm_start->now {(now-turn_timing['llm_start'])*1000:.0f}ms, speech_end->now {(now-turn_timing.get('speech_end',now))*1000:.0f}ms active={turn_timing.get('llm_active')}")
@@ -1865,20 +1933,60 @@ async def entrypoint(ctx):
                 llm_provider = turn_timing.get("llm_provider") or turn_timing.get("last_provider") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[0] if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm.id)
                 llm_model = turn_timing.get("llm_model") or turn_timing.get("last_model") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[1] if hasattr(cfg.providers, 'get_primary_llm') else (cfg.providers.llm.config or {}).get("model", ""))
                 
-                # Input/output tokens: current, then last, then usage
-                llm_input = turn_timing.get("input_tokens", 0) or turn_timing.get("last_input", 0) or usage["llm_input_tokens"]
-                llm_cached = turn_timing.get("cached_input_tokens", 0) or turn_timing.get("last_cached", 0)
-                llm_output = turn_timing.get("output_tokens", 0) or turn_timing.get("last_output", 0) or usage["llm_output_tokens"]
+                # FIX: Use aggregated successful provider usage, not last/preserved timing object's token counts
+                # Final billing must equal sum of successful requests
+                aggregated_input = turn_timing.get("aggregated_input", 0)
+                aggregated_output = turn_timing.get("aggregated_output", 0)
+                aggregated_cached = turn_timing.get("aggregated_cached", 0)
+                successful_count = turn_timing.get("successful_requests", 0)
+                failed_count = turn_timing.get("failed_requests", 0)
+                all_reqs = turn_timing.get("all_requests", [])
+                
+                # Calculate total cost from aggregated
+                total_llm_cost = 0.0
+                try:
+                    from app.llm_catalog import get_llm_model, calculate_llm_cost
+                    for req in all_reqs:
+                        if req.get("success"):
+                            m = get_llm_model(req.get("provider",""), req.get("model",""))
+                            if m:
+                                c = calculate_llm_cost(m, req["input"], req["cached"], req["output"])
+                                total_llm_cost += c['total_llm_cost']
+                except Exception as e:
+                    logger.debug(f"Could not calculate total aggregated cost: {e}")
+                
+                if aggregated_input > 0 and successful_count > 0:
+                    llm_input = aggregated_input
+                    llm_output = aggregated_output
+                    llm_cached = aggregated_cached
+                    logger.info(f"💰 FINAL BILLING using AGGREGATED successful usage: {successful_count} successful, {failed_count} failed/invalidated, input={llm_input} cached={llm_cached} output={llm_output} total_cost=${total_llm_cost:.6f} (from {len(all_reqs)} total requests)")
+                    for i, req in enumerate(all_reqs):
+                        logger.info(f"  Request {i+1}: input={req['input']} cached={req['cached']} output={req['output']} success={req['success']} is_closing={req.get('is_closing',False)} TTFT={req['ttft']:.0f}ms gen={req['gen_time']:.0f}ms {req['provider']}:{req['model']}")
+                    logger.info(f"📊 FINAL AGGREGATED BILLING successful_requests={successful_count} failed_requests={failed_count} total_input_tokens={aggregated_input} total_cached_tokens={aggregated_cached} total_output_tokens={aggregated_output} total_llm_cost=${total_llm_cost:.6f}")
+                else:
+                    # Fallback to last if no aggregated
+                    llm_input = turn_timing.get("input_tokens", 0) or turn_timing.get("last_input", 0) or usage["llm_input_tokens"]
+                    llm_cached = turn_timing.get("cached_input_tokens", 0) or turn_timing.get("last_cached", 0)
+                    llm_output = turn_timing.get("output_tokens", 0) or turn_timing.get("last_output", 0) or usage["llm_output_tokens"]
+                    logger.warning(f"⚠️ FINAL BILLING no aggregated successful usage, fallback to last/word count: input={llm_input} output={llm_output} (successful {successful_count}, failed {failed_count})")
+                    logger.info(f"📊 FINAL BILLING FALLBACK successful_requests={successful_count} failed_requests={failed_count} total_input_tokens={llm_input} total_cached_tokens={llm_cached} total_output_tokens={llm_output} total_llm_cost=${total_llm_cost:.6f}")
                 
                 # TTFT and gen_time: current, then last, preserve actual measured values
                 ttft = turn_timing.get("ttft_ms", 0) or turn_timing.get("last_ttft", 0)
                 gen_time = turn_timing.get("generation_time_ms", 0) or turn_timing.get("last_gen_time", 0)
                 
-                # If still 0, try to get from usage transcripts? Fallback to 0 but log warning
+                # For final billing, also log average TTFT/gen_time across successful
+                if all_reqs:
+                    successful_reqs = [r for r in all_reqs if r['success']]
+                    if successful_reqs:
+                        avg_ttft = sum(r['ttft'] for r in successful_reqs) / len(successful_reqs)
+                        avg_gen = sum(r['gen_time'] for r in successful_reqs) / len(successful_reqs)
+                        logger.info(f"📊 FINAL BILLING averages across {len(successful_reqs)} successful: avg TTFT {avg_ttft:.0f}ms avg gen_time {avg_gen:.0f}ms last TTFT {ttft:.0f}ms last gen {gen_time:.0f}ms")
+                
                 if ttft == 0 and gen_time == 0:
                     logger.warning(f"⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")
                 
-                logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms (preserved from last successful turn)")
+                logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms successful={successful_count} failed={failed_count} total_cost=${total_llm_cost:.6f} (aggregated authoritative)")
             except Exception as e:
                 logger.debug(f"Could not get V2 billing info: {e}")
                 llm_provider = cfg.providers.llm.id
