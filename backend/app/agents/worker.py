@@ -499,15 +499,29 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 self._timing["input_tokens"] = self._input_tokens
                 self._timing["output_tokens"] = self._output_tokens
                 self._timing["cached_input_tokens"] = self._cached_tokens
+                self._timing["llm_active"] = False
                 prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                 model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens}")
+                # Only consider successful if output>0 or assistant_output_received
+                is_success = self._output_tokens > 0 or self._timing.get("assistant_output_received", False)
+                if is_success:
+                    # Update last_successful_metrics for billing preservation
+                    try:
+                        # Access outer scope last_successful_metrics via timing dict hack: store in timing as well
+                        self._timing["last_ttft"] = self._timing.get("ttft_ms", 0)
+                        self._timing["last_gen_time"] = gen_time
+                        self._timing["last_input"] = self._input_tokens
+                        self._timing["last_output"] = self._output_tokens
+                        self._timing["last_cached"] = self._cached_tokens
+                    except Exception:
+                        pass
+                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False")
                 try:
                     from app.llm_catalog import get_llm_model, calculate_llm_cost
                     model_meta = get_llm_model(prov, model) if prov and model else None
                     if model_meta:
                         costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
-                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${costs['total_llm_cost']:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms")
+                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${costs['total_llm_cost']:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success}")
                 except Exception as e:
                     _logger.debug(f"Could not calculate LLM cost: {e}")
 
@@ -567,6 +581,17 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             request_start = _time.time()
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
+            self._timing["llm_active"] = True
+            self._timing["assistant_output_received"] = False
+            # Reset per-request metrics but preserve provider/model
+            self._timing["first_token"] = 0.0
+            self._timing["generation_complete"] = 0.0
+            self._timing["llm_complete"] = 0.0
+            self._timing["ttft_ms"] = 0.0
+            self._timing["generation_time_ms"] = 0.0
+            self._timing["input_tokens"] = 0
+            self._timing["output_tokens"] = 0
+            self._timing["cached_input_tokens"] = 0
             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', '') or 'unknown'
             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', '') or getattr(self._inner, 'model', 'unknown') or 'unknown'
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
@@ -949,6 +974,19 @@ async def entrypoint(ctx):
         "output_tokens": 0,
         "ttft_ms": 0.0,
         "generation_time_ms": 0.0,
+        "llm_active": False,
+        "assistant_output_received": False,
+    }
+    
+    # Preserve last successful metrics for final billing (fix 0ms telemetry)
+    last_successful_metrics = {
+        "ttft_ms": 0.0,
+        "generation_time_ms": 0.0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "provider": "",
+        "model": "",
     }
 
     # ------------------------------------------------------------------
@@ -1397,6 +1435,22 @@ async def entrypoint(ctx):
             reply_tracker["empty_spoken"] = False
             _schedule_silence_fallback(now)
         elif role == "assistant":
+            # Mark assistant output received for empty-turn race fix
+            turn_timing["assistant_output_received"] = True
+            # Update last_successful_metrics for billing preservation
+            try:
+                if turn_timing.get("ttft_ms",0) > 0:
+                    turn_timing["last_ttft"] = turn_timing.get("ttft_ms",0)
+                if turn_timing.get("generation_time_ms",0) > 0:
+                    turn_timing["last_gen_time"] = turn_timing.get("generation_time_ms",0)
+                turn_timing["last_input"] = turn_timing.get("input_tokens",0)
+                turn_timing["last_output"] = turn_timing.get("output_tokens",0)
+                turn_timing["last_cached"] = turn_timing.get("cached_input_tokens",0)
+                turn_timing["last_provider"] = turn_timing.get("llm_provider","")
+                turn_timing["last_model"] = turn_timing.get("llm_model","")
+            except Exception:
+                pass
+            
             # Log raw assistant item for debugging empty turns
             raw_text = _msg_text(item)
             is_tool = _item_is_tool_related(item)
@@ -1405,11 +1459,15 @@ async def entrypoint(ctx):
                 return
             now = time.time()
             if not text.strip():
-                # Detailed logging for empty LLM turn root cause
-                logger.warning(f"🧮 LLM produced an empty assistant item (raw_len={len(raw_text)}, role={role}, text_content={getattr(item,'text_content',None)}, content={getattr(item,'content',None)}); waiting for speakable reply. Possible 404/429 or filtered.")
+                # Check if LLM still active - if so, don't treat as empty yet
+                if turn_timing.get("llm_active", False):
+                    logger.info(f"⏳ LLM still active (request_start {now-turn_timing.get('request_start',now):.2f}s ago), empty assistant item ignored, waiting for stream")
+                    return
+                # Detailed logging for empty LLM turn root cause - only when stream terminated
+                logger.warning(f"🧮 LLM produced an empty assistant item after stream terminated (raw_len={len(raw_text)}, role={role}, text_content={getattr(item,'text_content',None)}, content={getattr(item,'content',None)}); waiting for speakable reply. Possible 404/429 or filtered. llm_active={turn_timing.get('llm_active')} gen_complete={turn_timing.get('generation_complete')}")
                 # Also log timing for empty turn diagnostics
                 if turn_timing.get("llm_start",0) > 0:
-                    logger.warning(f"⏱️ Empty turn timing: llm_start->now {(now-turn_timing['llm_start'])*1000:.0f}ms, speech_end->now {(now-turn_timing.get('speech_end',now))*1000:.0f}ms")
+                    logger.warning(f"⏱️ Empty turn timing: llm_start->now {(now-turn_timing['llm_start'])*1000:.0f}ms, speech_end->now {(now-turn_timing.get('speech_end',now))*1000:.0f}ms active={turn_timing.get('llm_active')}")
                 return
             _mark_reply(now)
             # Reset no-response timer when agent speaks - timeout starts after agent finishes
@@ -1545,13 +1603,43 @@ async def entrypoint(ctx):
                 logger.info(f"⏱️ TIMING speech_end->first_token: {speech_to_token:.0f}ms")
 
         elif prev == "thinking" and ev.new_state == "listening":
-            # Empty turn: thinking->listening without speaking (LLM returned empty/no TTS)
-            # Root causes observed: 404 LLM failure, 429 rate-limit, empty LLM response, tool filtering
-            # FIX: Reset timing so next turn doesn't use stale speech_end (caused 4712ms artifact)
-            # Also log detailed diagnostics for empty turn
-            logger.warning(f"⚠️ Empty LLM turn detected (thinking {elapsed:.2f}s → listening without speaking). Possible causes: LLM 404/429, empty response, or tool filtering. speech_end age: {(now-turn_timing.get('speech_end',0)) if turn_timing.get('speech_end') else 'N/A'}")
-            if turn_timing["speech_end"] != 0 and turn_timing["first_audio"] == 0:
-                logger.info(f"🔄 Resetting turn_timing after empty turn to avoid next-turn outlier")
+            # Empty turn: thinking->listening without speaking - FIXED RACE CONDITION
+            # Previous bug: detector fired before async LLM stream finished (0.04-0.08s)
+            # Evidence: LLM REQUEST START, then thinking->listening 0.04s, then TTFT 800ms, then GENERATION COMPLETE
+            # This means empty detection raced with active stream.
+            # Fix: Only fire when LLM stream has actually terminated (llm_active False) AND no assistant output
+            is_llm_active = turn_timing.get("llm_active", False)
+            has_output = turn_timing.get("assistant_output_received", False) or turn_timing.get("first_token",0) > 0
+            gen_complete = turn_timing.get("generation_complete",0)
+            request_start = turn_timing.get("request_start",0)
+            
+            if is_llm_active:
+                # LLM still streaming, don't treat as empty - this is the race fix
+                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {now-request_start:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - waiting for stream to finish")
+                # Do NOT reset timing, keep active request alive
+                state_tracker["state"] = ev.new_state
+                state_tracker["since"] = now
+                return
+            
+            # Only if LLM terminated and no output, then it's truly empty
+            if not has_output and gen_complete == 0 and request_start > 0:
+                # LLM terminated with no output and no assistant item - check if it was 0-token generation
+                if turn_timing.get("output_tokens",0) == 0 and turn_timing.get("input_tokens",0) == 0:
+                    logger.warning(f"⚠️ Empty LLM turn confirmed (stream terminated with 0 tokens): thinking {elapsed:.2f}s → listening without speaking. request_start {now-request_start:.2f}s ago, gen_complete {gen_complete}. Possible preemptive invalidation or 0-token response.")
+                else:
+                    logger.warning(f"⚠️ Empty LLM turn detected (thinking {elapsed:.2f}s → listening without speaking). Possible causes: LLM 404/429, empty response, or tool filtering. speech_end age: {(now-turn_timing.get('speech_end',0)) if turn_timing.get('speech_end') else 'N/A'} active={is_llm_active} has_output={has_output}")
+            elif not has_output:
+                logger.warning(f"⚠️ Empty LLM turn detected (thinking {elapsed:.2f}s → listening without speaking). No assistant output, llm_active={is_llm_active}, gen_complete={gen_complete>0}, first_token={turn_timing.get('first_token',0)>0}")
+            else:
+                # Had output but still went listening->thinking without speaking? Might be tool filtering
+                logger.info(f"ℹ️ thinking->listening after output (has_output={has_output}, first_token {turn_timing.get('first_token',0)>0}) - not empty, likely TTS finished")
+                state_tracker["state"] = ev.new_state
+                state_tracker["since"] = now
+                return
+            
+            if turn_timing["speech_end"] != 0 and turn_timing["first_audio"] == 0 and not is_llm_active:
+                # Only reset if LLM not active
+                logger.info(f"🔄 Resetting turn_timing after confirmed empty turn (LLM terminated, no output) to avoid next-turn outlier")
                 turn_timing["speech_end"] = 0.0
                 turn_timing["stt_final"] = 0.0
                 turn_timing["turn_detected"] = 0.0
@@ -1559,6 +1647,7 @@ async def entrypoint(ctx):
                 turn_timing["request_start"] = 0.0
                 turn_timing["first_token"] = 0.0
                 turn_timing["first_audio"] = 0.0
+                turn_timing["llm_active"] = False
                 if "tts_request" in turn_timing:
                     turn_timing["tts_request"] = 0.0
                 if "first_tts_audio" in turn_timing:
@@ -1575,6 +1664,8 @@ async def entrypoint(ctx):
                     turn_timing["ttft_ms"] = 0.0
                 if "generation_time_ms" in turn_timing:
                     turn_timing["generation_time_ms"] = 0.0
+                if "assistant_output_received" in turn_timing:
+                    turn_timing["assistant_output_received"] = False
 
         elif ev.new_state == "listening" and prev == "speaking":
             # Agent finished speaking, now listening: estimate speech_end for next turn
@@ -1713,16 +1804,28 @@ async def entrypoint(ctx):
         _finalized["done"] = True
         try:
             duration = int(time.time() - call_start)
-            # V2: Use actual LLM provider/model and cached tokens + TTFT for cost tracking
+            # V2: Use actual LLM provider/model and cached tokens + TTFT for cost tracking - FIXED 0ms telemetry
+            # Previous bug: turn_timing reset after each turn, so final billing showed 0ms TTFT/gen_time
+            # Fix: Preserve last successful metrics in turn_timing["last_*"] and use them if current is 0
             try:
-                llm_provider = turn_timing.get("llm_provider") or cfg.providers.get_primary_llm().resolve_llm_provider_model()[0] if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm.id
-                llm_model = turn_timing.get("llm_model") or cfg.providers.get_primary_llm().resolve_llm_provider_model()[1] if hasattr(cfg.providers, 'get_primary_llm') else (cfg.providers.llm.config or {}).get("model", "")
-                llm_input = turn_timing.get("input_tokens", 0) or usage["llm_input_tokens"]
-                llm_cached = turn_timing.get("cached_input_tokens", 0)
-                llm_output = turn_timing.get("output_tokens", 0) or usage["llm_output_tokens"]
-                ttft = turn_timing.get("ttft_ms", 0)
-                gen_time = turn_timing.get("generation_time_ms", 0)
-                logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms")
+                # Try current timing first, then last successful, then usage
+                llm_provider = turn_timing.get("llm_provider") or turn_timing.get("last_provider") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[0] if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm.id)
+                llm_model = turn_timing.get("llm_model") or turn_timing.get("last_model") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[1] if hasattr(cfg.providers, 'get_primary_llm') else (cfg.providers.llm.config or {}).get("model", ""))
+                
+                # Input/output tokens: current, then last, then usage
+                llm_input = turn_timing.get("input_tokens", 0) or turn_timing.get("last_input", 0) or usage["llm_input_tokens"]
+                llm_cached = turn_timing.get("cached_input_tokens", 0) or turn_timing.get("last_cached", 0)
+                llm_output = turn_timing.get("output_tokens", 0) or turn_timing.get("last_output", 0) or usage["llm_output_tokens"]
+                
+                # TTFT and gen_time: current, then last, preserve actual measured values
+                ttft = turn_timing.get("ttft_ms", 0) or turn_timing.get("last_ttft", 0)
+                gen_time = turn_timing.get("generation_time_ms", 0) or turn_timing.get("last_gen_time", 0)
+                
+                # If still 0, try to get from usage transcripts? Fallback to 0 but log warning
+                if ttft == 0 and gen_time == 0:
+                    logger.warning(f"⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")
+                
+                logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms (preserved from last successful turn)")
             except Exception as e:
                 logger.debug(f"Could not get V2 billing info: {e}")
                 llm_provider = cfg.providers.llm.id
@@ -1730,8 +1833,8 @@ async def entrypoint(ctx):
                 llm_input = usage["llm_input_tokens"]
                 llm_cached = 0
                 llm_output = usage["llm_output_tokens"]
-                ttft = turn_timing.get("ttft_ms", 0)
-                gen_time = turn_timing.get("generation_time_ms", 0)
+                ttft = turn_timing.get("ttft_ms", 0) or turn_timing.get("last_ttft", 0)
+                gen_time = turn_timing.get("generation_time_ms", 0) or turn_timing.get("last_gen_time", 0)
 
             costs = calculate_call_cost(
                 duration_seconds=duration,
