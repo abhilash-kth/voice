@@ -248,6 +248,21 @@ def build_llm(cfg: AgentConfig) -> Any:
         if not (fallback_pair.id == primary_pair.id and (fallback_pair.config or {}).get("model") == (primary_pair.config or {}).get("model")):
             fallbacks.append(fallback_pair)
 
+    # Safety net for observed 404 pattern: groq_gpt_oss (120b) sometimes 404s (recovery failed)
+    # Ensure groq_gpt_oss_20b is available as last resort if 120b is anywhere in chain and 20b not already present
+    # This preserves user intent (Groq) while handling 404, with explicit logging (not silent)
+    try:
+        chain_ids = [primary_pair.id] + [fb.id for fb in fallbacks]
+        has_120b = "groq_gpt_oss" in chain_ids
+        has_20b = "groq_gpt_oss_20b" in chain_ids
+        if has_120b and not has_20b:
+            from ..models import ProviderPair
+            safety_pair = ProviderPair(id="groq_gpt_oss_20b", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80})
+            fallbacks.append(safety_pair)
+            logger.info(f"🛡️ Added safety fallback groq_gpt_oss_20b (20b) because chain contains groq_gpt_oss (120b) which observed 404 recovery failed - ensures at least one Groq model works")
+    except Exception as e:
+        logger.debug(f"Could not add safety fallback: {e}")
+
     if not fallbacks:
         return primary
 
