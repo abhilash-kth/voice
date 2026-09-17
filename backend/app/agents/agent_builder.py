@@ -113,12 +113,22 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         env_model = _os.getenv("OPENAI_MODEL")
         default_model = _cat_model or "gpt-4o-mini"
     model = overrides.get("model") or env_model or default_model
+    # Mask API key for logging
+    key_masked = f"{api_key[:8]}...{api_key[-4:]}" if api_key and len(api_key) > 12 else "present" if api_key else "MISSING"
     logger.info(
-        "🤖 LLM selected provider=%s model=%s base_url=%s",
+        "🤖 LLM selected provider=%s model=%s base_url=%s api_key=%s key_env=%s",
         provider_id,
         model,
         base_url or "https://api.openai.com/v1",
+        key_masked,
+        key_env,
     )
+    # Explicit validation for gpt-4.1-mini which has been observed 404 in real logs
+    # Possible causes: OpenAI account lacks gpt-4.1 access, or plugin SDK outdated, or model needs date suffix
+    if model in ("gpt-4.1-mini", "gpt-4.1") and not base_url:
+        logger.info(f"🔍 Validating OpenAI model {model}: should exist on OpenAI API, but observed 404 in logs (req_652f..., req_4e92...). Possible causes: account lacks access, or SDK version. Will rely on fallback if 404.")
+    if model == "openai/gpt-oss-120b" and base_url and "groq" in base_url:
+        logger.info(f"🔍 Validating Groq model {model}: should exist on Groq API, but observed 404 recovery failed in logs. Possible: Groq key invalid or model not available on free tier.")
 
     low = model.lower()
     # Fix invalid models that cause 404 - observed in real call logs
@@ -259,7 +269,16 @@ def build_llm(cfg: AgentConfig) -> Any:
         all_llms = [primary] + fallback_instances
         adapter = llm_agents.FallbackAdapter(all_llms)
         chain_str = " -> ".join([primary_pair.id] + fallback_ids)
-        logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback)")
+        # Log full chain with models and base_urls for debugging 404
+        try:
+            chain_details = []
+            for pair in [primary_pair] + [fb for fb in fallbacks]:
+                cat_model = pair.config.get("model") if pair.config else "from catalog"
+                base = pair.config.get("base_url") if pair.config and pair.config.get("base_url") else ("https://api.groq.com/openai/v1" if pair.id.startswith("groq") else "https://api.openai.com/v1" if pair.id.startswith("openai") else "https://openrouter.ai/api/v1")
+                chain_details.append(f"{pair.id}({cat_model} @ {base})")
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback) | Details: {' -> '.join(chain_details)}")
+        except Exception:
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback)")
         return adapter
     except Exception as e:
         logger.warning(f"⚠️ Could not build LLM FallbackAdapter {fallback_ids}: {e} — using primary only")
@@ -535,17 +554,18 @@ def build_vad() -> Any:
 # numbers, etc) is preserved. User's log showed 5187->1000 truncation dropping
 # contact info, causing "Mere paas exact phone numbers nahi hain".
 # ---------------------------------------------------------------------------
-_KB_BUDGET_CHARS_DEFAULT_GROQ = 1000
-_FAQ_BUDGET_CHARS_DEFAULT_GROQ = 600
-_OWNER_PROMPT_BUDGET_CHARS_DEFAULT_GROQ = 1500
+_KB_BUDGET_CHARS_DEFAULT_GROQ = 2500
+_FAQ_BUDGET_CHARS_DEFAULT_GROQ = 1200
+_OWNER_PROMPT_BUDGET_CHARS_DEFAULT_GROQ = 3000
 
-# For OpenAI/OpenRouter: reduced from 2500/1200/4000 to 1500/800/2000 to fix Groq 429
-# Log showed Requested 2749 tokens with 2500/1200/4000 budgets -> 8000 TPM exceeded after 2 turns (6195 used)
-# Now ~1500 tokens/request allows 5 turns/min even on Groq free tier. Owner kept at 2000 to preserve contact info.
-# Groq gets even smaller: 1000/600/1500 (see below)
-_KB_BUDGET_CHARS_DEFAULT = 1000
-_FAQ_BUDGET_CHARS_DEFAULT = 600
-_OWNER_PROMPT_BUDGET_CHARS_DEFAULT = 1500
+# FIXED for KB grounding: Previous 1000/600/1500 budgets were too small, causing
+# \"Mere paas company ki exact team size nahi hai\" - KB truncated 45788->1001 chars.
+# Groq 8k TPM is tight, but with 6-msg history trim we can afford larger budgets.
+# New: Groq 2500/1200/3000, OpenAI 4000/2000/4000 to preserve KB grounding.
+# Task: \"Do not sacrifice correctness for latency\" - so preserve KB.
+_KB_BUDGET_CHARS_DEFAULT = 4000
+_FAQ_BUDGET_CHARS_DEFAULT = 2000
+_OWNER_PROMPT_BUDGET_CHARS_DEFAULT = 4000
 
 # Legacy module-level constants kept for backward compat / logging, but
 # build_instructions now uses provider-aware effective budgets.
@@ -605,10 +625,14 @@ def _rag_per_turn_enabled() -> bool:
         return False
     if v in ("1", "true", "on"):
         return True
-    # Default: on — UNLESS preemptive generation is on, because mutating the
-    # chat context per turn would invalidate preemptive generation (see
-    # on_user_turn_completed).
-    return os.getenv("VOICE_PREEMPTIVE", "0") != "1"
+    # FIXED: Always enable RAG per-turn for KB grounding, even when preemptive ON.
+    # Previous: disabled RAG when VOICE_PREEMPTIVE=1 to preserve preemptive, but that
+    # sacrificed correctness (\"Mere paas exact jaankari nahi hai\").
+    # Now: RAG always ON for correctness. When preemptive ON, we explicitly log
+    # that RAG will invalidate preemptive for this turn (correctness > latency),
+    # but we still do RAG. This is explicit handling, not silent skip.
+    # Preemptive still benefits non-KB turns (greetings, small talk).
+    return True
 
 
 def _chat_msg_text(item) -> str:
@@ -1081,20 +1105,24 @@ def build_voice_agent(
                 _elapsed_goodbye = (_time.time() - _rag_t0) * 1000
                 if _elapsed_goodbye > 50:
                     logger.warning(f"🐢 Slow goodbye detection: {_elapsed_goodbye:.0f}ms (should be <10ms)")
+                else:
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (goodbye check): {_elapsed_goodbye:.0f}ms")
             except Exception:
                 pass
 
+            # RAG handling - ALWAYS enabled for KB grounding (correctness > latency)
+            # When preemptive ON, RAG will invalidate preemptive for this turn, but we explicitly log it
+            # This is the fix for "Mere paas exact jaankari nahi hai" - KB grounding preserved
             if not _rag_per_turn_enabled():
-                # Preemptive ON: skip RAG to preserve preemptive generation, LLM starts immediately
-                # This saves ~100-300ms per turn (RAG would be 100-300ms)
-                logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG, preemptive): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                logger.info(f"⏱️ TIMING on_user_turn_completed (RAG disabled by env): {(_time.time()-_rag_t0)*1000:.0f}ms")
                 return
             try:
                 user_text = _chat_msg_text(new_message).strip()
                 if not user_text:
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
-                # Async RAG to avoid blocking event loop (was sync, blocked 100-300ms)
+                # Async RAG to avoid blocking event loop
                 try:
                     hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
                     hits = (hits or "").strip()
@@ -1103,22 +1131,26 @@ def build_voice_agent(
                     hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
                 _rag_elapsed = (_time.time() - _rag_t0) * 1000
                 if _rag_elapsed > 200:
-                    logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target (may cause 3-7s outlier if blocking)")
+                    logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
                 else:
-                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms")
+                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms (hits {len(hits)} chars)")
                 if not hits or hits == self._last_rag:
-                    return  # nothing new, or same facts as last turn
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                    return  # nothing new
                 target = _find_chat_ctx(turn_ctx)
                 if target is None:
+                    logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
-                # Drop the previous turn's RAG message so the context does not
-                # grow one system message per turn.
+                # Explicit handling for preemptive+RAG conflict: log that RAG will invalidate preemptive
+                if preemptive_on:
+                    logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
+                # Drop previous RAG message to avoid growth
                 try:
                     items = getattr(target, "items", None)
                     if isinstance(items, list):
                         target.items = [m for m in items if _RAG_PREFIX not in _chat_msg_text(m)]
                 except Exception:
-                    pass  # not prunable; add_message below still bounds growth via _last_rag
+                    pass
                 target.add_message(
                     role="system",
                     content=(
@@ -1127,10 +1159,10 @@ def build_voice_agent(
                     ),
                 )
                 self._last_rag = hits
+                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]}")
             except Exception as e:
-                # RAG must never take a live call down — fall back to the
-                # static (capped) facts.
                 logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
+                logger.info(f"⏱️ TIMING on_user_turn_completed (RAG error, fallback): {(_time.time()-_rag_t0)*1000:.0f}ms")
 
     return _VoiceAgent()
 
