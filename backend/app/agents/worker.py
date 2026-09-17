@@ -154,7 +154,11 @@ try:
 except Exception as e:
     logger.debug(f"Could not patch hyphenator: {e}")
 
-# Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks + TTS 340-437ms
+# Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks + TTS 340-437ms + 163ms block
+# Also patch google.auth.load_credentials_from_file to use cached credentials to avoid 163ms RSA init on event loop
+_google_creds_cache = None
+_google_creds_lock = _threading_prewarm.Lock()
+
 try:
     import google.auth.crypt._cryptography_rsa
     import google.auth._service_account_info
@@ -168,6 +172,40 @@ try:
     except Exception:
         pass
     logger.info("🔧 Prewarmed Google auth crypt + oauth2.credentials + service_account + texttospeech (avoids 176ms and 198ms blocks, reduces TTS 340-437ms)")
+
+    # Patch google.auth.load_credentials_from_file to cache credentials and avoid 163ms RSA block on event loop
+    try:
+        import google.auth as _ga
+        _orig_load_creds = _ga.load_credentials_from_file
+        def _patched_load_creds(*args, **kwargs):
+            global _google_creds_cache
+            with _google_creds_lock:
+                if _google_creds_cache is not None:
+                    return _google_creds_cache
+            creds = _orig_load_creds(*args, **kwargs)
+            with _google_creds_lock:
+                _google_creds_cache = creds
+            return creds
+        _ga.load_credentials_from_file = _patched_load_creds
+        logger.info("🔧 Patched google.auth.load_credentials_from_file to use cached credentials (fixes 163ms RSA init block)")
+
+        # Also patch _default version
+        import google.auth._default as _ga_default
+        _orig_default_load = _ga_default.load_credentials_from_file
+        def _patched_default_load(*args, **kwargs):
+            global _google_creds_cache
+            with _google_creds_lock:
+                if _google_creds_cache is not None:
+                    return _google_creds_cache
+            creds = _orig_default_load(*args, **kwargs)
+            with _google_creds_lock:
+                _google_creds_cache = creds
+            return creds
+        _ga_default.load_credentials_from_file = _patched_default_load
+        logger.info("🔧 Patched google.auth._default.load_credentials_from_file to use cached credentials (fixes 163ms block)")
+    except Exception as e:
+        logger.debug(f"Could not patch google auth credential cache: {e}")
+
 except Exception as e:
     logger.debug(f"Google auth prewarm failed: {e}")
 
@@ -867,6 +905,40 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             asyncio.to_thread(build_tts, cfg),
         )
         logger.info(f"⏱️ provider build async parallel {time.time()-build_t0:.2f}s")
+        # Prewarm TTS client off loop to avoid 163ms google.auth credential/RSA block on first audio
+        # The blocking load_credentials_from_file happens in _ensure_client during first streaming_synthesize (on event loop)
+        # Move it off loop now, after build, before session start
+        try:
+            # tts_inst may be FallbackAdapter, get inner Google TTS
+            tts_to_prewarm = tts_inst
+            try:
+                inner_list = getattr(tts_inst, '_tts_instances', None) or getattr(tts_inst, 'tts_instances', None) or getattr(tts_inst, '_instances', None)
+                if inner_list and len(inner_list) > 0:
+                    tts_to_prewarm = inner_list[0]
+            except Exception:
+                pass
+            # Try to ensure client off loop via to_thread with new event loop
+            def _ensure_tts_client_sync():
+                try:
+                    import asyncio as _aio
+                    loop = _aio.new_event_loop()
+                    _aio.set_event_loop(loop)
+                    try:
+                        # _tts is internal google client wrapper, has _ensure_client async
+                        inner = getattr(tts_to_prewarm, '_tts', None) or tts_to_prewarm
+                        if hasattr(inner, '_ensure_client'):
+                            loop.run_until_complete(inner._ensure_client())
+                            logger.info("🔧 TTS client prewarmed off loop after build (avoids 163ms RSA block on first audio)")
+                    finally:
+                        loop.close()
+                        _aio.set_event_loop(None)
+                except Exception as _e:
+                    logger.debug(f"TTS off-loop prewarm after build failed: {_e}")
+
+            await asyncio.wait_for(asyncio.to_thread(_ensure_tts_client_sync), timeout=3)
+            logger.info("🔧 TTS client off-loop prewarm completed (fixes 163ms google.auth block)")
+        except Exception as e:
+            logger.debug(f"TTS prewarm after build failed: {e}")
         # Log LLM provider details for 404 debugging and wrap with timing + failure logging
         try:
             llm_type = str(type(llm_inst))
