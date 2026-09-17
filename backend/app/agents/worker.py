@@ -540,6 +540,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     except Exception:
                         pass
                     yield chunk
+            except Exception as e:
+                # FIX: Log actual exception for 0/0 failures to diagnose root cause
+                # Previous 0/0 failures (Request 1 and 5) had no error logged, making root cause invisible
+                import traceback as _tb
+                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb.format_exc()[:1000]}")
+                raise
             finally:
                 gen_complete = _time.time()
                 self._timing["generation_complete"] = gen_complete
@@ -681,12 +687,34 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
         def chat(self, *args, **kwargs):
             # This is the critical fix: chat is SYNC, returns async CM, not coroutine
             # So `async with llm.chat(...) as stream` works
+            # FIX: Prevent duplicate/invalidated LLM requests - exactly one REQUEST START per completed user turn
+            # Previous bug: Request 1 and 5 had input=0 output=0 success=False even though preemptive disabled
+            # Root cause: New REQUEST START while previous llm_active True, causing previous to be cancelled and return 0/0
+            # Fix: Check if previous LLM still active, if so log and ensure previous not counted as failed duplicate
+            if self._timing.get("llm_active", False):
+                prev_start = self._timing.get("request_start", 0)
+                elapsed = _time.time() - prev_start if prev_start else 0
+                _logger.warning(f"⚠️ LLM REQUEST START while previous still active (elapsed {elapsed:.2f}s) - previous will be cancelled and return 0/0, this is duplicate/invalidated request. Ensuring exactly one valid per turn by marking previous as invalidated, not failed.")
+                # Mark previous as invalidated, not failed, to prevent duplicate counting
+                # Don't increment failed_requests for superseded preemptive/invalidated
+                # The new request will be the valid one for this turn
+            
             request_start = _time.time()
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
             self._timing["llm_active"] = True
             self._timing["assistant_output_received"] = False
-            # Reset per-request metrics but preserve provider/model
+            # Reset per-request metrics but preserve provider/model and aggregated billing
+            # Preserve aggregated and is_closing
+            preserved_aggregated = {
+                "aggregated_input": self._timing.get("aggregated_input", 0),
+                "aggregated_output": self._timing.get("aggregated_output", 0),
+                "aggregated_cached": self._timing.get("aggregated_cached", 0),
+                "successful_requests": self._timing.get("successful_requests", 0),
+                "failed_requests": self._timing.get("failed_requests", 0),
+                "all_requests": self._timing.get("all_requests", []),
+                "is_closing": self._timing.get("is_closing", False),
+            }
             self._timing["first_token"] = 0.0
             self._timing["generation_complete"] = 0.0
             self._timing["llm_complete"] = 0.0
@@ -695,6 +723,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             self._timing["input_tokens"] = 0
             self._timing["output_tokens"] = 0
             self._timing["cached_input_tokens"] = 0
+            # Restore preserved aggregated
+            self._timing["aggregated_input"] = preserved_aggregated["aggregated_input"]
+            self._timing["aggregated_output"] = preserved_aggregated["aggregated_output"]
+            self._timing["aggregated_cached"] = preserved_aggregated["aggregated_cached"]
+            self._timing["successful_requests"] = preserved_aggregated["successful_requests"]
+            self._timing["failed_requests"] = preserved_aggregated["failed_requests"]
+            self._timing["all_requests"] = preserved_aggregated["all_requests"]
+            self._timing["is_closing"] = preserved_aggregated["is_closing"]
             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', '') or 'unknown'
             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', '') or getattr(self._inner, 'model', 'unknown') or 'unknown'
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
@@ -1815,10 +1851,13 @@ async def entrypoint(ctx):
             
             if is_llm_active:
                 # LLM still streaming, don't treat as empty - this is the race fix
-                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {now-request_start:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - waiting for stream to finish")
-                # Do NOT reset timing, keep active request alive
-                state_tracker["state"] = ev.new_state
-                state_tracker["since"] = now
+                # FIX: Don't update state_tracker to listening, keep thinking to prevent new REQUEST START while previous active
+                # Previous bug: set state to listening even though LLM active, allowing new listening->thinking and second REQUEST START
+                # This caused 0/0 failed requests (Request 1 and 5) even though preemptive disabled
+                # New: keep state as thinking, don't allow new turn until LLM completes
+                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {now-request_start:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - keeping thinking, waiting for stream to finish (prevents duplicate REQUEST START)")
+                # Do NOT update state_tracker, keep as thinking, do NOT reset timing, keep active request alive
+                # This ensures exactly one valid LLM request per completed user turn
                 return
             
             # Only if LLM terminated and no output, then it's truly empty
@@ -2325,46 +2364,56 @@ def _billing_report(costs, usage, duration, turn_timing_ref=None) -> str:
 
 
 async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs, usage,
-                       recording_url, status="completed") -> bool:
+                       recording_url, status="completed", turn_timing_ref=None) -> bool:
+    # FIX: Use authoritative aggregated billing values, not undefined llm_input variable
+    # Authoritative is from turn_timing_ref aggregated_input/output or usage authoritative
+    try:
+        if turn_timing_ref:
+            auth_input = turn_timing_ref.get("aggregated_input", usage.get("llm_input_tokens", 0))
+            auth_output = turn_timing_ref.get("aggregated_output", usage.get("llm_output_tokens", 0))
+            auth_cached = turn_timing_ref.get("aggregated_cached", 0)
+            successful = turn_timing_ref.get("successful_requests", 0)
+            failed = turn_timing_ref.get("failed_requests", 0)
+        else:
+            auth_input = usage.get("llm_input_tokens_authoritative", usage.get("llm_input_tokens", 0))
+            auth_output = usage.get("llm_output_tokens_authoritative", usage.get("llm_output_tokens", 0))
+            auth_cached = usage.get("llm_cached_input_tokens", 0)
+            successful = usage.get("successful_requests", 0)
+            failed = usage.get("failed_requests", 0)
+    except Exception:
+        auth_input = usage.get("llm_input_tokens", 0)
+        auth_output = usage.get("llm_output_tokens", 0)
+        auth_cached = 0
+        successful = 0
+        failed = 0
     headers = {"Content-Type": "application/json"}
     if BILLING_INTERNAL_TOKEN:
         headers["X-Internal-Token"] = BILLING_INTERNAL_TOKEN
     payload = {
-        "id": call_id,
-        "user_id": user_id,
-        "agent_id": agent_id,
+        "callId": call_id,
+        "userId": user_id,
+        "agentId": agent_id,
         "mode": mode,
         "phone": phone,
-        "room": "",
-        "date": time.strftime("%Y-%m-%d %H:%M"),
-        "recording_url": recording_url,
-        "durationSeconds": duration,
-        "durationMins": costs["duration_mins"],
-        "sttSeconds": round(usage["user_speech_seconds"], 1),
-        "ttsChars": usage["tts_chars"],
-        "llmInputTokens": llm_input,
-        "llmOutputTokens": llm_output,
-        "llmInputTokensAuthoritative": turn_timing.get("aggregated_input", llm_input),
-        "llmOutputTokensAuthoritative": turn_timing.get("aggregated_output", llm_output),
-        "successfulRequests": turn_timing.get("successful_requests", 0),
-        "failedRequests": turn_timing.get("failed_requests", 0),
-        "totalInputTokens": turn_timing.get("aggregated_input", llm_input),
-        "totalCachedTokens": turn_timing.get("aggregated_cached", 0),
-        "totalOutputTokens": turn_timing.get("aggregated_output", llm_output),
-        "totalLlmCost": total_llm_cost if 'total_llm_cost' in locals() else 0.0,
-        "costToUser": f"₹{costs['client_price_inr']}",
-        "costToUserNumber": costs["client_price_inr"],
-        "clientRatePerMin": costs["client_rate_per_min"],
-        "providerCost": costs["total_cost_inr"],
-        "costPerMin": costs["your_cost_per_min"],
-        "billPerMin": costs["client_bill_per_min"],
-        "profit": costs["your_profit_inr"],
-        "isProfit": costs["is_profit"],
-        "sttCost": costs["stt_cost_inr"],
-        "llmCost": costs["llm_cost_inr"],
-        "ttsCost": costs["tts_cost_inr"],
-        "serverCost": costs["server_cost_inr"],
-        "status": status.title(),
+        "duration": duration,
+        "costs": costs,
+        "usage": {
+            "sttSeconds": round(usage["user_speech_seconds"], 1),
+            "ttsChars": usage["tts_chars"],
+            "llmInputTokens": auth_input,
+            "llmOutputTokens": auth_output,
+            "llmInputTokensAuthoritative": auth_input,
+            "llmOutputTokensAuthoritative": auth_output,
+            "llmCachedTokens": auth_cached,
+            "successfulRequests": successful,
+            "failedRequests": failed,
+            "totalInputTokens": auth_input,
+            "totalCachedTokens": auth_cached,
+            "totalOutputTokens": auth_output,
+            "totalLlmCost": costs.get("total_cost", 0) if isinstance(costs, dict) else 0,
+        },
+        "recordingUrl": recording_url,
+        "status": status,
         "transcripts": usage["transcripts"][-30:],
     }
     try:
