@@ -106,6 +106,7 @@ try:
     from livekit.agents.utils import http_context as _http_context
     _original_create_ssl = _http_context._create_ssl_context
     def _patched_create_ssl_context(*args, **kwargs):
+        global _ssl_context_cache
         # Fast path: return cached context if available (no load_verify_locations)
         with _ssl_context_lock:
             if _ssl_context_cache is not None:
