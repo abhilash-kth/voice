@@ -290,9 +290,19 @@ CATALOG["llm"] = _build_llm_catalog_v2_with_compat()
 # Helper functions - V2 architecture with backward compat
 # ---------------------------------------------------------------------------
 def providers_of(kind: str) -> List[Dict[str, Any]]:
-    """Return provider list for kind, each with id embedded."""
+    """Return provider list for kind, each with id embedded.
+    
+    For LLM, filter out legacy ids from main catalog list to avoid cluttering UI
+    with 'GPT-4o Mini (legacy id, use openai provider)' etc. Legacy ids still
+    exist in CATALOG['llm'] for backward compat (old agents), but are hidden from
+    provider dropdown. Frontend V2 uses llm_providers (3 providers) + llm_by_provider
+    for model selection. Legacy mapping still works for existing agents.
+    """
     out = []
     for pid, spec in CATALOG.get(kind, {}).items():
+        # For LLM, hide legacy ids from providers_of to clean UI
+        if kind == "llm" and spec.get("legacy"):
+            continue
         item = dict(spec)
         item["id"] = pid
         out.append(item)
