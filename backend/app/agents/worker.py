@@ -78,6 +78,55 @@ from livekit.plugins import openai    # noqa: E402,F401  (LLM)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("voice-agent-saas-worker")
 
+# FIX: 314ms synchronous SSL initialization block on LiveKit agent event loop
+# LiveKit worker startup does: aiohttp.TCPConnector(ssl=http_context._create_ssl_context())
+# which calls ssl.create_default_context() synchronously on event loop, blocking 314ms
+# Fix: Prewarm SSL context at import time in background thread and cache, patch http_context to use cached
+import ssl as _ssl_prewarm
+import threading as _threading_prewarm
+
+_ssl_context_cache = None
+_ssl_context_lock = _threading_prewarm.Lock()
+
+def _prewarm_ssl_context():
+    global _ssl_context_cache
+    try:
+        ctx = _ssl_prewarm.create_default_context()
+        with _ssl_context_lock:
+            _ssl_context_cache = ctx
+        logger.info("🔧 SSL context prewarmed at import time in background thread (fixes 314ms event loop block)")
+    except Exception as e:
+        logger.debug(f"SSL prewarm failed: {e}")
+
+# Start prewarm immediately in daemon thread
+_threading_prewarm.Thread(target=_prewarm_ssl_context, daemon=True).start()
+
+# Patch LiveKit http_context to use cached SSL context
+try:
+    from livekit.agents.utils import http_context as _http_context
+    _original_create_ssl = _http_context._create_ssl_context
+    def _patched_create_ssl_context(*args, **kwargs):
+        # Fast path: return cached context if available (no load_verify_locations)
+        with _ssl_context_lock:
+            if _ssl_context_cache is not None:
+                return _ssl_context_cache
+        # Fallback: if not cached yet (very early), create but log
+        logger.info("🔧 SSL cache miss, creating context (should be prewarmed)")
+        try:
+            ctx = _ssl_prewarm.create_default_context(*args, **kwargs)
+            with _ssl_context_lock:
+                _ssl_context_cache = ctx
+            return ctx
+        except Exception:
+            return _original_create_ssl(*args, **kwargs)
+    _http_context._create_ssl_context = _patched_create_ssl_context
+    logger.info("🔧 Patched http_context._create_ssl_context to use cached SSL (fixes 314ms event loop block at ssl.py:717)")
+except Exception as e:
+    logger.debug(f"Could not patch http_context for SSL fix: {e}")
+
+# Also patch aiohttp TCPConnector creation if needed - but http_context patch should be enough
+
+
 # Latency fix globals: cache DB init and agent lookup per process
 _DB_INIT_DONE = False
 _AGENT_CACHE: dict = {}  # key -> {"rec": ..., "ts": float}
