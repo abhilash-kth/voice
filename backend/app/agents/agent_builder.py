@@ -730,7 +730,19 @@ def build_tts(cfg: AgentConfig) -> Any:
         return primary
 
 
+_VAD_CACHE_AGENT = None
+_VAD_CACHE_LOCK_AGENT = __import__('threading').Lock()
+
 def build_vad() -> Any:
+    global _VAD_CACHE_AGENT
+    # Use cached VAD if available to avoid 406ms onnxruntime block
+    try:
+        with _VAD_CACHE_LOCK_AGENT:
+            if _VAD_CACHE_AGENT is not None:
+                logger.info("🔧 VAD cache hit in agent_builder (avoids 406ms onnxruntime block)")
+                return _VAD_CACHE_AGENT
+    except Exception:
+        pass
     from livekit.plugins import silero
     # Production latency fix (eliminate 3-7s outliers):
     # Root cause of outliers: VAD inference slower than realtime 0.4s + job executor unresponsive 1.5s
@@ -751,12 +763,18 @@ def build_vad() -> Any:
     # Combined with STT turn_detection and endpointing 0.20/0.55, total speech_end->LLM ~400-500ms
     # For short "haan/ok" (1-2 words): VAD 0.30s + STT final 200ms + endpointing 0.20 = 0.5s total -> fast
     # For natural pause in Hindi: Deepgram utterance_end 1000ms prevents premature final, endpointing max 0.55 caps
-    return silero.VAD.load(
+    vad = silero.VAD.load(
         min_speech_duration=0.20,
         min_silence_duration=0.30,
         prefix_padding_duration=0.20,
         activation_threshold=0.55,
     )
+    try:
+        with _VAD_CACHE_LOCK_AGENT:
+            _VAD_CACHE_AGENT = vad
+    except Exception:
+        pass
+    return vad
 
 
 # ---------------------------------------------------------------------------

@@ -101,7 +101,7 @@ def _prewarm_ssl_context():
 # Start prewarm immediately in daemon thread
 _threading_prewarm.Thread(target=_prewarm_ssl_context, daemon=True).start()
 
-# Patch LiveKit http_context to use cached SSL context
+# Patch LiveKit http_context and httpx to use cached SSL context - fixes 314ms and 1359ms blocks
 try:
     from livekit.agents.utils import http_context as _http_context
     _original_create_ssl = _http_context._create_ssl_context
@@ -124,6 +124,49 @@ try:
     logger.info("🔧 Patched http_context._create_ssl_context to use cached SSL (fixes 314ms event loop block at ssl.py:717)")
 except Exception as e:
     logger.debug(f"Could not patch http_context for SSL fix: {e}")
+
+# Also patch httpx SSL context to fix 1359ms block during prisma/httpx DB init
+try:
+    import httpx._config as _httpx_config
+    _original_httpx_ssl = _httpx_config.create_ssl_context
+    def _patched_httpx_ssl(*args, **kwargs):
+        global _ssl_context_cache
+        with _ssl_context_lock:
+            if _ssl_context_cache is not None:
+                return _ssl_context_cache
+        return _original_httpx_ssl(*args, **kwargs)
+    _httpx_config.create_ssl_context = _patched_httpx_ssl
+    logger.info("🔧 Patched httpx._config.create_ssl_context to use cached SSL (fixes 1359ms block during DB init)")
+except Exception as e:
+    logger.debug(f"Could not patch httpx SSL: {e}")
+
+# Prewarm hyphenator off loop to avoid 256ms/391ms re.split block
+try:
+    from livekit.agents.tokenize._basic_hyphenator import Hyphenator as _Hyph, PATTERNS as _Pat, EXCEPTIONS as _Exc
+    _hyph_cache = _Hyph(_Pat, _Exc)
+    # Patch _get_hyphenator to return cached
+    import livekit.agents.tokenize._basic_hyphenator as _hyph_module
+    _orig_get_hyph = _hyph_module._get_hyphenator
+    def _patched_get_hyph():
+        return _hyph_cache
+    _hyph_module._get_hyphenator = _patched_get_hyph
+    logger.info("🔧 Patched hyphenator to use cached (fixes 256ms/391ms re.split block)")
+except Exception as e:
+    logger.debug(f"Could not patch hyphenator: {e}")
+
+# Prewarm Google auth crypt off loop to avoid 176ms block
+try:
+    import google.auth.crypt._cryptography_rsa
+    logger.info("🔧 Prewarmed Google auth crypt (avoids 176ms block)")
+except Exception as e:
+    logger.debug(f"Google auth prewarm failed: {e}")
+
+# Prewarm async_toolset import
+try:
+    import livekit.agents.llm.async_toolset
+    logger.info("🔧 Prewarmed async_toolset (avoids 101ms import block)")
+except Exception as e:
+    logger.debug(f"async_toolset prewarm failed: {e}")
 
 # Also patch aiohttp TCPConnector creation if needed - but http_context patch should be enough
 
@@ -1039,18 +1082,45 @@ async def entrypoint(ctx):
     # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
     # Total 13.5s before user hears greeting. Fix: cache DB init per process, parallel provider build.
     global _DB_INIT_DONE, _AGENT_CACHE
+    # Ensure SSL cache ready before DB init to prevent 1359ms block
+    try:
+        global _ssl_context_cache
+        if _ssl_context_cache is None:
+            # Create synchronously if not yet prewarmed (first call, cache miss)
+            import ssl as _ssl_sync
+            ctx = _ssl_sync.create_default_context()
+            with _ssl_context_lock:
+                _ssl_context_cache = ctx
+            logger.info("🔧 SSL context created synchronously before DB init (was not prewarmed, fixes 1359ms block)")
+    except Exception as _e:
+        logger.debug(f"SSL ensure failed: {_e}")
+
     db_t0 = time.time()
     if not _DB_INIT_DONE:
         try:
             # FIX: Move DB init off event loop to prevent 1359ms SSL block at ssl.py:717 (httpx create_ssl_context)
             # Prisma client connect creates httpx.AsyncClient which calls ssl.create_default_context synchronously on loop
             # Move off loop via to_thread to avoid blocking audio and turn handling
+            async def _db_init_thread():
+                # Run db_init in thread with new event loop to avoid blocking main loop
+                import asyncio as _aio
+                loop = _aio.new_event_loop()
+                try:
+                    _aio.set_event_loop(loop)
+                    return await loop.run_until_complete(db_init())
+                finally:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+                    _aio.set_event_loop(None)
+
             try:
-                await asyncio.wait_for(asyncio.to_thread(lambda: __import__('asyncio').run(db_init())), timeout=8)
+                await asyncio.wait_for(asyncio.to_thread(lambda: __import__('asyncio').new_event_loop().run_until_complete(db_init())), timeout=8)
                 logger.info("🔧 DB init moved off event loop via to_thread (fixes 1359ms SSL block)")
             except Exception as e:
-                # Fallback to original async if to_thread fails
-                logger.warning(f"DB init off-loop failed, fallback to async: {e}")
+                # Fallback to original async if to_thread fails, but SSL already cached so should not block 1359ms
+                logger.warning(f"DB init off-loop failed, fallback to async (SSL cached, should not block 1359ms): {e}")
                 await asyncio.wait_for(db_init(), timeout=5)
             _DB_INIT_DONE = True
             logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s (first time, cached for next calls)")
@@ -2456,7 +2526,14 @@ def prewarm(proc):
         )
         with _VAD_CACHE_LOCK:
             _VAD_CACHE = vad
-        logger.info("🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55, STT turn_detection, endpointing 0.20/0.55) - cached to avoid 406ms block")
+        # Also set agent_builder cache to avoid 406ms block in build_vad
+        try:
+            from app.agents import agent_builder as _ab
+            with _ab._VAD_CACHE_LOCK_AGENT:
+                _ab._VAD_CACHE_AGENT = vad
+            logger.info("🔥 Prewarm: VAD hot cached in both worker and agent_builder (avoids 406ms onnxruntime block)")
+        except Exception as _e:
+            logger.info(f"🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55) - cached in worker, agent_builder cache set failed: {_e}")
     except Exception as e:
         logger.warning(f"VAD prewarm failed: {e}")
     
