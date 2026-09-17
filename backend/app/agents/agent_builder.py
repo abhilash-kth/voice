@@ -1042,6 +1042,7 @@ def build_voice_agent(
     greeting: str = "",
     prior_memory: str = "",
     lead_data: Optional[dict] = None,
+    turn_timing_ref: Optional[dict] = None,
 ) -> "Any":
     """Return a LiveKit v1 ``Agent`` instance wired for this config.
 
@@ -1186,6 +1187,7 @@ def build_voice_agent(
             self.cfg = cfg
             self.greeting = greeting
             self._last_rag = ""  # per-turn RAG injection (see on_user_turn_completed)
+            self._turn_timing_ref = turn_timing_ref  # For preventing duplicate REQUEST START while previous active
             # Store instance so _end_call tool can speak deterministic closing via session.
             agent_ref["instance"] = self
             super().__init__(
@@ -1228,7 +1230,29 @@ def build_voice_agent(
             - RAG is now async via to_thread to avoid blocking event loop (was sync, could be 100-300ms)
             - When VOICE_PREEMPTIVE=1, RAG is skipped (static facts only) to preserve preemptive generation
             - Added timing logs for STT_final->LLM_start to detect 3-7s outliers
+            - FIX: Prevent duplicate/invalidated LLM requests - wait for previous LLM to complete before new REQUEST START
+            - Exactly one REQUEST START per completed user turn, no 0/0 race
             """
+            # FIX: Prevent duplicate REQUEST START while previous LLM still active
+            # Root cause of Request 1 and 5 0/0 failures: new REQUEST START while previous llm_active True
+            # This causes previous to be cancelled and return 0/0, then new starts - duplicate/invalidated
+            # Fix: Wait for previous LLM to complete before allowing new turn's LLM request
+            try:
+                if self._turn_timing_ref and self._turn_timing_ref.get("llm_active", False):
+                    prev_start = self._turn_timing_ref.get("request_start", 0)
+                    elapsed = time.time() - prev_start if prev_start else 0
+                    if elapsed < 5.0:  # Only wait if previous started recently (<5s), not stale
+                        logger.info(f"⏳ Previous LLM still active (elapsed {elapsed:.2f}s), waiting for it to complete before new REQUEST START (prevents 0/0 duplicate)")
+                        # Wait up to 2s for previous to complete, checking every 50ms
+                        wait_start = time.time()
+                        while self._turn_timing_ref.get("llm_active", False) and (time.time() - wait_start) < 2.0:
+                            await asyncio.sleep(0.05)
+                        if self._turn_timing_ref.get("llm_active", False):
+                            logger.warning(f"⚠️ Previous LLM still active after 2s wait, proceeding anyway (may cause 0/0)")
+                        else:
+                            logger.info(f"✅ Previous LLM completed, proceeding with new REQUEST START")
+            except Exception as e:
+                logger.debug(f"Could not wait for previous LLM: {e}")
             nonlocal explicit_goodbye
             import time as _time
             _rag_t0 = _time.time()

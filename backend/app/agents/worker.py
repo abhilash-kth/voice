@@ -132,6 +132,8 @@ except Exception as e:
 _DB_INIT_DONE = False
 _AGENT_CACHE: dict = {}  # key -> {"rec": ..., "ts": float}
 _AGENT_CACHE_TTL = 30.0
+_VAD_CACHE = None
+_VAD_CACHE_LOCK = __import__('threading').Lock()
 
 FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
 # Spoken when a user turn gets NO LLM reply at all (provider 429 after the
@@ -1040,7 +1042,16 @@ async def entrypoint(ctx):
     db_t0 = time.time()
     if not _DB_INIT_DONE:
         try:
-            await asyncio.wait_for(db_init(), timeout=5)
+            # FIX: Move DB init off event loop to prevent 1359ms SSL block at ssl.py:717 (httpx create_ssl_context)
+            # Prisma client connect creates httpx.AsyncClient which calls ssl.create_default_context synchronously on loop
+            # Move off loop via to_thread to avoid blocking audio and turn handling
+            try:
+                await asyncio.wait_for(asyncio.to_thread(lambda: __import__('asyncio').run(db_init())), timeout=8)
+                logger.info("🔧 DB init moved off event loop via to_thread (fixes 1359ms SSL block)")
+            except Exception as e:
+                # Fallback to original async if to_thread fails
+                logger.warning(f"DB init off-loop failed, fallback to async: {e}")
+                await asyncio.wait_for(db_init(), timeout=5)
             _DB_INIT_DONE = True
             logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s (first time, cached for next calls)")
         except Exception as exc:
@@ -1998,7 +2009,7 @@ async def entrypoint(ctx):
         agent = build_announce_agent(cfg, announce_text=script)
         logger.info("📢 mode=announcement (fixed-script only, no STT/LLM)")
     else:
-        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data)
+        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing)
         logger.info("💬 mode=assistant (STT+LLM+TTS)")
     agent_holder["agent"] = agent
 
@@ -2432,19 +2443,49 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
-    # Production prewarm: ONLY VAD, NOT DB (DB prewarm caused "Event loop is closed" -> 1.73s lookup retry)
-    # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU (no more 0.4s slower-than-realtime)
-    # Endpointing now STT-based 0.20/0.55, so VAD only for barge-in, not turn detection
-    silero.VAD.load(
-        min_speech_duration=0.20,
-        min_silence_duration=0.30,
-        prefix_padding_duration=0.20,
-        activation_threshold=0.55,
-    )
-    logger.info("🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55, STT turn_detection, endpointing 0.20/0.55)")
+    # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
+    # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
+    # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU
+    global _VAD_CACHE
+    try:
+        vad = silero.VAD.load(
+            min_speech_duration=0.20,
+            min_silence_duration=0.30,
+            prefix_padding_duration=0.20,
+            activation_threshold=0.55,
+        )
+        with _VAD_CACHE_LOCK:
+            _VAD_CACHE = vad
+        logger.info("🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55, STT turn_detection, endpointing 0.20/0.55) - cached to avoid 406ms block")
+    except Exception as e:
+        logger.warning(f"VAD prewarm failed: {e}")
+    
+    # Prewarm Google auth crypt off loop to avoid 176ms block at crypt/_cryptography_rsa.py from_string
+    try:
+        import google.auth.crypt._cryptography_rsa as _crypt_rsa
+        import google.auth._service_account_info as _sa_info
+        logger.info("🔥 Prewarm: Google auth crypt imported (avoids 176ms block during TTS)")
+    except Exception as e:
+        logger.debug(f"Google auth prewarm failed: {e}")
+    
+    # Prewarm hyphenator off loop to avoid 256ms/391ms block at re.split in _basic_hyphenator
+    try:
+        from livekit.agents.tokenize._basic_hyphenator import Hyphenator, PATTERNS, EXCEPTIONS
+        Hyphenator(PATTERNS, EXCEPTIONS)
+        logger.info("🔥 Prewarm: Hyphenator hot (avoids 256ms/391ms re.split block in transcription synchronizer)")
+    except Exception as e:
+        logger.debug(f"Hyphenator prewarm failed: {e}")
+    
+    # Prewarm async_toolset import off loop to avoid 101ms block
+    try:
+        import livekit.agents.llm.async_toolset as _async_toolset
+        logger.info("🔥 Prewarm: async_toolset imported (avoids 101ms import block)")
+    except Exception as e:
+        logger.debug(f"async_toolset prewarm failed: {e}")
+    
     # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
     # "Event loop is closed" on next Prisma call -> 1.73s retry. DB now cached per process
-    # via _DB_INIT_DONE global, first job pays 2.33s, subsequent 0.00s, no loop closure.
+    # via _DB_INIT_DONE global and moved off loop via to_thread in entrypoint (fixes 1359ms SSL block)
 
 
 if __name__ == "__main__":
