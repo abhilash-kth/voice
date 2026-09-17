@@ -122,6 +122,12 @@ def build_llm(cfg: AgentConfig) -> Any:
         env_model = _os.getenv("OPENAI_MODEL")
         default_model = _cat_model or "gpt-4o-mini"
     model = overrides.get("model") or env_model or default_model
+    logger.info(
+        "🤖 LLM selected provider=%s model=%s base_url=%s",
+        provider_id,
+        model,
+        base_url or "https://api.openai.com/v1",
+    )
 
     # Reasoning control, model-aware. Some reasoning models have no "none" level:
     #   * gpt-oss -> "low"  (valid on Groq, minimal chain-of-thought)
@@ -169,16 +175,17 @@ def build_llm(cfg: AgentConfig) -> Any:
     # `conn_options`, see worker.py) so a transient DNS blip or provider 429 fails
     # fast instead of stacking retries and freezing the call for ~20s.
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-    return LLM(
-        client=client,
-        model=model,
-        temperature=float(overrides.get("temperature", 0.1)),
-        max_completion_tokens=int(overrides.get("max_tokens", 180)),
-        # See `reasoning` above. For gpt-oss keep it low so the model doesn't spend
-        # time on a long chain-of-thought that also risks leaking into the spoken
-        # reply (the worker's clean_reply_text strips <think>/<reasoning> anyway).
-        reasoning_effort=reasoning,
-    )
+    llm_kwargs = {
+        "client": client,
+        "model": model,
+        "temperature": float(overrides.get("temperature", 0.1)),
+        "max_completion_tokens": int(overrides.get("max_tokens", 180)),
+    }
+    # Standard OpenAI chat models reject reasoning_effort. Only send it to
+    # models whose API supports it.
+    if "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
+        llm_kwargs["reasoning_effort"] = reasoning
+    return LLM(**llm_kwargs)
 
 
 def build_stt(cfg: AgentConfig) -> Any:
@@ -428,7 +435,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
         "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
-        "Keep replies to 1 or 2 short spoken sentences. No analysis, markdown, lists, or emojis.",
+        "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
     # Natural, human-like behaviour: concise, non-repetitive, never salesy, and
@@ -580,9 +587,11 @@ def build_voice_agent(
         "partial, interrupted, or unclear first user utterance. Acknowledge briefly and "
         "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
         "collection. End the call only when the caller clearly and explicitly asks to "
-        "disconnect, hang up, cut the call, or says goodbye/bye as a standalone final "
-        "utterance. Phrases such as 'no more help', 'that's all for this question', "
-        "or 'okay' are NOT goodbye, especially when followed by another question. "
+        "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
+        "that's all, no more help, or no more questions, or a mixed Hindi/English request "
+        "such as 'call cut kar dijiye' or 'और तो मुझे कुछ नहीं जानना' as a standalone final "
+        "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
+        "especially when followed by another question. "
         "When the caller explicitly says goodbye, first speak exactly one short polite "
         "closing sentence, such as 'Thank you for calling us. Aapse baat karke achha laga. "
         "Goodbye.' Then call the end_call tool once. Never call the tool before the "
@@ -698,13 +707,37 @@ def build_voice_agent(
             nonlocal explicit_goodbye
             try:
                 user_text = _chat_msg_text(new_message).strip()
-                normalized = " ".join(user_text.lower().replace(".", " ").replace(",", " ").split())
-                # Require a clear final intent. Do not treat "no more help" or
-                # "thank you" as a hang-up request because callers often continue.
+                normalized = " ".join(
+                    user_text.lower()
+                    .replace(".", " ")
+                    .replace(",", " ")
+                    .split()
+                )
+                # This is deliberately transcript-level (rather than an LLM
+                # decision): short, natural closings must authorize the tool
+                # even when STT returns "bye bye" or Hindi mixed with English.
+                # Do not require the literal word "goodbye".
+                closing_phrases = {
+                    "bye", "bye bye", "goodbye", "good bye", "ok bye",
+                    "okay bye", "good bye bye", "thank you", "thanks",
+                    "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                    "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                    "no more questions", "no more help", "that's all", "that is all",
+                }
+                disconnect_phrases = (
+                    "cut the call", "hang up", "disconnect", "disconnect the call",
+                    "end the call", "call cut", "कॉल कट", "call काट",
+                    "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
+                    "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                    "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                    "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                    "no more questions", "no more help", "that's all", "that is all",
+                )
                 explicit_goodbye = bool(
-                    normalized in {"bye", "goodbye", "ok bye", "okay bye", "good bye", "good bye bye"}
-                    or any(p in normalized for p in ("cut the call", "hang up", "disconnect the call", "end the call"))
-                    or ("thank you" in normalized and "?" not in user_text and len(normalized.split()) <= 12)
+                    normalized in closing_phrases
+                    or any(p in normalized for p in disconnect_phrases)
+                    or ("thank you" in normalized and "?" not in user_text
+                        and len(normalized.split()) <= 12)
                 )
             except Exception:
                 explicit_goodbye = False

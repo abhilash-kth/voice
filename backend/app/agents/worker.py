@@ -454,6 +454,11 @@ async def entrypoint(ctx):
     # FALLBACK_SILENCE and let the caller retry (by then the rate-limit window
     # has usually rolled over).
     # ------------------------------------------------------------------
+    call_closed = {"done": False}
+    # Set from the final user transcript before generation.  Closing intent is
+    # not the same as disconnected: the one closing sentence still needs to be
+    # played, but watchdog fallbacks and later generations must be suppressed.
+    closing_requested = {"done": False}
     reply_tracker = {
         "last_user_ts": 0.0,
         "last_assistant_ts": 0.0,
@@ -500,8 +505,8 @@ async def entrypoint(ctx):
         finally:
             if reply_tracker["pending"] is asyncio.current_task():
                 reply_tracker["pending"] = None
-        if reply_tracker["last_assistant_ts"] >= turn_ts:
-            return  # the LLM did answer this turn (late, but it answered)
+        if reply_tracker["last_assistant_ts"] >= turn_ts or closing_requested["done"]:
+            return  # closing turns must never receive a delayed fallback
         logger.warning(
             f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
             "(rate-limited 429 or failed generation) — speaking a fallback line "
@@ -518,6 +523,10 @@ async def entrypoint(ctx):
             logger.warning(f"🛟 could not arm silence watchdog: {e}")
 
     def on_item_added(ev):
+        # LiveKit can flush a late assistant item while the room is already
+        # closing. Never log, bill, or try to speak that stale item.
+        if call_closed["done"]:
+            return
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
         text = _msg_text(item)
@@ -536,6 +545,30 @@ async def entrypoint(ctx):
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
             usage["transcripts"].append({"role": "user", "text": text})
             logger.info(f"👂 User: {text}")
+            normalized_user = " ".join(text.lower().replace(".", " ").replace(",", " ").split())
+            closing_requested["done"] = (
+                normalized_user in {
+                    "bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye",
+                    "thank you", "thanks", "और तो मुझे कुछ नहीं जानना",
+                    "अब मुझे कुछ नहीं जानना", "मुझे और कुछ नहीं जानना", "बस इतना ही",
+                    "बस इतना ही पूछना था", "no more questions", "no more help",
+                    "that's all", "that is all",
+                }
+                or ("thank you" in normalized_user and "?" not in text and len(normalized_user.split()) <= 12)
+                or ("thanks" in normalized_user and "?" not in text and len(normalized_user.split()) <= 12)
+                or any(phrase in normalized_user for phrase in (
+                    "cut the call", "hang up", "disconnect", "end the call", "call cut",
+                    "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
+                    "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                    "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                    "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                    "no more questions", "no more help", "that's all", "that is all",
+                ))
+            )
+            if closing_requested["done"]:
+                # Never let the generic provider-timeout fallback speak after a
+                # caller has already asked to leave.
+                _cancel_pending()
             # A fresh turn supersedes any fallback still speaking from the
             # previous failed turn; never let it bleed into this reply.
             old_fallback = reply_tracker.get("fallback_say")
@@ -572,7 +605,10 @@ async def entrypoint(ctx):
             latest_user = last_user_transcript["text"].lower()
             explicit_end = any(term in latest_user for term in (
                 "goodbye", "good bye", "bye", "hang up", "cut the call",
-                "disconnect", "end the call", "thank you", "thankyou"
+                "disconnect", "end the call", "thank you", "thankyou", "bye bye",
+                "ok bye", "okay bye", "कॉल कट", "call काट", "कॉल काट",
+                "call cut कर दीजिए", "call काट दीजिए", "कॉल बंद कर दीजिए",
+                "फोन काट दीजिए"
             ))
             if not explicit_end and any(term in cleaned.lower() for term in ("goodbye", "good bye", "thank you for calling")):
                 logger.warning("🛡️ Suppressed model farewell without explicit caller goodbye")
@@ -740,6 +776,14 @@ async def entrypoint(ctx):
                 caller_joined.set()
 
         def _on_disconnected(participant):
+            call_closed["done"] = True
+            # Cancel pending fallback speech immediately when the caller leaves.
+            # Otherwise the watchdog can try to speak into a closed AgentSession.
+            _cancel_pending()
+            fallback_task = reply_tracker.get("fallback_say")
+            if fallback_task is not None and not fallback_task.done():
+                fallback_task.cancel()
+            reply_tracker["fallback_say"] = None
             # "remote participants" = the caller(s). When there are none left and
             # we previously saw at least one caller, the call is over.
             if not room.remote_participants:
@@ -752,7 +796,32 @@ async def entrypoint(ctx):
             if room.remote_participants:
                 caller_joined.set()
             await caller_joined.wait()
-            await caller_left.wait()
+            idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 60) or 60))
+            try:
+                await asyncio.wait_for(caller_left.wait(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                # Keep this deterministic and customer-configurable. Do not run
+                # the LLM for an idle caller; speak the saved line once, then hang up.
+                message = (getattr(cfg, "no_response_message", "") or
+                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+                _cancel_pending()
+                fallback_task = reply_tracker.get("fallback_say")
+                if fallback_task is not None and not fallback_task.done():
+                    fallback_task.cancel()
+                try:
+                    await session.say(message, allow_interruptions=False)
+                except Exception as exc:
+                    logger.info("Idle timeout message could not be played because the session closed: %s", exc)
+                logger.info("⏱️ Caller inactive for %ss — ending call.", idle_timeout)
+                try:
+                    session.shutdown(drain=False)
+                except Exception:
+                    pass
+                try:
+                    ctx.shutdown()
+                except Exception:
+                    pass
+                return
             logger.info("👋 Caller hang up — ending call.")
         finally:
             room.off("participant_connected", _on_connected)
@@ -793,7 +862,8 @@ def _billing_report(costs, usage, duration) -> str:
         f"🧠 LLM {usage['llm_input_tokens']}in/{usage['llm_output_tokens']}out -> ₹{costs['llm_cost_inr']}\n"
         f"🗣️ TTS {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}\n"
         f"🖥️ Server -> ₹{costs['server_cost_inr']}\n"
-        f"💸 YOUR COST ₹{costs['total_cost_inr']}   💳 BILL ₹{costs['client_price_inr']}\n"
+        f"💸 YOUR COST ₹{costs['total_cost_inr']} (₹{costs['your_cost_per_min']}/min)\n"
+        f"💳 CUSTOMER BILL ₹{costs['client_price_inr']} (₹{costs['client_bill_per_min']}/min)\n"
         f"🤑 PROFIT ₹{costs['your_profit_inr']} [{'PROFIT ✅' if costs['is_profit'] else 'LOSS ⚠️'}]\n"
         + "=" * 64
     )
