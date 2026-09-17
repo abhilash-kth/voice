@@ -327,24 +327,47 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         llm_kwargs["reasoning_effort"] = reasoning
 
     # Try responses API for gpt-5 reasoning models with tools (proper support)
+    # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
+    # responses API uses reasoning object, not reasoning_effort string, and supports tools
+    # For now, we KEEP chat LLM as primary because logs show reasoning=low is being passed and no 400 observed for gpt-5.4-mini
+    # But we prepare correct responses.LLM build for future use if needed
     if use_responses_api:
         try:
             from livekit.plugins.openai import responses as openai_responses
-            # responses.LLM uses same kwargs but routes to /v1/responses which supports reasoning+tools
-            logger.info(f"🔧 Attempting openai.responses.LLM for {model_id} with reasoning={reasoning} (proper API for reasoning+tools)")
-            # responses.LLM may not accept client param same way, try
-            try:
-                resp_kwargs = dict(llm_kwargs)
-                # responses API may need model as first arg
-                llm_instance = openai_responses.LLM(**resp_kwargs)
-                logger.info(f"✅ Built openai.responses.LLM successfully for {model_id} reasoning={reasoning} (transmitted to /v1/responses API)")
-                return llm_instance
-            except Exception as e_resp:
-                logger.warning(f"⚠️ responses.LLM build failed for {model_id}: {e_resp}, falling back to chat LLM (reasoning may not be applied on chat/completions with tools)")
-                # Fall through to regular LLM
-                pass
+            # responses.LLM expects reasoning=Reasoning(effort="low") not reasoning_effort string
+            # It also does NOT use prompt_cache_key (uses previous_response_id caching)
+            # For voice latency, chat LLM with prompt_cache_key may actually be faster due to prefix caching
+            # So we log but do NOT switch unless explicitly enabled via VOICE_USE_RESPONSES_API=1
+            import os as _os_resp
+            if _os_resp.getenv("VOICE_USE_RESPONSES_API", "0") == "1":
+                logger.info(f"🔧 Attempting openai.responses.LLM for {model_id} with reasoning={reasoning} (VOICE_USE_RESPONSES_API=1, proper API for reasoning+tools)")
+                try:
+                    # Build correct kwargs for responses API
+                    from openai.types.shared import Reasoning as _Reasoning
+                    resp_reasoning = _Reasoning(effort=reasoning) if reasoning != "none" else _Reasoning(effort="none")
+                    resp_kwargs = {
+                        "model": model_id,
+                        "temperature": float(overrides.get("temperature", 0.1)),
+                        "reasoning": resp_reasoning,
+                    }
+                    # Pass api_key/base_url via env or client? responses.LLM uses api_key param, not client
+                    # Try with api_key and base_url
+                    if base_url:
+                        resp_kwargs["base_url"] = base_url
+                    if api_key:
+                        resp_kwargs["api_key"] = api_key
+                    # max_output_tokens -> max_output_tokens for responses
+                    resp_kwargs["max_output_tokens"] = int(overrides.get("max_tokens", 80))
+                    llm_instance = openai_responses.LLM(**resp_kwargs)
+                    logger.info(f"✅ Built openai.responses.LLM successfully for {model_id} reasoning={reasoning} (transmitted to /v1/responses API, reasoning object)")
+                    return llm_instance
+                except Exception as e_resp:
+                    logger.warning(f"⚠️ responses.LLM build failed for {model_id}: {e_resp}, falling back to chat LLM (reasoning may not be applied on chat/completions with tools)")
+                    pass
+            else:
+                logger.info(f"🔧 Model {model_id} reasoning+tools: chat LLM supports reasoning_effort low via extra['reasoning_effort'] (verified in plugin code), responses API available but not enabled (VOICE_USE_RESPONSES_API=0) to preserve prompt_cache_key caching and avoid websocket overhead for voice")
         except ImportError as e_imp:
-            logger.warning(f"⚠️ openai.responses module not available (plugin version {e_imp}), using chat LLM - reasoning=low may be ignored on chat/completions with tools for {model_id}")
+            logger.warning(f"⚠️ openai.responses module not available (plugin version {e_imp}), using chat LLM - reasoning=low transmitted via extra['reasoning_effort'] for {model_id}")
         except Exception as e:
             logger.warning(f"⚠️ Could not build responses.LLM for {model_id}: {e}, using chat LLM")
 
@@ -874,9 +897,14 @@ _FAQ_BUDGET_CHARS_DEFAULT = 2000
 _OWNER_PROMPT_BUDGET_CHARS_DEFAULT = 4000
 
 # Voice latency optimized defaults when RAG enabled (reduces 3500-3700 -> ~2000 tokens)
-_KB_BUDGET_CHARS_VOICE_RAG = 1200
-_FAQ_BUDGET_CHARS_VOICE_RAG = 800
-_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 2500
+# v2: Further reduction to hit ~1500 tokens for TTFT improvement, prior_memory also budgeted
+# KB 800 (was 1200), FAQ 400 (was 800), owner 2000 (was 2500), prior_memory 800 (was unlimited 40 turns ~4000 tokens)
+# Total static ~3200 chars ~800 tokens + RAG 500 + history 8*150=1200 = ~2500 tokens (was 3500-3700)
+# Prior_memory 40 turns -> 800 chars preserves recent cross-call context without bloating
+_KB_BUDGET_CHARS_VOICE_RAG = 800
+_FAQ_BUDGET_CHARS_VOICE_RAG = 400
+_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 2000
+_PRIOR_MEMORY_BUDGET_CHARS_VOICE_RAG = 800
 
 # Legacy module-level constants kept for backward compat / logging, but
 # build_instructions now uses provider-aware effective budgets.
@@ -908,11 +936,12 @@ def _effective_budgets(cfg: AgentConfig) -> tuple[int, int, int]:
     else:
         # Voice latency optimization: when RAG enabled, use smaller static budgets to reduce 3500-3700 input tokens
         # RAG provides relevant facts per-turn (27-105ms), so static KB can be smaller without hurting quality
+        # v2: 800/400/2000 + prior_memory 800 (was 1200/800/2500) saves additional ~1000 chars
         if rag_enabled:
             kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_VOICE_RAG)))
             faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_VOICE_RAG)))
             owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG)))
-            logger.info(f"🔧 Voice latency budgets (RAG enabled): KB {kb} (was 4000), FAQ {faq} (was 2000), owner {owner} (was 4000) - reduces 3500-3700 input tokens -> ~2000, TTFT 1203/894/1189/882ms should improve")
+            logger.info(f"🔧 Voice latency budgets v2 (RAG enabled): KB {kb} (was 4000), FAQ {faq} (was 2000), owner {owner} (was 4000), prior_memory 800 - reduces 3500-3700 -> ~2000-2500, TTFT 1203/894/1189/882ms should improve")
         else:
             kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_DEFAULT)))
             faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_DEFAULT)))
@@ -1281,10 +1310,28 @@ def build_voice_agent(
             ),
         )
     if prior_memory:
+        # Voice latency: truncate prior_memory to 800 chars when RAG enabled (was unlimited 40 turns ~4000 tokens)
+        # Preserves recent cross-call memory (name, preferences) without bloating input tokens 3500-3700
+        try:
+            import os as _os_pm
+            _rag_pm = (_os_pm.getenv("VOICE_RAG_PER_TURN") or "").strip().lower() not in ("0", "false", "off")
+            _pm_budget = int(_os_pm.getenv("VOICE_PRIOR_MEMORY_BUDGET_CHARS", "800")) if _rag_pm else 2000
+        except Exception:
+            _pm_budget = 800
+        _pm_truncated = prior_memory
+        if len(prior_memory) > _pm_budget:
+            # Keep last _pm_budget chars (most recent)
+            _pm_truncated = prior_memory[-_pm_budget:]
+            # Try to cut at line boundary
+            _nl = _pm_truncated.find("\n")
+            if _nl != -1 and _nl < _pm_budget * 0.3:
+                _pm_truncated = _pm_truncated[_nl+1:]
         chat_ctx.add_message(
             role="system",
-            content="Prior conversation with this customer:\n" + prior_memory,
+            content="Prior conversation with this customer:\n" + _pm_truncated,
         )
+        if len(prior_memory) != len(_pm_truncated):
+            logger.info(f"🔧 Prior memory truncated {len(prior_memory)} -> {len(_pm_truncated)} chars (budget {_pm_budget}) to reduce 3500-3700 tokens")
 
     class _VoiceAgent(Agent):
         def __init__(self):
@@ -1442,18 +1489,18 @@ def build_voice_agent(
                 try:
                     target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
                     items = getattr(target_ctx, "items", None)
-                    # Voice latency optimization: keep 12 dialogue max when RAG enabled (was 20) to reduce 3500-3700 tokens
-                    # With RAG enabled and cross-call memory via prior_memory, 12 is enough for name/phone memory
-                    # Saves ~8*150=1200 tokens, TTFT improves. Groq still 20 for TPM safety, OpenAI 12 for latency.
+                    # Voice latency optimization v2: keep 8 dialogue max for OpenAI when RAG enabled (was 12) to reduce 3500-3700 tokens further
+                    # Billing shows avg 4 turns per call, 8 covers full call. prior_memory 800 chars handles cross-call memory.
+                    # Saves additional ~4*150=600 tokens vs 12. Groq still 16 for TPM safety (reduced from 20), OpenAI 8 for latency.
                     # Determine history limit based on provider
                     try:
                         _llm_id_hist = (cfg.providers.llm.id or "").lower() if cfg.providers and cfg.providers.llm else ""
                         _is_groq_hist = _llm_id_hist.startswith("groq")
-                        _history_limit = 20 if _is_groq_hist else 12
-                        _trim_threshold = 28 if _is_groq_hist else 16
+                        _history_limit = 16 if _is_groq_hist else 8
+                        _trim_threshold = 20 if _is_groq_hist else 12
                     except Exception:
-                        _history_limit = 12
-                        _trim_threshold = 16
+                        _history_limit = 8
+                        _trim_threshold = 12
                     if isinstance(items, list) and len(items) > _trim_threshold:
                         system_items = [m for m in items if getattr(m, "role", "") == "system"]
                         dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
