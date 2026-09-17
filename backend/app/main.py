@@ -32,7 +32,8 @@ from .models import (
 )
 from . import auth
 from . import repo
-from .catalog import catalog_summary, get_provider
+from .catalog import catalog_summary, get_provider, validate_llm_provider_model, get_llm_model, LLM_PROVIDERS, LLM_MODELS
+from .llm_catalog import validate_provider_model as validate_llm_v2, get_llm_model as get_llm_model_v2
 from . import telephony
 from . import billing as billing_mod
 from . import campaign as campaign_store
@@ -138,15 +139,65 @@ async def me(user=Depends(auth.get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Provider catalog (for the config UI)
+# Provider catalog (for the config UI) - V2 Provider → Multiple Models
 # ---------------------------------------------------------------------------
 @app.get("/api/catalog")
 async def get_catalog():
+    cat = catalog_summary()
+    # New V2 structure: providers with models
+    from .llm_catalog import catalog_summary_v2
+    llm_v2 = catalog_summary_v2()
     return {
-        "catalog": catalog_summary(),
+        "catalog": cat,
+        "llm_catalog": llm_v2,  # New: provider → multiple models
+        "llm_providers": llm_v2["providers"],
+        "llm_models": llm_v2["models"],
+        "llm_by_provider": llm_v2["by_provider"],
         "walletTopupAmounts": WALLET_TOPUP_AMOUNT,
         "server_cost_per_min": SERVER_COST_PER_MIN,
     }
+
+@app.get("/api/llm/providers")
+async def list_llm_providers():
+    from .llm_catalog import LLM_PROVIDERS, LLM_MODELS
+    return {
+        "providers": list(LLM_PROVIDERS.values()),
+        "by_provider": {pid: [m for m in LLM_MODELS if m["provider"] == pid] for pid in LLM_PROVIDERS},
+    }
+
+@app.get("/api/llm/providers/{provider_id}/models")
+async def list_models_for_provider(provider_id: str):
+    from .llm_catalog import list_models_for_provider, get_llm_provider
+    prov = get_llm_provider(provider_id)
+    if not prov:
+        raise HTTPException(404, f"Unknown LLM provider '{provider_id}'")
+    models = list_models_for_provider(provider_id)
+    return {"provider": prov, "models": models}
+
+@app.get("/api/llm/models/{provider}/{model_id}")
+async def get_model_details(provider: str, model_id: str):
+    from .llm_catalog import get_llm_model, validate_provider_model
+    is_valid, msg = validate_provider_model(provider, model_id)
+    if not is_valid:
+        raise HTTPException(400, msg)
+    model = get_llm_model(provider, model_id)
+    if not model:
+        raise HTTPException(404, f"Model {model_id} not found for provider {provider}")
+    return {"model": model}
+
+@app.post("/api/llm/validate")
+async def validate_llm_selection(body: dict):
+    """Validate provider/model combination, return clear error if invalid, no silent substitution."""
+    provider = body.get("provider", "")
+    model_id = body.get("model_id", body.get("model", ""))
+    if not provider or not model_id:
+        raise HTTPException(400, "Both provider and model_id required")
+    from .llm_catalog import validate_provider_model, get_llm_model
+    is_valid, msg = validate_provider_model(provider, model_id)
+    if not is_valid:
+        raise HTTPException(400, msg)
+    model = get_llm_model(provider, model_id)
+    return {"valid": True, "provider": provider, "model": model, "message": msg}
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +226,45 @@ async def get_agent(agent_id: str, user=Depends(auth.get_current_user)):
 
 @app.post("/api/agents", status_code=201)
 async def create_agent(body: AgentCreate, user=Depends(auth.get_current_user)):
-    for kind, sel in (("llm", body.providers.llm), ("stt", body.providers.stt),
+    # Validate LLM with new V2 catalog - no silent substitution, clear error
+    try:
+        if body.providers.llm_v2:
+            prov = body.providers.llm_v2.provider
+            model = body.providers.llm_v2.model_id
+            is_valid, msg = validate_llm_v2(prov, model)
+            if not is_valid:
+                raise HTTPException(400, f"Primary LLM invalid: {msg}")
+        else:
+            # Old style: resolve provider/model and validate
+            prov, model_id, _ = body.providers.llm.resolve_llm_provider_model()
+            if prov and model_id:
+                is_valid, msg = validate_llm_v2(prov, model_id)
+                if not is_valid:
+                    raise HTTPException(400, f"Primary LLM invalid: {msg}. Selected id={body.providers.llm.id} config={body.providers.llm.config}. Do NOT silently replace.")
+            else:
+                # Fallback to old get_provider check for backward compat
+                if not get_provider("llm", body.providers.llm.id):
+                    raise HTTPException(400, f"Unknown LLM provider {body.providers.llm.id}")
+        
+        if body.providers.llm_fallback_v2:
+            prov = body.providers.llm_fallback_v2.provider
+            model = body.providers.llm_fallback_v2.model_id
+            is_valid, msg = validate_llm_v2(prov, model)
+            if not is_valid:
+                raise HTTPException(400, f"Fallback LLM invalid: {msg}")
+        elif body.providers.llm_fallback:
+            prov, model_id, _ = body.providers.llm_fallback.resolve_llm_provider_model()
+            if prov and model_id:
+                is_valid, msg = validate_llm_v2(prov, model_id)
+                if not is_valid:
+                    raise HTTPException(400, f"Fallback LLM invalid: {msg}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"LLM validation error: {e}")
+    
+    for kind, sel in (("stt", body.providers.stt),
                       ("tts", body.providers.tts), ("telephony", body.providers.telephony)):
         if sel and not get_provider(kind, sel.id):
             raise HTTPException(400, f"Unknown provider {sel.id} for {kind}")

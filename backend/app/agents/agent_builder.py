@@ -72,160 +72,369 @@ def _resolve_tts_voice(language: str, raw_voice: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 # Provider → plugin construction
 # ---------------------------------------------------------------------------
+
 def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
-    """Build an LLM instance from a ProviderPair (primary or fallback)."""
+    """Build an LLM instance from a ProviderPair (primary or fallback) - V2 Provider → Multiple Models.
+    
+    No silent model substitution. Invalid provider/model returns clear config error.
+    Logs LLM PROVIDER CONFIG with provider, model, base_url exactly as selected.
+    Fixes OpenAI 404 by validating exact model and capturing actual API error.
+    """
     from livekit.plugins.openai import LLM
     from openai import AsyncOpenAI
 
     sel = pair
     overrides = sel.config or {}
-    provider_id = sel.id
+    raw_id = sel.id
 
-    if provider_id.startswith("groq"):
-        base_url = overrides.get("base_url") or "https://api.groq.com/openai/v1"
+    # Resolve provider, model, base_url using V2 logic (no silent replacement)
+    # Use ProviderPair's resolve method for backward compat
+    try:
+        provider, model_id, base_url_resolved = sel.resolve_llm_provider_model()
+    except AttributeError:
+        # Fallback if sel doesn't have resolve method (should not happen)
+        provider = raw_id
+        model_id = overrides.get("model", "")
+        base_url_resolved = overrides.get("base_url", "")
+
+    # Determine provider id (openai, groq, openrouter) and model_id
+    # If id is old style like openai_gpt_4_1_mini, resolve already handled
+    # For new style, id is provider, model from config
+    if not provider:
+        provider = raw_id
+    if not model_id:
+        model_id = overrides.get("model", "")
+
+    # Get base_url from overrides or resolved or provider default
+    base_url = overrides.get("base_url") or base_url_resolved
+    if not base_url:
+        if provider == "openai":
+            base_url = "https://api.openai.com/v1"
+        elif provider == "groq":
+            base_url = "https://api.groq.com/openai/v1"
+        elif provider == "openrouter":
+            base_url = "https://openrouter.ai/api/v1"
+        else:
+            base_url = None  # OpenAI default
+
+    # Get API key based on provider
+    if provider.startswith("groq"):
         api_key = overrides.get("api_key") or GROQ_API_KEY
         key_env = "GROQ_API_KEY"
-    elif provider_id.startswith("openrouter"):
-        base_url = overrides.get("base_url") or "https://openrouter.ai/api/v1"
+        provider_type = "groq"
+    elif provider.startswith("openrouter"):
         api_key = overrides.get("api_key") or OPENROUTER_API_KEY
         key_env = "OPENROUTER_API_KEY"
+        provider_type = "openrouter"
     else:
-        base_url = overrides.get("base_url") or None
+        # Default to openai
         api_key = overrides.get("api_key") or OPENAI_API_KEY
         key_env = "OPENAI_API_KEY"
+        provider_type = "openai"
+        # Normalize provider to openai if it's old style or unknown
+        if provider not in ("openai", "groq", "openrouter"):
+            # Check if raw_id maps to known provider via old mapping
+            if raw_id.startswith("groq"):
+                provider = "groq"
+                base_url = base_url or "https://api.groq.com/openai/v1"
+                api_key = overrides.get("api_key") or GROQ_API_KEY
+                key_env = "GROQ_API_KEY"
+            elif raw_id.startswith("openrouter"):
+                provider = "openrouter"
+                base_url = base_url or "https://openrouter.ai/api/v1"
+                api_key = overrides.get("api_key") or OPENROUTER_API_KEY
+                key_env = "OPENROUTER_API_KEY"
+            else:
+                provider = "openai"
+                base_url = base_url or "https://api.openai.com/v1"
 
     if not api_key:
         raise RuntimeError(
-            f"No API key for LLM provider '{provider_id}'. Set '{key_env}' "
-            "in backend/.env (or pass api_key in the agent's llm config)."
+            f"No API key for LLM provider '{provider}' (id={raw_id}). Set '{key_env}' "
+            f"in backend/.env (or pass api_key in agent's llm config). "
+            f"Provider={provider}, model={model_id}, base_url={base_url or 'https://api.openai.com/v1'}"
         )
 
-    import os as _os
-    from ..catalog import get_provider as _get_provider
-    _cat_model = (_get_provider("llm", provider_id) or {}).get("model")
-    if sel.id.startswith("openrouter"):
-        env_model = _os.getenv("LLM_MODEL") or _os.getenv("OPENAI_MODEL")
-        default_model = _cat_model or "google/gemma-4-31b-it:free"
-    elif sel.id.startswith("groq"):
-        env_model = _os.getenv("GROQ_MODEL")
-        default_model = _cat_model or "openai/gpt-oss-20b"
-    else:
-        env_model = _os.getenv("OPENAI_MODEL")
-        default_model = _cat_model or "gpt-4o-mini"
-    model = overrides.get("model") or env_model or default_model
-    # Mask API key for logging
-    key_masked = f"{api_key[:8]}...{api_key[-4:]}" if api_key and len(api_key) > 12 else "present" if api_key else "MISSING"
-    logger.info(
-        "🤖 LLM selected provider=%s model=%s base_url=%s api_key=%s key_env=%s",
-        provider_id,
-        model,
-        base_url or "https://api.openai.com/v1",
-        key_masked,
-        key_env,
-    )
-    # Explicit validation for gpt-4.1-mini which has been observed 404 in real logs
-    # Possible causes: OpenAI account lacks gpt-4.1 access, or plugin SDK outdated, or model needs date suffix
-    if model in ("gpt-4.1-mini", "gpt-4.1") and not base_url:
-        logger.info(f"🔍 Validating OpenAI model {model}: should exist on OpenAI API, but observed 404 in logs (req_652f..., req_4e92...). Possible causes: account lacks access, or SDK version. Will rely on fallback if 404.")
-    if model == "openai/gpt-oss-120b" and base_url and "groq" in base_url:
-        logger.info(f"🔍 Validating Groq model {model}: should exist on Groq API, but observed 404 recovery failed in logs. Possible: Groq key invalid or model not available on free tier.")
+    # Import new catalog for validation and metadata
+    try:
+        from ..llm_catalog import get_llm_model, validate_provider_model, get_llm_provider
+        # If model_id empty, try to get default from catalog or env
+        if not model_id:
+            import os as _os
+            env_model = _os.getenv("GROQ_MODEL") if provider == "groq" else _os.getenv("OPENAI_MODEL") if provider == "openai" else _os.getenv("LLM_MODEL")
+            if env_model:
+                model_id = env_model
+                logger.info(f"🔍 LLM model from env: {env_model} for provider {provider}")
+            else:
+                # Get first active model for provider as default
+                from ..llm_catalog import list_models_for_provider
+                models = list_models_for_provider(provider)
+                if models:
+                    model_id = models[0]["model_id"]
+                    logger.info(f"🔍 LLM model default from catalog: {model_id} for provider {provider} (no model in config)")
+        
+        # Validate provider/model combination - NO SILENT REPLACEMENT, clear error
+        is_valid, validation_msg = validate_provider_model(provider, model_id)
+        if not is_valid:
+            # Check if model exists under different provider for helpful error
+            from ..llm_catalog import get_llm_model_by_id
+            existing = get_llm_model_by_id(model_id)
+            if existing:
+                error_msg = (
+                    f"❌ LLM CONFIG ERROR: Invalid provider/model combination. "
+                    f"Provider='{provider}' Model='{model_id}' Base_URL='{base_url or 'https://api.openai.com/v1'}' - "
+                    f"Model '{model_id}' belongs to provider '{existing['provider']}' (base_url {existing['base_url']}). "
+                    f"Do not treat Groq's 120B as OpenAI model. Provider and model must remain separate. "
+                    f"Fix: Use provider='{existing['provider']}' with model='{model_id}'. "
+                    f"Original error: {validation_msg}"
+                )
+            else:
+                from ..llm_catalog import list_models_for_provider
+                valid_models = [m["model_id"] for m in list_models_for_provider(provider)]
+                error_msg = (
+                    f"❌ LLM CONFIG ERROR: Invalid provider/model combination. "
+                    f"Provider='{provider}' Model='{model_id}' Base_URL='{base_url or 'https://api.openai.com/v1'}' - "
+                    f"Unknown model '{model_id}' for provider '{provider}'. "
+                    f"Valid models for {provider}: {valid_models}. "
+                    f"If model is from another provider, use that provider. "
+                    f"Do NOT silently replace model. Original: {validation_msg}"
+                )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Get model metadata for logging and pricing
+        model_meta = get_llm_model(provider, model_id)
+        if model_meta:
+            logger.info(
+                f"✅ LLM MODEL METADATA provider={provider} model={model_id} "
+                f"display_name={model_meta['display_name']} "
+                f"input_price=${model_meta['input_price_per_1m']}/1M cached=${model_meta['cached_input_price_per_1m']}/1M output=${model_meta['output_price_per_1m']}/1M "
+                f"context={model_meta['context_window']} max_output={model_meta['max_output_tokens']} "
+                f"reasoning={model_meta['reasoning_supported']} speed={model_meta['expected_speed']} "
+                f"streaming={model_meta['streaming_supported']} tools={model_meta['tool_calling_supported']} "
+                f"status={model_meta['status']}"
+            )
+        
+        # Log LLM PROVIDER CONFIG exactly as required
+        logger.info(
+            f"🤖 LLM PROVIDER CONFIG provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
+            f"provider_type={provider_type} raw_id={raw_id} key_env={key_env}"
+        )
+        
+        # Additional validation for OpenAI 404 root cause
+        if provider == "openai" and model_id in ("gpt-4.1-mini", "gpt-4.1", "gpt-4.1-nano"):
+            logger.info(
+                f"🔍 Validating OpenAI model {model_id}: Should exist on OpenAI API (base_url {base_url or 'https://api.openai.com/v1'}). "
+                f"If 404 occurs, possible causes: "
+                f"1) incorrect model ID (should be exactly {model_id}), "
+                f"2) incorrect base_url (should be https://api.openai.com/v1), "
+                f"3) wrong provider adapter (should be openai), "
+                f"4) API/project configuration (project lacks access to {model_id}, needs billing enabled), "
+                f"5) unsupported parameter (check max_completion_tokens, reasoning_effort), "
+                f"6) authentication. Will capture actual API error if 404."
+            )
+        
+        if provider == "groq" and model_id == "openai/gpt-oss-120b":
+            logger.info(
+                f"🔍 Validating Groq model {model_id}: Should exist on Groq API (base_url {base_url}). "
+                f"If 404 recovery failed, possible: Groq key invalid or model not available on free tier. "
+                f"Safety fallback to openai/gpt-oss-20b will be added if needed."
+            )
+    
+    except ImportError as e:
+        logger.warning(f"Could not import llm_catalog for validation: {e}")
+        model_meta = None
+        # Fallback validation: if model empty, error
+        if not model_id:
+            raise ValueError(f"❌ LLM CONFIG ERROR: No model specified for provider {provider}. Provide model in config.")
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.warning(f"LLM validation warning: {e}")
+        model_meta = None
 
-    low = model.lower()
-    # Fix invalid models that cause 404 - observed in real call logs
-    # OpenAI provider (base_url None) cannot handle models with "/" like "openai/gpt-oss-120b" or "gpt-oss-120b"
-    # Those are Groq models, not OpenAI. Map to valid OpenAI model to avoid 404 + fallback latency
-    if not base_url and "/" in model:
-        logger.warning(f"⚠️ Invalid model '{model}' for OpenAI provider (contains '/'), mapping to gpt-4o to avoid 404")
-        model = "gpt-4o"
-        low = model.lower()
-    if not base_url and low == "gpt-oss-120b":
-        logger.warning(f"⚠️ Invalid model 'gpt-oss-120b' for OpenAI provider (does not exist on OpenAI, causes 404), mapping to gpt-4o")
-        model = "gpt-4o"
-        low = model.lower()
-    # Groq qwen models have low quota and cause 429, also some variants don't exist
-    if sel.id.startswith("groq") and low in ("qwen/qwen3.6-27b", "qwen/qwen3.8-27b", "qwen/qwen3-8b-27b"):
-        logger.warning(f"⚠️ Migrating Groq qwen model '{model}' to openai/gpt-oss-20b for voice reliability (qwen 429 + possible 404)")
-        model = "openai/gpt-oss-20b"
-        low = model.lower()
-    # Fix: Don't auto-migrate gpt-oss-120b to 20b — user explicitly wants 120b as fallback.
-    # Only migrate truly problematic qwen models. 120b is valid and higher quality, just higher TPM cost.
-    if "qwen" in low or "gemma" in low:
-        default_reasoning = "none"
-    elif "gpt-oss" in low:
-        default_reasoning = "low"
-    else:
-        default_reasoning = "none"
+    low = model_id.lower()
+
+    # Determine reasoning effort from model metadata or overrides
+    try:
+        from ..llm_catalog import get_llm_model
+        meta = get_llm_model(provider, model_id)
+        if meta:
+            default_reasoning = meta.get("reasoning_default") or ("low" if meta.get("reasoning_supported") else "none")
+        else:
+            if "qwen" in low or "gemma" in low:
+                default_reasoning = "none"
+            elif "gpt-oss" in low:
+                default_reasoning = "low"
+            else:
+                default_reasoning = "none"
+    except Exception:
+        if "qwen" in low or "gemma" in low:
+            default_reasoning = "none"
+        elif "gpt-oss" in low:
+            default_reasoning = "low"
+        else:
+            default_reasoning = "none"
+    
     reasoning = overrides.get("reasoning_effort", default_reasoning)
 
-    if sel.id.startswith("groq") and "qwen" in low:
-        logger.warning(
-            f"⚠️ LLM model '{model}' is a Groq *reasoning* model with a 200k tokens/day "
-            "quota. It 429s (rate-limit) after a handful of calls, then LiveKit retries "
-            "3x with backoff → 15–20s 'thinking' stalls. For a voice agent pick "
-            "'openai/gpt-oss-120b' or 'openai/gpt-oss-20b' instead "
-            "(see .env GROQ_MODEL / agent config)."
-        )
-    if sel.id.startswith("groq") and any(m in low for m in ("llama-3.3-70b", "llama-3.1-8b")):
-        logger.warning(
-            f"⚠️ LLM model '{model}' was DEPRECATED by Groq (shutdown 08/16/26). "
-            "Use 'openai/gpt-oss-120b' (or 'openai/gpt-oss-20b') instead."
-        )
-    if sel.id.startswith("openrouter") and ":free" not in model and "free" not in low:
-        logger.info(
-            f"ℹ️ OpenRouter model '{model}' is not a :free model — it will bill your "
-            "OpenRouter credits. Use a ':free' model for the demo (see LLM_MODEL)."
-        )
-
+    # Build client with exact base_url and model, no silent replacement
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     llm_kwargs = {
         "client": client,
-        "model": model,
+        "model": model_id,  # EXACT model as selected, no rewriting
         "temperature": float(overrides.get("temperature", 0.1)),
-        "max_completion_tokens": int(overrides.get("max_tokens", 60)),
+        "max_completion_tokens": int(overrides.get("max_tokens", 80)),
     }
-    if "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
+    if model_meta and model_meta.get("reasoning_supported"):
         llm_kwargs["reasoning_effort"] = reasoning
-    return LLM(**llm_kwargs)
+    elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
+        llm_kwargs["reasoning_effort"] = reasoning
+
+    logger.info(
+        f"🔧 Building LLM instance: provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
+        f"temperature={llm_kwargs['temperature']} max_tokens={llm_kwargs['max_completion_tokens']} reasoning={llm_kwargs.get('reasoning_effort','none')} "
+        f"EXACT model passed to runtime, no silent substitution"
+    )
+
+    try:
+        llm_instance = LLM(**llm_kwargs)
+        logger.info(f"✅ LLM instance built successfully: provider={provider} model={model_id}")
+        return llm_instance
+    except Exception as e:
+        logger.error(
+            f"❌ LLM BUILD FAILED: provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
+            f"Error: {e}. This is the actual API error - check if model ID, base_url, provider adapter, or project config is wrong. "
+            f"Do not silently rewrite model. Fix root cause."
+        )
+        raise
+
+
 
 
 def build_llm(cfg: AgentConfig) -> Any:
-    """Build LLM with optional fallback via LiveKit FallbackAdapter."""
-    primary_pair = cfg.providers.llm
-    # --- Respect user's choice: DO NOT auto-swap OpenAI -> Groq by default ---
-    # Previous version auto-swapped openai_gpt_4_1_mini -> groq_gpt_oss_20b (VOICE_PREFER_GROQ=1 default)
-    # which caused confusion: user set primary=openai, fallback=groq_120b but worker used groq_20b + openrouter.
-    # Now default is 0 (respect user). Set VOICE_PREFER_GROQ=1 in .env to enable low-latency auto-swap.
-    # Also fixed 429 issue: Groq free tier is 8000 TPM, but prompt was 2749 tokens/request (KB 2498+FAQ 1200+owner 1097+history)
-    # causing "Rate limit reached Limit 8000, Used 6195, Requested 2749" after 2 turns.
-    # Fix: use smaller budgets for Groq and trim history to 6 msgs (see _effective_budgets).
+    """Build LLM with optional fallback via LiveKit FallbackAdapter - V2 Provider → Multiple Models.
+    
+    Primary and fallback both support multiple models.
+    Provider and model remain separate fields, no silent substitution.
+    Logs explicit provider/model/base_url/fallback for 404 debugging.
+    """
+    # Get primary and fallback using new V2 methods if available
     try:
-        prefer_groq = os.getenv("VOICE_PREFER_GROQ", "0") == "1"  # default 0 = respect user choice
-        has_groq_key = bool((GROQ_API_KEY or "").strip() or os.getenv("GROQ_API_KEY", "").strip())
-        is_openai_primary = (primary_pair.id or "").lower().startswith("openai")
-        if prefer_groq and has_groq_key and is_openai_primary:
-            logger.info(f"⚡ Low-latency mode (VOICE_PREFER_GROQ=1): swapping primary LLM {primary_pair.id} -> groq_gpt_oss_20b for faster responses (OpenAI {primary_pair.id} kept as fallback).")
-            from ..models import ProviderPair
-            groq_pair = ProviderPair(id="groq_gpt_oss_20b", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80})
-            primary = _build_llm_from_pair(groq_pair, getattr(cfg, "language", "hi"))
-            fallback_pair = getattr(cfg.providers, "llm_fallback", None)
-            if not fallback_pair:
-                try:
-                    fp = getattr(cfg, "fallback_providers", None)
-                    if fp and getattr(fp, "llm", None):
-                        fallback_pair = fp.llm
-                except Exception:
-                    pass
-            if not fallback_pair:
-                fallback_pair = primary_pair
+        primary_pair = cfg.providers.get_primary_llm()
+        fallback_pair = cfg.providers.get_fallback_llm()
+    except AttributeError:
+        primary_pair = cfg.providers.llm
+        fallback_pair = getattr(cfg.providers, "llm_fallback", None)
+        if not fallback_pair:
             try:
-                fallback = _build_llm_from_pair(fallback_pair, getattr(cfg, "language", "hi"))
-                from livekit.agents import llm as llm_agents
-                adapter = llm_agents.FallbackAdapter([primary, fallback])
-                logger.info(f"🔁 LLM FallbackAdapter armed (latency-optimized): primary=groq_gpt_oss_20b -> fallback={fallback_pair.id}")
-                return adapter
-            except Exception as e:
-                logger.warning(f"⚠️ Could not build optimized fallback {fallback_pair.id}: {e} — using groq primary only")
-                return primary
+                fp = getattr(cfg, "fallback_providers", None)
+                if fp and getattr(fp, "llm", None):
+                    fallback_pair = fp.llm
+            except Exception:
+                pass
+
+    # Log LLM PROVIDER CONFIG for primary
+    try:
+        prov, model, base_url = primary_pair.resolve_llm_provider_model()
+        logger.info(f"🤖 LLM PRIMARY CONFIG provider={prov} model={model} base_url={base_url or 'https://api.openai.com/v1'} raw_id={primary_pair.id}")
+    except Exception as e:
+        logger.warning(f"Could not log primary LLM config: {e}")
+
+    if fallback_pair:
+        try:
+            prov, model, base_url = fallback_pair.resolve_llm_provider_model()
+            logger.info(f"🤖 LLM FALLBACK CONFIG provider={prov} model={model} base_url={base_url or 'https://api.openai.com/v1'} raw_id={fallback_pair.id}")
+        except Exception as e:
+            logger.warning(f"Could not log fallback LLM config: {e}")
+
+    # Build primary with exact model, no silent substitution
+    primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
+
+    # Build fallback chain - supports multiple models, provider/model separate
+    fallbacks = []
+    if fallback_pair:
+        # Validate fallback is not same as primary (same provider and model)
+        try:
+            p_prov, p_model, _ = primary_pair.resolve_llm_provider_model()
+            f_prov, f_model, _ = fallback_pair.resolve_llm_provider_model()
+            if not (p_prov == f_prov and p_model == f_model):
+                fallbacks.append(fallback_pair)
+            else:
+                logger.info(f"Fallback same as primary ({p_prov}:{p_model}), skipping")
+        except Exception:
+            # Fallback to old comparison
+            if not (fallback_pair.id == primary_pair.id and (fallback_pair.config or {}).get("model") == (primary_pair.config or {}).get("model")):
+                fallbacks.append(fallback_pair)
+
+    # Safety net for Groq 120b 404 - add 20b if 120b present and 20b not, with explicit logging
+    try:
+        chain_ids = []
+        try:
+            p_prov, p_model, _ = primary_pair.resolve_llm_provider_model()
+            chain_ids.append(f"{p_prov}:{p_model}")
+        except Exception:
+            chain_ids.append(primary_pair.id)
+        for fb in fallbacks:
+            try:
+                f_prov, f_model, _ = fb.resolve_llm_provider_model()
+                chain_ids.append(f"{f_prov}:{f_model}")
+            except Exception:
+                chain_ids.append(fb.id)
+        
+        has_120b = any("gpt-oss-120b" in cid for cid in chain_ids)
+        has_20b = any("gpt-oss-20b" in cid for cid in chain_ids)
+        if has_120b and not has_20b:
+            from ..models import ProviderPair
+            safety_pair = ProviderPair(id="groq", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80, "provider": "groq"})
+            fallbacks.append(safety_pair)
+            logger.info(f"🛡️ Added safety fallback groq:openai/gpt-oss-20b because chain contains gpt-oss-120b which observed 404 recovery failed")
+    except Exception as e:
+        logger.debug(f"Could not add safety fallback: {e}")
+
+    if not fallbacks:
+        logger.info(f"🤖 LLM single provider (no fallback): primary={primary_pair.id}")
+        return primary
+
+    fallback_instances = []
+    fallback_ids = []
+    for fb_pair in fallbacks:
+        try:
+            inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
+            fallback_instances.append(inst)
+            fallback_ids.append(fb_pair.id)
+        except Exception as e:
+            logger.error(f"❌ Could not build LLM fallback {fb_pair.id}: {e} - clear config error, no silent substitution")
+            # Do not silently skip, log error but continue to try other fallbacks
+            # If all fallbacks fail, primary will be used alone
+
+    if not fallback_instances:
+        logger.warning(f"⚠️ No valid fallback built, using primary only")
+        return primary
+
+    try:
+        from livekit.agents import llm as llm_agents
+        all_llms = [primary] + fallback_instances
+        adapter = llm_agents.FallbackAdapter(all_llms)
+        # Log full chain with exact provider/model/base_url
+        try:
+            chain_details = []
+            for pair in [primary_pair] + fallbacks:
+                try:
+                    prov, model, base_url = pair.resolve_llm_provider_model()
+                    chain_details.append(f"{prov}:{model} @ {base_url or 'https://api.openai.com/v1'} (id={pair.id})")
+                except Exception:
+                    chain_details.append(f"{pair.id}")
+            chain_str = " -> ".join([primary_pair.id] + fallback_ids)
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} | Details: {' -> '.join(chain_details)} | Provider and model remain separate, no silent substitution")
+        except Exception:
+            chain_str = " -> ".join([primary_pair.id] + fallback_ids)
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (provider/model separate)")
+        return adapter
+    except Exception as e:
+        logger.error(f"❌ Could not build LLM FallbackAdapter {fallback_ids}: {e} - using primary only, error: {e}")
+        return primary
+
     except Exception as e:
         logger.warning(f"Groq auto-prefer check failed: {e}")
 

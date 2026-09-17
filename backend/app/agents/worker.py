@@ -410,6 +410,121 @@ def _create_tts_timing_wrapper(tts_instance, timing_dict):
     return TTSTimingWrapper(tts_instance, timing_dict)
 
 
+
+def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
+    import time as _time
+    import logging as _logging
+    _logger = _logging.getLogger("voice-agent-saas-worker")
+    provider = timing_dict.get("llm_provider", "") or (provider_info.get("provider", "") if provider_info else "")
+    model_id = timing_dict.get("llm_model", "") or (provider_info.get("model_id", "") if provider_info else "")
+    try:
+        is_fallback = hasattr(llm_instance, '_llm_instances') or hasattr(llm_instance, 'llm_instances') or 'FallbackAdapter' in str(type(llm_instance))
+        if is_fallback:
+            inner_list = getattr(llm_instance, '_llm_instances', None) or getattr(llm_instance, 'llm_instances', None) or getattr(llm_instance, '_instances', None)
+            if inner_list:
+                _logger.info(f"LLM timing wrapper: FallbackAdapter with {len(inner_list)} providers - TTFT tracking enabled")
+                for idx, inner_llm in enumerate(inner_list):
+                    inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info)
+                return llm_instance
+    except Exception as e:
+        _logger.debug(f"Could not wrap FallbackAdapter inner LLMs: {e}")
+    original_chat = getattr(llm_instance, 'chat', None)
+    if not original_chat:
+        return llm_instance
+    class LLMTimingWrapper:
+        def __init__(self, inner, timing, prov_info):
+            self._inner = inner
+            self._timing = timing
+            self._prov_info = prov_info or {}
+            try:
+                self._model = getattr(inner, '_model', None) or getattr(inner, 'model', None) or prov_info.get('model_id', '') if prov_info else ''
+            except Exception:
+                self._model = prov_info.get('model_id', '') if prov_info else ''
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+        async def chat(self, *args, **kwargs):
+            request_start = _time.time()
+            self._timing["request_start"] = request_start
+            self._timing["llm_start"] = request_start
+            prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', '') or 'unknown'
+            model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', '') or getattr(self._inner, 'model', 'unknown') or 'unknown'
+            base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
+            _logger.info(f"LLM REQUEST START provider={prov} model={model} base_url={base_url} request_start={request_start}")
+            try:
+                stream = await self._inner.chat(*args, **kwargs)
+                timing = self._timing
+                prov_info = self._prov_info
+                class StreamWrapper:
+                    def __init__(self, inner_stream, timing, prov_info, req_start):
+                        self._inner_stream = inner_stream
+                        self._timing = timing
+                        self._prov_info = prov_info
+                        self._req_start = req_start
+                        self._first_token = True
+                        self._input_tokens = 0
+                        self._output_tokens = 0
+                        self._cached_tokens = 0
+                    def __getattr__(self, name):
+                        return getattr(self._inner_stream, name)
+                    async def __aiter__(self):
+                        async for chunk in self._inner_stream:
+                            now = _time.time()
+                            if self._first_token:
+                                self._first_token = False
+                                first_token = now
+                                self._timing["first_token"] = first_token
+                                ttft = (first_token - self._req_start) * 1000
+                                self._timing["ttft_ms"] = ttft
+                                prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
+                                model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
+                                _logger.info(f"LLM TTFT provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                                if self._timing.get("llm_start", 0) > 0:
+                                    _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
+                                if self._timing.get("speech_end", 0) > 0:
+                                    _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
+                            try:
+                                usage = getattr(chunk, 'usage', None)
+                                if usage:
+                                    self._input_tokens = getattr(usage, 'prompt_tokens', 0) or getattr(usage, 'input_tokens', 0) or self._input_tokens
+                                    self._output_tokens = getattr(usage, 'completion_tokens', 0) or getattr(usage, 'output_tokens', 0) or self._output_tokens
+                                    prompt_details = getattr(usage, 'prompt_tokens_details', None)
+                                    if prompt_details:
+                                        self._cached_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
+                            except Exception:
+                                pass
+                            yield chunk
+                        gen_complete = _time.time()
+                        self._timing["generation_complete"] = gen_complete
+                        self._timing["llm_complete"] = gen_complete
+                        gen_time = (gen_complete - self._req_start) * 1000
+                        self._timing["generation_time_ms"] = gen_time
+                        self._timing["input_tokens"] = self._input_tokens
+                        self._timing["output_tokens"] = self._output_tokens
+                        self._timing["cached_input_tokens"] = self._cached_tokens
+                        prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
+                        model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
+                        _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens}")
+                        try:
+                            from app.llm_catalog import get_llm_model, calculate_llm_cost
+                            model_meta = get_llm_model(prov, model) if prov and model else None
+                            if model_meta:
+                                costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
+                                _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${costs['total_llm_cost']:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms")
+                        except Exception as e:
+                            _logger.debug(f"Could not calculate LLM cost: {e}")
+                return StreamWrapper(stream, timing, prov_info, request_start)
+            except Exception as e:
+                error_time = _time.time()
+                prov = self._prov_info.get('provider', '') or 'unknown'
+                model = self._prov_info.get('model_id', '') or 'unknown'
+                base_url = self._prov_info.get('base_url', '') or 'unknown'
+                _logger.error(f"LLM API ERROR provider={prov} model={model} base_url={base_url} Error={e} Type={type(e).__name__} After {(error_time-request_start)*1000:.0f}ms")
+                import traceback
+                _logger.error(f"Full traceback: {traceback.format_exc()}")
+                raise
+    return LLMTimingWrapper(llm_instance, timing_dict, provider_info)
+
+
 def _create_llm_failure_logging_wrapper(llm_instance, cfg):
     """Wrap LLM to log failures with provider/model/base_url for 404 debugging.
     
@@ -460,7 +575,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             asyncio.to_thread(build_tts, cfg),
         )
         logger.info(f"⏱️ provider build async parallel {time.time()-build_t0:.2f}s")
-        # Log LLM provider details for 404 debugging and wrap with failure logging
+        # Log LLM provider details for 404 debugging and wrap with timing + failure logging
         try:
             llm_type = str(type(llm_inst))
             if "FallbackAdapter" in llm_type:
@@ -470,7 +585,22 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
                     logger.info(f"🤖 LLM fallback chain length: {len(inner)}")
             else:
                 logger.info(f"🤖 LLM single provider built: {llm_type}")
-            llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
+            
+            # Set provider/model in timing_dict for cost tracking and wrap with timing
+            if turn_timing_ref is not None:
+                try:
+                    primary = cfg.providers.get_primary_llm() if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm
+                    prov, model, base_url = primary.resolve_llm_provider_model()
+                    turn_timing_ref["llm_provider"] = prov
+                    turn_timing_ref["llm_model"] = model
+                    provider_info = {"provider": prov, "model_id": model, "base_url": base_url or "https://api.openai.com/v1"}
+                    llm_inst = _create_llm_timing_wrapper(llm_inst, turn_timing_ref, provider_info)
+                    logger.info(f"🔧 LLM timing wrapper applied: provider={prov} model={model} base_url={base_url} (TTFT + cost tracking)")
+                except Exception as e:
+                    logger.warning(f"Could not apply LLM timing wrapper: {e}, using failure wrapper")
+                    llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
+            else:
+                llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
         except Exception as e:
             logger.debug(f"Could not log LLM details: {e}")
     except Exception as e:
@@ -478,7 +608,20 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         stt_inst = build_stt(cfg)
         llm_inst = build_llm(cfg)
         tts_inst = build_tts(cfg)
-        llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
+        if turn_timing_ref is not None:
+            try:
+                primary = cfg.providers.get_primary_llm() if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm
+                prov, model, base_url = primary.resolve_llm_provider_model()
+                turn_timing_ref["llm_provider"] = prov
+                turn_timing_ref["llm_model"] = model
+                provider_info = {"provider": prov, "model_id": model, "base_url": base_url or "https://api.openai.com/v1"}
+                llm_inst = _create_llm_timing_wrapper(llm_inst, turn_timing_ref, provider_info)
+                logger.info(f"🔧 LLM timing wrapper applied (sync fallback): provider={prov} model={model}")
+            except Exception as e:
+                logger.warning(f"Could not apply LLM timing wrapper sync: {e}")
+                llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
+        else:
+            llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
         logger.info(f"⏱️ provider build sync fallback {time.time()-build_t0:.2f}s")
 
     # Wrap TTS with timing instrumentation if timing ref provided - works with any provider
@@ -718,21 +861,31 @@ async def entrypoint(ctx):
     # (used by bulk-call campaigns so every call is personalized).
     greeting = leadfile.render_template(greeting, lead_data)
 
-    # --- Production timing instrumentation for latency tracing ---
+    # --- Production timing instrumentation for latency tracing - V2 with TTFT and generation time ---
     # Track complete path: user stops speaking -> STT final -> turn detection -> LLM request
     # These timestamps are per-turn, reset on each user turn
-    # Added tts_request, first_tts_audio, llm_complete to trace real TTS pipeline
+    # V2: Added request_start, first_token, generation_complete for TTFT and generation_time
+    # Also logs provider, model, input_tokens, cached_input_tokens, output_tokens, costs
     turn_timing = {
-        "speech_end": 0.0,      # VAD detects speech end (approx from state change)
-        "stt_final": 0.0,       # STT final transcript received
-        "turn_detected": 0.0,   # Endpointing triggers thinking (turn completed)
-        "llm_start": 0.0,       # LLM request starts (on_user_turn_completed)
-        "first_token": 0.0,     # First token (thinking->speaking)
-        "tts_request": 0.0,     # First text chunk sent to TTS
-        "first_tts_audio": 0.0, # First audio chunk from TTS (REAL)
-        "llm_complete": 0.0,    # LLM full response complete (conversation_item_added)
-        "first_audio": 0.0,     # First audible audio (REAL TTS audio, set by wrapper)
+        "speech_end": 0.0,
+        "stt_final": 0.0,
+        "turn_detected": 0.0,
+        "llm_start": 0.0,
+        "request_start": 0.0,
+        "first_token": 0.0,
+        "tts_request": 0.0,
+        "first_tts_audio": 0.0,
+        "llm_complete": 0.0,
+        "generation_complete": 0.0,
+        "first_audio": 0.0,
         "last_speech_end_to_first_audio": 0.0,
+        "llm_provider": "",
+        "llm_model": "",
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "ttft_ms": 0.0,
+        "generation_time_ms": 0.0,
     }
 
     # ------------------------------------------------------------------
@@ -1063,14 +1216,21 @@ async def entrypoint(ctx):
                 stale_age = now - prev_speech_end
                 if stale_age > 2.0:
                     logger.info(f"🔄 Resetting turn_timing: prev speech_end {stale_age:.1f}s old (empty turn or long pause) for fresh turn")
-            # Fresh timing for this turn - reset ALL keys unconditionally
+            # Fresh timing for this turn - reset ALL keys unconditionally (V2 with TTFT)
             turn_timing["turn_detected"] = 0.0
             turn_timing["llm_start"] = 0.0
+            turn_timing["request_start"] = 0.0
             turn_timing["first_token"] = 0.0
             turn_timing["tts_request"] = 0.0
             turn_timing["first_tts_audio"] = 0.0
             turn_timing["llm_complete"] = 0.0
+            turn_timing["generation_complete"] = 0.0
             turn_timing["first_audio"] = 0.0
+            turn_timing["ttft_ms"] = 0.0
+            turn_timing["generation_time_ms"] = 0.0
+            turn_timing["input_tokens"] = 0
+            turn_timing["cached_input_tokens"] = 0
+            turn_timing["output_tokens"] = 0
             # Fresh speech_end and stt_final for this turn
             turn_timing["speech_end"] = now - 0.25  # approximate speech end 250ms before final
             turn_timing["stt_final"] = now
@@ -1269,11 +1429,15 @@ async def entrypoint(ctx):
                         turn_timing["stt_final"] = 0.0
                         turn_timing["turn_detected"] = 0.0
                         turn_timing["llm_start"] = 0.0
+                        turn_timing["request_start"] = 0.0
                         turn_timing["first_token"] = 0.0
                         turn_timing["tts_request"] = 0.0
                         turn_timing["first_tts_audio"] = 0.0
                         turn_timing["llm_complete"] = 0.0
+                        turn_timing["generation_complete"] = 0.0
                         turn_timing["first_audio"] = 0.0
+                        turn_timing["ttft_ms"] = 0.0
+                        turn_timing["generation_time_ms"] = 0.0
             logger.info(f"🗣️ TTS (LLM complete): {cleaned}")
 
     session.on("conversation_item_added", on_item_added)
@@ -1329,6 +1493,7 @@ async def entrypoint(ctx):
                 turn_timing["stt_final"] = 0.0
                 turn_timing["turn_detected"] = 0.0
                 turn_timing["llm_start"] = 0.0
+                turn_timing["request_start"] = 0.0
                 turn_timing["first_token"] = 0.0
                 turn_timing["first_audio"] = 0.0
                 if "tts_request" in turn_timing:
@@ -1339,6 +1504,14 @@ async def entrypoint(ctx):
                     turn_timing["audio_published"] = 0.0
                 if "llm_complete" in turn_timing:
                     turn_timing["llm_complete"] = 0.0
+                if "generation_complete" in turn_timing:
+                    turn_timing["generation_complete"] = 0.0
+                if "request_start" in turn_timing:
+                    turn_timing["request_start"] = 0.0
+                if "ttft_ms" in turn_timing:
+                    turn_timing["ttft_ms"] = 0.0
+                if "generation_time_ms" in turn_timing:
+                    turn_timing["generation_time_ms"] = 0.0
 
         elif ev.new_state == "listening" and prev == "speaking":
             # Agent finished speaking, now listening: estimate speech_end for next turn
@@ -1477,13 +1650,38 @@ async def entrypoint(ctx):
         _finalized["done"] = True
         try:
             duration = int(time.time() - call_start)
+            # V2: Use actual LLM provider/model and cached tokens + TTFT for cost tracking
+            try:
+                llm_provider = turn_timing.get("llm_provider") or cfg.providers.get_primary_llm().resolve_llm_provider_model()[0] if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm.id
+                llm_model = turn_timing.get("llm_model") or cfg.providers.get_primary_llm().resolve_llm_provider_model()[1] if hasattr(cfg.providers, 'get_primary_llm') else (cfg.providers.llm.config or {}).get("model", "")
+                llm_input = turn_timing.get("input_tokens", 0) or usage["llm_input_tokens"]
+                llm_cached = turn_timing.get("cached_input_tokens", 0)
+                llm_output = turn_timing.get("output_tokens", 0) or usage["llm_output_tokens"]
+                ttft = turn_timing.get("ttft_ms", 0)
+                gen_time = turn_timing.get("generation_time_ms", 0)
+                logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms")
+            except Exception as e:
+                logger.debug(f"Could not get V2 billing info: {e}")
+                llm_provider = cfg.providers.llm.id
+                llm_model = (cfg.providers.llm.config or {}).get("model", "")
+                llm_input = usage["llm_input_tokens"]
+                llm_cached = 0
+                llm_output = usage["llm_output_tokens"]
+                ttft = turn_timing.get("ttft_ms", 0)
+                gen_time = turn_timing.get("generation_time_ms", 0)
+
             costs = calculate_call_cost(
                 duration_seconds=duration,
                 stt_seconds=usage["user_speech_seconds"],
-                llm_input_tokens=usage["llm_input_tokens"],
-                llm_output_tokens=usage["llm_output_tokens"],
+                llm_input_tokens=llm_input,
+                llm_output_tokens=llm_output,
                 tts_chars=usage["tts_chars"],
-                llm_provider_id=cfg.providers.llm.id,
+                llm_provider_id=llm_provider,
+                llm_provider=llm_provider,
+                llm_model_id=llm_model,
+                llm_cached_input_tokens=llm_cached,
+                llm_ttft_ms=ttft,
+                llm_generation_time_ms=gen_time,
                 stt_provider_id=cfg.providers.stt.id,
                 tts_provider_id=cfg.providers.tts.id,
                 client_rate_per_min=cfg.client_rate_per_min,

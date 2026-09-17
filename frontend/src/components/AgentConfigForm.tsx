@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import {
   Catalog,
   ProviderDef,
@@ -29,6 +29,34 @@ interface FaqItem {
   a: string;
 }
 
+interface LLMModel {
+  provider: string;
+  model_id: string;
+  display_name: string;
+  base_url: string;
+  input_price_per_1m: number;
+  cached_input_price_per_1m: number;
+  output_price_per_1m: number;
+  context_window: number;
+  max_output_tokens: number;
+  reasoning_supported: boolean;
+  reasoning_default: string;
+  streaming_supported: boolean;
+  tool_calling_supported: boolean;
+  structured_output_supported: boolean;
+  expected_speed: string;
+  status: string;
+  capabilities: string[];
+  notes: string;
+}
+
+interface LLMProvider {
+  id: string;
+  display_name: string;
+  base_url: string;
+  tier: string;
+}
+
 export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const kinds = ["llm", "stt", "tts", "telephony"] as const;
   const fallbackKinds = ["llm", "stt", "tts"] as const;
@@ -51,6 +79,113 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [knowledgeText, setKnowledgeText] = useState(editing?.knowledge?.text || "");
   const [systemPrompt, setSystemPrompt] = useState(editing?.knowledge?.system_prompt || "");
   const [faq, setFaq] = useState<FaqItem[]>(editing?.knowledge?.faq || []);
+  
+  // V2 LLM state: provider → multiple models
+  const llmProviders: LLMProvider[] = (catalog as any).llm_providers || [];
+  const llmModels: LLMModel[] = (catalog as any).llm_models || [];
+  const llmByProvider: Record<string, LLMModel[]> = (catalog as any).llm_by_provider || {};
+  
+  const isV2 = llmProviders.length > 0 && llmModels.length > 0;
+  
+  // Helper to parse old id like groq_gpt_oss_20b to provider/model
+  const parseOldLlmId = (id: string, config: any) => {
+    if (!id) return { provider: "groq", model: "openai/gpt-oss-20b" };
+    // If config has model and provider, use those
+    if (config?.provider && config?.model) {
+      return { provider: config.provider, model: config.model };
+    }
+    if (config?.model) {
+      const m = config.model;
+      // Detect provider from model
+      if (m.includes("gpt-oss") || m.startsWith("llama") || m.startsWith("qwen") || m.startsWith("meta-llama") || m.includes("kimi") || m.includes("moonshot")) {
+        return { provider: "groq", model: m };
+      }
+      if (m.includes("/") && !m.startsWith("openai/")) {
+        // Could be openrouter
+        if (id.startsWith("openrouter") || m.includes("openrouter") || m.includes("google/") || m.includes("anthropic/")) {
+          return { provider: "openrouter", model: m };
+        }
+      }
+      // Default openai
+      if (m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")) {
+        return { provider: "openai", model: m };
+      }
+      // Groq models
+      if (m.startsWith("openai/gpt-oss")) {
+        return { provider: "groq", model: m };
+      }
+      return { provider: "openai", model: m };
+    }
+    // Parse id like openai_gpt_4_1_mini
+    if (id.startsWith("groq")) return { provider: "groq", model: config?.model || "openai/gpt-oss-20b" };
+    if (id.startsWith("openrouter")) return { provider: "openrouter", model: config?.model || "google/gemma-3-27b-it:free" };
+    if (id.startsWith("openai")) {
+      // Try to map old id to new model
+      const mapping: Record<string, string> = {
+        "openai_gpt_4_1": "gpt-4.1",
+        "openai_gpt_4_1_mini": "gpt-4.1-mini",
+        "openai_gpt_4_1_nano": "gpt-4.1-nano",
+        "openai_gpt_5": "gpt-5",
+        "openai_gpt_5_mini": "gpt-5-mini",
+        "openai_gpt_5_nano": "gpt-5-nano",
+        "openai_gpt_4o": "gpt-4o",
+        "openai_gpt_4o_mini": "gpt-4o-mini",
+      };
+      return { provider: "openai", model: mapping[id] || config?.model || "gpt-4.1-mini" };
+    }
+    return { provider: "groq", model: "openai/gpt-oss-20b" };
+  };
+
+  // Initialize primary LLM from editing
+  const initPrimary = () => {
+    if (editing?.providers) {
+      const p: any = editing.providers;
+      // Check V2 first
+      if (p.llm_v2?.provider && p.llm_v2?.model_id) {
+        return { provider: p.llm_v2.provider, model: p.llm_v2.model_id };
+      }
+      if (p.llm) {
+        return parseOldLlmId(p.llm.id, p.llm.config);
+      }
+    }
+    return { provider: "openai", model: "gpt-4.1-mini" };
+  };
+
+  const initFallback = () => {
+    if (editing?.providers) {
+      const p: any = editing.providers;
+      if (p.llm_fallback_v2?.provider && p.llm_fallback_v2?.model_id) {
+        return { provider: p.llm_fallback_v2.provider, model: p.llm_fallback_v2.model_id };
+      }
+      if (p.llm_fallback) {
+        return parseOldLlmId(p.llm_fallback.id, p.llm_fallback.config);
+      }
+    }
+    return { provider: "groq", model: "openai/gpt-oss-20b" };
+  };
+
+  const [primaryLlmProvider, setPrimaryLlmProvider] = useState(() => initPrimary().provider);
+  const [primaryLlmModel, setPrimaryLlmModel] = useState(() => initPrimary().model);
+  const [fallbackLlmProvider, setFallbackLlmProvider] = useState(() => initFallback().provider);
+  const [fallbackLlmModel, setFallbackLlmModel] = useState(() => initFallback().model);
+
+  // Update models when provider changes
+  useEffect(() => {
+    if (!isV2) return;
+    const models = llmByProvider[primaryLlmProvider] || [];
+    if (models.length > 0 && !models.find(m => m.model_id === primaryLlmModel)) {
+      setPrimaryLlmModel(models[0].model_id);
+    }
+  }, [primaryLlmProvider]);
+
+  useEffect(() => {
+    if (!isV2) return;
+    const models = llmByProvider[fallbackLlmProvider] || [];
+    if (models.length > 0 && !models.find(m => m.model_id === fallbackLlmModel)) {
+      setFallbackLlmModel(models[0].model_id);
+    }
+  }, [fallbackLlmProvider]);
+
   const [picked, setPicked] = useState<Record<string, string>>(
     editing?.providers
       ? {
@@ -76,7 +211,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   });
   const [fallbackEnabled, setFallbackEnabled] = useState<boolean>(() => {
     const p: any = editing?.providers || {};
-    return !!(p.llm_fallback || p.stt_fallback || p.tts_fallback);
+    return !!(p.llm_fallback || p.stt_fallback || p.tts_fallback || p.llm_fallback_v2);
   });
   const [optionVals, setOptionVals] = useState<Record<string, Record<string, string>>>({});
   const [file, setFile] = useState<File | null>(null);
@@ -101,6 +236,41 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     if (p?.model && !opts.model) opts.model = p.model as string;
     if (p?.voice && !opts.voice) opts.voice = p.voice as string;
     return { id: pid, config: opts };
+  };
+
+  const getModelMeta = (provider: string, modelId: string): LLMModel | undefined => {
+    return llmModels.find(m => m.provider === provider && m.model_id === modelId);
+  };
+
+  const renderModelInfo = (provider: string, modelId: string) => {
+    const meta = getModelMeta(provider, modelId);
+    if (!meta) return null;
+    return (
+      <div className="mt-2 p-2 bg-gray-800/50 rounded-lg border border-gray-700/50 text-[11px] space-y-1">
+        <div className="flex flex-wrap gap-2">
+          <span className="bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded">Input ${meta.input_price_per_1m}/1M</span>
+          <span className="bg-green-500/20 text-green-300 px-2 py-0.5 rounded">Cached ${meta.cached_input_price_per_1m}/1M</span>
+          <span className="bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">Output ${meta.output_price_per_1m}/1M</span>
+        </div>
+        <div className="flex flex-wrap gap-2 text-gray-400">
+          <span>Context {meta.context_window.toLocaleString()}</span>
+          <span>• Max out {meta.max_output_tokens.toLocaleString()}</span>
+          <span>• Speed {meta.expected_speed}</span>
+          <span>• Reasoning {meta.reasoning_supported ? meta.reasoning_default : "no"}</span>
+          <span>• {meta.status}</span>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {meta.capabilities.map(c => (
+            <span key={c} className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">{c}</span>
+          ))}
+          {meta.streaming_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">streaming</span>}
+          {meta.tool_calling_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">tools</span>}
+          {meta.structured_output_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">structured</span>}
+        </div>
+        {meta.notes && <div className="text-amber-300/80">{meta.notes}</div>}
+        <div className="text-gray-500">Base URL: {meta.base_url}</div>
+      </div>
+    );
   };
 
   const renderOptions = (pid: string) => {
@@ -137,13 +307,90 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
 
   const buildConfig = () => {
     const cfg: any = {};
-    for (const kind of kinds) {
+    // V2 LLM handling
+    if (isV2) {
+      const primaryMeta = getModelMeta(primaryLlmProvider, primaryLlmModel);
+      cfg.llm = {
+        id: primaryLlmProvider,
+        config: {
+          model: primaryLlmModel,
+          provider: primaryLlmProvider,
+          base_url: primaryMeta?.base_url || "",
+          temperature: 0.1,
+          max_tokens: primaryMeta?.max_output_tokens ? Math.min(80, primaryMeta.max_output_tokens) : 80,
+        }
+      };
+      cfg.llm_v2 = {
+        provider: primaryLlmProvider,
+        model_id: primaryLlmModel,
+        base_url: primaryMeta?.base_url || "",
+        temperature: 0.1,
+        max_tokens: 80,
+      };
+      if (fallbackEnabled) {
+        const fallbackMeta = getModelMeta(fallbackLlmProvider, fallbackLlmModel);
+        // Do not treat Groq 120B as OpenAI - keep separate
+        if (!(primaryLlmProvider === fallbackLlmProvider && primaryLlmModel === fallbackLlmModel)) {
+          cfg.llm_fallback = {
+            id: fallbackLlmProvider,
+            config: {
+              model: fallbackLlmModel,
+              provider: fallbackLlmProvider,
+              base_url: fallbackMeta?.base_url || "",
+              temperature: 0.1,
+              max_tokens: 80,
+            }
+          };
+          cfg.llm_fallback_v2 = {
+            provider: fallbackLlmProvider,
+            model_id: fallbackLlmModel,
+            base_url: fallbackMeta?.base_url || "",
+            temperature: 0.1,
+            max_tokens: 80,
+          };
+        }
+      }
+    } else {
+      // Legacy fallback
+      for (const kind of ["stt", "tts", "telephony"] as const) {
+        const pid = picked[kind];
+        if (!pid) continue;
+        cfg[kind] = buildProviderEntry(pid);
+      }
+      // For LLM legacy
+      const pid = picked.llm;
+      if (pid) cfg.llm = buildProviderEntry(pid);
+      if (fallbackEnabled) {
+        for (const kind of fallbackKinds) {
+          if (kind === "llm") continue; // handled separately
+          const fpid = fallbackPicked[kind];
+          if (!fpid) continue;
+          const primaryId = picked[kind];
+          if (fpid === primaryId) {
+            const primaryCfg = cfg[kind]?.config || {};
+            const fallbackCfg = optionVals[fpid] || {};
+            const sameModel = (primaryCfg.model || "") === (fallbackCfg.model || "") && Object.keys(fallbackCfg).length === 0;
+            if (sameModel) continue;
+          }
+          cfg[`${kind}_fallback`] = buildProviderEntry(fpid);
+        }
+        // LLM fallback legacy
+        const fpid = fallbackPicked.llm;
+        if (fpid && fpid !== picked.llm) {
+          cfg.llm_fallback = buildProviderEntry(fpid);
+        }
+      }
+      return cfg;
+    }
+
+    // STT, TTS, telephony (same for V2)
+    for (const kind of ["stt", "tts", "telephony"] as const) {
       const pid = picked[kind];
       if (!pid) continue;
       cfg[kind] = buildProviderEntry(pid);
     }
     if (fallbackEnabled) {
-      for (const kind of fallbackKinds) {
+      for (const kind of ["stt", "tts"] as const) {
         const fpid = fallbackPicked[kind];
         if (!fpid) continue;
         const primaryId = picked[kind];
@@ -166,6 +413,22 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     if (!name) return setErr("Please give the agent a name.");
     if (mode === "announcement" && !announceText.trim() && !greeting.trim()) {
       return setErr("For Announcement mode, fill in a Fixed script (or a Greeting to use as its fallback).");
+    }
+    // Validate V2 LLM provider/model
+    if (isV2) {
+      const primaryMeta = getModelMeta(primaryLlmProvider, primaryLlmModel);
+      if (!primaryMeta) {
+        return setErr(`Invalid primary LLM: provider=${primaryLlmProvider} model=${primaryLlmModel} not found. Valid models for ${primaryLlmProvider}: ${(llmByProvider[primaryLlmProvider] || []).map(m => m.model_id).join(", ")}`);
+      }
+      if (fallbackEnabled) {
+        const fallbackMeta = getModelMeta(fallbackLlmProvider, fallbackLlmModel);
+        if (!fallbackMeta) {
+          return setErr(`Invalid fallback LLM: provider=${fallbackLlmProvider} model=${fallbackLlmModel} not found.`);
+        }
+        if (fallbackMeta.provider !== fallbackLlmProvider) {
+          return setErr(`Fallback model ${fallbackLlmModel} belongs to ${fallbackMeta.provider}, not ${fallbackLlmProvider}. Do not treat Groq 120B as OpenAI.`);
+        }
+      }
     }
     setBusy(true);
     try {
@@ -204,7 +467,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     }
   };
 
-  const visibleKinds = mode === "announcement" ? kinds.filter((k) => k === "tts" || k === "telephony") : kinds;
+  const visibleKinds = mode === "announcement" ? kinds.filter((k) => k === "tts" || k === "telephony") : kinds.filter(k => k !== "llm");
 
   const Toggle = ({
     on,
@@ -462,6 +725,76 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       </div>
 
       <div className="space-y-4">
+        {/* V2 LLM Provider → Multiple Models */}
+        {mode === "assistant" && isV2 && (
+          <div className="bg-gray-900 p-4 rounded-xl border border-gray-800">
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm font-semibold">{KIND_LABEL.llm} - V2 Provider → Models</span>
+              <span className="text-[11px] text-green-400">Exact model passed to runtime</span>
+            </div>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <label className="flex flex-col gap-1 text-xs">
+                  <span className="text-gray-400 font-medium">Provider</span>
+                  <select
+                    value={primaryLlmProvider}
+                    onChange={(e) => setPrimaryLlmProvider(e.target.value)}
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                  >
+                    {llmProviders.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.display_name} {p.tier === "free" ? "(free)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-xs">
+                  <span className="text-gray-400 font-medium">Model (for {primaryLlmProvider})</span>
+                  <select
+                    value={primaryLlmModel}
+                    onChange={(e) => setPrimaryLlmModel(e.target.value)}
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                  >
+                    {(llmByProvider[primaryLlmProvider] || []).map((m) => (
+                      <option key={m.model_id} value={m.model_id}>
+                        {m.display_name} {m.status === "deprecated" ? "(deprecated)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              {renderModelInfo(primaryLlmProvider, primaryLlmModel)}
+            </div>
+            <p className="mt-2 text-[11px] text-amber-300/90">Provider and model remain separate. No silent substitution. If invalid, returns clear config error.</p>
+          </div>
+        )}
+
+        {/* Legacy LLM fallback if V2 not available */}
+        {mode === "assistant" && !isV2 && (
+          <div className="bg-gray-900 p-4 rounded-xl border border-gray-800">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-semibold">{KIND_LABEL.llm}</span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="flex flex-col gap-1 text-xs">
+                <span className="text-gray-400 font-medium">Provider</span>
+                <select
+                  value={picked.llm}
+                  onChange={(e) => setPick("llm", e.target.value)}
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                >
+                  {catalog.catalog.llm.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.display_name} {p.tier === "free" ? "(free)" : "*"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {renderOptions(picked.llm)}
+            </div>
+          </div>
+        )}
+
         {visibleKinds.map((kind) => (
           <div key={kind} className="bg-gray-900 p-4 rounded-xl border border-gray-800">
             <div className="flex items-center justify-between mb-2">
@@ -491,10 +824,10 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           </div>
         ))}
 
-        {/* Fallback providers */}
+        {/* Fallback providers V2 */}
         <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 border-dashed">
           <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-semibold">🔁 Fallback Providers</span>
+            <span className="text-sm font-semibold">🔁 Fallback Providers - V2 Multiple Models</span>
             <button
               type="button"
               onClick={() => setFallbackEnabled(!fallbackEnabled)}
@@ -504,11 +837,49 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             </button>
           </div>
           <p className="text-[11px] text-gray-500 mb-3">
-            If primary hits 429 rate-limit, the agent retries once with the fallback. Recommended: Groq primary + OpenRouter free fallback for LLM.
+            Fallback supports multiple models with provider+model separate. Example: primary OpenAI gpt-4.1-mini, fallback Groq openai/gpt-oss-120b. Do not treat Groq 120B as OpenAI.
           </p>
           {fallbackEnabled && (
             <div className="space-y-3">
-              {fallbackKinds.map((kind) => (
+              {isV2 && (
+                <div className="bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-gray-300">LLM fallback - Provider → Model</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="flex flex-col gap-1 text-xs">
+                      <span className="text-gray-400 font-medium">Provider</span>
+                      <select
+                        value={fallbackLlmProvider}
+                        onChange={(e) => setFallbackLlmProvider(e.target.value)}
+                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                      >
+                        {llmProviders.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.display_name} {p.tier === "free" ? "(free)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="flex flex-col gap-1 text-xs">
+                      <span className="text-gray-400 font-medium">Model (for {fallbackLlmProvider})</span>
+                      <select
+                        value={fallbackLlmModel}
+                        onChange={(e) => setFallbackLlmModel(e.target.value)}
+                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                      >
+                        {(llmByProvider[fallbackLlmProvider] || []).map((m) => (
+                          <option key={m.model_id} value={m.model_id}>
+                            {m.display_name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  {renderModelInfo(fallbackLlmProvider, fallbackLlmModel)}
+                </div>
+              )}
+              {fallbackKinds.filter(k => k !== "llm" || !isV2).map((kind) => (
                 <div key={kind} className="bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-semibold text-gray-300">{KIND_LABEL[kind]} fallback</span>
@@ -540,9 +911,14 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           <label className="text-xs text-gray-400 font-medium">Pricing</label>
           <p className="text-[13px] text-gray-300 mt-1">
             The per-minute charge to the customer is <b>calculated automatically</b> from the provider costs (LLM + STT + TTS + telephony) plus a
-            platform margin set in <code>.env</code>. Your daily margin and each call's total &amp; per-minute cost are shown in the{" "}
+            platform margin set in <code>.env</code>. Your daily margin and each call&apos;s total &amp; per-minute cost are shown in the{" "}
             <span className="text-blue-400">Wallet</span> / <span className="text-blue-400">Calls</span> tabs.
           </p>
+          {isV2 && (
+            <p className="text-[11px] text-gray-500 mt-2">
+              V2 cost tracking: input_tokens*input_price + cached_input_tokens*cached_input_price + output_tokens*output_price. Logs provider, model, TTFT, generation_time.
+            </p>
+          )}
         </div>
 
         {err && <div className="text-red-400 text-sm bg-red-500/10 border border-red-500/30 rounded-lg p-3">{err}</div>}

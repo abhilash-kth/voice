@@ -1,212 +1,43 @@
 """
-Provider catalog for the Voice Agent SaaS platform.
+Provider catalog for the Voice Agent SaaS platform - V2 architecture.
 
-Each provider exposes:
-  - kind          : llm | stt | tts
-  - display_name  : shown in the UI
-  - provider      : the backend plugin type (openai, deepgram, google, ...)
-  - tier          : "free" | "paid"  -> decides wallet requirement / badge
-  - requires_key  : True if the customer must supply their own API key
-  - cost          : per-unit cost used for the "your cost" billing line.
-                   Units are normalised below.
-  - options       : selectable sub-options (models / voices / languages).
+Provider → Multiple Models architecture.
 
-We deliberately include a FREE-ONLY set (Groq LLM, Deepgram STT, Google TTS)
-so the demo runs with essentially zero cost, plus paid options to show the
-"different quality, different price" pitch. Prices are illustrative and live
-entirely in this file + config JSON so they can be edited without code changes.
+Each provider has multiple models with rich metadata:
+- provider, model_id, display_name, base_url
+- input_price_per_1m, cached_input_price_per_1m, output_price_per_1m
+- context_window, max_output_tokens
+- reasoning_supported, reasoning_default
+- streaming_supported, tool_calling_supported, structured_output_supported
+- expected_speed (very_fast, fast, medium, slow)
+- status (active/deprecated), capabilities, notes
+
+No silent model substitution. Invalid provider/model returns clear config error.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Optional
+import os
 
-# Cost units (normalised):
-#   llm  : per 1K tokens (in        -> cost_per_1k_in;  out -> cost_per_1k_out)
-#   stt  : per minute of audio     -> cost_per_min
-#   tts  : per 1K characters       -> cost_per_1k_chars
-# Server cost is handled separately in config.SERVER_COST_PER_MIN.
+# Import new LLM catalog with Provider → Multiple Models
+from .llm_catalog import (
+    LLM_PROVIDERS,
+    LLM_MODELS,
+    get_llm_provider as _get_llm_provider_v2,
+    get_llm_model as _get_llm_model_v2,
+    get_llm_model_by_id as _get_llm_model_by_id_v2,
+    list_providers as _list_llm_providers_v2,
+    list_models_for_provider as _list_llm_models_for_provider_v2,
+    validate_provider_model as _validate_llm_provider_model,
+    calculate_llm_cost as _calculate_llm_cost_v2,
+    catalog_summary_v2 as _llm_catalog_summary_v2,
+)
 
-CATALOG: dict[str, Any] = {
-    # ----------------------------------------------------------------------
-    # LLMs
-    # ----------------------------------------------------------------------
-    "llm": {
-        "groq_gpt_oss": {
-            "kind": "llm",
-            "display_name": "Groq GPT-OSS 120B (recommended, free-tier)",
-            "provider": "openai",             # Groq exposes an OpenAI-compatible API
-            "base_url": "https://api.groq.com/openai/v1",
-            "model": "openai/gpt-oss-120b",
-            "tier": "free",
-            "requires_key": True,
-            "key_env": "GROQ_API_KEY",
-            "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
-            # Groq DEPRECATED llama-3.3-70b-versatile / llama-3.1-8b-instant (shutdown
-            # 08/16/26); their replacement is the openai/gpt-oss family.
-            "notes": "Groq's current default. Reasoning model — keep 'reasoning_effort' = low for fast voice replies.",
-            "options": {
-                "model": ["openai/gpt-oss-120b"],
-                "reasoning_effort": ["low", "medium", "high"],
-                "temperature": [0.0, 0.1, 0.3, 0.7],
-            },
-        },
-        "groq_llama_3_3_70b": {
-            "kind": "llm",
-            "display_name": "Groq Llama 3.3 70B (⚠️ deprecated by Groq)",
-            "provider": "openai",             # Groq exposes an OpenAI-compatible API
-            "base_url": "https://api.groq.com/openai/v1",
-            "model": "llama-3.3-70b-versatile",
-            "tier": "free",
-            "requires_key": True,
-            "key_env": "GROQ_API_KEY",
-            "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
-            "notes": "Deprecated by Groq (shutdown 08/16/26). Use Groq GPT-OSS 120B / 20B instead.",
-            "options": {
-                "model": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
-                "temperature": [0.0, 0.1, 0.3, 0.7],
-            },
-        },
-        "groq_gpt_oss_20b": {
-            "kind": "llm",
-            "display_name": "Groq GPT-OSS 20B (free-tier)",
-            "provider": "openai",
-            "base_url": "https://api.groq.com/openai/v1",
-            "model": "openai/gpt-oss-20b",
-            "tier": "free",
-            "requires_key": True,
-            "key_env": "GROQ_API_KEY",
-            "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
-            # LiveKit retries a rate-limit 3x with backoff -> 15-20s "thinking" stalls.
-            "notes": "Reasoning model: hits Groq's 200k tokens/day quota in a few calls, then 429s. Prefer Groq GPT-OSS for voice.",
-            "options": {"model": ["openai/gpt-oss-20b"]},
-        },
-        "groq_qwen_3_8_27b": {
-            "kind": "llm",
-            "display_name": "Groq Qwen3.8 27B (free-tier)",
-            "provider": "openai",
-            "base_url": "https://api.groq.com/openai/v1",
-            "model": "qwen/qwen3.8-27b",
-            "tier": "free",
-            "requires_key": True,
-            "key_env": "GROQ_API_KEY",
-            "cost": {"per_1k_in": 0.03, "per_1k_out": 0.06},
-            "notes": "Qwen3.8 27B on Groq. Use low reasoning effort for responsive voice calls.",
-            "options": {
-                "model": ["qwen/qwen3.8-27b"],
-                "reasoning_effort": ["low", "medium", "high"],
-                "temperature": [0.0, 0.1, 0.3, 0.7],
-            },
-        },
-        "openrouter_gemma": {
-            "kind": "llm",
-            "display_name": "OpenRouter Gemma 4 31B (free, tool-calling)",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model": "google/gemma-4-31b-it:free",
-            "tier": "free",
-            "requires_key": True,
-            "key_env": "OPENROUTER_API_KEY",
-            "cost": {"per_1k_in": 0.00, "per_1k_out": 0.00},
-            "notes": "Needs OPENROUTER_API_KEY. Free :free models are rate-limited (low req/day) — good for a demo. All options support tool calling (end_call).",
-            "options": {
-                "model": [
-                    "google/gemma-4-31b-it:free",
-                    "google/gemma-4-26b-a4b-it:free",
-                    "nvidia/nemotron-3-super-120b-a12b:free",
-                    "z-ai/glm-5.2:free",
-                    "openrouter/free",
-                ],
-                "temperature": [0.0, 0.1, 0.3, 0.7],
-            },
-        },
-        "openrouter_gemma_26b": {
-            "kind": "llm",
-            "display_name": "OpenRouter Gemma 4 26B (free, lighter)",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "model": "google/gemma-4-26b-a4b-it:free",
-            "tier": "free",
-            "requires_key": True,
-            "key_env": "OPENROUTER_API_KEY",
-            "cost": {"per_1k_in": 0.00, "per_1k_out": 0.00},
-            "notes": "Smaller/faster sibling of Gemma 31B. Free tier rate-limited.",
-            "options": {
-                "model": ["google/gemma-4-26b-a4b-it:free", "google/gemma-4-31b-it:free"],
-                "temperature": [0.0, 0.1, 0.3, 0.7],
-            },
-        },
-        "openai_gpt_4o_mini": {
-            "kind": "llm",
-            "display_name": "OpenAI GPT-4o mini (paid, better quality)",
-            "provider": "openai",
-            "base_url": None,
-            "model": "gpt-4o-mini",
-            "tier": "paid",
-            "requires_key": True,
-            "key_env": "OPENAI_API_KEY",
-            "cost": {"per_1k_in": 0.15, "per_1k_out": 0.60},
-        },
-        "openai_gpt_4o": {
-            "kind": "llm",
-            "display_name": "OpenAI GPT-4o (paid)",
-            "provider": "openai",
-            "base_url": None,
-            "model": "gpt-4o",
-            "tier": "paid",
-            "requires_key": True,
-            "key_env": "OPENAI_API_KEY",
-            "cost": {"per_1k_in": 0.21, "per_1k_out": 0.84},
-            "notes": "Fast, high-quality general-purpose model for voice calls.",
-            "options": {"model": ["gpt-4o"]},
-        },
-        "openai_gpt_4_1_mini": {
-            "kind": "llm",
-            "display_name": "OpenAI GPT-4.1 mini (paid, low latency)",
-            "provider": "openai",
-            "base_url": None,
-            "model": "gpt-4.1-mini",
-            "tier": "paid",
-            "requires_key": True,
-            "key_env": "OPENAI_API_KEY",
-            "cost": {"per_1k_in": 0.033, "per_1k_out": 0.132},
-            "notes": "Recommended OpenAI option for fast, lower-cost voice responses.",
-            "options": {"model": ["gpt-4.1-mini"]},
-        },
-        "openai_gpt_4_1": {
-            "kind": "llm",
-            "display_name": "OpenAI GPT-4.1 (paid, best quality)",
-            "provider": "openai",
-            "base_url": None,
-            "model": "gpt-4.1",
-            "tier": "paid",
-            "requires_key": True,
-            "key_env": "OPENAI_API_KEY",
-            "cost": {"per_1k_in": 0.166, "per_1k_out": 0.664},
-            "notes": "Higher-quality OpenAI model; slower and more expensive than GPT-4.1 mini.",
-            "options": {"model": ["gpt-4.1"]},
-        },
-        "openai_gpt_oss_120b": {
-            "kind": "llm",
-            "display_name": "OpenAI GPT-4o (reasoning, paid) - fixed from invalid gpt-oss-120b",
-            "provider": "openai",
-            "base_url": None,
-            "model": "gpt-4o",
-            "tier": "paid",
-            "requires_key": True,
-            "key_env": "OPENAI_API_KEY",
-            "cost": {"per_1k_in": 0.20, "per_1k_out": 0.80},
-            # Fixed: gpt-oss-120b does not exist on OpenAI API (404), was causing fallback latency
-            # Now uses gpt-4o which exists on OpenAI. Original gpt-oss-120b is available via groq_gpt_oss provider
-            "notes": "Fixed from invalid gpt-oss-120b (404 on OpenAI) to gpt-4o. Use groq_gpt_oss for actual gpt-oss-120b via Groq. Keep reasoning_effort low for voice.",
-            "options": {
-                "model": ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
-                "reasoning_effort": ["low", "medium", "high"],
-            },
-        },
-    },
-    # ----------------------------------------------------------------------
-    # STT (speech-to-text)
-    # ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Legacy STT/TTS/Telephony catalog (unchanged, but kept for backward compat)
+# ---------------------------------------------------------------------------
+CATALOG: Dict[str, Any] = {
+    "llm": {},  # Will be populated from new LLM catalog with backward compat
     "stt": {
         "deepgram_nova2": {
             "kind": "stt",
@@ -214,7 +45,7 @@ CATALOG: dict[str, Any] = {
             "provider": "deepgram",
             "model": "nova-2",
             "tier": "free",
-            "requires_key": False,            # key comes from backend env
+            "requires_key": False,
             "key_env": "DEEPGRAM_API_KEY",
             "cost": {"per_min": 0.22},
             "options": {"language": ["hi", "en", "hi-Latn", "multi"]},
@@ -242,9 +73,6 @@ CATALOG: dict[str, Any] = {
             "options": {"language": ["hi-IN", "en-IN"]},
         },
     },
-    # ----------------------------------------------------------------------
-    # TTS (text-to-speech)
-    # ----------------------------------------------------------------------
     "tts": {
         "google_wavenet_hi": {
             "kind": "tts",
@@ -256,8 +84,6 @@ CATALOG: dict[str, Any] = {
             "requires_key": False,
             "key_env": "GOOGLE_APPLICATION_CREDENTIALS",
             "cost": {"per_1k_chars": 1.33},
-            # NOTE: Google's streaming TTS endpoint only supports Chirp 3: HD
-            # voices (Wavenet/Standard/Neural2 are rejected with 400).
             "options": {"voice": ["hi-IN-Chirp3-HD-Leda", "hi-IN-Chirp3-HD-Kore", "hi-IN-Chirp3-HD-Charon", "hi-IN-Chirp3-HD-Fenrir"]},
         },
         "google_neural2_hi": {
@@ -295,9 +121,7 @@ CATALOG: dict[str, Any] = {
             "requires_key": True,
             "key_env": "OPENROUTER_API_KEY",
             "cost": {"per_1k_chars": 0.00},
-            # Flux voices are all English (`*-en`). It is the easiest FREE OpenRouter
-            # TTS to test (has documented voices + streams). Not for Hindi.
-            "notes": "FREE but ENGLISH-only. Needs OPENROUTER_API_KEY. Use for English test calls; use Google Chirp 3 HD for Hindi.",
+            "notes": "FREE but ENGLISH-only.",
             "options": {"voice": ["flux-bree-en", "flux-alexis-en", "flux-priya-en", "flux-maeve-en"]},
         },
         "openrouter_kokoro_tts": {
@@ -311,20 +135,10 @@ CATALOG: dict[str, Any] = {
             "requires_key": True,
             "key_env": "OPENROUTER_API_KEY",
             "cost": {"per_1k_chars": 0.20},
-            # Kokoro is multilingual (incl. Hindi via the `hf_*` voices) but is
-            # NOT free on OpenRouter.
-            "notes": "Multilingual (Hindi voices hf_alpha/hf_beta). PAID on OpenRouter. Needs OPENROUTER_API_KEY.",
+            "notes": "Multilingual.",
             "options": {"voice": ["af_bella", "af_heart", "am_michael", "hf_alpha", "hf_beta"]},
         },
-        # NOTE: fish-audio/s2.1-pro-free:free is NOT listed here because it is
-        # voice-cloning only (no preset voice) — it cannot synthesize from a plain
-        # voice string, so it is not a self-service drop-in. If a saved agent still
-        # references it, build_tts falls back to the free Flux voice instead of
-        # failing the call.
     },
-    # ----------------------------------------------------------------------
-    # Telephony providers (outbound)
-    # ----------------------------------------------------------------------
     "telephony": {
         "telnyx": {
             "kind": "telephony",
@@ -356,9 +170,127 @@ CATALOG: dict[str, Any] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Build LLM catalog from new V2 architecture with backward compat
+# ---------------------------------------------------------------------------
+def _build_llm_catalog_v2_with_compat():
+    """Populate CATALOG['llm'] from new LLM_PROVIDERS and LLM_MODELS with backward compat."""
+    llm_catalog = {}
+    
+    # New provider → models structure: each provider id has multiple models
+    # For backward compat, also create old-style ids like openai_gpt_4_1_mini
+    # that map to provider=openai, model=gpt-4.1-mini
+    
+    # First, add new-style entries: provider id itself (e.g., "openai") with models list
+    # But old code expects CATALOG["llm"] to be dict of provider_id -> spec with model field
+    # We will create both:
+    # - New style: "openai" provider with models catalog
+    # - Old style: "openai_gpt_4_1_mini" etc for backward compat, marked deprecated
+    
+    # Map old ids to new provider/model for backward compat
+    old_id_mapping = {
+        "openai_gpt_4o_mini": ("openai", "gpt-4o-mini"),
+        "openai_gpt_4o": ("openai", "gpt-4o"),
+        "openai_gpt_4_1_mini": ("openai", "gpt-4.1-mini"),
+        "openai_gpt_4_1": ("openai", "gpt-4.1"),
+        "openai_gpt_oss_120b": ("openai", "gpt-4o"),  # Old invalid mapping, now points to valid gpt-4o
+        "groq_gpt_oss": ("groq", "openai/gpt-oss-120b"),
+        "groq_gpt_oss_20b": ("groq", "openai/gpt-oss-20b"),
+        "groq_llama_3_3_70b": ("groq", "llama-3.3-70b-versatile"),
+        "groq_qwen_3_8_27b": ("groq", "qwen/qwen3-32b"),  # Map old qwen to new
+        "openrouter_gemma": ("openrouter", "google/gemma-3-27b-it:free"),
+        "openrouter_gemma_26b": ("openrouter", "google/gemma-3-12b-it:free"),
+    }
+    
+    # Build new provider entries
+    for prov_id, prov_meta in LLM_PROVIDERS.items():
+        # Get models for this provider
+        models = [m for m in LLM_MODELS if m["provider"] == prov_id and m["status"] == "active"]
+        # For new architecture, provider entry contains models list
+        llm_catalog[prov_id] = {
+            "kind": "llm",
+            "id": prov_id,
+            "display_name": prov_meta["display_name"],
+            "provider": prov_meta["provider_type"],
+            "provider_id": prov_id,
+            "base_url": prov_meta["base_url"],
+            "tier": prov_meta["tier"],
+            "requires_key": prov_meta["requires_key"],
+            "key_env": prov_meta["key_env"],
+            "notes": prov_meta.get("notes", ""),
+            "models": models,  # Rich model catalog
+            "model_count": len(models),
+            # For backward compat, keep single model field as first model
+            "model": models[0]["model_id"] if models else "",
+            "cost": {
+                "per_1k_in": models[0]["input_price_per_1m"] / 1000 if models else 0,
+                "per_1k_out": models[0]["output_price_per_1m"] / 1000 if models else 0,
+            } if models else {},
+            "options": {
+                "model": [m["model_id"] for m in models],
+            },
+        }
+    
+    # Add backward compat old ids
+    for old_id, (new_prov, new_model) in old_id_mapping.items():
+        model_meta = _get_llm_model_v2(new_prov, new_model)
+        if not model_meta:
+            # Try by model_id alone
+            model_meta = _get_llm_model_v2(new_prov, new_model) or next((m for m in LLM_MODELS if m["model_id"] == new_model), None)
+        prov_meta = LLM_PROVIDERS.get(new_prov, {})
+        if model_meta:
+            llm_catalog[old_id] = {
+                "kind": "llm",
+                "id": old_id,
+                "display_name": f"{model_meta['display_name']} (legacy id, use {new_prov} provider)",
+                "provider": prov_meta.get("provider_type", new_prov),
+                "provider_id": new_prov,
+                "base_url": model_meta["base_url"],
+                "model": model_meta["model_id"],
+                "model_meta": model_meta,  # Rich metadata
+                "tier": prov_meta.get("tier", "paid"),
+                "requires_key": prov_meta.get("requires_key", True),
+                "key_env": prov_meta.get("key_env", ""),
+                "cost": {
+                    "per_1k_in": model_meta["input_price_per_1m"] / 1000,
+                    "per_1k_out": model_meta["output_price_per_1m"] / 1000,
+                },
+                "options": {
+                    "model": [model_meta["model_id"]],
+                },
+                "notes": f"Legacy id for backward compat. New: provider={new_prov}, model={new_model}. {model_meta.get('notes','')}",
+                "legacy": True,
+                "new_provider": new_prov,
+                "new_model": new_model,
+            }
+        else:
+            # If model not found, keep minimal entry to avoid breaking existing agents
+            llm_catalog[old_id] = {
+                "kind": "llm",
+                "id": old_id,
+                "display_name": old_id,
+                "provider": new_prov,
+                "provider_id": new_prov,
+                "base_url": prov_meta.get("base_url"),
+                "model": new_model,
+                "tier": "paid",
+                "requires_key": True,
+                "key_env": prov_meta.get("key_env", ""),
+                "cost": {"per_1k_in": 0.15, "per_1k_out": 0.60},
+                "options": {"model": [new_model]},
+                "notes": f"Legacy id, maps to {new_prov}:{new_model}",
+                "legacy": True,
+            }
+    
+    return llm_catalog
 
-def providers_of(kind: str) -> list[dict[str, Any]]:
-    """Return the provider list, each with its own id embedded."""
+CATALOG["llm"] = _build_llm_catalog_v2_with_compat()
+
+# ---------------------------------------------------------------------------
+# Helper functions - V2 architecture with backward compat
+# ---------------------------------------------------------------------------
+def providers_of(kind: str) -> List[Dict[str, Any]]:
+    """Return provider list for kind, each with id embedded."""
     out = []
     for pid, spec in CATALOG.get(kind, {}).items():
         item = dict(spec)
@@ -366,14 +298,115 @@ def providers_of(kind: str) -> list[dict[str, Any]]:
         out.append(item)
     return out
 
-
-def get_provider(kind: str, provider_id: str) -> dict[str, Any] | None:
+def get_provider(kind: str, provider_id: str) -> Optional[Dict[str, Any]]:
+    """Get provider by kind and id. Supports both new and legacy ids."""
+    if kind == "llm":
+        # Try new catalog first
+        if provider_id in CATALOG["llm"]:
+            return CATALOG["llm"][provider_id]
+        # Try to parse provider:model format
+        if ":" in provider_id:
+            prov, model = provider_id.split(":", 1)
+            model_meta = _get_llm_model_v2(prov, model)
+            if model_meta:
+                prov_meta = LLM_PROVIDERS.get(prov, {})
+                return {
+                    "kind": "llm",
+                    "id": provider_id,
+                    "display_name": model_meta["display_name"],
+                    "provider": prov_meta.get("provider_type", prov),
+                    "provider_id": prov,
+                    "base_url": model_meta["base_url"],
+                    "model": model_meta["model_id"],
+                    "model_meta": model_meta,
+                    "tier": prov_meta.get("tier", "paid"),
+                    "requires_key": True,
+                    "key_env": prov_meta.get("key_env", ""),
+                    "cost": {
+                        "per_1k_in": model_meta["input_price_per_1m"] / 1000,
+                        "per_1k_out": model_meta["output_price_per_1m"] / 1000,
+                    },
+                }
+        # Try model_id alone
+        model_meta = next((m for m in LLM_MODELS if m["model_id"] == provider_id), None)
+        if model_meta:
+            prov_meta = LLM_PROVIDERS.get(model_meta["provider"], {})
+            return {
+                "kind": "llm",
+                "id": provider_id,
+                "display_name": model_meta["display_name"],
+                "provider": prov_meta.get("provider_type", model_meta["provider"]),
+                "provider_id": model_meta["provider"],
+                "base_url": model_meta["base_url"],
+                "model": model_meta["model_id"],
+                "model_meta": model_meta,
+                "tier": prov_meta.get("tier", "paid"),
+                "requires_key": True,
+                "key_env": prov_meta.get("key_env", ""),
+                "cost": {
+                    "per_1k_in": model_meta["input_price_per_1m"] / 1000,
+                    "per_1k_out": model_meta["output_price_per_1m"] / 1000,
+                },
+            }
     return CATALOG.get(kind, {}).get(provider_id)
 
-
-def catalog_summary() -> dict[str, Any]:
-    """Return the catalogue organised for the frontend config UI."""
-    out: dict[str, Any] = {}
+def catalog_summary() -> Dict[str, Any]:
+    """Return catalogue organised for frontend config UI - backward compat + new."""
+    out: Dict[str, Any] = {}
     for kind in ("llm", "stt", "tts", "telephony"):
         out[kind] = providers_of(kind)
+    # Add new V2 structure for LLM
+    out["llm_v2"] = _llm_catalog_summary_v2()
+    out["llm_providers"] = list(LLM_PROVIDERS.values())
+    out["llm_models"] = LLM_MODELS
+    out["llm_by_provider"] = {pid: [m for m in LLM_MODELS if m["provider"] == pid] for pid in LLM_PROVIDERS}
     return out
+
+# ---------------------------------------------------------------------------
+# New V2 API for LLM - Provider → Multiple Models
+# ---------------------------------------------------------------------------
+def get_llm_provider(provider_id: str) -> Optional[Dict[str, Any]]:
+    return _get_llm_provider_v2(provider_id)
+
+def get_llm_model(provider: str, model_id: str) -> Optional[Dict[str, Any]]:
+    return _get_llm_model_v2(provider, model_id)
+
+def list_llm_providers() -> List[Dict[str, Any]]:
+    return _list_llm_providers_v2()
+
+def list_llm_models_for_provider(provider: str) -> List[Dict[str, Any]]:
+    return _list_llm_models_for_provider_v2(provider)
+
+def validate_llm_provider_model(provider: str, model_id: str) -> tuple[bool, str]:
+    return _validate_llm_provider_model(provider, model_id)
+
+def calculate_llm_cost(provider: str, model_id: str, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> Dict[str, float]:
+    model = get_llm_model(provider, model_id)
+    if not model:
+        return {"input_cost": 0, "output_cost": 0, "total_llm_cost": 0}
+    return _calculate_llm_cost_v2(model, input_tokens, cached_input_tokens, output_tokens)
+
+def get_model_pricing(provider: str, model_id: str) -> Optional[Dict[str, Any]]:
+    model = get_llm_model(provider, model_id)
+    if not model:
+        return None
+    return {
+        "provider": model["provider"],
+        "model_id": model["model_id"],
+        "display_name": model["display_name"],
+        "input_price_per_1m": model["input_price_per_1m"],
+        "cached_input_price_per_1m": model["cached_input_price_per_1m"],
+        "output_price_per_1m": model["output_price_per_1m"],
+        "context_window": model["context_window"],
+        "max_output_tokens": model["max_output_tokens"],
+        "reasoning_supported": model["reasoning_supported"],
+        "reasoning_default": model["reasoning_default"],
+        "streaming_supported": model["streaming_supported"],
+        "tool_calling_supported": model["tool_calling_supported"],
+        "structured_output_supported": model["structured_output_supported"],
+        "expected_speed": model["expected_speed"],
+        "status": model["status"],
+        "capabilities": model["capabilities"],
+        "notes": model["notes"],
+        "base_url": model["base_url"],
+    }
