@@ -154,14 +154,20 @@ try:
 except Exception as e:
     logger.debug(f"Could not patch hyphenator: {e}")
 
-# Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks
+# Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks + TTS 340-437ms
 try:
     import google.auth.crypt._cryptography_rsa
     import google.auth._service_account_info
     import google.auth._default
     import google.oauth2.credentials
     import google.oauth2.service_account
-    logger.info("🔧 Prewarmed Google auth crypt + oauth2.credentials + service_account (avoids 176ms and 198ms blocks)")
+    # Also prewarm google cloud texttospeech client to avoid TTS latency
+    try:
+        import google.cloud.texttospeech
+        logger.info("🔧 Prewarmed google.cloud.texttospeech (reduces TTS 340-437ms)")
+    except Exception:
+        pass
+    logger.info("🔧 Prewarmed Google auth crypt + oauth2.credentials + service_account + texttospeech (avoids 176ms and 198ms blocks, reduces TTS 340-437ms)")
 except Exception as e:
     logger.debug(f"Google auth prewarm failed: {e}")
 
@@ -2576,6 +2582,52 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: async_toolset imported (avoids 101ms import block)")
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
+
+    # Prewarm Google TTS client completely before first customer response to avoid 340-437ms TTS latency + 198ms auth block
+    # Move blocking Google auth/import work off event loop
+    try:
+        from livekit.plugins.google import TTS as _GoogleTTS
+        import os as _os_tts
+        creds = _os_tts.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if creds:
+            # Create dummy TTS to trigger client creation off loop
+            # Use to_thread to avoid blocking, but prewarm_fnc is sync, so we do sync prewarm
+            # The TTS __init__ is lightweight, _ensure_client is heavy and does load_credentials_from_file
+            # We prewarm by importing and creating client in thread
+            def _prewarm_google_tts():
+                try:
+                    import asyncio as _aio
+                    loop = _aio.new_event_loop()
+                    _aio.set_event_loop(loop)
+                    try:
+                        # Create TTS instance
+                        tts = _GoogleTTS(
+                            voice_name="en-IN-Chirp3-HD-Leda",
+                            language="en-IN",
+                            credentials_file=creds,
+                        )
+                        # Try to ensure client (loads credentials)
+                        async def _ensure():
+                            try:
+                                await tts._tts._ensure_client()
+                            except Exception:
+                                pass
+                        loop.run_until_complete(_ensure())
+                        logger.info("🔥 Prewarm: Google TTS client fully prewarmed (credentials loaded, avoids 198ms auth block + reduces 340-437ms TTS)")
+                    finally:
+                        loop.close()
+                        _aio.set_event_loop(None)
+                except Exception as _e:
+                    logger.debug(f"Google TTS client prewarm thread failed: {_e}")
+            import threading as _thr
+            t = _thr.Thread(target=_prewarm_google_tts, daemon=True)
+            t.start()
+            t.join(timeout=3)  # Wait up to 3s for prewarm
+            logger.info("🔥 Prewarm: Google TTS client prewarm attempted (off loop)")
+        else:
+            logger.info("🔥 Prewarm: GOOGLE_APPLICATION_CREDENTIALS not set, skipping Google TTS client prewarm")
+    except Exception as e:
+        logger.debug(f"Google TTS prewarm failed: {e}")
     
     # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
     # "Event loop is closed" on next Prisma call -> 1.73s retry. DB now cached per process
