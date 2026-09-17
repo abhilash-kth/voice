@@ -79,6 +79,7 @@ export interface Agent {
   created_at: string;
   agent_mode?: string;
   announce_text?: string;
+  fallback_response?: string;
   providers: {
     llm: { id: string; config: Record<string, unknown> };
     stt: { id: string; config: Record<string, unknown> };
@@ -180,6 +181,7 @@ export const startCall = (body: {
   }>("/api/calls", { method: "POST", body: JSON.stringify(body) });
 export const listCalls = () => req<{ calls: CallRecord[] }>("/api/calls");
 export const getCall = (id: string) => req<CallRecord>(`/api/calls/${id}`);
+export const deleteCall = (id: string) => req<void>(`/api/calls/${id}`, { method: "DELETE" });
 
 // ------ campaigns (bulk calling) ------------------------------------------
 export interface CampaignLead {
@@ -253,6 +255,7 @@ export const setKnowledge = (
     text?: string;
     system_prompt?: string;
     faq?: { q: string; a: string }[];
+    documents?: { name: string; content: string }[];
   },
 ) =>
   req<{ ok: boolean }>(`/api/agents/${agentId}/knowledge`, {

@@ -78,15 +78,32 @@ from livekit.plugins import openai    # noqa: E402,F401  (LLM)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("voice-agent-saas-worker")
 
+# Latency fix globals: cache DB init and agent lookup per process
+_DB_INIT_DONE = False
+_AGENT_CACHE: dict = {}  # key -> {"rec": ..., "ts": float}
+_AGENT_CACHE_TTL = 30.0
+
 FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
 # Spoken when a user turn gets NO LLM reply at all (provider 429 after the
 # fail-fast retries, or a failed/empty generation) so the caller is never left
 # in dead air — that silence is what made callers hang up.
-FALLBACK_SILENCE = "Sorry, thoda technical glitch hua. Aap dobara pooch sakte hain?"
+DEFAULT_FALLBACK_RESPONSE = "Sorry, there is a temporary technical problem. Please try again shortly."
+# Deterministic closing speech — always the same line, never LLM-generated.
+# This is the fix for non-deterministic goodbyes: the closing TTS is fixed so
+# every call ends with the same polite sentence in the caller's language.
+DETERMINISTIC_CLOSING_MESSAGE = "Thank you for calling us. Aapse baat karke achha laga. Goodbye."
+DETERMINISTIC_CLOSING_MESSAGE_EN = "Thank you for calling us. It was nice talking to you. Goodbye."
+
+def _get_deterministic_closing(cfg: AgentConfig) -> str:
+    lang = (getattr(cfg, "language", "hi") or "hi").lower()
+    if lang.startswith("en"):
+        return DETERMINISTIC_CLOSING_MESSAGE_EN
+    return DETERMINISTIC_CLOSING_MESSAGE
+
 # How long to wait for the LLM to answer a user turn before speaking
 # FALLBACK_SILENCE. Groq's 429 backoff can be 7-45s, so 12s is a good balance:
 # a normal fast turn never gets here, but a rate-limited one does.
-LLM_FALLBACK_DELAY = float(os.getenv("VOICE_LLM_FALLBACK_DELAY", "12"))
+LLM_FALLBACK_DELAY = float(os.getenv("VOICE_LLM_FALLBACK_DELAY", "8"))
 
 BILLING_BACKEND_URL = os.getenv("BILLING_BACKEND_URL", "http://127.0.0.1:8000")
 WORKER_AGENT_NAME = "voice-agent-saas"
@@ -159,10 +176,20 @@ def _item_is_tool_related(item) -> bool:
     These items have no speakable text; without this guard they fall through as
     "empty assistant replies" (bogus ``🗣️ TTS: Sorry...`` lines and, worse, a
     fallback line spoken right before ``end_call`` hangs up)."""
-    for attr in ("function_call", "function_call_output", "tool_call"):
-        if getattr(item, attr, None):
+    # Depending on the LiveKit version, a tool invocation is exposed as
+    # ``tool_calls`` (ChatMessage), ``function_call`` or ``tool_call``.  In
+    # particular, an assistant item can have *no text* and still be a perfectly
+    # valid tool-call item.  Treat all of these as non-spoken items before the
+    # empty-text handling below.
+    for attr in ("function_call", "function_call_output", "tool_call", "tool_calls"):
+        value = getattr(item, attr, None)
+        if value:
             return True
     if getattr(item, "role", None) == "tool":
+        return True
+    # Some SDK releases put the calls in ``content`` as typed objects, while
+    # others use a dict. Neither form is speakable.
+    if isinstance(getattr(item, "content", None), dict):
         return True
     content = getattr(item, "content", None)
     # A text message's content is strings; a function message carries objects.
@@ -209,7 +236,7 @@ def _build_conn_options():
     from livekit.agents.llm.llm import APIConnectOptions
     from livekit.agents.voice.agent_session import SessionConnectOptions
 
-    _conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=8.0)
+    _conn = APIConnectOptions(max_retry=0, retry_interval=0.5, timeout=8.0)
     # STT/TTS also get their own bound so a provider hiccup never stacks.
     _media_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=6.0)
     return SessionConnectOptions(
@@ -219,37 +246,243 @@ def _build_conn_options():
     )
 
 
-def build_assistant_session(cfg: AgentConfig):
-    """Full conversational session: STT + VAD + LLM + TTS, low-latency config."""
+def _create_tts_timing_wrapper(tts_instance, timing_dict):
+    """Wrap TTS instance to measure actual TTS pipeline timing.
+    
+    Measures:
+    - tts_request: when text first sent to TTS (first chunk)
+    - first_tts_audio: when first audio chunk returned from TTS
+    - Works with any TTS provider (Google, ElevenLabs, OpenRouter) - no hardcoding
+    """
+    original_synthesize = getattr(tts_instance, 'synthesize', None)
+
+    class TTSTimingWrapper:
+        def __init__(self, inner, timing):
+            self._inner = inner
+            self._timing = timing
+            try:
+                self.capabilities = getattr(inner, 'capabilities', None)
+                self._opts = getattr(inner, '_opts', None)
+                self._label = getattr(inner, '_label', None)
+            except Exception:
+                pass
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def synthesize(self, text, **kwargs):
+            now = time.time()
+            if self._timing.get("first_token", 0) > 0 and self._timing.get("tts_request", 0) == 0:
+                self._timing["tts_request"] = now
+                first_token = self._timing.get("first_token", 0)
+                if first_token > 0:
+                    logger.info(f"⏱️ TIMING first_token->tts_request (text_chunk→TTS): {(now-first_token)*1000:.0f}ms (text: {text[:50]})")
+                if self._timing.get("llm_start", 0) > 0:
+                    logger.info(f"⏱️ TIMING llm_start->tts_request: {(now-self._timing['llm_start'])*1000:.0f}ms")
+            first_chunk = True
+            try:
+                async for chunk in self._inner.synthesize(text, **kwargs):
+                    if first_chunk:
+                        now_audio = time.time()
+                        if self._timing.get("first_tts_audio", 0) == 0:
+                            self._timing["first_tts_audio"] = now_audio
+                            if self._timing.get("tts_request", 0) > 0:
+                                logger.info(f"⏱️ TIMING tts_request->first_tts_audio (TTS synthesis): {(now_audio-self._timing['tts_request'])*1000:.0f}ms")
+                            if self._timing.get("first_token", 0) > 0:
+                                logger.info(f"⏱️ TIMING first_token->first_tts_audio (REAL TTS): {(now_audio-self._timing['first_token'])*1000:.0f}ms")
+                                if self._timing.get("first_audio", 0) == 0:
+                                    self._timing["first_audio"] = now_audio
+                                    logger.info(f"⏱️ TIMING first_token->first_audio (REAL TTS audio): {(now_audio-self._timing['first_token'])*1000:.0f}ms")
+                                if self._timing.get("speech_end", 0) > 0:
+                                    total = (now_audio-self._timing['speech_end'])*1000
+                                    logger.info(f"⏱️ TIMING speech_end->first_audio (REAL total): {total:.0f}ms (target ~1-1.5s)")
+                                    self._timing["last_speech_end_to_first_audio"] = total
+                                    # Full breakdown with REAL TTS
+                                    if self._timing.get("stt_final",0) and self._timing.get("turn_detected",0) and self._timing.get("llm_start",0) and self._timing.get("first_token",0):
+                                        logger.info(
+                                            f"📊 TURN BREAKDOWN (REAL): speech_end->STT_final {(self._timing['stt_final']-self._timing['speech_end'])*1000:.0f}ms | "
+                                            f"STT_final->turn {(self._timing['turn_detected']-self._timing['stt_final'])*1000:.0f}ms | "
+                                            f"turn->LLM {(self._timing['llm_start']-self._timing['turn_detected'])*1000:.0f}ms | "
+                                            f"LLM->first_token {(self._timing['first_token']-self._timing['llm_start'])*1000:.0f}ms | "
+                                            f"first_token->tts_request {(self._timing.get('tts_request',0)-self._timing['first_token'])*1000:.0f}ms | "
+                                            f"tts_request->first_audio {(now_audio-self._timing.get('tts_request',now_audio))*1000:.0f}ms | "
+                                            f"TOTAL {total:.0f}ms"
+                                        )
+                                    # Reset for next turn after REAL audio
+                                    self._timing["speech_end"] = 0.0
+                                    self._timing["stt_final"] = 0.0
+                                    self._timing["turn_detected"] = 0.0
+                                    self._timing["llm_start"] = 0.0
+                                    self._timing["first_token"] = 0.0
+                                    self._timing["tts_request"] = 0.0
+                                    self._timing["first_tts_audio"] = 0.0
+                                    self._timing["llm_complete"] = 0.0
+                                    self._timing["first_audio"] = 0.0
+                        first_chunk = False
+                    yield chunk
+            except Exception as e:
+                logger.warning(f"TTS synthesize wrapper error: {e}")
+                raise
+
+        def stream(self, **kwargs):
+            inner_stream = self._inner.stream(**kwargs)
+            timing = self._timing
+
+            class StreamWrapper:
+                def __init__(self, inner_stream, timing):
+                    self._inner_stream = inner_stream
+                    self._timing = timing
+                    self._first_chunk = True
+
+                def __getattr__(self, name):
+                    return getattr(self._inner_stream, name)
+
+                async def __aenter__(self):
+                    await self._inner_stream.__aenter__()
+                    return self
+
+                async def __aexit__(self, *args):
+                    return await self._inner_stream.__aexit__(*args)
+
+                def push_text(self, text):
+                    now = time.time()
+                    if timing.get("first_token", 0) > 0 and timing.get("tts_request", 0) == 0 and text and text.strip():
+                        timing["tts_request"] = now
+                        logger.info(f"⏱️ TIMING first_token->tts_request (stream push): {(now-timing['first_token'])*1000:.0f}ms (chunk: {text[:50]})")
+                    return self._inner_stream.push_text(text)
+
+                async def __aiter__(self):
+                    async for chunk in self._inner_stream:
+                        if self._first_chunk:
+                            now_audio = time.time()
+                            if timing.get("first_tts_audio", 0) == 0:
+                                timing["first_tts_audio"] = now_audio
+                                if timing.get("tts_request", 0) > 0:
+                                    logger.info(f"⏱️ TIMING tts_request->first_tts_audio (stream): {(now_audio-timing['tts_request'])*1000:.0f}ms")
+                                if timing.get("first_token", 0) > 0:
+                                    logger.info(f"⏱️ TIMING first_token->first_tts_audio (REAL stream): {(now_audio-timing['first_token'])*1000:.0f}ms")
+                                    if timing.get("first_audio", 0) == 0:
+                                        timing["first_audio"] = now_audio
+                                        logger.info(f"⏱️ TIMING first_token->first_audio (REAL stream audio): {(now_audio-timing['first_token'])*1000:.0f}ms")
+                                    if timing.get("speech_end", 0) > 0:
+                                        total = (now_audio-timing['speech_end'])*1000
+                                        logger.info(f"⏱️ TIMING speech_end->first_audio (REAL stream total): {total:.0f}ms")
+                                        timing["last_speech_end_to_first_audio"] = total
+                                        if timing.get("stt_final",0) and timing.get("turn_detected",0) and timing.get("llm_start",0) and timing.get("first_token",0):
+                                            logger.info(
+                                                f"📊 TURN BREAKDOWN (REAL stream): speech_end->STT_final {(timing['stt_final']-timing['speech_end'])*1000:.0f}ms | "
+                                                f"STT_final->turn {(timing['turn_detected']-timing['stt_final'])*1000:.0f}ms | "
+                                                f"turn->LLM {(timing['llm_start']-timing['turn_detected'])*1000:.0f}ms | "
+                                                f"LLM->first_token {(timing['first_token']-timing['llm_start'])*1000:.0f}ms | "
+                                                f"first_token->tts_request {(timing.get('tts_request',0)-timing['first_token'])*1000:.0f}ms | "
+                                                f"tts_request->first_audio {(now_audio-timing.get('tts_request',now_audio))*1000:.0f}ms | "
+                                                f"TOTAL {total:.0f}ms"
+                                            )
+                                        timing["speech_end"] = 0.0
+                                        timing["stt_final"] = 0.0
+                                        timing["turn_detected"] = 0.0
+                                        timing["llm_start"] = 0.0
+                                        timing["first_token"] = 0.0
+                                        timing["tts_request"] = 0.0
+                                        timing["first_tts_audio"] = 0.0
+                                        timing["llm_complete"] = 0.0
+                                        timing["first_audio"] = 0.0
+                            self._first_chunk = False
+                        yield chunk
+
+                async def aclose(self):
+                    try:
+                        return await self._inner_stream.aclose()
+                    except Exception:
+                        pass
+
+                def close(self):
+                    try:
+                        return self._inner_stream.close()
+                    except Exception:
+                        pass
+
+            return StreamWrapper(inner_stream, timing)
+
+    return TTSTimingWrapper(tts_instance, timing_dict)
+
+
+async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
+    """Full conversational session: STT + VAD + LLM + TTS, production low-latency.
+
+    Fixes:
+    - Async parallel build to avoid blocking job executor (was 3.46s sync -> unresponsive 1.5s)
+    - STT turn_detection with endpointing_ms 200ms + utterance_end_ms 1000ms (Deepgram correct params)
+    - VAD tuned 0.20/0.30/0.20/0.55 for faster speech_end detection + less CPU
+    - Endpointing 0.20/0.55 for target speech_end->LLM <=500ms
+    - TTS timing wrapper to measure actual first TTS audio (not LLM completion)
+    """
     from livekit.agents import AgentSession
     from app.agents.agent_builder import build_vad, build_stt, build_llm, build_tts
 
+    vad_inst = build_vad()
+    build_t0 = time.time()
+
+    try:
+        stt_inst, llm_inst, tts_inst = await asyncio.gather(
+            asyncio.to_thread(build_stt, cfg),
+            asyncio.to_thread(build_llm, cfg),
+            asyncio.to_thread(build_tts, cfg),
+        )
+        logger.info(f"⏱️ provider build async parallel {time.time()-build_t0:.2f}s")
+    except Exception as e:
+        logger.warning(f"Async parallel build failed ({e}), falling back to sync")
+        stt_inst = build_stt(cfg)
+        llm_inst = build_llm(cfg)
+        tts_inst = build_tts(cfg)
+        logger.info(f"⏱️ provider build sync fallback {time.time()-build_t0:.2f}s")
+
+    # Wrap TTS with timing instrumentation if timing ref provided - works with any provider
+    if turn_timing_ref is not None:
+        try:
+            is_fallback = hasattr(tts_inst, '_tts_instances') or hasattr(tts_inst, 'tts_instances') or 'FallbackAdapter' in str(type(tts_inst))
+            if is_fallback:
+                try:
+                    inner_list = getattr(tts_inst, '_tts_instances', None) or getattr(tts_inst, 'tts_instances', None) or getattr(tts_inst, '_instances', None)
+                    if inner_list:
+                        for idx, inner_tts in enumerate(inner_list):
+                            inner_list[idx] = _create_tts_timing_wrapper(inner_tts, turn_timing_ref)
+                        logger.info(f"🔧 TTS timing wrapper applied to FallbackAdapter ({len(inner_list)} providers)")
+                    else:
+                        tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
+                except Exception as e:
+                    logger.warning(f"Could not wrap FallbackAdapter inner TTS: {e}, wrapping outer")
+                    tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
+            else:
+                tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
+                logger.info(f"🔧 TTS timing wrapper applied")
+        except Exception as e:
+            logger.warning(f"Could not apply TTS timing wrapper: {e}")
+
+    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.20"))
+    max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.55"))
+    turn_detection_mode = os.getenv("VOICE_TURN_DETECTION", "stt").strip().lower()
+    if turn_detection_mode not in ("vad", "stt", "realtime_llm", "manual"):
+        turn_detection_mode = "stt"
+
+    # Preemptive TTS: check compatibility - all supported TTS (Google, ElevenLabs, OpenRouter) support streaming
+    # So preemptive_tts is safe, but keep env-controlled to avoid unexpected behavior
+    # Default 0 for compatibility, enable via VOICE_PREEMPTIVE_TTS=1 if needed
+    preemptive_tts_enabled = os.getenv("VOICE_PREEMPTIVE_TTS", "0") == "1"
+
     return AgentSession(
-        stt=build_stt(cfg),
-        vad=build_vad(),
-        llm=build_llm(cfg),
-        tts=build_tts(cfg),
-        # Fail FAST on any LLM/STT/TTS provider error (see _build_conn_options).
+        stt=stt_inst,
+        vad=vad_inst,
+        llm=llm_inst,
+        tts=tts_inst,
         conn_options=_build_conn_options(),
-        # Turn-handling is set here (the session). This is the SIMPLE, LOCAL, stable
-        # configuration that makes a self-hosted worker feel human:
-        #   * turn_detection = "vad"  -> end-of-turn from the local silero VAD, so STT
-        #     and VAD stop fighting (that fight was re-feeding audio into VAD and
-        #     backing its buffer up -> "inference is slower than realtime").
-        #   * interruption mode="vad" -> local VAD barge-in. Do NOT use the default
-        #     (adaptive): it calls LiveKit Cloud's barge-in service, which 401s on a
-        #     self-hosted worker and then falls back (adds lag + noise).
         turn_handling={
-            "turn_detection": "vad",
-            "endpointing": {"min_delay": 0.6, "max_delay": 1.2},
-            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 0},
-            # Preemptive generation (LLM answers while the user is still speaking) is
-            # great for latency, BUT here it was being invalidated almost every turn and
-            # adding speculative LLM work that starved the loop. Keep it OFF by default;
-            # re-enable with VOICE_PREEMPTIVE=1 only after the VAD backlog is gone.
+            "turn_detection": turn_detection_mode,
+            "endpointing": {"min_delay": min_delay, "max_delay": max_delay},
+            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 1},
             "preemptive_generation": {
-                "enabled": os.getenv("VOICE_PREEMPTIVE", "0") == "1",
-                "preemptive_tts": False,
+                "enabled": os.getenv("VOICE_PREEMPTIVE", "1") == "1",
+                "preemptive_tts": preemptive_tts_enabled,
             },
         },
     )
@@ -335,7 +568,22 @@ async def entrypoint(ctx):
 
     call_start = time.time()
 
-    await db_init()
+    # --- Latency fix: DB init was 2.33s per job + 1.13s lookup + 8.62s None->listening
+    # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
+    # Total 13.5s before user hears greeting. Fix: cache DB init per process, parallel provider build.
+    global _DB_INIT_DONE, _AGENT_CACHE
+    db_t0 = time.time()
+    if not _DB_INIT_DONE:
+        try:
+            await asyncio.wait_for(db_init(), timeout=5)
+            _DB_INIT_DONE = True
+            logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s (first time, cached for next calls)")
+        except Exception as exc:
+            logger.error("database initialization unavailable (%.2fs); continuing voice call: %s", time.time()-db_t0, exc)
+    else:
+        logger.info(f"⏱️ DB init 0.00s (cached)")
+
+    # Agent lookup cache (in-memory, 30s TTL) to avoid 1.13s DB hit per call
 
     try:
         meta = json.loads(ctx.job.metadata or "{}")
@@ -351,8 +599,23 @@ async def entrypoint(ctx):
     lead_data = meta.get("lead_data") or {}
 
     rec = None
-    if agent_id and user_id:
-        rec = await repo.get_agent(agent_id, user_id)
+    cache_key = f"{agent_id}:{user_id}"
+    cache_entry = _AGENT_CACHE.get(cache_key) if agent_id and user_id else None
+    if cache_entry and (time.time() - cache_entry["ts"]) < _AGENT_CACHE_TTL:
+        rec = cache_entry["rec"]
+        logger.info(f"⏱️ agent lookup 0.00s (cached, age {time.time()-cache_entry['ts']:.1f}s)")
+    elif agent_id and user_id:
+        lookup_t0 = time.time()
+        for attempt in range(2):  # Reduced from 3 to 2 attempts for faster fail
+            try:
+                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=3)  # 3s instead of 4s
+                logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
+                _AGENT_CACHE[cache_key] = {"rec": rec, "ts": time.time()}
+                break
+            except Exception as exc:
+                logger.warning("agent lookup attempt %s/2 failed (%.2fs): %s", attempt + 1, time.time()-lookup_t0, exc)
+                if attempt < 1:
+                    await asyncio.sleep(0.15)
 
     if rec is None:
         # fall back to the default demo agent so the worker never crashes
@@ -408,6 +671,23 @@ async def entrypoint(ctx):
     # (used by bulk-call campaigns so every call is personalized).
     greeting = leadfile.render_template(greeting, lead_data)
 
+    # --- Production timing instrumentation for latency tracing ---
+    # Track complete path: user stops speaking -> STT final -> turn detection -> LLM request
+    # These timestamps are per-turn, reset on each user turn
+    # Added tts_request, first_tts_audio, llm_complete to trace real TTS pipeline
+    turn_timing = {
+        "speech_end": 0.0,      # VAD detects speech end (approx from state change)
+        "stt_final": 0.0,       # STT final transcript received
+        "turn_detected": 0.0,   # Endpointing triggers thinking (turn completed)
+        "llm_start": 0.0,       # LLM request starts (on_user_turn_completed)
+        "first_token": 0.0,     # First token (thinking->speaking)
+        "tts_request": 0.0,     # First text chunk sent to TTS
+        "first_tts_audio": 0.0, # First audio chunk from TTS (REAL)
+        "llm_complete": 0.0,    # LLM full response complete (conversation_item_added)
+        "first_audio": 0.0,     # First audible audio (REAL TTS audio, set by wrapper)
+        "last_speech_end_to_first_audio": 0.0,
+    }
+
     # ------------------------------------------------------------------
     # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
     # ------------------------------------------------------------------
@@ -415,25 +695,117 @@ async def entrypoint(ctx):
     if agent_mode == "announcement":
         session = build_announcement_session(cfg)
     else:
-        session = build_assistant_session(cfg)
+        # Async build to avoid blocking job executor (was 3.46s sync -> unresponsive)
+        # Pass turn_timing_ref to enable TTS timing wrapper (measures real TTS audio)
+        session = await build_assistant_session(cfg, turn_timing_ref=turn_timing)
 
     # ------------------------------------------------------------------
-    # Silence watchdog.
+    # Silence watchdog + No-response watchdog.
     #
-    # When the LLM 429s (Groq free-tier TPM limit) the fail-fast retry budget in
-    # _build_conn_options gives up in <1s and LiveKit logs the error but speaks
-    # NOTHING — the caller is left in dead air and hangs up. Same symptom when a
-    # model returns an empty completion. So: arm a timer on every user turn, and
-    # if no assistant reply lands within LLM_FALLBACK_DELAY, speak
-    # FALLBACK_SILENCE and let the caller retry (by then the rate-limit window
-    # has usually rolled over).
+    # 1) LLM silence: When the LLM 429s (Groq free-tier TPM limit) the fail-fast
+    #    retry budget gives up in <1s and LiveKit logs the error but speaks
+    #    NOTHING — caller left in dead air. So arm timer on every user turn,
+    #    if no assistant reply within LLM_FALLBACK_DELAY, speak fallback.
+    # 2) User silence: If user says nothing for no_response_timeout_seconds
+    #    (configurable per agent, e.g. 30 sec), speak the agent's
+    #    no_response_message and hang up. Requested by user.
     # ------------------------------------------------------------------
+    call_closed = {"done": False}
+    closing_requested = {"done": False}
+    closing_in_progress = {"done": False}
+    closing_task_ref = {"task": None}
+    agent_holder = {"agent": None}
     reply_tracker = {
         "last_user_ts": 0.0,
         "last_assistant_ts": 0.0,
-        "empty_spoken": False,  # already spoke a fallback for the current turn
-        "pending": None,        # pending silence-fallback task
+        "empty_spoken": False,
+        "pending": None,
+        "fallback_say": None,
     }
+    # No-response tracking: last time user spoke or agent spoke
+    no_response_state = {
+        "last_activity": time.time(),
+        "task": None,
+        "triggered": False,
+    }
+
+    async def _do_deterministic_closing():
+        # Prevent duplicate closings, but allow if already closing to ensure completion
+        if closing_in_progress["done"]:
+            logger.info("Deterministic closing already in progress — skipping duplicate")
+            return
+        closing_in_progress["done"] = True
+        call_closed["done"] = True
+        closing_requested["done"] = True
+        _cancel_pending()
+        _cancel_no_response()
+        fb = reply_tracker.get("fallback_say")
+        if fb is not None and not fb.done():
+            fb.cancel()
+        reply_tracker["fallback_say"] = None
+        closing_msg = _get_deterministic_closing(cfg)
+        try:
+            usage["tts_chars"] += len(closing_msg)
+            usage["transcripts"].append({"role": "agent", "text": closing_msg})
+            logger.info(f"👋 Deterministic closing: {closing_msg} — will play fully then auto-cut")
+            # Mark timestamp so end_call tool knows closing was already spoken
+            try:
+                ag = agent_holder.get("agent")
+                if ag is not None:
+                    setattr(ag, '_last_deterministic_closing_ts', time.time())
+                    if hasattr(ag, 'cfg'):
+                        setattr(ag.cfg, '_last_closing_ts', time.time())
+                    # Also store on global ref for agent_builder
+                    setattr(ag, '_closing_msg', closing_msg)
+            except Exception:
+                pass
+            # Interrupt any ongoing LLM/TTS generation to prioritize goodbye
+            try:
+                session.interrupt()
+                await asyncio.sleep(0.15)
+            except Exception:
+                pass
+            # Speak deterministic closing — MUST complete before shutdown
+            try:
+                await asyncio.wait_for(session.say(closing_msg, allow_interruptions=False), timeout=20)
+                logger.info(f"✅ Deterministic closing TTS completed: {closing_msg}")
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Deterministic closing TTS timed out after 20s: {closing_msg}")
+            except Exception as e:
+                # Transport closed is expected if frontend already left, but try to still log
+                if "transport is closed" in str(e).lower() or "no stream" in str(e).lower():
+                    logger.warning(f"⚠️ Transport closed during closing TTS (frontend may have left early), but message was: {closing_msg} — will still shutdown after delay: {e}")
+                else:
+                    logger.warning(f"Deterministic closing say failed: {e}")
+            # Critical: wait for audio to flush to frontend before cutting
+            # 2.5s ensures TTS audio packet fully delivered even on slow network
+            await asyncio.sleep(2.5)
+        except asyncio.CancelledError:
+            logger.info("Deterministic closing cancelled")
+            return
+        except Exception as e:
+            logger.warning(f"Deterministic closing outer failed: {e}")
+            await asyncio.sleep(1.0)
+        # Now auto-cut the call
+        logger.info("✂️ Auto-cutting call after deterministic closing TTS")
+        try:
+            session.shutdown(drain=False)
+        except Exception:
+            pass
+        try:
+            ctx.shutdown()
+        except Exception:
+            pass
+
+    def _schedule_deterministic_closing():
+        if closing_in_progress["done"]:
+            return
+        if closing_task_ref["task"] is not None and not closing_task_ref["task"].done():
+            return
+        try:
+            closing_task_ref["task"] = asyncio.ensure_future(_do_deterministic_closing())
+        except Exception as e:
+            logger.warning(f"Could not schedule deterministic closing: {e}")
 
     def _cancel_pending():
         t = reply_tracker["pending"]
@@ -444,15 +816,24 @@ async def entrypoint(ctx):
     def _mark_reply(ts: float):
         reply_tracker["last_assistant_ts"] = ts
         _cancel_pending()
+        fallback_task = reply_tracker.get("fallback_say")
+        if fallback_task is not None and not fallback_task.done():
+            fallback_task.cancel()
+        reply_tracker["fallback_say"] = None
 
     def _spawn_say(text_to_say: str):
         async def _say():
             try:
                 await asyncio.wait_for(session.say(text_to_say, allow_interruptions=True), timeout=15)
+            except asyncio.CancelledError:
+                return
             except Exception as e:
                 logger.warning(f"🛟 fallback say failed: {e}")
         try:
-            asyncio.ensure_future(_say())
+            old = reply_tracker.get("fallback_say")
+            if old is not None and not old.done():
+                old.cancel()
+            reply_tracker["fallback_say"] = asyncio.ensure_future(_say())
         except Exception as e:
             logger.warning(f"🛟 could not schedule fallback reply: {e}")
 
@@ -464,14 +845,14 @@ async def entrypoint(ctx):
         finally:
             if reply_tracker["pending"] is asyncio.current_task():
                 reply_tracker["pending"] = None
-        if reply_tracker["last_assistant_ts"] >= turn_ts:
-            return  # the LLM did answer this turn (late, but it answered)
+        if reply_tracker["last_assistant_ts"] >= turn_ts or closing_requested["done"]:
+            return  # closing turns must never receive a delayed fallback
         logger.warning(
             f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
             "(rate-limited 429 or failed generation) — speaking a fallback line "
             "so the call is not silent."
         )
-        _spawn_say(FALLBACK_SILENCE)
+        _spawn_say(getattr(cfg, "fallback_response", "").strip() or DEFAULT_FALLBACK_RESPONSE)
 
     def _schedule_silence_fallback(turn_ts: float):
         _cancel_pending()
@@ -481,48 +862,315 @@ async def entrypoint(ctx):
             reply_tracker["pending"] = None
             logger.warning(f"🛟 could not arm silence watchdog: {e}")
 
+    # ---------- No-response handling — robust scheduled timer ----------
+    def _cancel_no_response():
+        t = no_response_state.get("task")
+        if t is not None and not t.done():
+            t.cancel()
+        no_response_state["task"] = None
+
+    async def _no_response_timeout_handler():
+        idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
+        no_response_msg = (getattr(cfg, "no_response_message", "") or
+                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+        try:
+            await asyncio.sleep(idle_timeout)
+        except asyncio.CancelledError:
+            return
+        if call_closed["done"] or closing_in_progress["done"] or closing_requested["done"] or no_response_state.get("triggered"):
+            return
+        elapsed = time.time() - no_response_state.get("last_activity", 0)
+        # If user spoke during sleep, task would have been cancelled; double-check
+        if elapsed < idle_timeout - 0.5:
+            logger.info(f"⏱️ No-response timer fired but user spoke {elapsed:.1f}s ago (timeout {idle_timeout}s) — skipping")
+            return
+        # Only trigger when waiting for user
+        cur_state = state_tracker.get("state")
+        if cur_state not in ("listening", None):
+            logger.info(f"⏱️ No-response timer fired but state is {cur_state} (not listening) — rescheduling")
+            _schedule_no_response()
+            return
+        no_response_state["triggered"] = True
+        # Mark call as closing to prevent re-arming watchdog on listening transition
+        call_closed["done"] = True
+        closing_in_progress["done"] = True
+        logger.info(f"⏱️ No user response for {elapsed:.0f}s (timeout {idle_timeout}s) — speaking no-response message and ending call")
+        try:
+            _cancel_pending()
+            fb = reply_tracker.get("fallback_say")
+            if fb is not None and not fb.done():
+                fb.cancel()
+            reply_tracker["fallback_say"] = None
+            try:
+                session.interrupt()
+                await asyncio.sleep(0.15)
+            except Exception:
+                pass
+            usage["tts_chars"] += len(no_response_msg)
+            usage["transcripts"].append({"role": "agent", "text": no_response_msg})
+            logger.info(f"⏱️ No-response closing TTS: {no_response_msg} — will play fully then auto-cut")
+            try:
+                await asyncio.wait_for(session.say(no_response_msg, allow_interruptions=False), timeout=20)
+                logger.info(f"✅ No-response TTS completed: {no_response_msg}")
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ No-response TTS timed out after 20s: {no_response_msg}")
+            except Exception as e:
+                if "transport is closed" in str(e).lower() or "no stream" in str(e).lower():
+                    logger.warning(f"⚠️ Transport closed during no-response TTS (frontend left early), but message was: {no_response_msg}: {e}")
+                else:
+                    logger.warning(f"No-response say failed: {e}")
+            await asyncio.sleep(2.5)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning(f"No-response outer failed: {e}")
+            await asyncio.sleep(1.0)
+        logger.info("✂️ Auto-cutting call after no-response TTS")
+        try:
+            session.shutdown(drain=False)
+        except Exception:
+            pass
+        try:
+            ctx.shutdown()
+        except Exception:
+            pass
+
+    def _schedule_no_response():
+        if no_response_state.get("triggered") or call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
+            logger.info("⏱️ Not arming no-response — call already closing/triggered")
+            return
+        _cancel_no_response()
+        idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
+        no_response_msg = (getattr(cfg, "no_response_message", "") or
+                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+        no_response_state["last_activity"] = time.time()
+        try:
+            no_response_state["task"] = asyncio.ensure_future(_no_response_timeout_handler())
+            logger.info(f"⏱️ No-response watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}' (scheduled)")
+        except Exception as e:
+            logger.warning(f"Could not arm no-response watchdog: {e}")
+
+    # Fallback loop monitor (kept for safety, primary is scheduled timer)
+    async def _no_response_monitor():
+        idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
+        no_response_msg = (getattr(cfg, "no_response_message", "") or
+                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+        logger.info(f"⏱️ No-response loop watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}'")
+        await asyncio.sleep(2)
+        while not call_closed["done"] and not closing_in_progress["done"] and not no_response_state.get("triggered"):
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                return
+            if closing_requested["done"] or closing_in_progress["done"] or call_closed["done"]:
+                continue
+            elapsed = time.time() - no_response_state.get("last_activity", 0)
+            cur_state = state_tracker.get("state")
+            if cur_state not in ("listening", None):
+                if cur_state in ("speaking", "thinking"):
+                    no_response_state["last_activity"] = time.time()
+                continue
+            if elapsed >= idle_timeout and not no_response_state.get("triggered"):
+                if no_response_state.get("task") is None or no_response_state["task"].done():
+                    logger.info(f"⏱️ Loop detected no response {elapsed:.0f}s — triggering")
+                    await _no_response_timeout_handler()
+                return
+
     def on_item_added(ev):
+        # Allow system closing/no-response messages even after call_closed is set
+        # to ensure transcript logging works; otherwise early return hides TTS log
+        try:
+            _item_role = getattr(getattr(ev, "item", None), "role", None)
+        except Exception:
+            _item_role = None
+        if call_closed["done"] and _item_role != "assistant" and not no_response_state.get("triggered"):
+            return
+        if call_closed["done"] and _item_role == "assistant":
+            # Still process if it's system closing (triggered flag) — otherwise skip LLM chatter after close
+            if not (no_response_state.get("triggered") or closing_in_progress["done"]):
+                return
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
         text = _msg_text(item)
         if role == "user":
             if not text:
                 return
-            # Skip the SAME phrase re-emitted within 2.5s (STT/endpointing dupes),
-            # otherwise the same speech is billed and shown multiple times.
             now = time.time()
-            if text == last_user_transcript["text"] and (now - last_user_transcript["ts"]) < 2.5:
+            # Production debounce fix: 2.5s was too long for short "haan/ok/yes" causing missed turns
+            # For short utterances (<3 words), debounce 0.8s, for longer 1.5s (was 2.5s)
+            # Prevents duplicate STT events (interim->final same text) from delaying turn, but allows quick repeats
+            words_in_text = len(text.split())
+            debounce_threshold = 0.8 if words_in_text <= 2 else 1.5
+            if text == last_user_transcript["text"] and (now - last_user_transcript["ts"]) < debounce_threshold:
+                logger.info(f"⏭️ Dedupe STT duplicate (same text within {debounce_threshold}s): {text[:60]}")
                 return
             last_user_transcript["text"] = text
             last_user_transcript["ts"] = now
+            # --- Production timing: STT final received ---
+            # FIX: Always start fresh timing for each user turn, don't reuse previous speech_end
+            # Previous bug: if LLM returned empty (thinking->listening without speaking), speech_end not reset,
+            # next turn measured from old speech_end → 4712ms outlier artifact
+            # Now: always overwrite speech_end with fresh approximation for this turn
+            # Also reset other timings if they were stale (>5s old) from previous empty turn
+            if turn_timing["speech_end"] != 0:
+                stale_age = now - turn_timing["speech_end"]
+                if stale_age > 5.0:
+                    logger.info(f"🔄 Resetting stale turn_timing (speech_end {stale_age:.1f}s old from empty turn) for fresh turn")
+                    turn_timing["speech_end"] = 0.0
+                    turn_timing["stt_final"] = 0.0
+                    turn_timing["turn_detected"] = 0.0
+                    turn_timing["llm_start"] = 0.0
+                    turn_timing["first_token"] = 0.0
+                    turn_timing["first_audio"] = 0.0
+                    # Keep tts_request and audio_published if they exist, reset them too
+                    if "tts_request" in turn_timing:
+                        turn_timing["tts_request"] = 0.0
+                    if "first_tts_audio" in turn_timing:
+                        turn_timing["first_tts_audio"] = 0.0
+            # Fresh timing for this turn
+            turn_timing["speech_end"] = now - 0.25  # approximate speech end 250ms before final
+            turn_timing["stt_final"] = now
+            # Calculate speech_end->STT_final
+            if turn_timing["speech_end"] > 0:
+                speech_to_stt = (now - turn_timing["speech_end"]) * 1000
+                logger.info(f"⏱️ TIMING speech_end->STT_final: {speech_to_stt:.0f}ms (text: {text[:50]}, words: {words_in_text})")
+                # Flag if exceeds 400ms target
+                if speech_to_stt > 600:
+                    logger.warning(f"🐢 Slow STT final: speech_end->STT_final {speech_to_stt:.0f}ms exceeds 400ms target (possible Deepgram delay)")
+            # Reset speech_end for next turn after logging
+            # Keep it for total calculation until first_audio
+            # User spoke — cancel any pending no-response timer (user is active)
+            _cancel_no_response()
+            no_response_state["last_activity"] = now
             words = max(len(text.split()), 1)
             usage["llm_input_tokens"] += int(words * 1.3)
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
             usage["transcripts"].append({"role": "user", "text": text})
             logger.info(f"👂 User: {text}")
+            normalized_user = " ".join(text.lower().replace(".", " ").replace(",", " ").split())
+            # Expanded closing detection for low-latency deterministic goodbye.
+            # Covers: bye variants, ok good bye, thank you, mixed Hindi/English,
+            # and natural no-help phrases like "नहीं और कोई मदद नहीं चाहिए"
+            # and transliterated "mujhe kuch nahi puchna hai".
+            closing_exact = {
+                "bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye",
+                "ok good bye", "okay good bye", "ok goodbye", "okay goodbye",
+                "good bye bye", "thank you", "thanks", "thankyou",
+                "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                "no more questions", "no more help", "that's all", "that is all",
+                "नहीं और कोई मदद नहीं चाहिए", "और कोई मदद नहीं चाहिए",
+                "कोई मदद नहीं चाहिए", "और कुछ नहीं चाहिए", "बस हो गया",
+                "नहीं और कोई सवाल नहीं है", "और कोई सवाल नहीं है",
+                "कोई सवाल नहीं है", "मुझे कुछ नहीं पूछना है", "मुझे कुछ नहीं पूछना",
+                "कुछ नहीं पूछना है", "कुछ नहीं पूछना",
+                "mujhe kuch nahi puchna hai", "mujhe kuch nahi puchna",
+                "kuch nahi puchna hai", "kuch nahi puchna",
+                "koi sawaal nahi hai", "koi sawal nahi hai",
+                "aur koi sawaal nahi hai", "aur koi sawal nahi hai",
+                "nahi aur koi madad nahi chahiye", "aur koi madad nahi chahiye",
+                "nahi aur koi sawaal nahi hai",
+            }
+            closing_substrings = (
+                "cut the call", "hang up", "disconnect", "end the call", "call cut",
+                "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
+                "कॉल बंद कर दीजिए", "फोन काट दीजिए", "फोन काट दो",
+                "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
+                "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
+                "no more questions", "no more help", "that's all", "that is all",
+                "नहीं और कोई मदद नहीं चाहिए", "और कोई मदद नहीं चाहिए",
+                "कोई मदद नहीं चाहिए", "और कुछ नहीं चाहिए",
+                "नहीं और कोई सवाल नहीं है", "और कोई सवाल नहीं है",
+                "मुझे कुछ नहीं पूछना है", "कुछ नहीं पूछना है",
+                "mujhe kuch nahi puchna", "kuch nahi puchna",
+                "koi sawaal nahi", "koi sawal nahi",
+            )
+            # Robust bye detection: any occurrence of goodbye/good bye, or standalone bye
+            has_goodbye = "goodbye" in normalized_user or "good bye" in normalized_user
+            # bye as separate token or at end, avoid false positive from "by" substring
+            tokens = normalized_user.split()
+            has_bye_token = "bye" in tokens or normalized_user.endswith(" bye") or normalized_user.startswith("bye ")
+            # Enhanced thank detection: "thank you very much", "thank kota" (mis-heard), "accha laga thank" etc
+            # Previous logic required <=12 tokens and exact thank you — too strict, caused
+            # "Ok, चलिए ठीक है आपसे बात करके अच्छा लगा thank Kota." to NOT close.
+            # Now: thank/thanks/dhanyavaad + positive sentiment or accha laga/khushi = closing
+            has_thank = "thank" in normalized_user or "thanks" in normalized_user or "धन्यवाद" in text or "dhanyavaad" in normalized_user
+            has_positive_close = any(w in normalized_user for w in ("accha laga", "achha laga", "khushi", "bahut accha", "very much", "bahut"))
+            has_contact_info = any(c in normalized_user for c in ("nine", "five", "double", "triple", "zero", "at the rate", "gmail", "dot com", "number", "email")) or (any(ch.isdigit() for ch in text) and len(tokens) >= 4 and len(tokens) <= 20)
+            if has_contact_info:
+                closing_requested["done"] = False
+            else:
+                closing_requested["done"] = (
+                    normalized_user in closing_exact
+                    or has_goodbye
+                    or (has_bye_token and len(tokens) <= 8)
+                    or (has_thank and "?" not in text and (len(tokens) <= 18 or has_positive_close or "accha laga" in normalized_user or "achha laga" in normalized_user))
+                    or any(phrase in normalized_user for phrase in closing_substrings)
+                )
+            if closing_requested["done"]:
+                # Never let the generic provider-timeout fallback speak after a
+                # caller has already asked to leave. Speak deterministic closing
+                # and hang up (bb393dd fix).
+                _cancel_pending()
+                old_fallback = reply_tracker.get("fallback_say")
+                if old_fallback is not None and not old_fallback.done():
+                    old_fallback.cancel()
+                reply_tracker["fallback_say"] = None
+                _schedule_deterministic_closing()
+                return
+            # A fresh turn supersedes any fallback still speaking from the
+            # previous failed turn; never let it bleed into this reply.
+            old_fallback = reply_tracker.get("fallback_say")
+            if old_fallback is not None and not old_fallback.done():
+                old_fallback.cancel()
+            reply_tracker["fallback_say"] = None
             # A fresh turn starts: arm the silence watchdog so a 429'd or empty
             # LLM turn never leaves the caller in dead air.
             reply_tracker["last_user_ts"] = now
             reply_tracker["empty_spoken"] = False
             _schedule_silence_fallback(now)
         elif role == "assistant":
-            # Tool-call / tool-result items are not spoken replies. Skip them —
-            # otherwise they show up as bogus "🗣️ TTS:" lines and, on the
-            # end_call turn, trigger a fallback line right before the hang-up.
             if _item_is_tool_related(item):
                 return
             now = time.time()
             if not text.strip():
-                # The LLM produced an empty completion — LiveKit has nothing to
-                # speak. Without this the caller hears dead air and hangs up.
-                logger.warning("🧮 LLM returned an empty reply — speaking fallback line.")
-                _mark_reply(now)
-                if not reply_tracker["empty_spoken"]:
-                    reply_tracker["empty_spoken"] = True
-                    _spawn_say(FALLBACK_REPLY)
+                logger.warning("🧮 LLM produced an empty assistant item; waiting for a speakable reply")
                 return
             _mark_reply(now)
+            # Reset no-response timer when agent speaks - timeout starts after agent finishes
+            no_response_state["last_activity"] = now
             cleaned = clean_reply_text(text)
+            # Never let the LLM close a call on its own. Models sometimes emit
+            # a farewell after ambiguous STT fragments such as "company go".
+            # Only transcript-level explicit intent may produce a closing TTS.
+            # EXEMPT system-initiated messages: no-response and deterministic closing
+            # must never be suppressed (they contain "thank you for calling").
+            is_system_closing = False
+            try:
+                sys_closing_msgs = [
+                    DETERMINISTIC_CLOSING_MESSAGE,
+                    DETERMINISTIC_CLOSING_MESSAGE_EN,
+                    (getattr(cfg, "no_response_message", "") or "").strip(),
+                ]
+                # also check configured message truncated log comparison
+                if any(cleaned == m or text.strip() == m for m in sys_closing_msgs if m):
+                    is_system_closing = True
+                if no_response_state.get("triggered") or closing_in_progress["done"] or closing_requested["done"]:
+                    # If we are already in closing/no-response flow, allow any farewell
+                    is_system_closing = True
+            except Exception:
+                pass
+            latest_user = last_user_transcript["text"].lower()
+            explicit_end = any(term in latest_user for term in (
+                "goodbye", "good bye", "bye", "hang up", "cut the call",
+                "disconnect", "end the call", "thank you", "thankyou", "bye bye",
+                "ok bye", "okay bye", "कॉल कट", "call काट", "कॉल काट",
+                "call cut कर दीजिए", "call काट दीजिए", "कॉल बंद कर दीजिए",
+                "फोन काट दीजिए"
+            ))
+            if not is_system_closing and not explicit_end and any(term in cleaned.lower() for term in ("goodbye", "good bye", "thank you for calling")):
+                logger.warning("🛡️ Suppressed model farewell without explicit caller goodbye")
+                cleaned = "Ji, batayiye, aapko kis tarah ki madad chahiye?"
             if cleaned == FALLBACK_REPLY and text.strip() != FALLBACK_REPLY:
                 # The model returned something but we flagged it as a fallback —
                 # surface the raw text so we can see WHY.
@@ -534,7 +1182,47 @@ async def entrypoint(ctx):
                 words = max(len(cleaned.split()), 1)
                 usage["llm_output_tokens"] += int(words * 1.3)
             usage["transcripts"].append({"role": "agent", "text": cleaned})
-            logger.info(f"🗣️ TTS: {cleaned}")
+            # --- Production timing: LLM complete (NOT audio yet) ---
+            # conversation_item_added = LLM finished, not TTS audio
+            # Real TTS audio timing is measured by TTS wrapper (first_tts_audio, first_audio)
+            now_llm_complete = time.time()
+            if turn_timing.get("llm_complete", 0) == 0:
+                turn_timing["llm_complete"] = now_llm_complete
+                if turn_timing["first_token"] > 0:
+                    logger.info(f"⏱️ TIMING first_token->llm_complete (LLM full response): {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms")
+                if turn_timing["llm_start"] > 0:
+                    logger.info(f"⏱️ TIMING llm_start->llm_complete: {(now_llm_complete-turn_timing['llm_start'])*1000:.0f}ms")
+                if turn_timing["speech_end"] > 0:
+                    logger.info(f"⏱️ TIMING speech_end->llm_complete: {(now_llm_complete-turn_timing['speech_end'])*1000:.0f}ms (NOTE: NOT audio, real audio via TTS wrapper)")
+            # Fallback for say() calls without TTS wrapper
+            if turn_timing.get("first_tts_audio", 0) == 0 and turn_timing.get("first_audio", 0) == 0:
+                if turn_timing["first_token"] > 0:
+                    token_to_audio = (now_llm_complete - turn_timing["first_token"]) * 1000
+                    logger.info(f"⏱️ TIMING first_token->first_audio (fallback no wrapper): {token_to_audio:.0f}ms")
+                if turn_timing["speech_end"] > 0:
+                    speech_to_audio = (now_llm_complete - turn_timing["speech_end"]) * 1000
+                    logger.info(f"⏱️ TIMING speech_end->first_audio (fallback): {speech_to_audio:.0f}ms")
+                    turn_timing["last_speech_end_to_first_audio"] = speech_to_audio
+                    if turn_timing["stt_final"] > 0 and turn_timing["turn_detected"] > 0 and turn_timing["llm_start"] > 0 and turn_timing["first_token"] > 0:
+                        logger.info(
+                            f"📊 TURN BREAKDOWN (fallback): speech_end->STT_final {(turn_timing['stt_final']-turn_timing['speech_end'])*1000:.0f}ms | "
+                            f"STT_final->turn {(turn_timing['turn_detected']-turn_timing['stt_final'])*1000:.0f}ms | "
+                            f"turn->LLM {(turn_timing['llm_start']-turn_timing['turn_detected'])*1000:.0f}ms | "
+                            f"LLM->first_token {(turn_timing['first_token']-turn_timing['llm_start'])*1000:.0f}ms | "
+                            f"first_token->audio {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms | "
+                            f"TOTAL {speech_to_audio:.0f}ms"
+                        )
+                    if turn_timing.get("tts_request", 0) == 0:
+                        turn_timing["speech_end"] = 0.0
+                        turn_timing["stt_final"] = 0.0
+                        turn_timing["turn_detected"] = 0.0
+                        turn_timing["llm_start"] = 0.0
+                        turn_timing["first_token"] = 0.0
+                        turn_timing["tts_request"] = 0.0
+                        turn_timing["first_tts_audio"] = 0.0
+                        turn_timing["llm_complete"] = 0.0
+                        turn_timing["first_audio"] = 0.0
+            logger.info(f"🗣️ TTS (LLM complete): {cleaned}")
 
     session.on("conversation_item_added", on_item_added)
 
@@ -545,6 +1233,96 @@ async def entrypoint(ctx):
         if prev == "thinking" and elapsed > 2.5:
             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
         logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+
+        # --- Production timing instrumentation ---
+        if prev == "listening" and ev.new_state == "thinking":
+            # Turn detected: listening -> thinking = endpointing triggered
+            # This is speech_end + VAD + endpointing + STT final -> LLM request path
+            turn_timing["turn_detected"] = now
+            if turn_timing["stt_final"] > 0:
+                stt_to_turn = (now - turn_timing["stt_final"]) * 1000
+                logger.info(f"⏱️ TIMING STT_final->turn_detected (endpointing): {stt_to_turn:.0f}ms")
+                if stt_to_turn > 150:
+                    logger.warning(f"🐢 Slow endpointing: STT_final->turn {stt_to_turn:.0f}ms exceeds 100ms target")
+            if turn_timing["speech_end"] > 0:
+                speech_to_turn = (now - turn_timing["speech_end"]) * 1000
+                logger.info(f"⏱️ TIMING speech_end->turn_detected (VAD+STT+endpointing): {speech_to_turn:.0f}ms")
+                if speech_to_turn > 700:
+                    logger.warning(f"🐢 Slow turn detection: speech_end->turn {speech_to_turn:.0f}ms exceeds 500ms target (outlier!)")
+            # Also log as LLM start (turn completed -> LLM request)
+            turn_timing["llm_start"] = now
+            if turn_timing["stt_final"] > 0:
+                stt_to_llm = (now - turn_timing["stt_final"]) * 1000
+                logger.info(f"⏱️ TIMING STT_final->LLM_start: {stt_to_llm:.0f}ms (target ≤100ms)")
+
+        elif prev == "thinking" and ev.new_state == "speaking":
+            # First token -> first audio: LLM first token arrived, TTS starting
+            turn_timing["first_token"] = now
+            if turn_timing["llm_start"] > 0:
+                llm_to_token = (now - turn_timing["llm_start"]) * 1000
+                logger.info(f"⏱️ TIMING LLM_start->first_token: {llm_to_token:.0f}ms (target ≤500ms)")
+            if turn_timing["speech_end"] > 0:
+                speech_to_token = (now - turn_timing["speech_end"]) * 1000
+                logger.info(f"⏱️ TIMING speech_end->first_token: {speech_to_token:.0f}ms")
+
+        elif prev == "thinking" and ev.new_state == "listening":
+            # Empty turn: thinking->listening without speaking (LLM returned empty/no TTS)
+            # FIX: Reset timing so next turn doesn't use stale speech_end (caused 4712ms artifact)
+            if turn_timing["speech_end"] != 0 and turn_timing["first_audio"] == 0:
+                logger.info(f"⚠️ Empty LLM turn detected (thinking {elapsed:.2f}s → listening without speaking), resetting turn_timing to avoid next-turn outlier")
+                turn_timing["speech_end"] = 0.0
+                turn_timing["stt_final"] = 0.0
+                turn_timing["turn_detected"] = 0.0
+                turn_timing["llm_start"] = 0.0
+                turn_timing["first_token"] = 0.0
+                turn_timing["first_audio"] = 0.0
+                if "tts_request" in turn_timing:
+                    turn_timing["tts_request"] = 0.0
+                if "first_tts_audio" in turn_timing:
+                    turn_timing["first_tts_audio"] = 0.0
+                if "audio_published" in turn_timing:
+                    turn_timing["audio_published"] = 0.0
+
+        elif ev.new_state == "listening" and prev == "speaking":
+            # Agent finished speaking, now listening: estimate speech_end for next turn
+            # Reset timing for next turn, but keep last turn's metrics for final calc
+            # Actually speech_end will be set when user starts speaking? We need VAD hook.
+            # For now, reset stt_final and turn_detected for next turn
+            # Keep speech_end as 0 until next VAD end (we approximate via last_user_transcript timing)
+            pass
+
+        # Track VAD speech end approximation: when listening starts, user hasn't spoken yet
+        # When user stops speaking, STT final arrives, then turn detected.
+        # For barge-in detection: listening->thinking is turn, but we also need speech_end.
+        # We approximate speech_end as stt_final - 200ms (Deepgram endpointing) or use VAD if available.
+        # Better: set speech_end when we get interim STT that then becomes final after silence.
+        # For now, we set speech_end when state goes listening->thinking minus endpointing delay
+        # to measure outlier.
+
+        if ev.new_state == "speaking":
+            _cancel_pending()
+            # Don't cancel if we are in no-response closing flow — keep triggered flag
+            if not no_response_state.get("triggered"):
+                _cancel_no_response()
+            no_response_state["last_activity"] = now
+            # First audio timing will be logged in TTS handler
+        elif ev.new_state == "listening":
+            # If no-response already triggered or call closing, do NOT re-arm
+            if no_response_state.get("triggered") or call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
+                logger.info(f"⏱️ Listening but no-response/closing already triggered — not re-arming")
+            else:
+                no_response_state["last_activity"] = now
+                _schedule_no_response()
+            # Reset for next turn's speech_end detection
+            # We will set speech_end when VAD would have detected end, approx now + user speech
+            # Actually we need to track when user starts speaking vs stops.
+            # For outlier detection, we log listening duration: if >3s, flag
+            if elapsed > 3.0 and prev in ("listening", None):
+                logger.warning(f"🐢 Listening outlier: {prev}->{ev.new_state} took {elapsed:.2f}s (possible 3-7s outlier, check VAD/STT)")
+        elif ev.new_state == "thinking":
+            if not no_response_state.get("triggered"):
+                _cancel_no_response()
+            no_response_state["last_activity"] = now
         state_tracker["state"] = ev.new_state
         state_tracker["since"] = now
 
@@ -576,6 +1354,7 @@ async def entrypoint(ctx):
     else:
         agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data)
         logger.info("💬 mode=assistant (STT+LLM+TTS)")
+    agent_holder["agent"] = agent
 
     # Server-side noise cancellation. Two tiers:
     #   * NOISE_CANCELLATION=krisp -> server-side Krisp (BVC) filter. Only works on
@@ -592,11 +1371,12 @@ async def entrypoint(ctx):
             from livekit import rtc
             from livekit.agents.voice import room_io
             room_options = room_io.RoomOptions(
+                close_on_disconnect=False,
                 input_options=room_io.RoomInputOptions(
                     noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
                 )
             )
-            logger.info("🎤 Krisp noise cancellation enabled.")
+            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=False).")
         except Exception as e:
             logger.warning(
                 "Krisp noise cancellation unavailable (%s). To enable it on LiveKit "
@@ -605,8 +1385,22 @@ async def entrypoint(ctx):
                 "browser calls get WebRTC noise suppression and Deepgram VAD filters "
                 "non-speech.", e,
             )
-    elif nc_mode:
-        logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
+            # Fallback: still ensure close_on_disconnect=False even if Krisp fails
+            try:
+                from livekit.agents.voice import room_io as _rio
+                room_options = _rio.RoomOptions(close_on_disconnect=False)
+                logger.info("🎤 RoomOptions(close_on_disconnect=False) armed as fallback after Krisp failure.")
+            except Exception:
+                pass
+    else:
+        try:
+            from livekit.agents.voice import room_io as _rio
+            room_options = _rio.RoomOptions(close_on_disconnect=False)
+            logger.info("🎤 RoomOptions(close_on_disconnect=False) armed (TTS goodbye protected).")
+        except Exception as e:
+            logger.warning(f"Could not set RoomOptions close_on_disconnect=False: {e}")
+        if nc_mode:
+            logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
 
     # ------------------------------------------------------------------
     # Finalization (idempotent) + call-end watchdog.
@@ -645,19 +1439,56 @@ async def entrypoint(ctx):
             real_call = (duration >= _FAIL_THRESHOLD_SECONDS) or (usage["user_speech_seconds"] > 0)
             status = "completed" if real_call else "failed"
 
-            await repo.update_call(call_record["id"], {
-                "status": status,
-                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
-                "duration_seconds": duration,
-                "transcripts": usage["transcripts"][-60:],
-                "usage": usage,
-                "cost": costs if real_call else {},
-                "recording_url": recording_url,
-            })
             print(_billing_report(costs, usage, duration))
+
+            # IMPORTANT: Post billing to backend FIRST so wallet deduction happens
+            # atomically in main.py (which also updates the call record). This
+            # prevents the race where worker marks completed before backend can deduct.
+            billing_posted = False
             if real_call:
-                await _post_billing(call_record["id"], user_id, agent_id, mode, phone,
-                                    duration, costs, usage, recording_url, status)
+                try:
+                    billing_posted = await _post_billing(call_record["id"], user_id, agent_id, mode, phone,
+                                        duration, costs, usage, recording_url, status)
+                except Exception as e:
+                    logger.warning(f"Billing POST exception, will fallback to direct DB: {e!r}", exc_info=True)
+                    billing_posted = False
+
+            # Fallback local update (ensures call is marked completed even if backend unreachable)
+            try:
+                await repo.update_call(call_record["id"], {
+                    "status": status,
+                    "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    "duration_seconds": duration,
+                    "transcripts": usage["transcripts"][-60:],
+                    "usage": usage,
+                    "cost": costs if real_call else {},
+                    "recording_url": recording_url,
+                })
+            except Exception as e:
+                logger.warning(f"Local call update failed: {e}")
+
+            # Safety net: ALWAYS check wallet deduction — if backend failed or returned non-200,
+            # deduct directly via DB (idempotent, checks existing spend transaction)
+            if real_call:
+                try:
+                    has_spend = False
+                    try:
+                        has_spend = await repo.has_spend_for_call(call_record.get("user_id", user_id), call_record["id"])
+                    except Exception as he:
+                        logger.warning(f"has_spend check failed: {he}")
+                        has_spend = False
+                    if not has_spend:
+                        charge = float(costs.get("client_price_inr", 0) or 0)
+                        if charge > 0:
+                            wallet = await repo.deduct(call_record.get("user_id", user_id), charge, note=f"Call {call_record['id']}")
+                            logger.info(f"💸 Wallet auto-deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)} (billing_posted={billing_posted})")
+                        else:
+                            logger.info(f"Call {call_record['id']} has zero charge, no deduction needed")
+                    else:
+                        logger.info(f"💰 Wallet already deducted for call {call_record['id']} (billing_posted={billing_posted}) — skipping direct deduct")
+                except Exception as de:
+                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}", exc_info=True)
+
         except Exception as e:
             logger.exception(f"finalize_billing error: {e}")
 
@@ -681,6 +1512,21 @@ async def entrypoint(ctx):
                 caller_joined.set()
 
         def _on_disconnected(participant):
+            # If we are already in deterministic closing, don't trigger hangup watchdog
+            # — let closing TTS finish fully before cutting
+            if closing_in_progress["done"]:
+                logger.info("👋 Caller disconnected during deterministic closing — letting goodbye TTS finish before cut")
+                if not room.remote_participants:
+                    caller_left.set()
+                return
+            call_closed["done"] = True
+            # Cancel pending fallback speech immediately when the caller leaves.
+            # Otherwise the watchdog can try to speak into a closed AgentSession.
+            _cancel_pending()
+            fallback_task = reply_tracker.get("fallback_say")
+            if fallback_task is not None and not fallback_task.done():
+                fallback_task.cancel()
+            reply_tracker["fallback_say"] = None
             # "remote participants" = the caller(s). When there are none left and
             # we previously saw at least one caller, the call is over.
             if not room.remote_participants:
@@ -693,7 +1539,36 @@ async def entrypoint(ctx):
             if room.remote_participants:
                 caller_joined.set()
             await caller_joined.wait()
-            await caller_left.wait()
+            idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
+            try:
+                await asyncio.wait_for(caller_left.wait(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                # Keep this deterministic and customer-configurable. Do not run
+                # the LLM for an idle caller; speak the saved line once, then hang up.
+                message = (getattr(cfg, "no_response_message", "") or
+                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+                _cancel_pending()
+                _cancel_no_response()
+                no_response_state["triggered"] = True
+                call_closed["done"] = True
+                closing_in_progress["done"] = True
+                fallback_task = reply_tracker.get("fallback_say")
+                if fallback_task is not None and not fallback_task.done():
+                    fallback_task.cancel()
+                try:
+                    await session.say(message, allow_interruptions=False)
+                except Exception as exc:
+                    logger.info("Idle timeout message could not be played because the session closed: %s", exc)
+                logger.info("⏱️ Caller inactive for %ss — ending call.", idle_timeout)
+                try:
+                    session.shutdown(drain=False)
+                except Exception:
+                    pass
+                try:
+                    ctx.shutdown()
+                except Exception:
+                    pass
+                return
             logger.info("👋 Caller hang up — ending call.")
         finally:
             room.off("participant_connected", _on_connected)
@@ -709,12 +1584,9 @@ async def entrypoint(ctx):
             logger.warning(f"could not trigger job shutdown: {e}")
 
     watchdog = asyncio.create_task(watch_call_end())
+    # Primary: scheduled timer (resets on activity), fallback: loop monitor
+    loop_monitor_task = asyncio.create_task(_no_response_monitor())
 
-    # session.start connects to the room (calls ctx.connect() internally) and
-    # keeps the job alive until the room disconnects (call ends).
-    # NOTE: only pass room_options when it's a real RoomOptions — livekit 1.7.1
-    # rejects an explicit None (room_options defaults to NOT_GIVEN, so omitting
-    # it makes the session build its own default options).
     start_kwargs: dict = {"agent": agent, "room": ctx.room}
     if room_options is not None:
         start_kwargs["room_options"] = room_options
@@ -722,6 +1594,8 @@ async def entrypoint(ctx):
         await session.start(**start_kwargs)
     finally:
         watchdog.cancel()
+        loop_monitor_task.cancel()
+        _cancel_no_response()
         if egress_task is not None:
             egress_task.cancel()
 
@@ -734,14 +1608,15 @@ def _billing_report(costs, usage, duration) -> str:
         f"🧠 LLM {usage['llm_input_tokens']}in/{usage['llm_output_tokens']}out -> ₹{costs['llm_cost_inr']}\n"
         f"🗣️ TTS {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}\n"
         f"🖥️ Server -> ₹{costs['server_cost_inr']}\n"
-        f"💸 YOUR COST ₹{costs['total_cost_inr']}   💳 BILL ₹{costs['client_price_inr']}\n"
+        f"💸 YOUR COST ₹{costs['total_cost_inr']} (₹{costs['your_cost_per_min']}/min)\n"
+        f"💳 CUSTOMER BILL ₹{costs['client_price_inr']} (₹{costs['client_bill_per_min']}/min)\n"
         f"🤑 PROFIT ₹{costs['your_profit_inr']} [{'PROFIT ✅' if costs['is_profit'] else 'LOSS ⚠️'}]\n"
         + "=" * 64
     )
 
 
 async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs, usage,
-                       recording_url, status="completed"):
+                       recording_url, status="completed") -> bool:
     headers = {"Content-Type": "application/json"}
     if BILLING_INTERNAL_TOKEN:
         headers["X-Internal-Token"] = BILLING_INTERNAL_TOKEN
@@ -778,22 +1653,32 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{BILLING_BACKEND_URL}/api/billing/log",
-                                    json=payload, headers=headers, timeout=5) as resp:
-                logger.info(f"✅ Billing posted HTTP {resp.status}")
+                                    json=payload, headers=headers, timeout=8) as resp:
+                body = await resp.text()
+                logger.info(f"✅ Billing posted HTTP {resp.status} for call {call_id} — billed ₹{costs['client_price_inr']} — backend will deduct wallet")
+                if resp.status >= 400:
+                    logger.warning(f"⚠️ Billing POST returned {resp.status}: {body[:500]}")
+                    return False
+                return True
     except Exception as e:
-        logger.warning(f"⚠️ Billing POST failed: {e}")
+        logger.warning(f"⚠️ Billing POST failed for call {call_id} to {BILLING_BACKEND_URL}: {e!r} — will fallback to direct DB deduct", exc_info=True)
+        return False
 
 
 def prewarm(proc):
-    # silero was imported at module top-level (main thread), so the plugin is
-    # already registered; this only loads the VAD model weights into memory.
+    # Production prewarm: ONLY VAD, NOT DB (DB prewarm caused "Event loop is closed" -> 1.73s lookup retry)
+    # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU (no more 0.4s slower-than-realtime)
+    # Endpointing now STT-based 0.20/0.55, so VAD only for barge-in, not turn detection
     silero.VAD.load(
-        min_speech_duration=0.1,
-        min_silence_duration=0.5,
-        prefix_padding_duration=0.2,
-        activation_threshold=0.45,
+        min_speech_duration=0.20,
+        min_silence_duration=0.30,
+        prefix_padding_duration=0.20,
+        activation_threshold=0.55,
     )
-    logger.info("🔥 Prewarm: VAD hot")
+    logger.info("🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55, STT turn_detection, endpointing 0.20/0.55)")
+    # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
+    # "Event loop is closed" on next Prisma call -> 1.73s retry. DB now cached per process
+    # via _DB_INIT_DONE global, first job pays 2.33s, subsequent 0.00s, no loop closure.
 
 
 if __name__ == "__main__":

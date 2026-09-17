@@ -219,12 +219,20 @@ async def add_knowledge(
     if not await repo.get_agent(agent_id, user.id):
         raise HTTPException(404, "Agent not found")
 
+    if file is not None and text and text.strip():
+        raise HTTPException(400, "Choose either a knowledge file or pasted text, not both")
+
     if file is not None:
         doc_name = file.filename or "uploaded-doc"
         raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(413, "Knowledge file must be 10 MB or smaller")
         content = _parse_file(doc_name, raw)
-        await repo.append_agent_document(agent_id, user.id, {"name": doc_name, "content": content})
-        return {"ok": True, "appended": "document"}
+        if len(content) > 2_000_000:
+            raise HTTPException(413, "Extracted knowledge content is too large")
+        # File upload is a replacement operation: never accumulate stale files.
+        await repo.set_agent_knowledge(agent_id, user.id, {"text": "", "documents": [{"name": doc_name, "content": content}]})
+        return {"ok": True, "replaced": "document"}
 
     if text:
         await repo.set_agent_knowledge(agent_id, user.id, {"text": text})
@@ -342,6 +350,21 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
     return rec
 
 
+@app.delete("/api/calls/{call_id}", status_code=204)
+async def delete_call(call_id: str, user=Depends(auth.get_current_user)):
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    # If the selected row is still live, close its room before deleting the row.
+    if rec.get("status") in ("planned", "in-progress") and rec.get("room"):
+        try:
+            await telephony.end_active_room(rec["room"])
+        except Exception as e:
+            logger.warning(f"Could not close room before deleting call {call_id}: {e}")
+    if not await repo.delete_call(call_id, user.id):
+        raise HTTPException(404, "Call not found")
+
+
 # ---------------------------------------------------------------------------
 # Bulk-call campaigns (upload leads -> dial up to concurrency)
 # ---------------------------------------------------------------------------
@@ -446,6 +469,17 @@ async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(No
     if not rec:
         raise HTTPException(404, "Call record not found")
 
+    # Idempotency: if we already have a spend transaction for this call, don't double-charge.
+    # But still ensure the call record is up-to-date.
+    already_charged = False
+    try:
+        already_charged = await repo.has_spend_for_call(rec["user_id"], call_id)
+    except Exception:
+        already_charged = False
+
+    if rec.get("status") == "completed" and already_charged:
+        return {"ok": True, "call_id": call_id, "already_processed": True}
+
     await repo.update_call(call_id, {
         "status": status,
         "room": payload.get("room", rec.get("room", "")),
@@ -475,12 +509,13 @@ async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(No
         },
     })
 
-    # Settle the wallet for completed calls (deduct the customer's price once).
-    if status == "completed" and rec.get("status") != "completed":
+    # Settle the wallet for completed calls — deduct once per call, idempotent via repo.deduct.
+    if status == "completed" and not already_charged:
         charge = float(payload.get("costToUserNumber", 0) or 0)
         if charge > 0:
             try:
                 await repo.deduct(rec["user_id"], charge, note=f"Call {call_id}")
+                logger.info(f"💸 Deducted ₹{charge} for call {call_id} — remaining balance will update")
             except Exception as de:
                 logger.warning(f"Could not deduct wallet for call {call_id}: {de}")
 

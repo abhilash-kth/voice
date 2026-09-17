@@ -16,11 +16,17 @@ def default_config(agent_id: str = "demo") -> AgentConfig:
         ),
         providers=ProviderSelection(
             llm=ProviderPair(
-                id="groq_llama_3_3_70b",
-                config={"model": "llama-3.3-70b-versatile", "temperature": 0.1},
+                id="groq_gpt_oss_20b",
+                config={"model": "openai/gpt-oss-20b", "temperature": 0.1},
+            ),
+            llm_fallback=ProviderPair(
+                id="openrouter_gemma_free",
+                config={"model": "google/gemma-3-27b-it:free", "temperature": 0.1},
             ),
             stt=ProviderPair(id="deepgram_nova2", config={"language": "hi"}),
+            stt_fallback=ProviderPair(id="google_stt", config={"language": "hi-IN"}),
             tts=ProviderPair(id="google_wavenet_hi", config={"voice": "hi-IN-Chirp3-HD-Leda"}),
+            tts_fallback=ProviderPair(id="google_wavenet_hi", config={"voice": "hi-IN-Chirp3-HD-Leda"}),
             telephony=ProviderPair(id="browser", config={}),
         ),
         knowledge=KnowledgeBase(

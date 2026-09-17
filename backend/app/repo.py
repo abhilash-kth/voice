@@ -87,6 +87,9 @@ def _agent_dict(a: Any) -> dict:
         "enabled": bool(a.enabled),
         "agent_mode": a.agentMode or "assistant",
         "announce_text": a.announceText or "",
+        "fallback_response": getattr(a, "fallbackResponse", "") or "Sorry, there is a temporary technical problem. Please try again shortly.",
+        "no_response_timeout_seconds": getattr(a, "noResponseTimeoutSeconds", 60) or 60,
+        "no_response_message": getattr(a, "noResponseMessage", "") or "I did not hear a response, so I will end the call now. Thank you for calling.",
         "providers": _load_dict(a.providers),
         "knowledge": _load_dict(a.knowledge),
         "created_at": a.createdAt,
@@ -122,6 +125,9 @@ async def create_agent(user_id: str, data: dict) -> dict:
             "enabled": bool(data.get("enabled", True)),
             "agentMode": data.get("agent_mode", "assistant"),
             "announceText": data.get("announce_text", ""),
+            "fallbackResponse": data.get("fallback_response", "Sorry, there is a temporary technical problem. Please try again shortly."),
+            "noResponseTimeoutSeconds": max(15, int(data.get("no_response_timeout_seconds", 60))),
+            "noResponseMessage": data.get("no_response_message", "I did not hear a response, so I will end the call now. Thank you for calling."),
             "providers": _dump(data.get("providers", {})),
             "knowledge": _dump(data.get("knowledge", {})),
         }
@@ -136,7 +142,7 @@ async def update_agent(agent_id: str, user_id: str, patch: dict) -> Optional[dic
         "language": "language", "voice_personality": "voicePersonality",
         "client_rate_per_min": "clientRatePerMin", "memory_enabled": "memoryEnabled",
         "recording_enabled": "recordingEnabled", "max_concurrency": "maxConcurrency",
-        "enabled": "enabled", "agent_mode": "agentMode", "announce_text": "announceText",
+        "enabled": "enabled", "agent_mode": "agentMode", "announce_text": "announceText", "fallback_response": "fallbackResponse", "no_response_timeout_seconds": "noResponseTimeoutSeconds", "no_response_message": "noResponseMessage",
     }
     for k, v in patch.items():
         if k in mapping:
@@ -172,6 +178,14 @@ async def set_agent_knowledge(agent_id: str, user_id: str, kb: dict) -> Optional
         current["system_prompt"] = kb.get("system_prompt") or ""
     if "faq" in kb:
         current["faq"] = kb.get("faq") or []
+    if "documents" in kb:
+        current["documents"] = kb.get("documents") or []
+    # Keep the knowledge source unambiguous even for non-UI/API callers.
+    if current.get("text", "").strip() and current.get("documents"):
+        if "documents" in kb:
+            current["text"] = ""
+        else:
+            current["documents"] = []
     a = await get_prisma().agent.update(where={"id": agent_id}, data={"knowledge": _dump(current)})
     return _agent_dict(a)
 
@@ -225,7 +239,15 @@ async def get_call(call_id: str, user_id: str) -> Optional[dict]:
     return _call_dict(c)
 
 
-async def create_call(data: dict) -> dict:
+async def delete_call(call_id: str, user_id: str) -> bool:
+    existing = await get_call(call_id, user_id)
+    if not existing:
+        return False
+    await get_prisma().call.delete(where={"id": call_id})
+    return True
+
+
+async def create_call(data: dict):
     db = get_prisma()
     c = await db.call.create(
         data={
@@ -384,12 +406,33 @@ async def deduct(user_id: str, amount: float, note: str = "") -> dict:
     u = await db.user.find_unique(where={"id": user_id})
     if not u:
         raise ValueError("user not found")
+    # Idempotency: if a spend transaction for this exact call already exists, skip
+    if note:
+        try:
+            existing = await db.transaction.find_first(
+                where={"userId": user_id, "kind": "spend", "note": note}
+            )
+            if existing:
+                return await get_wallet(user_id)
+        except Exception:
+            pass
     new_balance = round(max((u.walletBalance or 0) - amount, 0.0), 2)
     await db.user.update(where={"id": user_id}, data={"walletBalance": new_balance})
     await db.transaction.create(
         data={"userId": user_id, "kind": "spend", "amount": -amount, "note": note, "ts": _ts()}
     )
     return await get_wallet(user_id)
+
+
+async def has_spend_for_call(user_id: str, call_id: str) -> bool:
+    db = get_prisma()
+    try:
+        existing = await db.transaction.find_first(
+            where={"userId": user_id, "kind": "spend", "note": {"contains": call_id}}
+        )
+        return existing is not None
+    except Exception:
+        return False
 
 
 async def get_usage(user_id: str, agent_id: Optional[str] = None) -> dict:
