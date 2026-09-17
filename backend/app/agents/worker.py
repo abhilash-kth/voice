@@ -154,10 +154,14 @@ try:
 except Exception as e:
     logger.debug(f"Could not patch hyphenator: {e}")
 
-# Prewarm Google auth crypt off loop to avoid 176ms block
+# Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks
 try:
     import google.auth.crypt._cryptography_rsa
-    logger.info("🔧 Prewarmed Google auth crypt (avoids 176ms block)")
+    import google.auth._service_account_info
+    import google.auth._default
+    import google.oauth2.credentials
+    import google.oauth2.service_account
+    logger.info("🔧 Prewarmed Google auth crypt + oauth2.credentials + service_account (avoids 176ms and 198ms blocks)")
 except Exception as e:
     logger.debug(f"Google auth prewarm failed: {e}")
 
@@ -167,6 +171,16 @@ try:
     logger.info("🔧 Prewarmed async_toolset (avoids 101ms import block)")
 except Exception as e:
     logger.debug(f"async_toolset prewarm failed: {e}")
+
+# Prewarm tokenize and linecache to avoid 108ms tokenize.open during loop_monitor reporting
+try:
+    import linecache
+    import tokenize
+    # Pre-populate linecache for common files to avoid open() during reporting
+    linecache.clearcache()
+    logger.info("🔧 Prewarmed linecache/tokenize (reduces 108ms open block during loop_monitor reporting)")
+except Exception as e:
+    logger.debug(f"linecache prewarm failed: {e}")
 
 # Also patch aiohttp TCPConnector creation if needed - but http_context patch should be enough
 
@@ -2537,11 +2551,14 @@ def prewarm(proc):
     except Exception as e:
         logger.warning(f"VAD prewarm failed: {e}")
     
-    # Prewarm Google auth crypt off loop to avoid 176ms block at crypt/_cryptography_rsa.py from_string
+    # Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks
     try:
         import google.auth.crypt._cryptography_rsa as _crypt_rsa
         import google.auth._service_account_info as _sa_info
-        logger.info("🔥 Prewarm: Google auth crypt imported (avoids 176ms block during TTS)")
+        import google.auth._default as _auth_default
+        import google.oauth2.credentials as _oauth2_creds
+        import google.oauth2.service_account as _oauth2_sa
+        logger.info("🔥 Prewarm: Google auth crypt + oauth2.credentials imported (avoids 176ms and 198ms blocks during TTS)")
     except Exception as e:
         logger.debug(f"Google auth prewarm failed: {e}")
     

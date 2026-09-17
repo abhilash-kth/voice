@@ -551,11 +551,14 @@ async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(No
         raise HTTPException(401, "Invalid internal token")
 
     status = (payload.get("status") or "completed").lower()
-    call_id = payload.get("id")
+    # Support both old (id) and new (callId, call_id) formats
+    call_id = payload.get("callId") or payload.get("call_id") or payload.get("id")
+    user_id_from_payload = payload.get("userId") or payload.get("user_id") or ""
     rec = None
     if call_id:
-        rec = await get_call_for_billing(call_id, payload.get("user_id", ""))
+        rec = await get_call_for_billing(call_id, user_id_from_payload)
     if not rec:
+        logger.warning(f"Billing log: call record not found for id={call_id} user_id={user_id_from_payload} payload keys={list(payload.keys())}")
         raise HTTPException(404, "Call record not found")
 
     # Idempotency: if we already have a spend transaction for this call, don't double-charge.
@@ -569,21 +572,42 @@ async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(No
     if rec.get("status") == "completed" and already_charged:
         return {"ok": True, "call_id": call_id, "already_processed": True}
 
-    await repo.update_call(call_id, {
-        "status": status,
-        "room": payload.get("room", rec.get("room", "")),
-        "ended_at": payload.get("date", ""),
-        "duration_seconds": payload.get("durationSeconds", rec.get("duration_seconds", 0)),
-        "transcripts": payload.get("transcripts", rec.get("transcripts", [])),
-        "recording_url": payload.get("recording_url", rec.get("recording_url")),
-        "usage": {
+    # Parse new format (costs dict, usage dict) and old format (flat fields)
+    costs = payload.get("costs") or {}
+    usage = payload.get("usage") or {}
+    # New format: usage contains sttSeconds, ttsChars, llmInputTokens etc, costs contains client_price_inr etc
+    # Old format: flat fields costToUserNumber, providerCost, etc
+    duration = payload.get("duration") or payload.get("durationSeconds") or rec.get("duration_seconds", 0)
+    transcripts = payload.get("transcripts") or rec.get("transcripts", [])
+    recording_url = payload.get("recordingUrl") or payload.get("recording_url") or rec.get("recording_url")
+
+    # Build usage dict for storage
+    if usage:
+        # New format from worker.py _post_billing
+        usage_to_store = {
+            "stt_seconds": usage.get("sttSeconds", 0) or payload.get("sttSeconds", 0),
+            "tts_chars": usage.get("ttsChars", 0) or payload.get("ttsChars", 0),
+            "llm_input_tokens": usage.get("llmInputTokens", 0) or usage.get("llmInputTokensAuthoritative", 0) or usage.get("totalInputTokens", 0) or payload.get("llmInputTokens", 0),
+            "llm_output_tokens": usage.get("llmOutputTokens", 0) or usage.get("llmOutputTokensAuthoritative", 0) or usage.get("totalOutputTokens", 0) or payload.get("llmOutputTokens", 0),
+            "llm_cached_tokens": usage.get("llmCachedTokens", 0) or usage.get("totalCachedTokens", 0),
+            "user_speech_seconds": usage.get("sttSeconds", 0) or payload.get("sttSeconds", 0),
+            "successful_requests": usage.get("successfulRequests", 0),
+            "failed_requests": usage.get("failedRequests", 0),
+        }
+    else:
+        usage_to_store = {
             "stt_seconds": payload.get("sttSeconds", 0),
             "tts_chars": payload.get("ttsChars", 0),
             "llm_input_tokens": payload.get("llmInputTokens", 0),
             "llm_output_tokens": payload.get("llmOutputTokens", 0),
             "user_speech_seconds": payload.get("sttSeconds", 0),
-        },
-        "cost": {
+        }
+
+    # Build cost dict
+    if costs:
+        cost_to_store = costs
+    else:
+        cost_to_store = {
             "client_price_inr": payload.get("costToUserNumber", 0),
             "total_cost_inr": payload.get("providerCost", 0),
             "your_profit_inr": payload.get("profit", 0),
@@ -595,20 +619,31 @@ async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(No
             "your_cost_per_min": payload.get("costPerMin", 0),
             "client_bill_per_min": payload.get("billPerMin", 0),
             "duration_mins": payload.get("durationMins", 0),
-        },
+        }
+
+    await repo.update_call(call_id, {
+        "status": status,
+        "room": payload.get("room", rec.get("room", "")),
+        "ended_at": payload.get("date", "") or payload.get("ended_at", ""),
+        "duration_seconds": duration,
+        "transcripts": transcripts,
+        "recording_url": recording_url,
+        "usage": usage_to_store,
+        "cost": cost_to_store,
     })
 
     # Settle the wallet for completed calls — deduct once per call, idempotent via repo.deduct.
     if status == "completed" and not already_charged:
-        charge = float(payload.get("costToUserNumber", 0) or 0)
+        # New format: costs dict has client_price_inr, old: costToUserNumber
+        charge = float(costs.get("client_price_inr", 0) or payload.get("costToUserNumber", 0) or 0)
         if charge > 0:
             try:
                 await repo.deduct(rec["user_id"], charge, note=f"Call {call_id}")
-                logger.info(f"💸 Deducted ₹{charge} for call {call_id} — remaining balance will update")
+                logger.info(f"💸 Deducted ₹{charge} for call {call_id} — remaining balance will update (billing_posted via backend)")
             except Exception as de:
                 logger.warning(f"Could not deduct wallet for call {call_id}: {de}")
 
-    return {"ok": True, "call_id": call_id}
+    return {"ok": True, "call_id": call_id, "billing_posted": True}
 
 
 async def get_call_for_billing(call_id: str, user_id: str):
