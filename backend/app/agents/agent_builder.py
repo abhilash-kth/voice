@@ -1304,18 +1304,32 @@ def build_voice_agent(
             # When preemptive ON, skip trimming to preserve preemptive.
             # When preemptive OFF, trim to avoid 429.
             preemptive_on = os.getenv("VOICE_PREEMPTIVE", "0") == "1"
+            # FIX 4: Conversation memory - name unavailable but mobile remembered
+            # Root cause: trimming to 6 dialogue messages max drops early name if many turns
+            # Evidence: user asked name after previously giving it, agent said unavailable, but mobile 9538450441 remembered (later in conversation)
+            # Fix: increase trim limit from 6 to 20 dialogue messages to preserve name, and preserve memory when memory_enabled
+            # Also check if KB present - when KB present we already disable preemptive in worker.py, so trimming will happen
+            # We should preserve more history for memory retention, not aggressively trim
             if not preemptive_on:
                 try:
                     target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
                     items = getattr(target_ctx, "items", None)
-                    # Fix 429: trim more aggressively to keep tokens low. Groq 8k TPM with 2749 tokens/req only allows 2 turns.
-                    # Now keep 6 dialogue messages max (was 8) + system, so ~1000 tokens history vs ~1500 before.
-                    if isinstance(items, list) and len(items) > 8:
+                    # FIXED: Keep 20 dialogue messages max (was 6) to preserve conversation memory like name
+                    # Groq 8k TPM still allows 20 messages (~3000 tokens) vs 6 (~1000), tradeoff correctness > token savings
+                    # For OpenAI etc, even more headroom
+                    # Only trim when >24 items to avoid frequent mutations
+                    if isinstance(items, list) and len(items) > 24:
                         system_items = [m for m in items if getattr(m, "role", "") == "system"]
                         dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
-                        # Keep only last 6 dialogue turns for low token usage
-                        target_ctx.items = system_items + dialogue_items[-6:]
-                        logger.info("🧹 Trimmed conversation context to %s messages (429 fix: 6 dialogue max)", len(target_ctx.items))
+                        # Preserve 20 dialogue turns for memory (name, phone, etc)
+                        # Previously 6 caused name loss when user asked "मेरा नाम क्या है?" after many turns
+                        kept_dialogue = dialogue_items[-20:]
+                        target_ctx.items = system_items + kept_dialogue
+                        logger.info("🧹 Trimmed conversation context to %s messages (memory fix: 20 dialogue max, was 6, preserves name)", len(target_ctx.items))
+                        # Log what was trimmed for debugging memory issues
+                        trimmed_count = len(dialogue_items) - len(kept_dialogue)
+                        if trimmed_count > 0:
+                            logger.info(f"📝 Trimmed {trimmed_count} old dialogue items, kept last 20 for memory retention")
                 except Exception as exc:
                     logger.debug("conversation context trim skipped: %s", exc)
             else:
@@ -1323,7 +1337,9 @@ def build_voice_agent(
                 # Previous lenient trim (10 msgs when >12) still changed chat_ctx → is_equivalent False → invalidation
                 # So when preemptive ON, skip trimming entirely to preserve preemptive generation
                 # This eliminates "preemptive generation invalidated after on_user_turn_completed" warning
-                logger.debug("Preemptive ON: skipping chat_ctx trim to preserve preemptive generation")
+                # FIX: Also for memory, when preemptive ON and KB present, we already disabled preemptive in worker.py
+                # So this path is for non-KB calls where preemptive ON is safe and we want speed
+                logger.debug("Preemptive ON: skipping chat_ctx trim to preserve preemptive generation and memory")
             # Log timing for STT_final->LLM_start path
             try:
                 _elapsed_goodbye = (_time.time() - _rag_t0) * 1000

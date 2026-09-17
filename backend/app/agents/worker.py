@@ -744,9 +744,35 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # So preemptive_tts is safe, but keep env-controlled to avoid unexpected behavior
     # Default 0 for compatibility, enable via VOICE_PREEMPTIVE_TTS=1 if needed
     # FIXED: Log preemptive_tts compatibility and verify wrapper works with it
+    # FIX 3: Prevent duplicate LLM requests caused by preemptive + RAG
+    # Evidence: LLM REQUEST START -> RAG context update -> preemptive invalidated -> another REQUEST START -> input=0/output=0
+    # Root cause: preemptive starts LLM before on_user_turn_completed, then RAG mutates chat_ctx, invalidating preemptive, causing second request
+    # Fix: Disable preemptive when KB has content (text/documents/faq) to avoid duplicate, preserve RAG correctness
+    # REAL latency is already good 1.3-1.6s, so disabling preemptive when KB present is acceptable tradeoff (correctness > latency)
+    # When KB empty, keep preemptive enabled for faster responses
     preemptive_tts_enabled = os.getenv("VOICE_PREEMPTIVE_TTS", "0") == "1"
-    preemptive_enabled = os.getenv("VOICE_PREEMPTIVE", "1") == "1"
-    logger.info(f"🔧 Session config: preemptive={preemptive_enabled}, preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, endpointing={min_delay}/{max_delay} (TTS wrapper compatible: yes, all providers support streaming)")
+    env_preemptive = os.getenv("VOICE_PREEMPTIVE", "1") == "1"
+    
+    # Check if KB has content
+    has_kb = False
+    try:
+        kb = getattr(cfg, 'knowledge', None)
+        if kb:
+            has_text = bool((getattr(kb, 'text', '') or '').strip())
+            has_docs = bool(getattr(kb, 'documents', []) or [])
+            has_faq = bool(getattr(kb, 'faq', []) or [])
+            has_kb = has_text or has_docs or has_faq
+    except Exception:
+        has_kb = False
+    
+    # Disable preemptive if KB present to avoid duplicate requests
+    if has_kb and env_preemptive:
+        preemptive_enabled = False
+        logger.info(f"🔧 RAG+preemptive fix: KB present (has_kb={has_kb}), disabling preemptive to prevent duplicate LLM requests (was {env_preemptive} from env). Preserving RAG correctness over preemptive latency.")
+    else:
+        preemptive_enabled = env_preemptive
+    
+    logger.info(f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, endpointing={min_delay}/{max_delay} (TTS wrapper compatible: yes)")
 
     return AgentSession(
         stt=stt_inst,
@@ -759,7 +785,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             "endpointing": {"min_delay": min_delay, "max_delay": max_delay},
             "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 1},
             "preemptive_generation": {
-                "enabled": os.getenv("VOICE_PREEMPTIVE", "1") == "1",
+                "enabled": preemptive_enabled,
                 "preemptive_tts": preemptive_tts_enabled,
             },
         },
@@ -1515,20 +1541,37 @@ async def entrypoint(ctx):
                 words = max(len(cleaned.split()), 1)
                 usage["llm_output_tokens"] += int(words * 1.3)
             usage["transcripts"].append({"role": "agent", "text": cleaned})
-            # --- Production timing: LLM complete (NOT audio yet) ---
-            # conversation_item_added = LLM finished, not TTS audio
-            # Real TTS audio timing is measured by TTS wrapper (first_tts_audio, first_audio)
+            # --- Production timing: LLM complete - FIXED 6-9s delay ---
+            # Previous bug: conversation_item_added (llm_complete) fired 6-9s after first_token,
+            # even though REAL stream already completed in 1.0-1.2s and first_audio at 1.3-1.6s.
+            # This caused duplicate completion path and misleading first_token->llm_complete 6735ms logs.
+            # Fix: Authoritative completion is generation_complete from wrapper (REAL stream), not llm_complete from conversation_item_added.
+            # conversation_item_added is delayed (after TTS speaking), so we should NOT treat it as authoritative for latency.
+            # Only set llm_complete if REAL audio not yet happened, and don't log fallback if REAL already happened.
             now_llm_complete = time.time()
-            if turn_timing.get("llm_complete", 0) == 0:
+            has_real_audio = turn_timing.get("first_audio", 0) > 0 or turn_timing.get("first_tts_audio", 0) > 0 or turn_timing.get("last_speech_end_to_first_audio", 0) > 0
+            
+            # Only set llm_complete if not already set AND real audio not yet happened (avoid delayed overwrite)
+            if turn_timing.get("llm_complete", 0) == 0 and not has_real_audio:
                 turn_timing["llm_complete"] = now_llm_complete
                 if turn_timing["first_token"] > 0:
-                    logger.info(f"⏱️ TIMING first_token->llm_complete (LLM full response): {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms")
+                    logger.info(f"⏱️ TIMING first_token->llm_complete (LLM full response): {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms (authoritative if no REAL audio yet)")
                 if turn_timing["llm_start"] > 0:
                     logger.info(f"⏱️ TIMING llm_start->llm_complete: {(now_llm_complete-turn_timing['llm_start'])*1000:.0f}ms")
                 if turn_timing["speech_end"] > 0:
-                    logger.info(f"⏱️ TIMING speech_end->llm_complete: {(now_llm_complete-turn_timing['speech_end'])*1000:.0f}ms (NOTE: NOT audio, real audio via TTS wrapper)")
-            # Fallback for say() calls without TTS wrapper
-            if turn_timing.get("first_tts_audio", 0) == 0 and turn_timing.get("first_audio", 0) == 0:
+                    logger.info(f"⏱️ TIMING speech_end->llm_complete: {(now_llm_complete-turn_timing['speech_end'])*1000:.0f}ms (NOTE: REAL audio via TTS wrapper is authoritative)")
+            elif has_real_audio:
+                # REAL audio already happened at 1.3-1.6s, this llm_complete is delayed 6-9s, don't treat as authoritative
+                if turn_timing["first_token"] > 0:
+                    delay = (now_llm_complete - turn_timing["first_token"]) * 1000
+                    if delay > 5000:
+                        logger.info(f"ℹ️ Delayed conversation_item_added {delay:.0f}ms after first_token (REAL audio already at {turn_timing.get('last_speech_end_to_first_audio',0):.0f}ms) - not authoritative, REAL stream is authoritative")
+                # Don't overwrite llm_complete if already set from REAL path
+                if turn_timing.get("llm_complete", 0) == 0:
+                    turn_timing["llm_complete"] = now_llm_complete
+            
+            # Fallback for say() calls without TTS wrapper - only if REAL audio never happened
+            if turn_timing.get("first_tts_audio", 0) == 0 and turn_timing.get("first_audio", 0) == 0 and not has_real_audio:
                 if turn_timing["first_token"] > 0:
                     token_to_audio = (now_llm_complete - turn_timing["first_token"]) * 1000
                     logger.info(f"⏱️ TIMING first_token->first_audio (fallback no wrapper): {token_to_audio:.0f}ms")
@@ -1559,7 +1602,7 @@ async def entrypoint(ctx):
                         turn_timing["first_audio"] = 0.0
                         turn_timing["ttft_ms"] = 0.0
                         turn_timing["generation_time_ms"] = 0.0
-            logger.info(f"🗣️ TTS (LLM complete): {cleaned}")
+            logger.info(f"🗣️ TTS (LLM complete): {cleaned} (REAL audio was at {turn_timing.get('last_speech_end_to_first_audio',0):.0f}ms, this is transcript only)")
 
     session.on("conversation_item_added", on_item_added)
 
@@ -1594,13 +1637,23 @@ async def entrypoint(ctx):
 
         elif prev == "thinking" and ev.new_state == "speaking":
             # First token -> first audio: LLM first token arrived, TTS starting
-            turn_timing["first_token"] = now
+            # FIX: Don't overwrite first_token if already set by LLM wrapper (authoritative TTFT)
+            # Previous bug: wrapper set first_token at TTFT time (e.g. 772ms), then _on_state set it again at speaking time (1.07s),
+            # causing first_token->llm_complete to be calculated from speaking time, not actual first_token, leading to 6-9s delay logs
+            if turn_timing.get("first_token", 0) == 0:
+                turn_timing["first_token"] = now
+                logger.info(f"ℹ️ first_token set from state thinking->speaking (no wrapper TTFT yet)")
+            else:
+                # first_token already set by wrapper at actual TTFT time, preserve it
+                existing_age = (now - turn_timing["first_token"]) * 1000
+                logger.info(f"ℹ️ first_token already set {existing_age:.0f}ms ago by wrapper (TTFT {turn_timing.get('ttft_ms',0):.0f}ms), preserving authoritative")
+            
             if turn_timing["llm_start"] > 0:
                 llm_to_token = (now - turn_timing["llm_start"]) * 1000
-                logger.info(f"⏱️ TIMING LLM_start->first_token: {llm_to_token:.0f}ms (target ≤500ms)")
+                logger.info(f"⏱️ TIMING LLM_start->first_token: {llm_to_token:.0f}ms (target ≤500ms) (wrapper TTFT {turn_timing.get('ttft_ms',0):.0f}ms is authoritative)")
             if turn_timing["speech_end"] > 0:
                 speech_to_token = (now - turn_timing["speech_end"]) * 1000
-                logger.info(f"⏱️ TIMING speech_end->first_token: {speech_to_token:.0f}ms")
+                logger.info(f"⏱️ TIMING speech_end->first_token: {speech_to_token:.0f}ms (wrapper {turn_timing.get('ttft_ms',0):.0f}ms is authoritative)")
 
         elif prev == "thinking" and ev.new_state == "listening":
             # Empty turn: thinking->listening without speaking - FIXED RACE CONDITION
