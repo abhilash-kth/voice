@@ -742,8 +742,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
                   >
                     {llmProviders.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.display_name} {p.tier === "free" ? "(free)" : ""}
+                      <option key={p.id} value={p.id} title={`${p.display_name} - ${p.base_url} - ${p.tier}`}>
+                        {p.display_name} {p.tier === "free" ? "(free)" : "(paid)"} - {p.base_url}
                       </option>
                     ))}
                   </select>
@@ -756,8 +756,12 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
                   >
                     {(llmByProvider[primaryLlmProvider] || []).map((m) => (
-                      <option key={m.model_id} value={m.model_id}>
-                        {m.display_name} {m.status === "deprecated" ? "(deprecated)" : ""}
+                      <option 
+                        key={m.model_id} 
+                        value={m.model_id}
+                        title={`$${m.input_price_per_1m}/1M in, $${m.cached_input_price_per_1m}/1M cached, $${m.output_price_per_1m}/1M out | ${m.context_window/1000}K context | Speed: ${m.expected_speed} | ${m.reasoning_supported ? 'Reasoning: '+m.reasoning_default : 'No reasoning'} | ${m.capabilities.join(', ')}`}
+                      >
+                        {m.display_name} - ${m.input_price_per_1m}/1M in, ${m.output_price_per_1m}/1M out, {m.expected_speed} {m.status === "deprecated" ? "(deprecated)" : ""}
                       </option>
                     ))}
                   </select>
@@ -783,9 +787,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   onChange={(e) => setPick("llm", e.target.value)}
                   className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
                 >
-                  {catalog.catalog.llm.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.display_name} {p.tier === "free" ? "(free)" : "*"}
+                  {catalog.catalog.llm.filter((p: any) => !(p as any).legacy).map((p) => (
+                    <option key={p.id} value={p.id} title={`${(p as any).models ? (p as any).models.length + ' models' : ''} ${(p as any).base_url || ''}`}>
+                      {p.display_name} {p.tier === "free" ? "(free)" : "*"} {(p as any).model_count ? `(${(p as any).model_count} models)` : ''}
                     </option>
                   ))}
                 </select>
@@ -855,8 +859,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                         className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
                       >
                         {llmProviders.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.display_name} {p.tier === "free" ? "(free)" : ""}
+                          <option key={p.id} value={p.id} title={`${p.display_name} - ${p.base_url}`}>
+                            {p.display_name} {p.tier === "free" ? "(free)" : "(paid)"}
                           </option>
                         ))}
                       </select>
@@ -869,8 +873,12 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                         className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
                       >
                         {(llmByProvider[fallbackLlmProvider] || []).map((m) => (
-                          <option key={m.model_id} value={m.model_id}>
-                            {m.display_name}
+                          <option 
+                            key={m.model_id} 
+                            value={m.model_id}
+                            title={`$${m.input_price_per_1m}/1M in, $${m.cached_input_price_per_1m}/1M cached, $${m.output_price_per_1m}/1M out | ${m.context_window/1000}K context | Speed: ${m.expected_speed}`}
+                          >
+                            {m.display_name} - ${m.input_price_per_1m}/1M in, {m.expected_speed}
                           </option>
                         ))}
                       </select>

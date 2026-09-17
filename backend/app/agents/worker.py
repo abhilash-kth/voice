@@ -412,25 +412,137 @@ def _create_tts_timing_wrapper(tts_instance, timing_dict):
 
 
 def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
+    """Fixed LLM timing wrapper that properly implements async context manager protocol.
+    
+    LiveKit's LLM.chat returns an async context manager (LLMStream), used as:
+        async with llm.chat(chat_ctx=...) as stream:
+            async for chunk in stream:
+    
+    Previous buggy version made chat async def returning StreamWrapper directly,
+    causing TypeError: 'coroutine' object does not support async context manager.
+    
+    Fixed version: chat is sync def returning a custom async CM that wraps inner CM,
+    and whose __aenter__ returns a TimingStreamWrapper that measures TTFT.
+    """
+    import asyncio as _asyncio
     import time as _time
     import logging as _logging
     _logger = _logging.getLogger("voice-agent-saas-worker")
-    provider = timing_dict.get("llm_provider", "") or (provider_info.get("provider", "") if provider_info else "")
-    model_id = timing_dict.get("llm_model", "") or (provider_info.get("model_id", "") if provider_info else "")
+
     try:
         is_fallback = hasattr(llm_instance, '_llm_instances') or hasattr(llm_instance, 'llm_instances') or 'FallbackAdapter' in str(type(llm_instance))
         if is_fallback:
             inner_list = getattr(llm_instance, '_llm_instances', None) or getattr(llm_instance, 'llm_instances', None) or getattr(llm_instance, '_instances', None)
             if inner_list:
-                _logger.info(f"LLM timing wrapper: FallbackAdapter with {len(inner_list)} providers - TTFT tracking enabled")
+                _logger.info(f"LLM timing wrapper: FallbackAdapter with {len(inner_list)} providers - TTFT tracking enabled (fixed CM protocol)")
                 for idx, inner_llm in enumerate(inner_list):
-                    inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info)
+                    # Avoid infinite recursion: only wrap if not already wrapped
+                    if 'LLMTimingWrapper' not in str(type(inner_llm)):
+                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info)
                 return llm_instance
     except Exception as e:
         _logger.debug(f"Could not wrap FallbackAdapter inner LLMs: {e}")
+
     original_chat = getattr(llm_instance, 'chat', None)
     if not original_chat:
         return llm_instance
+
+    class TimingStreamWrapper:
+        """Wraps LLMStream to measure first_token TTFT and generation_complete."""
+        def __init__(self, inner_stream, timing, prov_info, req_start):
+            self._inner_stream = inner_stream
+            self._timing = timing
+            self._prov_info = prov_info
+            self._req_start = req_start
+            self._first_token = True
+            self._input_tokens = 0
+            self._output_tokens = 0
+            self._cached_tokens = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner_stream, name)
+
+        async def __aiter__(self):
+            try:
+                async for chunk in self._inner_stream:
+                    now = _time.time()
+                    if self._first_token:
+                        self._first_token = False
+                        first_token = now
+                        self._timing["first_token"] = first_token
+                        ttft = (first_token - self._req_start) * 1000
+                        self._timing["ttft_ms"] = ttft
+                        prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
+                        model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
+                        _logger.info(f"LLM TTFT provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                        if self._timing.get("llm_start", 0) > 0:
+                            _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
+                        if self._timing.get("speech_end", 0) > 0:
+                            _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
+                    try:
+                        usage = getattr(chunk, 'usage', None)
+                        if usage:
+                            self._input_tokens = getattr(usage, 'prompt_tokens', 0) or getattr(usage, 'input_tokens', 0) or self._input_tokens
+                            self._output_tokens = getattr(usage, 'completion_tokens', 0) or getattr(usage, 'output_tokens', 0) or self._output_tokens
+                            prompt_details = getattr(usage, 'prompt_tokens_details', None)
+                            if prompt_details:
+                                self._cached_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
+                    except Exception:
+                        pass
+                    yield chunk
+            finally:
+                gen_complete = _time.time()
+                self._timing["generation_complete"] = gen_complete
+                self._timing["llm_complete"] = gen_complete
+                gen_time = (gen_complete - self._req_start) * 1000
+                self._timing["generation_time_ms"] = gen_time
+                self._timing["input_tokens"] = self._input_tokens
+                self._timing["output_tokens"] = self._output_tokens
+                self._timing["cached_input_tokens"] = self._cached_tokens
+                prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
+                model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
+                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens}")
+                try:
+                    from app.llm_catalog import get_llm_model, calculate_llm_cost
+                    model_meta = get_llm_model(prov, model) if prov and model else None
+                    if model_meta:
+                        costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
+                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${costs['total_llm_cost']:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms")
+                except Exception as e:
+                    _logger.debug(f"Could not calculate LLM cost: {e}")
+
+    class TimingChatCM:
+        """Async context manager that wraps inner LLM chat CM and returns TimingStreamWrapper."""
+        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start):
+            self._inner_orig = inner_cm_or_coro
+            self._timing = timing
+            self._prov_info = prov_info
+            self._req_start = req_start
+            self._inner_cm = None
+            self._inner_stream = None
+
+        async def __aenter__(self):
+            # Resolve inner if it's a coroutine (some LLM impls have async chat)
+            inner = self._inner_orig
+            if _asyncio.iscoroutine(inner):
+                inner = await inner
+            self._inner_cm = inner
+            # Enter inner CM
+            if hasattr(inner, '__aenter__'):
+                stream = await inner.__aenter__()
+            else:
+                stream = inner
+            self._inner_stream = stream
+            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            try:
+                if self._inner_cm and hasattr(self._inner_cm, '__aexit__'):
+                    return await self._inner_cm.__aexit__(exc_type, exc, tb)
+            except Exception as e:
+                _logger.debug(f"Error in inner CM __aexit__: {e}")
+            return False
+
     class LLMTimingWrapper:
         def __init__(self, inner, timing, prov_info):
             self._inner = inner
@@ -438,11 +550,20 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             self._prov_info = prov_info or {}
             try:
                 self._model = getattr(inner, '_model', None) or getattr(inner, 'model', None) or prov_info.get('model_id', '') if prov_info else ''
+                self._label = getattr(inner, '_label', None) or getattr(inner, 'label', None)
             except Exception:
                 self._model = prov_info.get('model_id', '') if prov_info else ''
+                self._label = None
+
         def __getattr__(self, name):
+            # Delegate everything except chat
+            if name == 'chat':
+                return self.chat
             return getattr(self._inner, name)
-        async def chat(self, *args, **kwargs):
+
+        def chat(self, *args, **kwargs):
+            # This is the critical fix: chat is SYNC, returns async CM, not coroutine
+            # So `async with llm.chat(...) as stream` works
             request_start = _time.time()
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
@@ -451,68 +572,9 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
             _logger.info(f"LLM REQUEST START provider={prov} model={model} base_url={base_url} request_start={request_start}")
             try:
-                stream = await self._inner.chat(*args, **kwargs)
-                timing = self._timing
-                prov_info = self._prov_info
-                class StreamWrapper:
-                    def __init__(self, inner_stream, timing, prov_info, req_start):
-                        self._inner_stream = inner_stream
-                        self._timing = timing
-                        self._prov_info = prov_info
-                        self._req_start = req_start
-                        self._first_token = True
-                        self._input_tokens = 0
-                        self._output_tokens = 0
-                        self._cached_tokens = 0
-                    def __getattr__(self, name):
-                        return getattr(self._inner_stream, name)
-                    async def __aiter__(self):
-                        async for chunk in self._inner_stream:
-                            now = _time.time()
-                            if self._first_token:
-                                self._first_token = False
-                                first_token = now
-                                self._timing["first_token"] = first_token
-                                ttft = (first_token - self._req_start) * 1000
-                                self._timing["ttft_ms"] = ttft
-                                prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
-                                model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                                _logger.info(f"LLM TTFT provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
-                                if self._timing.get("llm_start", 0) > 0:
-                                    _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
-                                if self._timing.get("speech_end", 0) > 0:
-                                    _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
-                            try:
-                                usage = getattr(chunk, 'usage', None)
-                                if usage:
-                                    self._input_tokens = getattr(usage, 'prompt_tokens', 0) or getattr(usage, 'input_tokens', 0) or self._input_tokens
-                                    self._output_tokens = getattr(usage, 'completion_tokens', 0) or getattr(usage, 'output_tokens', 0) or self._output_tokens
-                                    prompt_details = getattr(usage, 'prompt_tokens_details', None)
-                                    if prompt_details:
-                                        self._cached_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
-                            except Exception:
-                                pass
-                            yield chunk
-                        gen_complete = _time.time()
-                        self._timing["generation_complete"] = gen_complete
-                        self._timing["llm_complete"] = gen_complete
-                        gen_time = (gen_complete - self._req_start) * 1000
-                        self._timing["generation_time_ms"] = gen_time
-                        self._timing["input_tokens"] = self._input_tokens
-                        self._timing["output_tokens"] = self._output_tokens
-                        self._timing["cached_input_tokens"] = self._cached_tokens
-                        prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
-                        model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                        _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens}")
-                        try:
-                            from app.llm_catalog import get_llm_model, calculate_llm_cost
-                            model_meta = get_llm_model(prov, model) if prov and model else None
-                            if model_meta:
-                                costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
-                                _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${costs['total_llm_cost']:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms")
-                        except Exception as e:
-                            _logger.debug(f"Could not calculate LLM cost: {e}")
-                return StreamWrapper(stream, timing, prov_info, request_start)
+                inner_result = self._inner.chat(*args, **kwargs)
+                # inner_result may be coroutine or CM - handle both in TimingChatCM
+                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start)
             except Exception as e:
                 error_time = _time.time()
                 prov = self._prov_info.get('provider', '') or 'unknown'
@@ -522,6 +584,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 import traceback
                 _logger.error(f"Full traceback: {traceback.format_exc()}")
                 raise
+
     return LLMTimingWrapper(llm_instance, timing_dict, provider_info)
 
 
