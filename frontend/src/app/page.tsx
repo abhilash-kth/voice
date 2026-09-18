@@ -332,7 +332,17 @@ export default function Dashboard() {
               </div>
             )}
 
-            {!editing && (
+            {!editing && agents.length === 0 && (
+              <div className="bg-gray-900 rounded-2xl border border-dashed border-gray-800 p-12 text-center animate-fade-in-up">
+                <div className="w-14 h-14 rounded-2xl bg-gray-800 flex items-center justify-center text-2xl mx-auto mb-4">🤖</div>
+                <p className="text-sm font-semibold text-gray-300">No agents yet</p>
+                <p className="text-xs text-gray-500 mt-1 max-w-[300px] mx-auto leading-relaxed">
+                  Fill in the form above — pick a provider, language and voice —
+                  and your first agent will be ready to take calls in seconds.
+                </p>
+              </div>
+            )}
+            {!editing && agents.length > 0 && (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {agents.map((a) => (
                   <div

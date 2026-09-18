@@ -419,7 +419,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             <select
               value={reasoningEffort}
               onChange={(e) => setReasoningEffort(e.target.value)}
-              className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+              className="input"
             >
               {(meta.reasoning_effort_options && meta.reasoning_effort_options.length
                 ? meta.reasoning_effort_options
@@ -448,7 +448,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         <label key={optName} className="flex flex-col gap-1 text-xs">
           <span className="text-gray-400 font-medium">{optName}</span>
           <select
-            className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+            className="input"
             value={current}
             onChange={(e) =>
               setOptionVals((v) => ({
@@ -685,7 +685,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. Kavya"
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
         </div>
         <div>
@@ -695,7 +695,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             onChange={(e) => setGreeting(e.target.value)}
             rows={2}
             placeholder="Namaste! Main Kavya hoon..."
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
           {mode === "announcement" && (
             <p className="text-[11px] text-gray-500 mt-1">Optional in Announcement mode — used only if the Fixed script below is left empty.</p>
@@ -709,7 +709,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             onChange={(e) => setFallbackResponse(e.target.value)}
             rows={2}
             placeholder="Please hold on, I am having a temporary issue."
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
           <p className="text-[11px] text-gray-500 mt-1">Spoken when there is a temporary network, provider, or server problem.</p>
         </div>
@@ -721,7 +721,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               min={15}
               value={noResponseTimeout}
               onChange={(e) => setNoResponseTimeout(Number(e.target.value))}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             />
             <p className="text-[11px] text-gray-500 mt-1">Recommended: 30 seconds.</p>
           </div>
@@ -731,7 +731,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               value={noResponseMessage}
               onChange={(e) => setNoResponseMessage(e.target.value)}
               rows={2}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             />
           </div>
         </div>
@@ -780,7 +780,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             <select
               value={personality}
               onChange={(e) => setPersonality(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             >
               {["friendly", "professional", "cautious", "playful", "formal"].map((p) => (
                 <option key={p} value={p}>
@@ -794,7 +794,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             <select
               value={language}
               onChange={(e) => setLanguage(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             >
               {LANGUAGES.map((l) => (
                 <option key={l.id} value={l.id}>
@@ -811,7 +811,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             <select
               value={gender}
               onChange={(e) => setGender(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             >
               <option value="female">Female</option>
               <option value="male">Male</option>
@@ -836,7 +836,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             min={1}
             value={maxConcurrency}
             onChange={(e) => setMaxConcurrency(Number(e.target.value))}
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
         </div>
 
@@ -850,7 +850,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 onChange={(e) => setKnowledgeText(e.target.value)}
                 rows={5}
                 placeholder="Company facts, FAQs, product info..."
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
             <div>
@@ -860,7 +860,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 rows={3}
                 placeholder="Extra instructions for the agent..."
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
 
@@ -938,7 +938,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   <select
                     value={primaryLlmProvider}
                     onChange={(e) => setPrimaryLlmProvider(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                    className="input"
                   >
                     {(llmProviders.some(p => p.id === primaryLlmProvider)
                       ? llmProviders
@@ -957,7 +957,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   <select
                     value={primaryLlmModel}
                     onChange={(e) => setPrimaryLlmModel(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                    className="input"
                   >
                     {modelsForSelect(primaryLlmProvider, primaryLlmModel).map((m) => (
                       <option
@@ -992,7 +992,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 <select
                   value={picked.llm}
                   onChange={(e) => setPick("llm", e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                  className="input"
                 >
                   {catalog.catalog.llm.filter((p: any) => !(p as any).legacy).map((p) => (
                     <option key={p.id} value={p.id} title={`${(p as any).models ? (p as any).models.length + ' models' : ''} ${(p as any).base_url || ''}`}>
@@ -1018,7 +1018,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 <select
                   value={picked[kind]}
                   onChange={(e) => setPick(kind, e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                  className="input"
                 >
                   {catalog.catalog[kind].map((p) => (
                     <option key={p.id} value={p.id}>
@@ -1063,7 +1063,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       <select
                         value={fallbackLlmProvider}
                         onChange={(e) => setFallbackLlmProvider(e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        className="input"
                       >
                         {llmProviders.map((p) => (
                           <option key={p.id} value={p.id} title={`${p.display_name} - ${p.base_url}`}>
@@ -1077,7 +1077,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       <select
                         value={fallbackLlmModel}
                         onChange={(e) => setFallbackLlmModel(e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        className="input"
                       >
                         {(llmByProvider[fallbackLlmProvider] || []).map((m) => (
                           <option 
@@ -1105,7 +1105,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       <select
                         value={fallbackPicked[kind]}
                         onChange={(e) => setFallbackPick(kind, e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        className="input"
                       >
                         {catalog.catalog[kind].map((p) => (
                           <option key={p.id} value={p.id}>
