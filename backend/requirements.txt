@@ -34,6 +34,7 @@ livekit-plugins-deepgram>=1.7.1
 livekit-plugins-openai>=1.8.2  # Latest available 1.8.2 supports gpt-4.1, gpt-5 families, fixes 404 (was 1.7.1, 1.8.5 not yet released)
 livekit-plugins-google>=1.7.1
 livekit-plugins-silero>=1.7.1
+livekit-plugins-sarvam>=1.4.1           # Sarvam AI: Bulbul TTS + Saaras STT (Indic)
 # livekit-plugins-elevenlabs>=1.7.1   # optional premium TTS (uncomment to enable)
 # Explicit provider SDKs (auto-installed by the plugins above, listed for clarity):
 openai>=1.50.0  # Supports gpt-4.1-mini, gpt-5.4 models (was 1.30, 1.68 not yet in all indexes)

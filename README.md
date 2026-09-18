@@ -178,6 +178,76 @@ the transcript, and posts the cost back to FastAPI. It uses the LiveKit v1 API
 > agent to actually transcribe and reply — with placeholder keys the session still
 > wires up and joins the room, but the STT/TTS/LLM calls will hit `401`.
 
+### 2.6.1 LLM / TTS providers, keys, voices, fallback
+
+Four LLM providers are offered. Every model card in the dashboard shows live
+pricing, context window, max output tokens, expected speed, whether temperature
+is adjustable, and reasoning effort — the same data the worker validates against,
+so nothing is silently substituted at call time.
+
+| Provider | Models offered | Key in `backend/.env` | Notes |
+| --- | --- | --- | --- |
+| **OpenAI** | `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.4-mini`, `gpt-5.4-nano` | `OPENAI_API_KEY=` | Low-latency tier only. Full-size + o-series reasoning models are marked deprecated (multi-second TTFT) but still resolve for agents already using them. gpt-5* are reasoning models: no temperature knob; `reasoning_effort=low` is forced for voice. |
+| **Groq** | `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `openai/gpt-oss-safeguard-20b`, `qwen/qwen3.6-27b`, `meta-llama/llama-4-maverick-17b-128e-instruct`, `moonshotai/kimi-k2-instruct`, `minimaxai/minimax-m2.7` | `GROQ_API_KEY=` | Free tier ($0/token, rate-limited per model). Only current models: `llama-3.1-8b`, `llama-3.3-70b`, `qwen/qwen3-32b`, `llama-4-scout` were retired by Groq (Jul–Aug 2026) and are hidden. "Qwen/Qwen3.8-27B" does not exist on Groq — `qwen/qwen3.6-27b` is the real model. |
+| **Google Gemini** | `gemini-2.5-flash-lite` ⭐ (voice pick), `gemini-2.5-flash` | `GEMINI_API_KEY=` or `GOOGLE_API_KEY=` | Native `livekit.plugins.google.LLM` (plugin already pinned). Key from <https://aistudio.google.com/apikey>; has a free tier. |
+| **Sarvam AI** | `sarvam-30b` ⭐, `sarvam-30b-16k`, `sarvam-105b`, `sarvam-105b-32k` | `SARVAM_API_KEY=` | Indic stack (LLM + Saaras STT + Bulbul TTS in one key), billed in ₹. Best Hindi/Hinglish code-mix handling. |
+
+> **OpenRouter is deprecated and hidden from the picker.** Its extra hop added
+> latency and its `:free` models rate-limited hard (429s → dropped turns). Agents
+> already saved against it keep validating and running, and its legacy catalog ids
+> (`openrouter_gemma*`) now resolve to `google:gemini-2.5-flash-lite`.
+
+**Sarvam needs one package** in the worker venv (already in `backend/requirements.txt`):
+
+```bash
+cd backend && source .venv/bin/activate
+pip install "livekit-plugins-sarvam>=1.4.1"
+```
+
+Add the keys you use to `backend/.env` (empty keys simply make that provider
+report a clear config error instead of failing silently):
+
+```
+OPENAI_API_KEY=
+GROQ_API_KEY=
+GEMINI_API_KEY=
+SARVAM_API_KEY=
+DEEPGRAM_API_KEY=
+OPENROUTER_API_KEY=        # deprecated: only for pre-existing agents
+```
+
+**TTS** — Sarvam Bulbul v3/v2 (₹3.0 / ₹1.5 per 1,000 chars, 11 Indian languages,
+streaming), Google Chirp 3: HD (default), ElevenLabs (optional). The OpenRouter
+TTS entries are deprecated and hidden.
+
+**Language + gender** are chosen in the agent form:
+
+* `language` sets the STT locale and the spoken locale (`hi` → `hi-IN`, `ta` →
+  `ta-IN`, `kn` → `kn-IN`, …). `hi-Latn`/`multi` keep Hindi speech with
+  code-mix transcription.
+* `gender` selects the voice — Google `female` → `Leda`, `male` → `Charon`,
+  `neutral` → `Zephyr`; Sarvam `female` → `priya`, `male` → `shubh`. An explicit
+  `voice` in the agent's TTS config always wins.
+
+`gender` is a new column on the `Agent` table, so after deploying run:
+
+```bash
+cd backend && python -m prisma db push --schema schema.prisma && python -m prisma generate --schema schema.prisma
+```
+
+(existing rows default to `female`; nothing is lost).
+
+**Per-provider fallback** — the *Enable fallback* switch in the agent form arms a
+second provider/model for LLM, STT and TTS. LiveKit's `FallbackAdapter` only
+switches when the primary raises (429/5xx/timeout); it never replaces a model
+that is merely slow. The armed chain is logged (`🔁 LLM FallbackAdapter armed`).
+
+**Recharge gating** — a call or campaign cannot start at ₹0
+(`402 Wallet balance is ₹0`), a running campaign pauses itself the moment the
+balance is depleted (`campaign …: paused — wallet balance depleted`), and each
+finished call deducts exactly once (idempotent). Calls already in progress are
+allowed to finish rather than being cut mid-sentence.
+
 ### 2.7 Frontend
 
 ```bash

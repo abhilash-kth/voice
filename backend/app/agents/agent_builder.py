@@ -27,6 +27,8 @@ from ..config import (
     DEEPGRAM_API_KEY,
     GOOGLE_APPLICATION_CREDENTIALS,
     OPENROUTER_API_KEY,
+    GEMINI_API_KEY,
+    SARVAM_API_KEY,
     LLM_MODEL,
 )
 
@@ -45,33 +47,88 @@ logger = logging.getLogger("voice-agent-saas-agent-builder")
 _CHIRP3_VOICES = {
     "female": "Leda",       # alternates: Kore, Zephyr, Aoede
     "male": "Charon",       # alternates: Fenrir, Orus, Puck
+    "neutral": "Zephyr",
+}
+
+# Agent "language" (dashboard value) -> full BCP-47 locale spoken by Google /
+# Sarvam TTS and expected by their STT. Anything unknown falls back to hi-IN so
+# legacy two-letter values keep working.
+_AGENT_LOCALES = {
+    "hi": "hi-IN", "hi-in": "hi-IN", "hi-latn": "hi-IN", "hinglish": "hi-IN",
+    "en": "en-IN", "en-in": "en-IN", "en-us": "en-US", "en-gb": "en-GB",
+    "mr": "mr-IN", "bn": "bn-IN", "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN",
+    "gu": "gu-IN", "ml": "ml-IN", "pa": "pa-IN", "or": "or-IN", "od": "od-IN",
+    "ur": "ur-IN", "as": "as-IN",
 }
 
 
-def _resolve_tts_voice(language: str, raw_voice: Optional[str]) -> str:
+def locale_for_language(agent_language: Optional[str]) -> str:
+    """Map the agent's configured language to a locale the TTS engines accept."""
+    lang = (agent_language or "hi").strip().lower()
+    if lang in _AGENT_LOCALES:
+        return _AGENT_LOCALES[lang]
+    if lang.startswith("en"):
+        return "en-IN"
+    if "-" in lang:  # already a full tag like "ta-IN"
+        return agent_language  # type: ignore[return-value]
+    if lang in ("multi", "multi-lingual", ""):
+        return "hi-IN"  # code-mix: speak Hindi, STT still handles mixing
+    return "hi-IN"
+
+
+def _resolve_tts_voice(language: str, raw_voice: Optional[str], gender: str = "female") -> str:
     """Return a voice name that Google's streaming endpoint accepts.
 
     A voice already set to a Chirp 3 or Gemini name is passed through unchanged.
-    An empty value defaults to Chirp 3: HD. Any legacy Wavenet/Standard/Neural2
-    voice is remapped to a Chirp 3: HD voice for the same locale.
+    An empty value defaults to Chirp 3: HD with the speaker matching the agent's
+    gender. Any legacy Wavenet/Standard/Neural2 voice is remapped to a Chirp 3:
+    HD voice for the same locale.
     """
     v = (raw_voice or "").strip()
     if v and ("chirp" in v.lower() or "gemini" in v.lower()):
         return v
+    speaker = _CHIRP3_VOICES.get((gender or "female").lower(), "Leda")
     if not v:
-        return f"{language or 'hi-IN'}-Chirp3-HD-Leda"
+        return f"{language or 'hi-IN'}-Chirp3-HD-{speaker}"
     # Derive the locale from a legacy voice name like "hi-IN-Wavenet-A"
     parts = v.split("-")
     if len(parts) >= 2 and parts[0] and parts[1]:
         locale = f"{parts[0]}-{parts[1]}"
     else:
         locale = language or "hi-IN"
-    return f"{locale}-Chirp3-HD-Leda"
+    return f"{locale}-Chirp3-HD-{speaker}"
 
 
 # ---------------------------------------------------------------------------
 # Provider → plugin construction
 # ---------------------------------------------------------------------------
+
+def _instantiate_llm(provider_type: str, llm_kwargs: dict) -> Any:
+    """Build the provider's native LLM plugin from normalised kwargs.
+
+    OpenAI-compatible providers (openai, groq, openrouter, sarvam) all share
+    ``livekit.plugins.openai.LLM`` (Sarvam's chat-completions endpoint is
+    OpenAI-compatible). Google Gemini has its own plugin with different kwarg
+    names, so translate rather than pass blindly: an unexpected kwarg raises
+    TypeError while the turn is being built and the agent goes silent.
+    """
+    if provider_type == "google":
+        try:
+            from livekit.plugins.google import LLM as GoogleLLM
+        except ImportError as e:
+            raise RuntimeError(
+                f"Gemini provider needs livekit-plugins-google ({e}). It is already "
+                "pinned for Google TTS/STT; if missing run "
+                "`pip install livekit-plugins-google>=1.7.1` in the worker venv."
+            ) from e
+        gk = {k: v for k, v in llm_kwargs.items() if k in ("model", "api_key", "temperature")}
+        if llm_kwargs.get("max_completion_tokens"):
+            gk["max_output_tokens"] = int(llm_kwargs["max_completion_tokens"])
+        return GoogleLLM(**gk)
+
+    from livekit.plugins.openai import LLM as OpenAILLM
+    return OpenAILLM(**llm_kwargs)
+
 
 def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     """Build an LLM instance from a ProviderPair (primary or fallback) - V2 Provider → Multiple Models.
@@ -123,16 +180,30 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         key_env = "GROQ_API_KEY"
         provider_type = "groq"
     elif provider.startswith("openrouter"):
+        # Deprecated provider: still resolvable so agents saved against it keep
+        # running, but no longer offered in the picker (see llm_catalog).
         api_key = overrides.get("api_key") or OPENROUTER_API_KEY
         key_env = "OPENROUTER_API_KEY"
         provider_type = "openrouter"
+    elif provider.lower() in ("google", "gemini"):
+        provider = "google"
+        api_key = overrides.get("api_key") or GEMINI_API_KEY
+        key_env = "GEMINI_API_KEY"
+        provider_type = "google"  # native livekit.plugins.google.LLM
+        base_url = None           # plugin owns the endpoint
+    elif provider.lower() in ("sarvam", "sarvamai", "sarvam-ai"):
+        provider = "sarvam"
+        api_key = overrides.get("api_key") or SARVAM_API_KEY
+        key_env = "SARVAM_API_KEY"
+        provider_type = "openai"  # OpenAI-compatible chat completions
+        base_url = base_url or "https://api.sarvam.ai/v1"
     else:
         # Default to openai
         api_key = overrides.get("api_key") or OPENAI_API_KEY
         key_env = "OPENAI_API_KEY"
         provider_type = "openai"
         # Normalize provider to openai if it's old style or unknown
-        if provider not in ("openai", "groq", "openrouter"):
+        if provider not in ("openai", "groq", "openrouter", "google", "sarvam"):
             # Check if raw_id maps to known provider via old mapping
             if raw_id.startswith("groq"):
                 provider = "groq"
@@ -289,18 +360,63 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     
     reasoning = overrides.get("reasoning_effort", default_reasoning)
     # Extra safety: if reasoning is medium/high for voice, downgrade to low
-    if reasoning in ("medium", "high") and provider in ("openai", "groq", "openrouter"):
+    if reasoning in ("medium", "high") and provider in ("openai", "groq", "openrouter", "google", "sarvam"):
         logger.info(f"🔧 Downgrading reasoning_effort {reasoning} -> low for voice model {model_id} to reduce TTFT")
         reasoning = "low"
 
-    # Build client with exact base_url and model, no silent replacement
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+    # Completion-token budget for a voice reply. Non-reasoning models: 80 is
+    # plentiful (~60 spoken words) and keeps replies short. REASONING models
+    # (gpt-5 family) spend HIDDEN reasoning tokens from the SAME budget —
+    # first failure at cap 80, then AGAIN at cap 500 on a vague question
+    # (2026-09-19 04:19: output=500/finish_reason=length with ZERO visible text
+    # -> 6s watchdog apology). Diffuse prompts can burn >500 tokens of thinking;
+    # 800 leaves headroom for think + reply without turning typical turns slow
+    # (the model still stops early at natural completion).
+    _cap_override = overrides.get("max_tokens")
+    _reasoning_mdl = bool((meta or {}).get("reasoning_supported"))
+    if _cap_override:
+        _cap = int(_cap_override)
+        if _reasoning_mdl and _cap < 500:
+            logger.warning(
+                f"⚠️ max_tokens={_cap} is too small for reasoning model {model_id}: the cap is spent on "
+                "hidden reasoning tokens leaving ZERO text for the spoken reply (agent went silent). Raising to 800."
+            )
+            _cap = 800
+    else:
+        _cap = 800 if _reasoning_mdl else 80
+
+    # Build client with exact base_url and model, no silent replacement.
+    # Only OpenAI-compatible providers ride on an AsyncOpenAI client: Gemini's
+    # plugin builds its own SDK client and would reject these kwargs.
+    _native_google = provider_type == "google"
+    client = None if _native_google else AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     llm_kwargs = {
-        "client": client,
         "model": model_id,  # EXACT model as selected, no rewriting
-        "temperature": float(overrides.get("temperature", 0.1)),
-        "max_completion_tokens": int(overrides.get("max_tokens", 80)),
+        "max_completion_tokens": _cap,
     }
+    if client is not None:
+        llm_kwargs["client"] = client
+    elif api_key:
+        llm_kwargs["api_key"] = api_key
+
+    # Temperature: reasoning models (gpt-5 family, o-series) do not support a
+    # custom temperature, so only send it when the catalog says the model
+    # accepts one. An explicit user override on a reasoning model is still
+    # honoured (the provider will clamp/ignore it) rather than silently dropped.
+    _temp_explicit = overrides.get("temperature", None)
+    _supports_temp = True if model_meta is None else bool(model_meta.get("supports_temperature", True))
+    if _supports_temp:
+        _temp = _temp_explicit
+        if _temp is None and model_meta is not None:
+            _temp = model_meta.get("default_temperature")
+        llm_kwargs["temperature"] = float(_temp if _temp is not None else 0.1)
+    elif _temp_explicit is not None:
+        llm_kwargs["temperature"] = float(_temp_explicit)
+    else:
+        logger.info(
+            f"ℹ️ {provider}:{model_id} is a reasoning model — temperature not sent "
+            f"(unsupported); set reasoning_effort instead"
+        )
     # For reasoning models, check if responses API should be used for tool+reasoning support
     # OpenAI Chat Completions rejects reasoning_effort with tools for gpt-5.4-mini (400 error)
     # LiveKit 1.8.2+ has openai.responses.LLM that supports reasoning+tools via /v1/responses
@@ -316,13 +432,19 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         # Verify: LiveKit plugin 1.8.2+ supports reasoning_effort via _opts.reasoning_effort -> extra["reasoning_effort"]
         # Chat API: extra["reasoning_effort"] = low, Responses API: same
         # For prompt caching, set prompt_cache_key to stable value to enable cached_input_tokens
-        # This can reduce TTFT by reusing cached system prompt prefix
-        try:
-            # Use model_id as cache key for stable prefix caching
-            llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-            logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
-        except Exception:
-            pass
+        # This can reduce TTFT by reusing cached system prompt prefix.
+        # NOTE: prompt_cache_key is an OPENAI-ONLY extension. Groq's OpenAI-compat
+        # endpoint hard-rejects it with 400 "property 'prompt_cache_key' is
+        # unsupported" on EVERY request (2026-09-19: gpt-oss-20b + qwen3.6-27b both
+        # 400'd all turns -> FallbackAdapter exhausted -> 6s watchdog apology).
+        # Only send it to api.openai.com.
+        if provider_type == "openai":
+            try:
+                # Use model_id as cache key for stable prefix caching
+                llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
+                logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
+            except Exception:
+                pass
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
         llm_kwargs["reasoning_effort"] = reasoning
 
@@ -357,7 +479,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
                     if api_key:
                         resp_kwargs["api_key"] = api_key
                     # max_output_tokens -> max_output_tokens for responses
-                    resp_kwargs["max_output_tokens"] = int(overrides.get("max_tokens", 80))
+                    resp_kwargs["max_output_tokens"] = _cap
                     llm_instance = openai_responses.LLM(**resp_kwargs)
                     logger.info(f"✅ Built openai.responses.LLM successfully for {model_id} reasoning={reasoning} (transmitted to /v1/responses API, reasoning object)")
                     return llm_instance
@@ -373,13 +495,13 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
 
     logger.info(
         f"🔧 Building LLM instance: provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
-        f"temperature={llm_kwargs['temperature']} max_tokens={llm_kwargs['max_completion_tokens']} reasoning={llm_kwargs.get('reasoning_effort','none')} "
+        f"provider_type={provider_type} temperature={llm_kwargs.get('temperature','n/a (reasoning model)')} max_tokens={llm_kwargs['max_completion_tokens']} reasoning={llm_kwargs.get('reasoning_effort','none')} "
         f"EXACT model passed to runtime, no silent substitution"
     )
 
     try:
-        llm_instance = LLM(**llm_kwargs)
-        logger.info(f"✅ LLM instance built successfully: provider={provider} model={model_id}")
+        llm_instance = _instantiate_llm(provider_type, llm_kwargs)
+        logger.info(f"✅ LLM instance built successfully: provider={provider} model={model_id} provider_type={provider_type}")
         return llm_instance
     except Exception as e:
         logger.error(
@@ -593,6 +715,30 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     sel = pair
     overrides = sel.config or {}
 
+    if sel.id.startswith("sarvam"):
+        try:
+            from livekit.plugins.sarvam import STT as SarvamSTT
+        except ImportError as e:
+            raise RuntimeError(
+                f"Sarvam STT needs livekit-plugins-sarvam ({e}). Run "
+                "`pip install livekit-plugins-sarvam>=1.4.1` in the worker venv."
+            ) from e
+        api_key = overrides.get("api_key") or SARVAM_API_KEY
+        if not api_key:
+            raise RuntimeError("Sarvam STT needs SARVAM_API_KEY (backend/.env).")
+        lang = overrides.get("language") or locale_for_language(getattr(cfg, "language", "hi"))
+        model = overrides.get("model", "saaras:v3")
+        kwargs = dict(model=model, target_language_code=lang, api_key=api_key)
+        # Code-mixed Hindi (Hinglish) benefits from codemix mode when available.
+        if overrides.get("mode"):
+            kwargs["mode"] = overrides["mode"]
+        logger.info(f"🎧 Sarvam STT: model={model} language={lang}")
+        try:
+            return SarvamSTT(**kwargs)
+        except TypeError as e:
+            logger.warning(f"⚠️ Sarvam STT rejected {sorted(kwargs)} ({e}); retrying minimal")
+            return SarvamSTT(model=model, target_language_code=lang, api_key=api_key)
+
     if sel.id.startswith("google"):
         from livekit.plugins.google import STT
         lang = overrides.get("language", "hi-IN")
@@ -630,18 +776,29 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # Preserve utterance_end_ms, smart_format, punctuate - don't drop all on single failure
     optional_params = {}
     # Support both endpointing_ms and legacy endpointing for backward compat
+    # Deepgram's own end-of-speech detection must NOT beat the session's
+    # endpointing (min_delay 0.35s). 200ms fired before silero's min_silence,
+    # so LiveKit logged "stt end of speech received while vad is still in a
+    # speech segment, flushing vad" and cut users off mid-sentence.
+    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300"))
+    # utterance_end is the fallback final when endpointing never fires (long
+    # pause): 1000ms added a full second of dead air on slow speakers — but
+    # Deepgram REJECTS utterance_end_ms below 1000 (WS handshake returns 400
+    # "Invalid response status", _stt_pump dies, the agent hears NOTHING — the
+    # user speaks, no reply, the no-response watchdog ends the call). Floor it.
+    _dg_utterance_end_default = max(1000, int(os.getenv("VOICE_STT_UTTERANCE_END_MS", "1000")))
     if "endpointing_ms" in overrides or "endpointing" in overrides:
-        ep_val = overrides.get("endpointing_ms", overrides.get("endpointing", 200))
+        ep_val = overrides.get("endpointing_ms", overrides.get("endpointing", _dg_endpointing_default))
         try:
             optional_params["endpointing_ms"] = int(ep_val)
         except Exception:
             pass
     else:
-        optional_params["endpointing_ms"] = 200
+        optional_params["endpointing_ms"] = _dg_endpointing_default
 
-    if "utterance_end_ms" in overrides or True:  # always try default 1000
+    if "utterance_end_ms" in overrides or True:  # always try default
         try:
-            optional_params["utterance_end_ms"] = int(overrides.get("utterance_end_ms", 1000))
+            optional_params["utterance_end_ms"] = int(overrides.get("utterance_end_ms", _dg_utterance_end_default))
         except Exception:
             pass
 
@@ -719,14 +876,84 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
     if sel.id.startswith("google"):
         from livekit.plugins.google import TTS
         configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
-        default_language = "en-IN" if configured_language.startswith("en") else "hi-IN"
+        # Honour the agent's language for every Indic locale we support (was
+        # hard-coded to hi-IN/en-IN, so a Tamil agent would have spoken Hindi).
+        default_language = locale_for_language(configured_language)
         language = overrides.get("language", default_language)
-        voice = _resolve_tts_voice(language, overrides.get("voice"))
+        gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
+        voice = _resolve_tts_voice(language, overrides.get("voice"), gender)
+        logger.info(f"🎙️ Google TTS: voice={voice} language={language} gender={gender}")
         return TTS(
             voice_name=voice,
             language=language,
             credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
         )
+
+    if sel.id.startswith("sarvam"):
+        try:
+            from livekit.plugins.sarvam import TTS as SarvamTTS
+        except ImportError as e:
+            raise RuntimeError(
+                f"Sarvam TTS needs livekit-plugins-sarvam ({e}). Run "
+                "`pip install livekit-plugins-sarvam>=1.4.1` in the worker venv and "
+                "set SARVAM_API_KEY in backend/.env."
+            ) from e
+        api_key = overrides.get("api_key") or SARVAM_API_KEY
+        if not api_key:
+            raise RuntimeError(
+                "Sarvam TTS needs SARVAM_API_KEY (backend/.env) or an api_key in the "
+                "agent's tts config. Get one at https://dashboard.sarvam.ai."
+            )
+        configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
+        target_language = overrides.get("language") or locale_for_language(configured_language)
+        # Gender selects the speaker unless one was chosen explicitly.
+        gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
+        model = overrides.get("model", "bulbul:v3")
+        # Sarvam retired bulbul:v2 SERVER-SIDE (every request now errors with
+        # "400: Model 'bulbul:v2' has been deprecated. Please use 'bulbul:v3'
+        # instead."). Saved v2 configs must keep speaking — upgrade loudly and
+        # remap v2-only speakers to their closest bulbul:v3 counterparts.
+        if model == "bulbul:v2":
+            logger.warning(
+                "⚠️ Sarvam bulbul:v2 is RETIRED server-side (API returns 400 'deprecated'). "
+                "Upgrading this agent's TTS to bulbul:v3 with the closest v3 speaker. "
+                "Open the agent and pick 'Sarvam Bulbul v3' to silence this warning."
+            )
+            model = "bulbul:v3"
+        _v2_to_v3_speaker = {
+            "anushka": "priya", "vidya": "kavya", "manisha": "ritu",
+            "abhilash": "shubh", "hitesh": "ratan", "karun": "aditya", "arya": "rohan",
+        }
+        default_speakers = {"female": "priya", "male": "shubh", "neutral": "priya"}
+        speaker = overrides.get("voice") or overrides.get("speaker") or default_speakers.get(gender, "priya")
+        if speaker and speaker.lower() in _v2_to_v3_speaker:
+            speaker = _v2_to_v3_speaker[speaker.lower()]
+        kwargs = dict(
+            model=model,
+            target_language_code=target_language,
+            speaker=speaker,
+            speech_sample_rate=int(overrides.get("speech_sample_rate", 22050)),
+            api_key=api_key,
+        )
+        if overrides.get("pace") is not None:
+            kwargs["pace"] = float(overrides["pace"])
+        if overrides.get("pitch") is not None:
+            kwargs["pitch"] = float(overrides["pitch"])
+        logger.info(
+            f"🎙️ Sarvam TTS: model={model} speaker={speaker} "
+            f"target_language_code={target_language} gender={gender}"
+        )
+        try:
+            return SarvamTTS(**kwargs)
+        except TypeError as e:
+            # Plugin version skew: retry with the minimal documented signature.
+            logger.warning(f"⚠️ Sarvam TTS rejected {sorted(kwargs)} ({e}); retrying minimal")
+            return SarvamTTS(
+                model=model,
+                target_language_code=target_language,
+                speaker=speaker,
+                api_key=api_key,
+            )
 
     if sel.id.startswith("elevenlabs"):
         from livekit.plugins.elevenlabs import TTS
@@ -813,6 +1040,21 @@ def build_tts(cfg: AgentConfig) -> Any:
 _VAD_CACHE_AGENT = None
 _VAD_CACHE_LOCK_AGENT = __import__('threading').Lock()
 
+def _vad_tuning() -> dict:
+    """Silero VAD knobs (env-overridable), aligned with the session endpointing
+    (VOICE_ENDPOINTING_MIN=0.35). VAD needing MORE silence than the endpointer
+    is what produced "stt end of speech received while vad is still in a speech
+    segment, flushing vad" — keep them in lock-step here."""
+    return {
+        # ignore <200ms blips (lip noise, clicks) but keep "haan"/"ok"
+        "min_speech_duration": float(os.getenv("VOICE_VAD_MIN_SPEECH", "0.20")),
+        # aligned with VOICE_ENDPOINTING_MIN so STT and VAD agree on turn end
+        "min_silence_duration": float(os.getenv("VOICE_VAD_MIN_SILENCE", "0.35")),
+        "prefix_padding_duration": float(os.getenv("VOICE_VAD_PREFIX_PADDING", "0.20")),
+        "activation_threshold": float(os.getenv("VOICE_VAD_THRESHOLD", "0.55")),
+    }
+
+
 def build_vad() -> Any:
     global _VAD_CACHE_AGENT
     # Use cached VAD if available to avoid 406ms onnxruntime block
@@ -843,12 +1085,7 @@ def build_vad() -> Any:
     # Combined with STT turn_detection and endpointing 0.20/0.55, total speech_end->LLM ~400-500ms
     # For short "haan/ok" (1-2 words): VAD 0.30s + STT final 200ms + endpointing 0.20 = 0.5s total -> fast
     # For natural pause in Hindi: Deepgram utterance_end 1000ms prevents premature final, endpointing max 0.55 caps
-    vad = silero.VAD.load(
-        min_speech_duration=0.20,
-        min_silence_duration=0.30,
-        prefix_padding_duration=0.20,
-        activation_threshold=0.55,
-    )
+    vad = silero.VAD.load(**_vad_tuning())
     try:
         with _VAD_CACHE_LOCK_AGENT:
             _VAD_CACHE_AGENT = vad
@@ -1052,6 +1289,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
         "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
+        "SCRIPT RULE (critical for the voice engine): when the caller writes or speaks Hindi, write your ENTIRE answer in Devanagari script (देवनागरी) only — NEVER in Roman/Latin letters like 'Iske details nahi hain'. Roman-script Hindi sounds broken when spoken aloud. Phone numbers, digits and email addresses may stay as digits/Latin (Sarvam reads them correctly).",
         "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
@@ -1061,7 +1299,10 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "give a long preamble. Answer exactly what was asked, then stop. "
         "ABSOLUTELY FORBIDDEN to add these after every answer: 'Aur kuch poochna hai?', "
         "'Aur kuch jaanana chahenge?', 'Aapko aur kuch jaanana hai?', 'Kya aapko aur koi madad chahiye?', "
-        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?' — "
+        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?', "
+        "'Aur kuch janna chahenge?', and their Devanagari forms — 'क्या आपको और कुछ जानकारी चाहिए?', "
+        "'क्या आपको अभी कुछ और जानकारी चाहिए?', 'क्या मैं आपकी और मदद कर सकती हूँ?', "
+        "'क्या मैं आपकी किसी और तरह से मदद कर सकती हूँ?', 'और कुछ पूछना चाहेंगे?', 'और कुछ जानना चाहेंगे?' — "
         "Only ask a follow-up when you are actively collecting missing required info "
         "for a project enquiry (like phone, budget). If the caller says they have no more questions "
         "(e.g., 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', "
@@ -1224,8 +1465,10 @@ def build_voice_agent(
         "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
         "collection. End the call only when the caller clearly and explicitly asks to "
         "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
-        "that's all, no more help, or no more questions, or a mixed Hindi/English request "
-        "such as 'call cut kar dijiye' or 'और तो मुझे कुछ नहीं जानना' as a standalone final "
+        "that's all, no more help, or no more questions — this INCLUDES Hindi hang-up grants "
+        "such as 'फ़ोन रख दीजिए', 'आप phone रख सकते', 'call kaat dijiye', and direct "
+        "'I need nothing more' answers like 'मुझे कुछ भी नहीं चाहिए', 'मुझे कोई जानकारी नहीं चाहिए', "
+        "'kuch bhi nahi chahiye', 'call cut kar dijiye', 'और तो मुझे कुछ नहीं जानना' as a standalone final "
         "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
         "especially when followed by another question. "
         "When the caller explicitly says goodbye, do NOT try to generate your own closing sentence — "
@@ -1384,26 +1627,27 @@ def build_voice_agent(
             - FIX: Prevent duplicate/invalidated LLM requests - wait for previous LLM to complete before new REQUEST START
             - Exactly one REQUEST START per completed user turn, no 0/0 race
             """
-            # FIX: Prevent duplicate REQUEST START while previous LLM still active
-            # Root cause of Request 1 and 5 0/0 failures: new REQUEST START while previous llm_active True
-            # This causes previous to be cancelled and return 0/0, then new starts - duplicate/invalidated
-            # Fix: Wait for previous LLM to complete before allowing new turn's LLM request
+            # NOTE: LiveKit `await`s this hook before generating the reply, so any
+            # waiting here stalls the whole turn pipeline. The old code busy-waited
+            # up to 2s for the previous LLM request to finish; when the user barged
+            # in, LiveKit's interruption had to wait on this hook, the speech handle
+            # never resolved, and the 5s INTERRUPTION_TIMEOUT fired:
+            #   "speech not done in time after interruption, cancelling arbitrarily"
+            # — which killed the rest of the call's audio (livekit/agents #5359).
+            # Turn serialization is LiveKit's job, not ours: a superseded request is
+            # simply cancelled and reported as 0/0 tokens, which billing ignores.
+            # So: log only, never wait.
             try:
                 if self._turn_timing_ref and self._turn_timing_ref.get("llm_active", False):
                     prev_start = self._turn_timing_ref.get("request_start", 0)
                     elapsed = time.time() - prev_start if prev_start else 0
-                    if elapsed < 5.0:  # Only wait if previous started recently (<5s), not stale
-                        logger.info(f"⏳ Previous LLM still active (elapsed {elapsed:.2f}s), waiting for it to complete before new REQUEST START (prevents 0/0 duplicate)")
-                        # Wait up to 2s for previous to complete, checking every 50ms
-                        wait_start = time.time()
-                        while self._turn_timing_ref.get("llm_active", False) and (time.time() - wait_start) < 2.0:
-                            await asyncio.sleep(0.05)
-                        if self._turn_timing_ref.get("llm_active", False):
-                            logger.warning(f"⚠️ Previous LLM still active after 2s wait, proceeding anyway (may cause 0/0)")
-                        else:
-                            logger.info(f"✅ Previous LLM completed, proceeding with new REQUEST START")
+                    logger.info(
+                        f"↪️ New user turn while previous LLM request still active "
+                        f"(elapsed {elapsed:.2f}s) — LiveKit will cancel the superseded "
+                        f"request; not waiting (waiting here stalls barge-in)"
+                    )
             except Exception as e:
-                logger.debug(f"Could not wait for previous LLM: {e}")
+                logger.debug(f"Could not inspect previous LLM state: {e}")
             nonlocal explicit_goodbye
             import time as _time
             _rag_t0 = _time.time()
@@ -1439,6 +1683,13 @@ def build_voice_agent(
                     "cut the call", "hang up", "disconnect", "end the call", "call cut",
                     "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
                     "कॉल बंद कर दीजिए", "फोन काट दीजिए", "फोन काट दो",
+                    # Hang-up granted in Hindi / mixed script (caller: "आप phone रख सकते")
+                    "फोन रख दो", "फ़ोन रख दो", "फोन रख दीजिए", "फ़ोन रख दीजिए", "फ़ोन रख",
+                    "फोन रख", "phone रख", "call रख", "कॉल रख",
+                    "phone rakh do", "phone rakh dijiye", "phone rakh sakte", "aap phone rakh sakte",
+                    # "I need nothing (else)"
+                    "कुछ भी नहीं चाहिए", "जानकारी नहीं चाहिए", "कोई भी जानकारी नहीं चाहिए",
+                    "kuch bhi nahi chahiye", "koi jaankari nahi chahiye", "kisi bhi tarah ki madad nahi chahiye",
                     "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
                     "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
                     "no more questions", "no more help", "that's all", "that is all",

@@ -145,13 +145,24 @@ async def me(user=Depends(auth.get_current_user)):
 async def get_catalog():
     cat = catalog_summary()
     # New V2 structure: providers with models
-    from .llm_catalog import catalog_summary_v2
+    from .llm_catalog import catalog_summary_v2, LLM_PROVIDERS, LLM_MODELS
     llm_v2 = catalog_summary_v2()
+    # Frontend expects JSON arrays; the v2 summary keys providers by id.
+    provs = llm_v2["providers"]
+    if not isinstance(provs, list):
+        provs = list(provs.values())
+    models = llm_v2["models"]
+    if not isinstance(models, list):
+        models = list(models.values())
     return {
         "catalog": cat,
         "llm_catalog": llm_v2,  # New: provider → multiple models
-        "llm_providers": llm_v2["providers"],
-        "llm_models": llm_v2["models"],
+        "llm_providers": provs,
+        "llm_models": models,
+        # Every model incl. deprecated — a saved retired model still renders.
+        "llm_models_all": list(LLM_MODELS),
+        # Deprecated providers (openrouter) for legacy-agent display only.
+        "llm_legacy_providers": [p for p in LLM_PROVIDERS.values() if p.get("status") == "deprecated"],
         "llm_by_provider": llm_v2["by_provider"],
         "walletTopupAmounts": WALLET_TOPUP_AMOUNT,
         "server_cost_per_min": SERVER_COST_PER_MIN,
@@ -159,10 +170,14 @@ async def get_catalog():
 
 @app.get("/api/llm/providers")
 async def list_llm_providers():
-    from .llm_catalog import LLM_PROVIDERS, LLM_MODELS
+    from .llm_catalog import list_models_for_provider, list_providers, LLM_PROVIDERS
+    # Deprecated providers (openrouter) are excluded from the picker but returned
+    # under legacy_providers so an agent already using one still renders.
+    provs = list_providers()
     return {
-        "providers": list(LLM_PROVIDERS.values()),
-        "by_provider": {pid: [m for m in LLM_MODELS if m["provider"] == pid] for pid in LLM_PROVIDERS},
+        "providers": provs,
+        "legacy_providers": [p for p in LLM_PROVIDERS.values() if p.get("status") == "deprecated"],
+        "by_provider": {p["id"]: list_models_for_provider(p["id"]) for p in provs},
     }
 
 @app.get("/api/llm/providers/{provider_id}/models")

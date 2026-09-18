@@ -24,7 +24,7 @@ import logging
 import time
 import json
 import aiohttp
-from typing import Optional
+from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
 # Thread limits. Cap the BLAS/math libs to 1 thread (avoids per-thread pool
@@ -74,6 +74,18 @@ from livekit.plugins import silero    # noqa: E402,F401  (VAD)
 from livekit.plugins import google    # noqa: E402,F401  (STT/TTS)
 from livekit.plugins import deepgram  # noqa: E402,F401  (STT)
 from livekit.plugins import openai    # noqa: E402,F401  (LLM)
+# Sarvam (LLM/STT/TTS) self-registers AT IMPORT TIME, and LiveKit only allows
+# registration on the MAIN thread. Importing it here — the top level of the
+# worker module, which every job child process re-imports on its main thread
+# (Windows spawn) — means agent_builder's lazy
+#   "from livekit.plugins.sarvam import TTS/STT/LLM"
+# just binds the already-registered module from sys.modules. Without this, the
+# first Sarvam-using call ran the import on a to_thread worker and died with
+# "RuntimeError: Plugins must be registered on the main thread".
+try:  # noqa: E402
+    from livekit.plugins import sarvam as _sarvam_plugin  # noqa: F401
+except ImportError:  # package is optional (pip install livekit-plugins-sarvam)
+    _sarvam_plugin = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("voice-agent-saas-worker")
@@ -88,10 +100,28 @@ import threading as _threading_prewarm
 _ssl_context_cache = None
 _ssl_context_lock = _threading_prewarm.Lock()
 
+def _build_ssl_context():
+    """Build the default SSL context the same way httpx does.
+
+    httpx (trust_env=True) honours SSL_CERT_FILE / SSL_CERT_DIR, and on Windows
+    parsing that CA bundle inside `ssl.create_default_context()` is what blocked
+    the agent loop for >1s during Prisma's connect. The cached context must be
+    built with the same cafile/capath, otherwise handing it to httpx would
+    silently change which CAs are trusted.
+    """
+    _cafile = os.environ.get("SSL_CERT_FILE")
+    _capath = os.environ.get("SSL_CERT_DIR")
+    if _cafile and os.path.exists(_cafile):
+        return _ssl_prewarm.create_default_context(cafile=_cafile)
+    if _capath and os.path.isdir(_capath):
+        return _ssl_prewarm.create_default_context(capath=_capath)
+    return _ssl_prewarm.create_default_context()
+
+
 def _prewarm_ssl_context():
     global _ssl_context_cache
     try:
-        ctx = _ssl_prewarm.create_default_context()
+        ctx = _build_ssl_context()
         with _ssl_context_lock:
             _ssl_context_cache = ctx
         logger.info("🔧 SSL context prewarmed at import time in background thread (fixes 314ms event loop block)")
@@ -125,18 +155,49 @@ try:
 except Exception as e:
     logger.debug(f"Could not patch http_context for SSL fix: {e}")
 
-# Also patch httpx SSL context to fix 1359ms block during prisma/httpx DB init
+# Also patch httpx SSL context to fix the multi-second ssl.create_default_context
+# block during prisma/httpx DB init (observed at 1359ms, then 1377ms even WITH
+# this patch — see below why it needed two bites).
 try:
     import httpx._config as _httpx_config
     _original_httpx_ssl = _httpx_config.create_ssl_context
-    def _patched_httpx_ssl(*args, **kwargs):
+
+    def _patched_httpx_ssl(verify=True, cert=None, trust_env=True, *args, **kwargs):
+        """Cached SSL context for httpx — but only for the default case.
+
+        `verify=False` or a client certificate must NOT be served the shared
+        default context (that would verify when the caller asked not to, or drop
+        the client cert), so anything non-default falls through to httpx's own
+        implementation.
+        """
         global _ssl_context_cache
-        with _ssl_context_lock:
-            if _ssl_context_cache is not None:
-                return _ssl_context_cache
-        return _original_httpx_ssl(*args, **kwargs)
+        non_default = (verify is not True) or cert is not None or args or kwargs
+        if not non_default:
+            with _ssl_context_lock:
+                if _ssl_context_cache is not None:
+                    return _ssl_context_cache
+        return _original_httpx_ssl(verify=verify, cert=cert, trust_env=trust_env,
+                                   *args, **kwargs)
+
     _httpx_config.create_ssl_context = _patched_httpx_ssl
-    logger.info("🔧 Patched httpx._config.create_ssl_context to use cached SSL (fixes 1359ms block during DB init)")
+    # httpx/_transports/default.py does `from .._config import create_ssl_context`,
+    # i.e. the transport holds its OWN reference bound at import time. Patching
+    # httpx._config alone therefore changed nothing for AsyncHTTPTransport — which
+    # is why the 1377ms ssl.py:717 stall was still in the log after the first
+    # version of this patch. Patch every module that imported the name.
+    _patched_httpx_modules = []
+    for _mod_name in ("httpx._transports.default", "httpx._client", "httpx"):
+        try:
+            _mod = __import__(_mod_name, fromlist=["create_ssl_context"])
+        except Exception:
+            continue
+        if getattr(_mod, "create_ssl_context", None) is _original_httpx_ssl:
+            _mod.create_ssl_context = _patched_httpx_ssl
+            _patched_httpx_modules.append(_mod_name)
+    logger.info(
+        "🔧 Patched httpx create_ssl_context to use cached SSL in "
+        f"{', '.join(['httpx._config'] + _patched_httpx_modules)} (fixes ssl block during DB init)"
+    )
 except Exception as e:
     logger.debug(f"Could not patch httpx SSL: {e}")
 
@@ -154,10 +215,288 @@ try:
 except Exception as e:
     logger.debug(f"Could not patch hyphenator: {e}")
 
-# Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks + TTS 340-437ms + 163ms block
-# Also patch google.auth.load_credentials_from_file to use cached credentials to avoid 163ms RSA init on event loop
-_google_creds_cache = None
-_google_creds_lock = _threading_prewarm.Lock()
+# ---------------------------------------------------------------------------
+# Google credentials cache + TTS event-loop guard.
+# ---------------------------------------------------------------------------
+# Bringing up Google TTS has two very different costs:
+#   1. reading the service-account JSON + parsing the RSA private key
+#      (`google.auth.load_credentials_from_file`, ~163-198ms of blocking CPU), and
+#   2. constructing `texttospeech.TextToSpeechAsyncClient`, which opens a
+#      **grpc.aio** channel bound to whatever event loop is running at that
+#      moment.
+#
+# (1) is loop-independent: it is done in a worker thread and cached (see
+# right below). (2) MUST happen on the agent's own event loop — a
+# channel keeps `self._loop` from construction time, so a client built on a
+# temporary loop that is later closed makes every `streaming_synthesize()` fail
+# with `RuntimeError: Event loop is closed` (grpc/aio/_call.py -> create_task ->
+# _check_closed) and the agent produces no audio at all for the whole call.
+# Loop-safety helpers (inlined — no extra module).
+import threading
+
+CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+# Cache of parsed service-account credentials: key -> (credentials, project_id).
+# Populated off-loop by warm_google_credentials() and read by the patched
+# google.auth.load_credentials_from_file() so the on-loop client build is cheap.
+CREDS_CACHE: dict = {}
+CREDS_LOCK = threading.Lock()
+
+# The unpatched loader, kept so warming works whether or not the patch installed.
+_ORIG_LOAD_CREDS = None
+
+# Attribute names used by livekit's FallbackAdapter / our timing wrapper to hold
+# the real TTS instances.
+_INNER_LIST_ATTRS = ("_tts_instances", "tts_instances", "_instances")
+_INNER_ATTRS = ("_tts", "_inner")
+
+
+# ---------------------------------------------------------------------------
+# Credentials cache
+# ---------------------------------------------------------------------------
+def creds_cache_key(args: tuple, kwargs: dict) -> str:
+    """Stable cache key for ``load_credentials_from_file(*args, **kwargs)``.
+
+    Keyed per (file, scopes) because one deployment can serve several agents,
+    potentially with different key files — a single global entry would hand the
+    wrong credentials to the second one.
+    """
+    try:
+        return repr((args, sorted((k, repr(v)) for k, v in kwargs.items())))
+    except Exception:
+        return "default"
+
+
+def default_credentials_path() -> Optional[str]:
+    """GOOGLE_APPLICATION_CREDENTIALS env var, else the repo's google-key.json."""
+    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path:
+        return env_path
+    try:
+        from app.config import GOOGLE_APPLICATION_CREDENTIALS as cfg_path
+        return cfg_path or None
+    except Exception:
+        return None
+
+
+def install_credential_cache() -> bool:
+    """Patch ``google.auth.load_credentials_from_file`` to use CREDS_CACHE.
+
+    Returns True when the patch is in place. Safe to call once at import time;
+    a failure (google-auth not installed) is logged at debug level because the
+    API-only environment doesn't need it.
+    """
+    global _ORIG_LOAD_CREDS
+    try:
+        import google.auth as _ga
+    except Exception as e:  # pragma: no cover - depends on installed extras
+        logger.debug(f"google.auth unavailable, credential cache not installed: {e!r}")
+        return False
+
+    if getattr(_ga.load_credentials_from_file, "_voice_cached", False):
+        return True  # idempotent
+
+    try:
+        _ORIG_LOAD_CREDS = _ga.load_credentials_from_file
+
+        def _patched_load_creds(*args, **kwargs):
+            key = creds_cache_key(args, kwargs)
+            with CREDS_LOCK:
+                hit = CREDS_CACHE.get(key)
+            if hit is not None:
+                return hit
+            creds = _ORIG_LOAD_CREDS(*args, **kwargs)
+            with CREDS_LOCK:
+                CREDS_CACHE[key] = creds
+            return creds
+
+        _patched_load_creds._voice_cached = True
+        _ga.load_credentials_from_file = _patched_load_creds
+
+        # google.auth re-exports the same function, but patch _default too: some
+        # SDK versions call it through the private module.
+        import google.auth._default as _ga_default
+
+        _orig_default_load = _ga_default.load_credentials_from_file
+
+        def _patched_default_load(*args, **kwargs):
+            key = creds_cache_key(args, kwargs)
+            with CREDS_LOCK:
+                hit = CREDS_CACHE.get(key)
+            if hit is not None:
+                return hit
+            creds = _orig_default_load(*args, **kwargs)
+            with CREDS_LOCK:
+                CREDS_CACHE[key] = creds
+            return creds
+
+        _patched_default_load._voice_cached = True
+        _ga_default.load_credentials_from_file = _patched_default_load
+        logger.info(
+            "🔧 Patched google.auth.load_credentials_from_file to use cached credentials (fixes 163ms RSA init block)"
+        )
+        return True
+    except Exception as e:
+        logger.debug(f"Could not patch google auth credential cache: {e!r}")
+        return False
+
+
+def warm_google_credentials(path: Optional[str] = None) -> bool:
+    """Parse + cache a service-account key file **in the calling thread**.
+
+    This is the blocking, loop-independent half of Google TTS startup (~163ms of
+    JSON + RSA work). Call it from ``asyncio.to_thread(...)`` or a prewarm
+    thread; the async gRPC client is still built lazily by the plugin on the
+    loop that actually synthesizes audio.
+
+    Returns True when credentials for ``path`` are now cached.
+    """
+    path = path or default_credentials_path()
+    if not path or not os.path.exists(path):
+        return False
+
+    # Exactly the call shape the Google plugin uses inside _ensure_client(), so
+    # the key matches and the later on-loop build is a cache hit.
+    args: tuple = (path,)
+    kwargs: dict = {"scopes": [CLOUD_PLATFORM_SCOPE]}
+    key = creds_cache_key(args, kwargs)
+    with CREDS_LOCK:
+        if key in CREDS_CACHE:
+            return True
+
+    loader = _ORIG_LOAD_CREDS
+    if loader is None:
+        try:
+            import google.auth as _ga
+            loader = _ga.load_credentials_from_file
+        except Exception as e:
+            logger.debug(f"Google credential warm unavailable: {e!r}")
+            return False
+
+    t0 = time.time()
+    try:
+        creds = loader(*args, **kwargs)
+        with CREDS_LOCK:
+            CREDS_CACHE[key] = creds
+        logger.info(
+            f"🔧 Google credentials warm off-loop in {(time.time() - t0) * 1000:.0f}ms "
+            f"({os.path.basename(path)}) — async TTS client stays on the agent loop"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Google credential warm failed for {path}: {e!r}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# TTS client loop guard
+# ---------------------------------------------------------------------------
+def iter_tts_instances(tts_inst: Any, _depth: int = 0) -> Iterator[Any]:
+    """Yield ``tts_inst`` plus any FallbackAdapter / timing-wrapper inner instances."""
+    if tts_inst is None or _depth > 4:
+        return
+    yield tts_inst
+    for attr in _INNER_LIST_ATTRS:
+        inner_list = getattr(tts_inst, attr, None)
+        if inner_list:
+            for inner in inner_list:
+                if inner is not None and inner is not tts_inst:
+                    yield from iter_tts_instances(inner, _depth + 1)
+    for attr in _INNER_ATTRS:
+        inner = getattr(tts_inst, attr, None)
+        if inner is not None and inner is not tts_inst:
+            yield from iter_tts_instances(inner, _depth + 1)
+
+
+def google_tts_credentials_path(tts_inst: Any) -> Optional[str]:
+    """The credentials file this (possibly wrapped) Google TTS would load lazily."""
+    for inst in iter_tts_instances(tts_inst):
+        path = getattr(inst, "_credentials_file", None)
+        # NOT_GIVEN / None are not str; only a real path is usable.
+        if isinstance(path, str) and path:
+            return path
+    fallback = default_credentials_path()
+    if fallback and os.path.exists(fallback):
+        return fallback
+    return None
+
+
+def client_bound_loop(client: Any) -> Optional[asyncio.AbstractEventLoop]:
+    """Best-effort: the event loop a google async client's gRPC channel is on."""
+    transport = getattr(client, "_transport", None)
+    candidates = (
+        transport,
+        getattr(transport, "_channel", None),
+        getattr(transport, "grpc_channel", None),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        loop = getattr(candidate, "_loop", None)
+        if isinstance(loop, asyncio.AbstractEventLoop):
+            return loop
+    return None
+
+
+def guard_tts_client_loop(tts_inst: Any) -> int:
+    """Drop cached async TTS clients bound to a dead or foreign event loop.
+
+    Self-healing net for ``RuntimeError: Event loop is closed`` escaping from
+    ``grpc.aio``: if a client was built on a loop other than the one now running
+    (an old off-loop prewarm, or an instance reused across jobs/processes),
+    reset ``_client`` so the plugin rebuilds it on the correct loop.
+
+    Must be called from the event loop that will do the synthesis.
+    Returns the number of poisoned clients that were dropped.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        return 0
+
+    dropped = 0
+    for inst in iter_tts_instances(tts_inst):
+        client = getattr(inst, "_client", None)
+        if client is None:
+            continue
+        bound = client_bound_loop(client)
+        if bound is not None and (bound.is_closed() or bound is not running):
+            try:
+                inst._client = None
+                dropped += 1
+                logger.warning(
+                    "🛑 Dropped a cached Google TTS async client bound to a "
+                    f"{'closed' if bound.is_closed() else 'foreign'} event loop — it will be "
+                    "rebuilt on the agent loop (prevents 'RuntimeError: Event loop is closed' "
+                    "from silencing the whole call)"
+                )
+            except Exception as e:
+                logger.debug(f"Could not reset poisoned TTS client: {e!r}")
+    return dropped
+
+
+async def warm_tts_off_loop(tts_inst: Any, timeout: float = 3.0) -> bool:
+    """Awaitable warm-up for a freshly built TTS instance.
+
+    Warms only credentials (in a thread) and then guards the instance against a
+    client that is bound to the wrong loop. Never creates the async client.
+    """
+    warmed = False
+    try:
+        creds_path = google_tts_credentials_path(tts_inst)
+        if creds_path:
+            await asyncio.wait_for(
+                asyncio.to_thread(warm_google_credentials, creds_path), timeout=timeout
+            )
+            warmed = True
+            logger.info("🔧 TTS credentials warm off-loop completed (client is created on the agent loop)")
+        else:
+            logger.debug("TTS credential warm skipped: no Google credentials file on the TTS instance")
+    except Exception as e:
+        logger.debug(f"TTS credential prewarm skipped: {e!r}")
+    guard_tts_client_loop(tts_inst)
+    return warmed
+
 
 try:
     import google.auth.crypt._cryptography_rsa
@@ -173,39 +512,8 @@ try:
         pass
     logger.info("🔧 Prewarmed Google auth crypt + oauth2.credentials + service_account + texttospeech (avoids 176ms and 198ms blocks, reduces TTS 340-437ms)")
 
-    # Patch google.auth.load_credentials_from_file to cache credentials and avoid 163ms RSA block on event loop
-    try:
-        import google.auth as _ga
-        _orig_load_creds = _ga.load_credentials_from_file
-        def _patched_load_creds(*args, **kwargs):
-            global _google_creds_cache
-            with _google_creds_lock:
-                if _google_creds_cache is not None:
-                    return _google_creds_cache
-            creds = _orig_load_creds(*args, **kwargs)
-            with _google_creds_lock:
-                _google_creds_cache = creds
-            return creds
-        _ga.load_credentials_from_file = _patched_load_creds
-        logger.info("🔧 Patched google.auth.load_credentials_from_file to use cached credentials (fixes 163ms RSA init block)")
-
-        # Also patch _default version
-        import google.auth._default as _ga_default
-        _orig_default_load = _ga_default.load_credentials_from_file
-        def _patched_default_load(*args, **kwargs):
-            global _google_creds_cache
-            with _google_creds_lock:
-                if _google_creds_cache is not None:
-                    return _google_creds_cache
-            creds = _orig_default_load(*args, **kwargs)
-            with _google_creds_lock:
-                _google_creds_cache = creds
-            return creds
-        _ga_default.load_credentials_from_file = _patched_default_load
-        logger.info("🔧 Patched google.auth._default.load_credentials_from_file to use cached credentials (fixes 163ms block)")
-    except Exception as e:
-        logger.debug(f"Could not patch google auth credential cache: {e}")
-
+    # Cache parsed credentials so the on-loop client build skips the 163ms RSA parse.
+    install_credential_cache()
 except Exception as e:
     logger.debug(f"Google auth prewarm failed: {e}")
 
@@ -905,40 +1213,27 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             asyncio.to_thread(build_tts, cfg),
         )
         logger.info(f"⏱️ provider build async parallel {time.time()-build_t0:.2f}s")
-        # Prewarm TTS client off loop to avoid 163ms google.auth credential/RSA block on first audio
-        # The blocking load_credentials_from_file happens in _ensure_client during first streaming_synthesize (on event loop)
-        # Move it off loop now, after build, before session start
+        # Warm the *blocking, loop-independent* half of Google TTS startup: the
+        # service-account JSON + RSA parse (~163-198ms) that _ensure_client()
+        # would otherwise run on the agent loop while the caller waits for audio.
+        #
+        # The previous code here called `inner._ensure_client()` inside
+        # `asyncio.new_event_loop()` in an `asyncio.to_thread()` worker and then
+        # closed that loop. _ensure_client() caches a
+        # texttospeech.TextToSpeechAsyncClient whose grpc.aio channel keeps a
+        # reference to the loop it was built on, so every later
+        # streaming_synthesize() on the real agent loop died with
+        #   RuntimeError: Event loop is closed  (grpc/aio/_call.py:761)
+        # and the agent produced no audio at all for the whole call. Never build
+        # an async gRPC client off the loop that will use it — warm credentials
+        # instead, and let the plugin create the client on the agent loop.
+        # warm_tts_off_loop() also drops any client already cached against a
+        # dead/foreign loop so it gets rebuilt on *this* one.
         try:
-            # tts_inst may be FallbackAdapter, get inner Google TTS
-            tts_to_prewarm = tts_inst
-            try:
-                inner_list = getattr(tts_inst, '_tts_instances', None) or getattr(tts_inst, 'tts_instances', None) or getattr(tts_inst, '_instances', None)
-                if inner_list and len(inner_list) > 0:
-                    tts_to_prewarm = inner_list[0]
-            except Exception:
-                pass
-            # Try to ensure client off loop via to_thread with new event loop
-            def _ensure_tts_client_sync():
-                try:
-                    import asyncio as _aio
-                    loop = _aio.new_event_loop()
-                    _aio.set_event_loop(loop)
-                    try:
-                        # _tts is internal google client wrapper, has _ensure_client async
-                        inner = getattr(tts_to_prewarm, '_tts', None) or tts_to_prewarm
-                        if hasattr(inner, '_ensure_client'):
-                            loop.run_until_complete(inner._ensure_client())
-                            logger.info("🔧 TTS client prewarmed off loop after build (avoids 163ms RSA block on first audio)")
-                    finally:
-                        loop.close()
-                        _aio.set_event_loop(None)
-                except Exception as _e:
-                    logger.debug(f"TTS off-loop prewarm after build failed: {_e}")
-
-            await asyncio.wait_for(asyncio.to_thread(_ensure_tts_client_sync), timeout=3)
-            logger.info("🔧 TTS client off-loop prewarm completed (fixes 163ms google.auth block)")
+            await warm_tts_off_loop(tts_inst)
         except Exception as e:
-            logger.debug(f"TTS prewarm after build failed: {e}")
+            # A warm-up must never take the call down.
+            logger.debug(f"TTS warm-up skipped: {e!r}")
         # Log LLM provider details for 404 debugging and wrap with timing + failure logging
         try:
             llm_type = str(type(llm_inst))
@@ -1010,8 +1305,19 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         except Exception as e:
             logger.warning(f"Could not apply TTS timing wrapper: {e}")
 
-    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.20"))
-    max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.55"))
+    # Turn-taking: how long the agent waits before it assumes the user is done,
+    # and how easily the user can barge in. The old values (0.20/0.55, interrupt
+    # after 0.25s + 1 word) made the agent jump in on every breath and read as
+    # robotic; worse, every false barge-in pushes a speech handle into LiveKit's
+    # interrupt path — where the repeated 5s timeout errors came from.
+    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.35"))
+    max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
+    # min_words is the knob that actually gates interruptions in LiveKit; a
+    # 0.5s / 2-word floor filters coughs, "hmm", and echo without making the
+    # agent feel un-interruptible.
+    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.5"))
+    min_interruption_words = int(os.getenv("VOICE_MIN_INTERRUPTION_WORDS", "2"))
+    allow_interruptions = os.getenv("VOICE_ALLOW_INTERRUPTIONS", "1") == "1"
     turn_detection_mode = os.getenv("VOICE_TURN_DETECTION", "stt").strip().lower()
     if turn_detection_mode not in ("vad", "stt", "realtime_llm", "manual"):
         turn_detection_mode = "stt"
@@ -1070,7 +1376,13 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # Verify runtime Session config will have preemptive disabled
     logger.info(f"🔧 FINAL Session config verification: preemptive={preemptive_enabled} (env {env_preemptive}, rag_enabled {rag_enabled}, has_kb {has_kb}) - must be False when RAG enabled to prevent duplicate")
     
-    logger.info(f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, endpointing={min_delay}/{max_delay} (TTS wrapper compatible: yes)")
+    logger.info(
+        f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), "
+        f"preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, "
+        f"endpointing={min_delay}/{max_delay}, "
+        f"interruption={'on' if allow_interruptions else 'off'} "
+        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words})"
+    )
 
     return AgentSession(
         stt=stt_inst,
@@ -1081,7 +1393,12 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         turn_handling={
             "turn_detection": turn_detection_mode,
             "endpointing": {"min_delay": min_delay, "max_delay": max_delay},
-            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 1},
+            "interruption": {
+                "enabled": allow_interruptions,
+                "mode": "vad",
+                "min_duration": min_interruption_duration,
+                "min_words": min_interruption_words,
+            },
             "preemptive_generation": {
                 "enabled": preemptive_enabled,
                 "preemptive_tts": preemptive_tts_enabled,
@@ -1174,50 +1491,64 @@ async def entrypoint(ctx):
     # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
     # Total 13.5s before user hears greeting. Fix: cache DB init per process, parallel provider build.
     global _DB_INIT_DONE, _AGENT_CACHE
-    # Ensure SSL cache ready before DB init to prevent 1359ms block
+    # Ensure SSL cache ready before DB init. If the import-time prewarm thread
+    # hasn't finished, build it in a thread — NOT here: doing it on the loop is
+    # the very >1s ssl.create_default_context stall we're avoiding, and it would
+    # land right before the greeting plays.
     try:
         global _ssl_context_cache
         if _ssl_context_cache is None:
-            # Create synchronously if not yet prewarmed (first call, cache miss)
-            import ssl as _ssl_sync
-            ctx = _ssl_sync.create_default_context()
-            with _ssl_context_lock:
-                _ssl_context_cache = ctx
-            logger.info("🔧 SSL context created synchronously before DB init (was not prewarmed, fixes 1359ms block)")
+            await asyncio.wait_for(asyncio.to_thread(_prewarm_ssl_context), timeout=4)
+            if _ssl_context_cache is None:
+                logger.warning("⚠️ SSL context still not cached before DB init — first connect may block the loop")
+            else:
+                logger.info("🔧 SSL context ready before DB init (built off-loop)")
     except Exception as _e:
-        logger.debug(f"SSL ensure failed: {_e}")
+        logger.debug(f"SSL ensure failed: {_e!r}")
 
     db_t0 = time.time()
+    db_just_initialized = False
     if not _DB_INIT_DONE:
         try:
-            # FIX: Move DB init off event loop to prevent 1359ms SSL block at ssl.py:717 (httpx create_ssl_context)
-            # Prisma client connect creates httpx.AsyncClient which calls ssl.create_default_context synchronously on loop
-            # Move off loop via to_thread to avoid blocking audio and turn handling
-            async def _db_init_thread():
-                # Run db_init in thread with new event loop to avoid blocking main loop
-                import asyncio as _aio
-                loop = _aio.new_event_loop()
-                try:
-                    _aio.set_event_loop(loop)
-                    return await loop.run_until_complete(db_init())
-                finally:
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
-                    _aio.set_event_loop(None)
-
+            # DB init MUST run on the agent's own event loop.
+            #
+            # An earlier version ran it as
+            #   asyncio.to_thread(lambda: asyncio.new_event_loop().run_until_complete(db_init()))
+            # which connected the *process-wide* Prisma singleton (engine +
+            # httpx connection pool) to a throwaway loop in a worker thread. The
+            # next real query — repo.get_agent() on the agent loop — then hung
+            # until the 3s lookup timeout, showing up as
+            #   "agent lookup attempt 1/2 failed (3.01s): "  (empty message = TimeoutError)
+            # and adding ~4.5s before the greeting.
+            #
+            # The 1359ms SSL block this hack was working around is already fixed
+            # globally by the cached httpx/SSL-context patch at import time, so
+            # connecting on-loop is cheap now. One synchronous piece remains in
+            # connect(): prisma_client first verifies the engine binary with
+            # `prisma-engine --version` via subprocess (~200ms on Windows).
+            # Run that check off the audio loop once, before connecting.
             try:
-                await asyncio.wait_for(asyncio.to_thread(lambda: __import__('asyncio').new_event_loop().run_until_complete(db_init())), timeout=8)
-                logger.info("🔧 DB init moved off event loop via to_thread (fixes 1359ms SSL block)")
-            except Exception as e:
-                # Fallback to original async if to_thread fails, but SSL already cached so should not block 1359ms
-                logger.warning(f"DB init off-loop failed, fallback to async (SSL cached, should not block 1359ms): {e}")
-                await asyncio.wait_for(db_init(), timeout=5)
+                def _ensure_prisma_engine_binary() -> bool:
+                    import importlib
+                    for mod_base in ("prisma_client", "prisma"):
+                        try:
+                            paths = importlib.import_module(f"{mod_base}.binaries.paths")
+                            utils = importlib.import_module(f"{mod_base}.engine.utils")
+                            utils.ensure(paths.BINARY_PATHS.query_engine)
+                            return True
+                        except Exception:
+                            continue
+                    return False
+                if await asyncio.to_thread(_ensure_prisma_engine_binary):
+                    logger.info("🔥 Prewarm: Prisma engine binary verified off-loop (avoids ~200ms subprocess spawn on agent loop during DB connect)")
+            except Exception:
+                pass  # db_init() will do the check itself; never block the call
+            await asyncio.wait_for(db_init(), timeout=8)
             _DB_INIT_DONE = True
-            logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s (first time, cached for next calls)")
+            db_just_initialized = True
+            logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
         except Exception as exc:
-            logger.error("database initialization unavailable (%.2fs); continuing voice call: %s", time.time()-db_t0, exc)
+            logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
     else:
         logger.info(f"⏱️ DB init 0.00s (cached)")
 
@@ -1244,14 +1575,24 @@ async def entrypoint(ctx):
         logger.info(f"⏱️ agent lookup 0.00s (cached, age {time.time()-cache_entry['ts']:.1f}s)")
     elif agent_id and user_id:
         lookup_t0 = time.time()
+        # Right after a fresh connect the first query still pays the cold TLS
+        # handshake to Postgres/Neon (~1.5-4s). Cancelling it at 3s and retrying
+        # just wastes 3s and can leave the engine's connection pool in a bad
+        # state, so give a cold first attempt more room.
+        timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
         for attempt in range(2):  # Reduced from 3 to 2 attempts for faster fail
             try:
-                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=3)  # 3s instead of 4s
+                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
                 logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
                 _AGENT_CACHE[cache_key] = {"rec": rec, "ts": time.time()}
                 break
             except Exception as exc:
-                logger.warning("agent lookup attempt %s/2 failed (%.2fs): %s", attempt + 1, time.time()-lookup_t0, exc)
+                # %r, not %s: a bare TimeoutError stringifies to "" and the old
+                # log line read "failed (3.01s): " with no reason at all.
+                logger.warning(
+                    "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
+                    attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
+                )
                 if attempt < 1:
                     await asyncio.sleep(0.15)
 
@@ -1497,7 +1838,9 @@ async def entrypoint(ctx):
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                logger.warning(f"🛟 fallback say failed: {e}")
+                # str(e) is EMPTY for asyncio.TimeoutError — log the type so a
+                # 15s session.say hang is diagnosable ("fallback say failed: " blank).
+                logger.warning(f"🛟 fallback say failed: {type(e).__name__}: {e!r}")
         try:
             old = reply_tracker.get("fallback_say")
             if old is not None and not old.done():
@@ -1516,6 +1859,24 @@ async def entrypoint(ctx):
                 reply_tracker["pending"] = None
         if reply_tracker["last_assistant_ts"] >= turn_ts or closing_requested["done"]:
             return  # closing turns must never receive a delayed fallback
+        # REAL-stream markers (immediate) vs conversation_item_added (lags 5-15s
+        # on reasoning-tool models like gpt-5-nano): _mark_reply only fires from
+        # item_added, so a reply that already generated and STARTED PLAYING was
+        # still getting an apology over it (2026-09-19 04:19: real answer played
+        # at +3.3s, 'Sorry, technical problem' followed at +15s). If this turn's
+        # LLM request exists and any immediate marker is set, the reply is alive.
+        try:
+            _rs = turn_timing.get("request_start", 0)
+            if _rs and _rs >= turn_ts - 2:
+                _m = max(
+                    turn_timing.get("first_token", 0), turn_timing.get("tts_request", 0),
+                    turn_timing.get("first_tts_audio", 0), turn_timing.get("first_audio", 0),
+                )
+                if _m >= _rs:
+                    logger.info("🛟 silence watchdog suppressed: reply already streaming/speaking per REAL stream markers (item_added lag)")
+                    return
+        except Exception:
+            pass
         logger.warning(
             f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
             "(rate-limited 429 or failed generation) — speaking a fallback line "
@@ -1748,6 +2109,14 @@ async def entrypoint(ctx):
                 "cut the call", "hang up", "disconnect", "end the call", "call cut",
                 "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
                 "कॉल बंद कर दीजिए", "फोन काट दीजिए", "फोन काट दो",
+                # Hang-up permission granted in Hindi / mixed script (2026-09-19: caller
+                # said "मुझे कुछ भी नहीं चाहिए. आप phone रख सकते" twice, call dragged 33s)
+                "फोन रख दो", "फ़ोन रख दो", "फोन रख दीजिए", "फ़ोन रख दीजिए", "फ़ोन रख",
+                "फोन रख", "phone रख", "call रख", "कॉल रख",
+                "phone rakh do", "phone rakh dijiye", "phone rakh sakte", "aap phone rakh sakte",
+                # "I need nothing (else)" — direct answer to 'anything else?' means close
+                "कुछ भी नहीं चाहिए", "जानकारी नहीं चाहिए", "कोई भी जानकारी नहीं चाहिए",
+                "kuch bhi nahi chahiye", "koi jaankari nahi chahiye", "kisi bhi tarah ki madad nahi chahiye",
                 "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
                 "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
                 "no more questions", "no more help", "that's all", "that is all",
@@ -1874,7 +2243,11 @@ async def entrypoint(ctx):
                 "disconnect", "end the call", "thank you", "thankyou", "bye bye",
                 "ok bye", "okay bye", "कॉल कट", "call काट", "कॉल काट",
                 "call cut कर दीजिए", "call काट दीजिए", "कॉल बंद कर दीजिए",
-                "फोन काट दीजिए"
+                "फोन काट दीजिए",
+                # Same hang-up / nothing-needed additions as closing_substrings
+                "फोन रख", "फ़ोन रख", "phone रख", "call रख", "कॉल रख",
+                "phone rakh", "कुछ भी नहीं चाहिए", "जानकारी नहीं चाहिए",
+                "kuch bhi nahi chahiye", "koi jaankari nahi chahiye"
             ))
             if not is_system_closing and not explicit_end and any(term in cleaned.lower() for term in ("goodbye", "good bye", "thank you for calling")):
                 logger.warning("🛡️ Suppressed model farewell without explicit caller goodbye")
@@ -2028,7 +2401,10 @@ async def entrypoint(ctx):
                 # Previous bug: set state to listening even though LLM active, allowing new listening->thinking and second REQUEST START
                 # This caused 0/0 failed requests (Request 1 and 5) even though preemptive disabled
                 # New: keep state as thinking, don't allow new turn until LLM completes
-                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {now-request_start:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - keeping thinking, waiting for stream to finish (prevents duplicate REQUEST START)")
+                # request_start may be 0 (timing not yet stamped); guard so the
+                # log doesn't print epoch seconds like "1789768698.62s ago".
+                _rs_ago = now - request_start if request_start else 0.0
+                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {_rs_ago:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - keeping thinking, waiting for stream to finish (prevents duplicate REQUEST START)")
                 # Do NOT update state_tracker, keep as thinking, do NOT reset timing, keep active request alive
                 # This ensures exactly one valid LLM request per completed user turn
                 return
@@ -2608,14 +2984,14 @@ def prewarm(proc):
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
     # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU
+    # VAD tuning comes from agent_builder._vad_tuning() (env-driven) so the
+    # prewarmed model and the one build_vad() would create are identical — this
+    # cache IS what build_vad() returns, so a hardcoded copy here would silently
+    # override any VOICE_VAD_* / VOICE_ENDPOINTING_* tuning.
     global _VAD_CACHE
     try:
-        vad = silero.VAD.load(
-            min_speech_duration=0.20,
-            min_silence_duration=0.30,
-            prefix_padding_duration=0.20,
-            activation_threshold=0.55,
-        )
+        from app.agents.agent_builder import _vad_tuning as _vad_params
+        vad = silero.VAD.load(**_vad_params())
         with _VAD_CACHE_LOCK:
             _VAD_CACHE = vad
         # Also set agent_builder cache to avoid 406ms block in build_vad
@@ -2655,55 +3031,58 @@ def prewarm(proc):
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
 
-    # Prewarm Google TTS client completely before first customer response to avoid 340-437ms TTS latency + 198ms auth block
-    # Move blocking Google auth/import work off event loop
+    # Warm the Google TTS *credentials* before the first customer response so the
+    # ~163-198ms JSON/RSA parse never lands on the agent event loop.
+    #
+    # This deliberately does NOT build a TextToSpeechAsyncClient any more. The old
+    # version created a throwaway TTS and called _ensure_client() inside
+    # asyncio.new_event_loop() + loop.close(); a grpc.aio channel remembers the
+    # loop it was created on, so any client warmed that way is bound to a dead
+    # loop and later synthesize() calls fail with
+    # `RuntimeError: Event loop is closed`. The async client must be created on
+    # the loop that uses it (the plugin does that lazily in _ensure_client()).
+    # Everything that IS loop-independent — credential parsing and the grpc/google
+    # module imports — is warmed here instead, in a thread so prewarm() itself
+    # never blocks.
     try:
-        from livekit.plugins.google import TTS as _GoogleTTS
         import os as _os_tts
-        creds = _os_tts.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds:
-            # Create dummy TTS to trigger client creation off loop
-            # Use to_thread to avoid blocking, but prewarm_fnc is sync, so we do sync prewarm
-            # The TTS __init__ is lightweight, _ensure_client is heavy and does load_credentials_from_file
-            # We prewarm by importing and creating client in thread
-            def _prewarm_google_tts():
+        from app.config import GOOGLE_APPLICATION_CREDENTIALS as _gac_default
+        creds = _os_tts.getenv("GOOGLE_APPLICATION_CREDENTIALS") or _gac_default
+
+        def _prewarm_google_tts():
+            try:
+                warmed = warm_google_credentials(creds)
+                # Import the transport machinery so the on-loop client build is
+                # just channel creation (module import cost paid off loop).
                 try:
-                    import asyncio as _aio
-                    loop = _aio.new_event_loop()
-                    _aio.set_event_loop(loop)
-                    try:
-                        # Create TTS instance
-                        tts = _GoogleTTS(
-                            voice_name="en-IN-Chirp3-HD-Leda",
-                            language="en-IN",
-                            credentials_file=creds,
-                        )
-                        # Try to ensure client (loads credentials)
-                        async def _ensure():
-                            try:
-                                await tts._tts._ensure_client()
-                            except Exception:
-                                pass
-                        loop.run_until_complete(_ensure())
-                        logger.info("🔥 Prewarm: Google TTS client fully prewarmed (credentials loaded, avoids 198ms auth block + reduces 340-437ms TTS)")
-                    finally:
-                        loop.close()
-                        _aio.set_event_loop(None)
-                except Exception as _e:
-                    logger.debug(f"Google TTS client prewarm thread failed: {_e}")
+                    import grpc.aio  # noqa: F401
+                    import google.api_core.grpc_helpers_async  # noqa: F401
+                    from google.cloud import texttospeech  # noqa: F401
+                except Exception:
+                    pass
+                if warmed:
+                    logger.info(
+                        "🔥 Prewarm: Google TTS credentials + grpc.aio/texttospeech imports warm "
+                        "(async client is built on the agent loop — never off-loop)"
+                    )
+            except Exception as _e:
+                logger.debug(f"Google TTS credential prewarm thread failed: {_e!r}")
+
+        if creds and _os_tts.path.exists(creds):
             import threading as _thr
             t = _thr.Thread(target=_prewarm_google_tts, daemon=True)
             t.start()
             t.join(timeout=3)  # Wait up to 3s for prewarm
-            logger.info("🔥 Prewarm: Google TTS client prewarm attempted (off loop)")
+            logger.info("🔥 Prewarm: Google TTS credential prewarm attempted (off loop, thread)")
         else:
-            logger.info("🔥 Prewarm: GOOGLE_APPLICATION_CREDENTIALS not set, skipping Google TTS client prewarm")
+            logger.info("🔥 Prewarm: no Google credentials file found, skipping TTS credential prewarm")
     except Exception as e:
-        logger.debug(f"Google TTS prewarm failed: {e}")
+        logger.debug(f"Google TTS prewarm failed: {e!r}")
     
     # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
-    # "Event loop is closed" on next Prisma call -> 1.73s retry. DB now cached per process
-    # via _DB_INIT_DONE global and moved off loop via to_thread in entrypoint (fixes 1359ms SSL block)
+    # "Event loop is closed" on next Prisma call -> 1.73s retry. DB is cached per process
+    # via the _DB_INIT_DONE global and connected ON the agent loop in entrypoint() (the
+    # 1359ms SSL block that pushed it off-loop is fixed by the cached SSL context patch).
 
 
 if __name__ == "__main__":

@@ -244,6 +244,9 @@ class AgentConfig(BaseModel):
     providers: ProviderSelection
     knowledge: KnowledgeBase = Field(default_factory=KnowledgeBase)
     language: str = "hi"
+    # Voice gender: drives the TTS voice (Google Chirp3 speaker / Sarvam Bulbul speaker)
+    # and helps STT pick the right acoustic expectations.
+    gender: str = "female"
     voice_personality: str = "friendly"
     client_rate_per_min: float = 2.50
     memory_enabled: bool = True
@@ -265,6 +268,9 @@ class AgentCreate(BaseModel):
     providers: ProviderSelection
     knowledge: KnowledgeBase = Field(default_factory=KnowledgeBase)
     language: str = "hi"
+    # Voice gender: drives the TTS voice (Google Chirp3 speaker / Sarvam Bulbul speaker)
+    # and helps STT pick the right acoustic expectations.
+    gender: str = "female"
     voice_personality: str = "friendly"
     client_rate_per_min: float = 2.50
     memory_enabled: bool = True
@@ -285,6 +291,7 @@ class AgentUpdate(BaseModel):
     providers: Optional[ProviderSelection] = None
     knowledge: Optional[KnowledgeBase] = None
     language: Optional[str] = None
+    gender: Optional[str] = None
     voice_personality: Optional[str] = None
     client_rate_per_min: Optional[float] = None
     memory_enabled: Optional[bool] = None
