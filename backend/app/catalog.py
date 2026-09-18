@@ -111,7 +111,7 @@ CATALOG: Dict[str, Any] = {
         },
         "sarvam_bulbul_v2": {
             "kind": "tts",
-            "display_name": "Sarvam Bulbul v2 (Indic, cheaper, pitch support)",
+            "display_name": "Sarvam Bulbul v2 (RETIRED by Sarvam — auto-upgraded to v3)",
             "provider": "sarvam",
             "model": "bulbul:v2",
             "tier": "paid",
@@ -119,13 +119,14 @@ CATALOG: Dict[str, Any] = {
             "key_env": "SARVAM_API_KEY",
             "cost": {"per_1k_chars": 1.5},
             "currency": "INR",
+            "deprecated": True,  # Sarvam returns 400 'deprecated'; runtime upgrades to bulbul:v3
             "options": {
                 "voices_female": ["anushka", "vidya", "manisha"],
                 "voices_male": ["abhilash", "hitesh", "karun", "arya"],
                 "language": ["hi-IN", "en-IN", "mr-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN", "gu-IN", "bn-IN", "pa-IN"],
                 "genders": ["female", "male", "neutral"],
             },
-            "notes": "₹1.5/1k chars. Half the v3 price; older voices, but supports pitch/loudness.",
+            "notes": "RETIRED by Sarvam (every request now returns 400). Saved configs auto-upgrade to bulbul:v3 at call time; pick Bulbul v3 instead.",
         },
         "google_wavenet_hi": {
             "kind": "tts",
