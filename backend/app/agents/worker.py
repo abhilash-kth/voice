@@ -2089,6 +2089,14 @@ async def entrypoint(ctx):
                 "cut the call", "hang up", "disconnect", "end the call", "call cut",
                 "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
                 "कॉल बंद कर दीजिए", "फोन काट दीजिए", "फोन काट दो",
+                # Hang-up permission granted in Hindi / mixed script (2026-09-19: caller
+                # said "मुझे कुछ भी नहीं चाहिए. आप phone रख सकते" twice, call dragged 33s)
+                "फोन रख दो", "फ़ोन रख दो", "फोन रख दीजिए", "फ़ोन रख दीजिए", "फ़ोन रख",
+                "फोन रख", "phone रख", "call रख", "कॉल रख",
+                "phone rakh do", "phone rakh dijiye", "phone rakh sakte", "aap phone rakh sakte",
+                # "I need nothing (else)" — direct answer to 'anything else?' means close
+                "कुछ भी नहीं चाहिए", "जानकारी नहीं चाहिए", "कोई भी जानकारी नहीं चाहिए",
+                "kuch bhi nahi chahiye", "koi jaankari nahi chahiye", "kisi bhi tarah ki madad nahi chahiye",
                 "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
                 "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
                 "no more questions", "no more help", "that's all", "that is all",
@@ -2215,7 +2223,11 @@ async def entrypoint(ctx):
                 "disconnect", "end the call", "thank you", "thankyou", "bye bye",
                 "ok bye", "okay bye", "कॉल कट", "call काट", "कॉल काट",
                 "call cut कर दीजिए", "call काट दीजिए", "कॉल बंद कर दीजिए",
-                "फोन काट दीजिए"
+                "फोन काट दीजिए",
+                # Same hang-up / nothing-needed additions as closing_substrings
+                "फोन रख", "फ़ोन रख", "phone रख", "call रख", "कॉल रख",
+                "phone rakh", "कुछ भी नहीं चाहिए", "जानकारी नहीं चाहिए",
+                "kuch bhi nahi chahiye", "koi jaankari nahi chahiye"
             ))
             if not is_system_closing and not explicit_end and any(term in cleaned.lower() for term in ("goodbye", "good bye", "thank you for calling")):
                 logger.warning("🛡️ Suppressed model farewell without explicit caller goodbye")

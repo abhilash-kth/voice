@@ -1298,7 +1298,10 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "give a long preamble. Answer exactly what was asked, then stop. "
         "ABSOLUTELY FORBIDDEN to add these after every answer: 'Aur kuch poochna hai?', "
         "'Aur kuch jaanana chahenge?', 'Aapko aur kuch jaanana hai?', 'Kya aapko aur koi madad chahiye?', "
-        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?' — "
+        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?', "
+        "'Aur kuch janna chahenge?', and their Devanagari forms — 'क्या आपको और कुछ जानकारी चाहिए?', "
+        "'क्या आपको अभी कुछ और जानकारी चाहिए?', 'क्या मैं आपकी और मदद कर सकती हूँ?', "
+        "'क्या मैं आपकी किसी और तरह से मदद कर सकती हूँ?', 'और कुछ पूछना चाहेंगे?', 'और कुछ जानना चाहेंगे?' — "
         "Only ask a follow-up when you are actively collecting missing required info "
         "for a project enquiry (like phone, budget). If the caller says they have no more questions "
         "(e.g., 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', "
@@ -1461,8 +1464,10 @@ def build_voice_agent(
         "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
         "collection. End the call only when the caller clearly and explicitly asks to "
         "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
-        "that's all, no more help, or no more questions, or a mixed Hindi/English request "
-        "such as 'call cut kar dijiye' or 'और तो मुझे कुछ नहीं जानना' as a standalone final "
+        "that's all, no more help, or no more questions — this INCLUDES Hindi hang-up grants "
+        "such as 'फ़ोन रख दीजिए', 'आप phone रख सकते', 'call kaat dijiye', and direct "
+        "'I need nothing more' answers like 'मुझे कुछ भी नहीं चाहिए', 'मुझे कोई जानकारी नहीं चाहिए', "
+        "'kuch bhi nahi chahiye', 'call cut kar dijiye', 'और तो मुझे कुछ नहीं जानना' as a standalone final "
         "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
         "especially when followed by another question. "
         "When the caller explicitly says goodbye, do NOT try to generate your own closing sentence — "
@@ -1677,6 +1682,13 @@ def build_voice_agent(
                     "cut the call", "hang up", "disconnect", "end the call", "call cut",
                     "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
                     "कॉल बंद कर दीजिए", "फोन काट दीजिए", "फोन काट दो",
+                    # Hang-up granted in Hindi / mixed script (caller: "आप phone रख सकते")
+                    "फोन रख दो", "फ़ोन रख दो", "फोन रख दीजिए", "फ़ोन रख दीजिए", "फ़ोन रख",
+                    "फोन रख", "phone रख", "call रख", "कॉल रख",
+                    "phone rakh do", "phone rakh dijiye", "phone rakh sakte", "aap phone rakh sakte",
+                    # "I need nothing (else)"
+                    "कुछ भी नहीं चाहिए", "जानकारी नहीं चाहिए", "कोई भी जानकारी नहीं चाहिए",
+                    "kuch bhi nahi chahiye", "koi jaankari nahi chahiye", "kisi bhi tarah ki madad nahi chahiye",
                     "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
                     "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
                     "no more questions", "no more help", "that's all", "that is all",
