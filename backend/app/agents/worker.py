@@ -52,6 +52,7 @@ from app.config import (  # noqa: E402
     EGRESS_S3_REGION,
     EGRESS_PUBLIC_BASE_URL,
     BILLING_INTERNAL_TOKEN,
+    GOOGLE_APPLICATION_CREDENTIALS,
 )
 from app.db import init as db_init  # noqa: E402
 from app import repo  # noqa: E402
@@ -85,6 +86,58 @@ from livekit.plugins import openai    # noqa: E402,F401  (LLM)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("voice-agent-saas-worker")
+
+# LiveKit/httpx create their default SSL context synchronously the first time a
+# worker or provider opens an HTTP session.  On this Windows host that real
+# operation took 0.9–1.3s on the agent loop.  Build/cache only the default
+# context during module import (before LiveKit starts its loop), then reuse it
+# for the default trust-store path.  Custom verify/cert arguments still use the
+# library implementation.
+import ssl as _ssl_prewarm
+_ssl_context_cache: dict[tuple[str | None, str | None], object] = {}
+
+
+def _get_ssl_context(cafile=None, capath=None):
+    key = (cafile or os.getenv("SSL_CERT_FILE"), capath or os.getenv("SSL_CERT_DIR"))
+    cached = _ssl_context_cache.get(key)
+    if cached is not None:
+        return cached
+    context = _ssl_prewarm.create_default_context(cafile=key[0], capath=key[1])
+    _ssl_context_cache[key] = context
+    return context
+
+
+try:
+    _get_ssl_context()
+    from livekit.agents.utils import http_context as _http_context
+    _original_livekit_ssl = _http_context._create_ssl_context
+
+    def _cached_livekit_ssl(cafile=None, capath=None):
+        try:
+            return _get_ssl_context(cafile, capath)
+        except Exception:
+            return _original_livekit_ssl(cafile=cafile, capath=capath)
+
+    _http_context._create_ssl_context = _cached_livekit_ssl
+
+    try:
+        import httpx._config as _httpx_config
+        _original_httpx_ssl = _httpx_config.create_ssl_context
+
+        def _cached_httpx_ssl(verify=True, cert=None, trust_env=True, **kwargs):
+            if verify in (True, None) and cert is None:
+                return _get_ssl_context(
+                    os.getenv("SSL_CERT_FILE") if trust_env else None,
+                    os.getenv("SSL_CERT_DIR") if trust_env else None,
+                )
+            return _original_httpx_ssl(verify=verify, cert=cert, trust_env=trust_env, **kwargs)
+
+        _httpx_config.create_ssl_context = _cached_httpx_ssl
+    except Exception as _httpx_error:
+        logger.debug(f"Could not patch httpx SSL context: {_httpx_error}")
+    logger.info("🔧 SSL context prewarmed before the LiveKit agent loop")
+except Exception as _ssl_error:
+    logger.debug(f"SSL context prewarm skipped: {_ssl_error}")
 
 FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
 # Spoken when a user turn gets NO LLM reply at all (provider 429 after the
@@ -244,6 +297,15 @@ def build_assistant_session(cfg: AgentConfig, timing: Optional[dict] = None):
         llm_instance = wrap_llm_for_timing(llm_instance, timing)
         tts_instance = wrap_tts_for_timing(tts_instance, timing)
 
+    # Respect the existing runtime configuration.  The previous hard-coded
+    # `turn_detection="vad"` ignored VOICE_TURN_DETECTION=stt and left the
+    # session stuck in listening when Silero was slower than realtime.
+    turn_detection = (os.getenv("VOICE_TURN_DETECTION", "vad") or "vad").strip().lower()
+    if turn_detection not in ("vad", "stt", "realtime_llm", "manual"):
+        turn_detection = "vad"
+    endpoint_min = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.6"))
+    endpoint_max = float(os.getenv("VOICE_ENDPOINTING_MAX", "1.2"))
+
     return AgentSession(
         stt=stt_instance,
         vad=vad_instance,
@@ -251,24 +313,16 @@ def build_assistant_session(cfg: AgentConfig, timing: Optional[dict] = None):
         tts=tts_instance,
         # Fail FAST on any LLM/STT/TTS provider error (see _build_conn_options).
         conn_options=_build_conn_options(),
-        # Turn-handling is set here (the session). This is the SIMPLE, LOCAL, stable
-        # configuration that makes a self-hosted worker feel human:
-        #   * turn_detection = "vad"  -> end-of-turn from the local silero VAD, so STT
-        #     and VAD stop fighting (that fight was re-feeding audio into VAD and
-        #     backing its buffer up -> "inference is slower than realtime").
-        #   * interruption mode="vad" -> local VAD barge-in. Do NOT use the default
-        #     (adaptive): it calls LiveKit Cloud's barge-in service, which 401s on a
-        #     self-hosted worker and then falls back (adds lag + noise).
+        # Turn-handling is set here (the session).  Interruption remains local
+        # VAD; only the already-configured end-of-turn detector is selected.
         turn_handling={
-            "turn_detection": "vad",
-            "endpointing": {"min_delay": 0.6, "max_delay": 1.2},
+            "turn_detection": turn_detection,
+            "endpointing": {"min_delay": endpoint_min, "max_delay": endpoint_max},
             "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 0},
-            # Preemptive generation (LLM answers while the user is still speaking) is
-            # great for latency, BUT here it was being invalidated almost every turn and
-            # adding speculative LLM work that starved the loop. Keep it OFF by default;
-            # re-enable with VOICE_PREEMPTIVE=1 only after the VAD backlog is gone.
+            # Preemptive generation remains disabled.  RAG is enabled separately
+            # with VOICE_RAG_PER_TURN=1 and must not be coupled to this flag.
             "preemptive_generation": {
-                "enabled": os.getenv("VOICE_PREEMPTIVE", "0") == "1",
+                "enabled": False,
                 "preemptive_tts": False,
             },
         },
@@ -871,8 +925,8 @@ def prewarm(proc):
     # TTS or call its async _ensure_client here: prewarm runs outside the
     # LiveKit AgentSession loop and an async gRPC channel created here would be
     # reused after this loop/thread exits.
-    prewarm_google_imports()
-    logger.info("🔥 Prewarm: VAD hot; Google async TTS client intentionally lazy")
+    prewarm_google_imports(GOOGLE_APPLICATION_CREDENTIALS)
+    logger.info("🔥 Prewarm: VAD hot; Google credentials/RSA ready; async TTS client remains loop-local")
 
 
 if __name__ == "__main__":

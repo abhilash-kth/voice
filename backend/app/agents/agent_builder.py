@@ -223,14 +223,22 @@ def build_tts(cfg: AgentConfig) -> Any:
         language = overrides.get("language", "hi-IN")
         voice = _resolve_tts_voice(language, overrides.get("voice"))
         # The Google plugin's async gRPC client is lazy.  Keep this constructor
-        # client-free and guard the first streaming call so the client/channel is
+        # channel-free and guard the first streaming call so the client/channel is
         # created on the LiveKit AgentSession loop, never in worker prewarm.
-        from .runtime import guard_google_tts
-        return guard_google_tts(TTS(
-            voice_name=voice,
-            language=language,
-            credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
-        ))
+        from .runtime import get_google_credentials, guard_google_tts
+        credentials_file = overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None
+        credentials = get_google_credentials(credentials_file)
+        tts_kwargs = {
+            "voice_name": voice,
+            "language": language,
+        }
+        if credentials is not None:
+            # Only the synchronous credential/signing object is reused.  The
+            # async Google client is still constructed by the loop guard.
+            tts_kwargs["credentials"] = credentials
+        else:
+            tts_kwargs["credentials_file"] = credentials_file
+        return guard_google_tts(TTS(**tts_kwargs))
 
     if sel.id.startswith("elevenlabs"):
         from livekit.plugins.elevenlabs import TTS

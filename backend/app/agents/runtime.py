@@ -12,11 +12,27 @@ import asyncio
 import importlib
 import inspect
 import logging
+import os
 import time
 from contextlib import suppress
 from typing import Any, AsyncIterator, Optional
 
 logger = logging.getLogger("voice-agent-saas-runtime")
+
+# Google credential objects are synchronous data/signers, not async clients or
+# gRPC channels.  They may safely be prepared during worker prewarm and passed
+# into the Google TTS constructor; the async client itself remains loop-local.
+_google_credentials_cache: dict[str, Any] = {}
+
+
+def _credential_cache_key(credentials_file: str) -> str:
+    return os.path.abspath(os.path.expanduser(credentials_file))
+
+
+def get_google_credentials(credentials_file: Optional[str]) -> Any:
+    if not credentials_file:
+        return None
+    return _google_credentials_cache.get(_credential_cache_key(credentials_file))
 
 
 class TTSLoopOwnershipError(RuntimeError):
@@ -523,8 +539,8 @@ def wrap_llm_for_timing(llm: Any, timing: Optional[dict[str, Any]]) -> Any:
     return LLMTimingWrapper(llm, timing)
 
 
-def prewarm_google_imports() -> None:
-    """Import Google auth/TTS modules without creating an async client/channel."""
+def prewarm_google_imports(credentials_file: Optional[str] = None) -> None:
+    """Prewarm imports and sync credentials, never an async client/channel."""
     modules = (
         "google.auth.crypt._cryptography_rsa",
         "google.auth._service_account_info",
@@ -540,5 +556,23 @@ def prewarm_google_imports() -> None:
             imported += 1
         except Exception as exc:
             logger.debug("Google import prewarm skipped %s: %s", name, exc)
-    if imported:
+
+    if credentials_file:
+        try:
+            import google.auth
+
+            path = _credential_cache_key(credentials_file)
+            if path not in _google_credentials_cache:
+                credentials, _ = google.auth.load_credentials_from_file(
+                    path,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                _google_credentials_cache[path] = credentials
+                logger.info(
+                    "Prewarmed Google credentials/RSA only; async TTS client remains loop-local"
+                )
+        except Exception as exc:
+            logger.debug("Google credential prewarm skipped: %s", exc)
+
+    if imported and not credentials_file:
         logger.info("Prewarmed Google auth/TTS imports only; async client remains loop-local")
