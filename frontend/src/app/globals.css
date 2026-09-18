@@ -11,11 +11,97 @@ body {
   @apply bg-gray-950 text-white antialiased;
 }
 
-/* thin scrollbars for panels */
+/* ------------------------------------------------------------------ */
+/* Scrollbars — slim, dark, consistent across panels                  */
+/* ------------------------------------------------------------------ */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
+::-webkit-scrollbar-track {
+  background: transparent;
+}
 ::-webkit-scrollbar-thumb {
-  @apply bg-gray-700 rounded;
+  @apply bg-gray-700/80 rounded-full border-2 border-solid border-transparent bg-clip-padding;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-600;
+}
+
+/* Hide scrollbars but keep scrolling (horizontal tab strips etc.)    */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Slender inner-panel scrollbar (transaction lists etc.)             */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  @apply bg-gray-800 rounded-full;
+}
+
+/* ------------------------------------------------------------------ */
+/* Component primitives used across the dashboard                     */
+/* ------------------------------------------------------------------ */
+
+/* Standard surface card */
+.card {
+  @apply bg-gray-900 rounded-2xl border border-gray-800 shadow-sm;
+}
+.card-hover {
+  @apply hover:border-gray-700 hover:shadow-xl hover:shadow-black/20 transition-all;
+}
+
+/* Form controls — one visual language for every input in the app     */
+.input {
+  @apply w-full bg-gray-800/70 border border-gray-700/70 rounded-xl px-3.5 py-2.5 text-sm text-white
+    placeholder-gray-500 outline-none transition-all
+    focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20;
+}
+select.input {
+  @apply pr-9 appearance-none bg-no-repeat;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 0.75rem center;
+}
+
+/* Focus visibility for keyboard users */
+button:focus-visible,
+a:focus-visible {
+  @apply outline-none ring-2 ring-blue-500/60 ring-offset-2 ring-offset-gray-950 rounded;
+}
+
+/* Status pill */
+.pill {
+  @apply inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold border;
+}
+
+/* ------------------------------------------------------------------ */
+/* Motion                                                              */
+/* ------------------------------------------------------------------ */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-fade-in-up {
+  animation: fade-in-up 0.35s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

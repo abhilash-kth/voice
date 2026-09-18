@@ -79,6 +79,7 @@ def _agent_dict(a: Any) -> dict:
         "description": a.description or "",
         "greeting": a.greeting or "",
         "language": a.language,
+        "gender": getattr(a, "gender", "female") or "female",
         "voice_personality": a.voicePersonality,
         "client_rate_per_min": a.clientRatePerMin,
         "memory_enabled": bool(a.memoryEnabled),
@@ -117,6 +118,7 @@ async def create_agent(user_id: str, data: dict) -> dict:
             "description": data.get("description", ""),
             "greeting": data.get("greeting", ""),
             "language": data.get("language", "hi"),
+            "gender": data.get("gender", "female"),
             "voicePersonality": data.get("voice_personality", "friendly"),
             "clientRatePerMin": float(data.get("client_rate_per_min", 2.5)),
             "memoryEnabled": bool(data.get("memory_enabled", True)),
@@ -139,7 +141,8 @@ async def update_agent(agent_id: str, user_id: str, patch: dict) -> Optional[dic
     data: dict = {}
     mapping = {
         "name": "name", "description": "description", "greeting": "greeting",
-        "language": "language", "voice_personality": "voicePersonality",
+        "language": "language", "gender": "gender",
+        "voice_personality": "voicePersonality",
         "client_rate_per_min": "clientRatePerMin", "memory_enabled": "memoryEnabled",
         "recording_enabled": "recordingEnabled", "max_concurrency": "maxConcurrency",
         "enabled": "enabled", "agent_mode": "agentMode", "announce_text": "announceText", "fallback_response": "fallbackResponse", "no_response_timeout_seconds": "noResponseTimeoutSeconds", "no_response_message": "noResponseMessage",

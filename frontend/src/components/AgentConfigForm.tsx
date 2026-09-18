@@ -11,6 +11,29 @@ import {
   Agent,
 } from "@/lib/api";
 
+// Languages the stack can transcribe and speak (Deepgram + Google + Sarvam).
+const LANGUAGES = [
+  { id: "hi", label: "Hindi (Devanagari)" },
+  { id: "hi-Latn", label: "Hinglish (Latin script)" },
+  { id: "en", label: "English (India)" },
+  { id: "mr", label: "Marathi" },
+  { id: "bn", label: "Bengali" },
+  { id: "ta", label: "Tamil" },
+  { id: "te", label: "Telugu" },
+  { id: "kn", label: "Kannada" },
+  { id: "gu", label: "Gujarati" },
+  { id: "ml", label: "Malayalam" },
+  { id: "pa", label: "Punjabi" },
+  { id: "multi", label: "Multilingual / code-mix" },
+];
+
+// What the gender choice maps to per TTS provider (see agent_builder.py).
+const GENDER_VOICE_HINT: Record<string, string> = {
+  female: "Google Chirp 3: HD \u201CLeda\u201D \u00B7 Sarvam Bulbul \u201Cpriya\u201D",
+  male: "Google Chirp 3: HD \u201CCharon\u201D \u00B7 Sarvam Bulbul \u201Cshubh\u201D",
+  neutral: "Google Chirp 3: HD \u201CZephyr\u201D \u00B7 Sarvam Bulbul \u201Cpriya\u201D",
+};
+
 interface Props {
   catalog: Catalog;
   editing?: Agent | null;
@@ -48,6 +71,18 @@ interface LLMModel {
   status: string;
   capabilities: string[];
   notes: string;
+  // Added with the provider overhaul — optional so older payloads still parse.
+  supports_temperature?: boolean;
+  default_temperature?: number | null;
+  temperature_range?: [number, number] | null;
+  supports_reasoning_effort?: boolean;
+  reasoning_effort_options?: string[];
+  voice_recommended?: boolean;
+  free_tier?: boolean;
+  price_currency?: string;
+  price_inr_per_1m?: { input: number; cached_input: number; output: number };
+  cost_per_1k_input?: number;
+  cost_per_1k_output?: number;
 }
 
 interface LLMProvider {
@@ -55,6 +90,9 @@ interface LLMProvider {
   display_name: string;
   base_url: string;
   tier: string;
+  key_env?: string;
+  notes?: string;
+  deprecated?: boolean;
 }
 
 export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
@@ -73,6 +111,16 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [announceText, setAnnounceText] = useState(editing?.announce_text || "");
   const [personality, setPersonality] = useState(editing?.voice_personality || "friendly");
   const [language, setLanguage] = useState(editing?.language || "hi");
+  // Spoken-voice gender: picks the Google Chirp 3 speaker / Sarvam Bulbul speaker.
+  const [gender, setGender] = useState(editing?.gender || "female");
+  // Sampling controls, sent per selected model (only when the model supports them).
+  const [temperature, setTemperature] = useState<number>(() => {
+    const saved = (editing?.providers as any)?.llm?.config?.temperature;
+    return typeof saved === "number" ? saved : 0.7;
+  });
+  const [reasoningEffort, setReasoningEffort] = useState<string>(
+    () => (editing?.providers as any)?.llm?.config?.reasoning_effort || "low"
+  );
   const [memoryEnabled, setMemoryEnabled] = useState(editing?.memory_enabled ?? true);
   const [recordingEnabled, setRecordingEnabled] = useState(editing?.recording_enabled ?? true);
   const [maxConcurrency, setMaxConcurrency] = useState(editing?.max_concurrency ?? 1);
@@ -80,10 +128,23 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [systemPrompt, setSystemPrompt] = useState(editing?.knowledge?.system_prompt || "");
   const [faq, setFaq] = useState<FaqItem[]>(editing?.knowledge?.faq || []);
   
-  // V2 LLM state: provider → multiple models
-  const llmProviders: LLMProvider[] = (catalog as any).llm_providers || [];
-  const llmModels: LLMModel[] = (catalog as any).llm_models || [];
+  // V2 LLM state: provider → multiple models.
+  // Tolerate either an array or an id-keyed object from /api/catalog so the
+  // form can never crash after a backend/shape mismatch (never iterate blindly).
+  const asList = <T,>(v: any): T[] =>
+    Array.isArray(v) ? v : v && typeof v === "object" ? (Object.values(v) as T[]) : [];
+  const llmProviders: LLMProvider[] = asList<LLMProvider>((catalog as any).llm_providers);
+  const llmModels: LLMModel[] = asList<LLMModel>((catalog as any).llm_models);
   const llmByProvider: Record<string, LLMModel[]> = (catalog as any).llm_by_provider || {};
+  // Includes deprecated models so an agent saved against one still renders its
+  // real metadata instead of being silently switched to a different model.
+  const llmModelsAll: LLMModel[] = asList<LLMModel>((catalog as any).llm_models_all).length
+    ? asList<LLMModel>((catalog as any).llm_models_all)
+    : llmModels;
+  const llmProvidersAll: LLMProvider[] = [
+    ...llmProviders,
+    ...asList<LLMProvider>((catalog as any).llm_legacy_providers),
+  ];
   
   const isV2 = llmProviders.length > 0 && llmModels.length > 0;
   
@@ -239,7 +300,29 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   };
 
   const getModelMeta = (provider: string, modelId: string): LLMModel | undefined => {
-    return llmModels.find(m => m.provider === provider && m.model_id === modelId);
+    return (
+      llmModels.find(m => m.provider === provider && m.model_id === modelId) ||
+      llmModelsAll.find(m => m.provider === provider && m.model_id === modelId)
+    );
+  };
+
+  // Human-readable price: Sarvam bills in INR, everyone else in USD.
+  const priceLabel = (m: LLMModel) => {
+    if (m.price_inr_per_1m || m.price_currency === "INR") {
+      const pin = m.price_inr_per_1m;
+      return pin ? `\u20B9${pin.input}/1M in, \u20B9${pin.output}/1M out`
+                 : `\u20B9${m.input_price_per_1m}/1M in, \u20B9${m.output_price_per_1m}/1M out`;
+    }
+    return `$${m.input_price_per_1m}/1M in, $${m.output_price_per_1m}/1M out`;
+  };
+
+  // Models still offered for a provider, plus the one this agent already uses
+  // (even if deprecated) so the select never blanks out or silently changes it.
+  const modelsForSelect = (provider: string, current: string): LLMModel[] => {
+    const active = llmByProvider[provider] || [];
+    if (active.some(m => m.model_id === current)) return active;
+    const saved = llmModelsAll.find(m => m.provider === provider && m.model_id === current);
+    return saved ? [saved, ...active] : active;
   };
 
   const renderModelInfo = (provider: string, modelId: string) => {
@@ -248,16 +331,34 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     return (
       <div className="mt-2 p-2 bg-gray-800/50 rounded-lg border border-gray-700/50 text-[11px] space-y-1">
         <div className="flex flex-wrap gap-2">
-          <span className="bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded">Input ${meta.input_price_per_1m}/1M</span>
-          <span className="bg-green-500/20 text-green-300 px-2 py-0.5 rounded">Cached ${meta.cached_input_price_per_1m}/1M</span>
-          <span className="bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">Output ${meta.output_price_per_1m}/1M</span>
+          <span className="bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded">
+            Input {meta.price_currency === "INR" ? `\u20B9${meta.input_price_per_1m}/1M` : `$${meta.input_price_per_1m}/1M`}
+          </span>
+          <span className="bg-green-500/20 text-green-300 px-2 py-0.5 rounded">
+            Cached {meta.price_currency === "INR" ? `\u20B9${meta.cached_input_price_per_1m}/1M` : `$${meta.cached_input_price_per_1m}/1M`}
+          </span>
+          <span className="bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">
+            Output {meta.price_currency === "INR" ? `\u20B9${meta.output_price_per_1m}/1M` : `$${meta.output_price_per_1m}/1M`}
+          </span>
+          {meta.free_tier && (
+            <span className="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded">free tier (rate-limited)</span>
+          )}
+          {meta.voice_recommended && (
+            <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded">\u2605 recommended for voice</span>
+          )}
+          {meta.status === "deprecated" && (
+            <span className="bg-red-500/20 text-red-300 px-2 py-0.5 rounded">deprecated — works, but switch</span>
+          )}
         </div>
         <div className="flex flex-wrap gap-2 text-gray-400">
           <span>Context {meta.context_window.toLocaleString()}</span>
           <span>• Max out {meta.max_output_tokens.toLocaleString()}</span>
           <span>• Speed {meta.expected_speed}</span>
           <span>• Reasoning {meta.reasoning_supported ? meta.reasoning_default : "no"}</span>
-          <span>• {meta.status}</span>
+          <span>• Temperature {meta.supports_temperature === false ? "fixed (reasoning model)" : "adjustable"}</span>
+          {meta.cost_per_1k_output != null && (
+            <span>• ${meta.cost_per_1k_output}/1K out tokens</span>
+          )}
         </div>
         <div className="flex flex-wrap gap-1">
           {meta.capabilities.map(c => (
@@ -268,7 +369,77 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           {meta.structured_output_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">structured</span>}
         </div>
         {meta.notes && <div className="text-amber-300/80">{meta.notes}</div>}
-        <div className="text-gray-500">Base URL: {meta.base_url}</div>
+        {meta.base_url && <div className="text-gray-500">Base URL: {meta.base_url}</div>}
+      </div>
+    );
+  };
+
+  // Follow the selected model: reasoning models have their own effort default and
+  // reject a custom temperature, so keep the UI honest about what will be sent.
+  useEffect(() => {
+    const meta = getModelMeta(primaryLlmProvider, primaryLlmModel);
+    if (!meta) return;
+    if (meta.supports_reasoning_effort || meta.reasoning_supported) {
+      setReasoningEffort(meta.reasoning_default || "low");
+    }
+  }, [primaryLlmProvider, primaryLlmModel]);
+
+  // Temperature / reasoning controls, shown only when the selected model accepts
+  // them. Reasoning models (gpt-5 family, o-series) have no temperature knob.
+  const renderTuning = (provider: string, modelId: string) => {
+    const meta = getModelMeta(provider, modelId);
+    if (!meta) return null;
+    const supportsTemp = meta.supports_temperature !== false;
+    const supportsReasoning = !!(meta.reasoning_supported || meta.supports_reasoning_effort);
+    if (!supportsTemp && !supportsReasoning) return null;
+    return (
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+        {supportsTemp ? (
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-gray-400 font-medium">
+              Temperature <span className="text-blue-300">{temperature.toFixed(2)}</span>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={temperature}
+              onChange={(e) => setTemperature(Number(e.target.value))}
+              className="w-full accent-blue-500"
+            />
+            <span className="text-[10px] text-gray-500">
+              0.3 = tight script adherence, 0.7 = natural variation, 1.0 = most creative.
+              {meta.default_temperature != null ? ` Model default ${meta.default_temperature}.` : ""}
+            </span>
+          </label>
+        ) : (
+          <div className="text-[11px] text-gray-500 self-end">
+            Temperature is not adjustable on this reasoning model — the provider fixes
+            sampling. Use reasoning effort instead.
+          </div>
+        )}
+        {supportsReasoning && (
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-gray-400 font-medium">Reasoning effort</span>
+            <select
+              value={reasoningEffort}
+              onChange={(e) => setReasoningEffort(e.target.value)}
+              className="input"
+            >
+              {(meta.reasoning_effort_options && meta.reasoning_effort_options.length
+                ? meta.reasoning_effort_options
+                : ["low", "medium", "high"]
+              ).map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
+            </select>
+            <span className="text-[10px] text-gray-500">
+              low = fastest first token (recommended for live calls); high thinks longer
+              and adds latency.
+            </span>
+          </label>
+        )}
       </div>
     );
   };
@@ -283,7 +454,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         <label key={optName} className="flex flex-col gap-1 text-xs">
           <span className="text-gray-400 font-medium">{optName}</span>
           <select
-            className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+            className="input"
             value={current}
             onChange={(e) =>
               setOptionVals((v) => ({
@@ -310,43 +481,58 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     // V2 LLM handling
     if (isV2) {
       const primaryMeta = getModelMeta(primaryLlmProvider, primaryLlmModel);
+      // Reasoning models (gpt-5 family, o-series) reject a custom temperature, so
+      // omit it rather than send a value the API would refuse or ignore.
+      const tuning: any = {};
+      if (primaryMeta?.supports_temperature !== false) tuning.temperature = temperature;
+      if (primaryMeta?.reasoning_supported || primaryMeta?.supports_reasoning_effort) {
+        tuning.reasoning_effort = reasoningEffort;
+      }
+      const maxTokens = primaryMeta?.max_output_tokens
+        ? Math.min(80, primaryMeta.max_output_tokens)
+        : 80;
       cfg.llm = {
         id: primaryLlmProvider,
         config: {
           model: primaryLlmModel,
           provider: primaryLlmProvider,
           base_url: primaryMeta?.base_url || "",
-          temperature: 0.1,
-          max_tokens: primaryMeta?.max_output_tokens ? Math.min(80, primaryMeta.max_output_tokens) : 80,
+          max_tokens: maxTokens,
+          ...tuning,
         }
       };
       cfg.llm_v2 = {
         provider: primaryLlmProvider,
         model_id: primaryLlmModel,
         base_url: primaryMeta?.base_url || "",
-        temperature: 0.1,
-        max_tokens: 80,
+        max_tokens: maxTokens,
+        ...tuning,
       };
       if (fallbackEnabled) {
         const fallbackMeta = getModelMeta(fallbackLlmProvider, fallbackLlmModel);
         // Do not treat Groq 120B as OpenAI - keep separate
         if (!(primaryLlmProvider === fallbackLlmProvider && primaryLlmModel === fallbackLlmModel)) {
+          const fbTuning: any = {};
+          if (fallbackMeta?.supports_temperature !== false) fbTuning.temperature = temperature;
+          if (fallbackMeta?.reasoning_supported || fallbackMeta?.supports_reasoning_effort) {
+            fbTuning.reasoning_effort = reasoningEffort;
+          }
           cfg.llm_fallback = {
             id: fallbackLlmProvider,
             config: {
               model: fallbackLlmModel,
               provider: fallbackLlmProvider,
               base_url: fallbackMeta?.base_url || "",
-              temperature: 0.1,
               max_tokens: 80,
+              ...fbTuning,
             }
           };
           cfg.llm_fallback_v2 = {
             provider: fallbackLlmProvider,
             model_id: fallbackLlmModel,
             base_url: fallbackMeta?.base_url || "",
-            temperature: 0.1,
             max_tokens: 80,
+            ...fbTuning,
           };
         }
       }
@@ -437,6 +623,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         description: editing?.description || "Self-service agent",
         greeting,
         language,
+        gender,
         voice_personality: personality,
         agent_mode: mode,
         announce_text: mode === "announcement" ? announceText : "",
@@ -504,7 +691,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. Kavya"
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
         </div>
         <div>
@@ -514,7 +701,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             onChange={(e) => setGreeting(e.target.value)}
             rows={2}
             placeholder="Namaste! Main Kavya hoon..."
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
           {mode === "announcement" && (
             <p className="text-[11px] text-gray-500 mt-1">Optional in Announcement mode — used only if the Fixed script below is left empty.</p>
@@ -528,7 +715,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             onChange={(e) => setFallbackResponse(e.target.value)}
             rows={2}
             placeholder="Please hold on, I am having a temporary issue."
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
           <p className="text-[11px] text-gray-500 mt-1">Spoken when there is a temporary network, provider, or server problem.</p>
         </div>
@@ -540,7 +727,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               min={15}
               value={noResponseTimeout}
               onChange={(e) => setNoResponseTimeout(Number(e.target.value))}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             />
             <p className="text-[11px] text-gray-500 mt-1">Recommended: 30 seconds.</p>
           </div>
@@ -550,7 +737,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               value={noResponseMessage}
               onChange={(e) => setNoResponseMessage(e.target.value)}
               rows={2}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             />
           </div>
         </div>
@@ -599,7 +786,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             <select
               value={personality}
               onChange={(e) => setPersonality(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             >
               {["friendly", "professional", "cautious", "playful", "formal"].map((p) => (
                 <option key={p} value={p}>
@@ -613,14 +800,32 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             <select
               value={language}
               onChange={(e) => setLanguage(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+              className="input mt-1"
             >
-              {["hi", "en", "hi-Latn", "multi"].map((p) => (
-                <option key={p} value={p}>
-                  {p}
+              {LANGUAGES.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.label}
                 </option>
               ))}
             </select>
+            <p className="mt-1 text-[10px] text-gray-500">
+              Drives STT language and the TTS locale the agent speaks in.
+            </p>
+          </div>
+          <div>
+            <label className="text-xs text-gray-400 font-medium">Voice gender</label>
+            <select
+              value={gender}
+              onChange={(e) => setGender(e.target.value)}
+              className="input mt-1"
+            >
+              <option value="female">Female</option>
+              <option value="male">Male</option>
+              <option value="neutral">Neutral</option>
+            </select>
+            <p className="mt-1 text-[10px] text-gray-500">
+              {GENDER_VOICE_HINT[gender] || GENDER_VOICE_HINT.female}
+            </p>
           </div>
         </div>
 
@@ -637,7 +842,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             min={1}
             value={maxConcurrency}
             onChange={(e) => setMaxConcurrency(Number(e.target.value))}
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+            className="input mt-1"
           />
         </div>
 
@@ -651,7 +856,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 onChange={(e) => setKnowledgeText(e.target.value)}
                 rows={5}
                 placeholder="Company facts, FAQs, product info..."
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
             <div>
@@ -661,7 +866,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 rows={3}
                 placeholder="Extra instructions for the agent..."
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
 
@@ -739,11 +944,16 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   <select
                     value={primaryLlmProvider}
                     onChange={(e) => setPrimaryLlmProvider(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                    className="input"
                   >
-                    {llmProviders.map((p) => (
-                      <option key={p.id} value={p.id} title={`${p.display_name} - ${p.base_url} - ${p.tier}`}>
-                        {p.display_name} {p.tier === "free" ? "(free)" : "(paid)"} - {p.base_url}
+                    {(llmProviders.some(p => p.id === primaryLlmProvider)
+                      ? llmProviders
+                      : [...llmProviders, ...(llmProvidersAll.filter(p => p.id === primaryLlmProvider))]
+                    ).map((p) => (
+                      <option key={p.id} value={p.id} title={`${p.display_name} - ${p.base_url || "native"} - ${p.tier}${p.notes ? "\n" + p.notes : ""}`}>
+                        {p.display_name} {p.tier === "free" ? "(free)" : p.tier === "freemium" ? "(free tier)" : "(paid)"}
+                        {p.key_env ? ` \u00B7 ${p.key_env}` : ""}
+                        {p.deprecated ? " \u2014 legacy only" : ""}
                       </option>
                     ))}
                   </select>
@@ -753,21 +963,24 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   <select
                     value={primaryLlmModel}
                     onChange={(e) => setPrimaryLlmModel(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                    className="input"
                   >
-                    {(llmByProvider[primaryLlmProvider] || []).map((m) => (
-                      <option 
-                        key={m.model_id} 
+                    {modelsForSelect(primaryLlmProvider, primaryLlmModel).map((m) => (
+                      <option
+                        key={m.model_id}
                         value={m.model_id}
-                        title={`$${m.input_price_per_1m}/1M in, $${m.cached_input_price_per_1m}/1M cached, $${m.output_price_per_1m}/1M out | ${m.context_window/1000}K context | Speed: ${m.expected_speed} | ${m.reasoning_supported ? 'Reasoning: '+m.reasoning_default : 'No reasoning'} | ${m.capabilities.join(', ')}`}
+                        title={`${priceLabel(m)} | cached $${m.cached_input_price_per_1m}/1M | ${(m.context_window/1000).toLocaleString()}K context | max out ${m.max_output_tokens.toLocaleString()} | speed: ${m.expected_speed} | ${m.reasoning_supported ? 'reasoning: '+m.reasoning_default : 'no reasoning'} | ${m.capabilities.join(', ')}`}
                       >
-                        {m.display_name} - ${m.input_price_per_1m}/1M in, ${m.output_price_per_1m}/1M out, {m.expected_speed} {m.status === "deprecated" ? "(deprecated)" : ""}
+                        {m.voice_recommended ? "\u2605 " : ""}{m.display_name} \u2014 {priceLabel(m)}, {m.expected_speed}
+                        {m.free_tier ? " [free tier]" : ""}
+                        {m.status === "deprecated" ? " (deprecated \u2014 switch recommended)" : ""}
                       </option>
                     ))}
                   </select>
                 </label>
               </div>
               {renderModelInfo(primaryLlmProvider, primaryLlmModel)}
+              {renderTuning(primaryLlmProvider, primaryLlmModel)}
             </div>
             <p className="mt-2 text-[11px] text-amber-300/90">Provider and model remain separate. No silent substitution. If invalid, returns clear config error.</p>
           </div>
@@ -785,7 +998,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 <select
                   value={picked.llm}
                   onChange={(e) => setPick("llm", e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                  className="input"
                 >
                   {catalog.catalog.llm.filter((p: any) => !(p as any).legacy).map((p) => (
                     <option key={p.id} value={p.id} title={`${(p as any).models ? (p as any).models.length + ' models' : ''} ${(p as any).base_url || ''}`}>
@@ -811,7 +1024,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 <select
                   value={picked[kind]}
                   onChange={(e) => setPick(kind, e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                  className="input"
                 >
                   {catalog.catalog[kind].map((p) => (
                     <option key={p.id} value={p.id}>
@@ -856,7 +1069,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       <select
                         value={fallbackLlmProvider}
                         onChange={(e) => setFallbackLlmProvider(e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        className="input"
                       >
                         {llmProviders.map((p) => (
                           <option key={p.id} value={p.id} title={`${p.display_name} - ${p.base_url}`}>
@@ -870,7 +1083,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       <select
                         value={fallbackLlmModel}
                         onChange={(e) => setFallbackLlmModel(e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        className="input"
                       >
                         {(llmByProvider[fallbackLlmProvider] || []).map((m) => (
                           <option 
@@ -898,7 +1111,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       <select
                         value={fallbackPicked[kind]}
                         onChange={(e) => setFallbackPick(kind, e.target.value)}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        className="input"
                       >
                         {catalog.catalog[kind].map((p) => (
                           <option key={p.id} value={p.id}>

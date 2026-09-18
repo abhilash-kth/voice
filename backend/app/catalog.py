@@ -72,8 +72,62 @@ CATALOG: Dict[str, Any] = {
             "cost": {"per_min": 0.24},
             "options": {"language": ["hi-IN", "en-IN"]},
         },
+        "sarvam_saaras_3": {
+            "kind": "stt",
+            "display_name": "Sarvam Saaras 3 (best Indic code-mix, paid)",
+            "provider": "sarvam",
+            "model": "saaras_3",
+            "tier": "paid",
+            "requires_key": True,
+            "key_env": "SARVAM_API_KEY",
+            "cost": {"per_min": 0.00833},
+            "options": {
+                "language": ["hi-IN", "en-IN", "mr-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN", "gu-IN", "bn-IN", "pa-IN", "auto"],
+                "genders": ["female", "male", "neutral"],
+            },
+        },
     },
     "tts": {
+        "sarvam_bulbul_v3": {
+            "kind": "tts",
+            "display_name": "Sarvam Bulbul v3 (Indic, streaming, low-latency)",
+            "provider": "sarvam",
+            "model": "bulbul:v3",
+            "tier": "paid",
+            "requires_key": True,
+            "key_env": "SARVAM_API_KEY",
+            "cost": {"per_1k_chars": 3.0},
+            "currency": "INR",
+            "options": {
+                # LiveKit plugin speakers for bulbul:v3 (docs.livekit.io TTS guide, Sep 2026)
+                # Female: amelia, ishita, kavitha, kavya, neha, pooja, priya, ritu, roopa, rupali, shruti, shreya, simran, sophia, suhani, tanya
+                # Male: aayan, aditya, advait, amit, ashutosh, dev, kabir, manan, rahul, ratan, rohan, shubh, sumit, varun
+                "voices_female": ["priya", "ishita", "pooja", "kavya", "neha", "ritu", "roopa", "suhani", "tanya", "simran", "kavitha", "rupali", "shruti", "shreya", "amelia", "sophia"],
+                "voices_male": ["shubh", "ratan", "rahul", "amit", "rohan", "aditya", "dev", "kabir", "manan", "sumit", "varun", "aayan", "advait", "ashutosh"],
+                "language": ["hi-IN", "en-IN", "mr-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN", "gu-IN", "bn-IN", "od-IN", "pa-IN"],
+                "genders": ["female", "male", "neutral"],
+            },
+            "notes": "₹3/1k chars (₹30/10k). Streaming via livekit-plugins-sarvam. Gender picks the speaker (female→priya/ishita, male→shubh/ratan); language follows the agent language.",
+        },
+        "sarvam_bulbul_v2": {
+            "kind": "tts",
+            "display_name": "Sarvam Bulbul v2 (RETIRED by Sarvam — auto-upgraded to v3)",
+            "provider": "sarvam",
+            "model": "bulbul:v2",
+            "tier": "paid",
+            "requires_key": True,
+            "key_env": "SARVAM_API_KEY",
+            "cost": {"per_1k_chars": 1.5},
+            "currency": "INR",
+            "deprecated": True,  # Sarvam returns 400 'deprecated'; runtime upgrades to bulbul:v3
+            "options": {
+                "voices_female": ["anushka", "vidya", "manisha"],
+                "voices_male": ["abhilash", "hitesh", "karun", "arya"],
+                "language": ["hi-IN", "en-IN", "mr-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN", "gu-IN", "bn-IN", "pa-IN"],
+                "genders": ["female", "male", "neutral"],
+            },
+            "notes": "RETIRED by Sarvam (every request now returns 400). Saved configs auto-upgrade to bulbul:v3 at call time; pick Bulbul v3 instead.",
+        },
         "google_wavenet_hi": {
             "kind": "tts",
             "display_name": "Google Chirp 3 HD Hindi (natural, streaming)",
@@ -111,7 +165,7 @@ CATALOG: Dict[str, Any] = {
             "options": {"voice": ["pNInz6obpgDQGcFmaJgB", "onwK4e9ZLuTAKqWW03F9"]},
         },
         "openrouter_flux_tts": {
-            "kind": "tts",
+            "kind": "tts", "deprecated": True,
             "display_name": "OpenRouter Deepgram Flux TTS (FREE, English only)",
             "provider": "openrouter",
             "model": "deepgram/flux-tts:free",
@@ -125,7 +179,7 @@ CATALOG: Dict[str, Any] = {
             "options": {"voice": ["flux-bree-en", "flux-alexis-en", "flux-priya-en", "flux-maeve-en"]},
         },
         "openrouter_kokoro_tts": {
-            "kind": "tts",
+            "kind": "tts", "deprecated": True,
             "display_name": "OpenRouter Kokoro 82M (multilingual, paid)",
             "provider": "openrouter",
             "model": "hexgrad/kokoro-82m",
@@ -196,10 +250,12 @@ def _build_llm_catalog_v2_with_compat():
         "openai_gpt_oss_120b": ("openai", "gpt-4o"),  # Old invalid mapping, now points to valid gpt-4o
         "groq_gpt_oss": ("groq", "openai/gpt-oss-120b"),
         "groq_gpt_oss_20b": ("groq", "openai/gpt-oss-20b"),
-        "groq_llama_3_3_70b": ("groq", "llama-3.3-70b-versatile"),
-        "groq_qwen_3_8_27b": ("groq", "qwen/qwen3-32b"),  # Map old qwen to new
-        "openrouter_gemma": ("openrouter", "google/gemma-3-27b-it:free"),
-        "openrouter_gemma_26b": ("openrouter", "google/gemma-3-12b-it:free"),
+        "groq_llama_3_3_70b": ("groq", "meta-llama/llama-4-maverick-17b-128e-instruct"),  # llama-3.3 retired 08/16/26 -> Llama 4 Maverick
+        "groq_qwen_3_8_27b": ("groq", "qwen/qwen3.6-27b"),  # was Qwen3 (deprecated), now current Qwen3.6 27B on Groq
+        # openrouter is deprecated: map its legacy ids onto live equivalents so an
+        # agent saved against them keeps working (and stops rate-limiting).
+        "openrouter_gemma": ("google", "gemini-2.5-flash-lite"),
+        "openrouter_gemma_26b": ("google", "gemini-2.5-flash-lite"),
     }
     
     # Build new provider entries
@@ -303,6 +359,10 @@ def providers_of(kind: str) -> List[Dict[str, Any]]:
         # For LLM, hide legacy ids from providers_of to clean UI
         if kind == "llm" and spec.get("legacy"):
             continue
+        # Hide deprecated providers (e.g. the OpenRouter TTS entries) from the
+        # picker; get_provider() still resolves them for saved agents.
+        if spec.get("deprecated"):
+            continue
         item = dict(spec)
         item["id"] = pid
         out.append(item)
@@ -367,7 +427,8 @@ def catalog_summary() -> Dict[str, Any]:
         out[kind] = providers_of(kind)
     # Add new V2 structure for LLM
     out["llm_v2"] = _llm_catalog_summary_v2()
-    out["llm_providers"] = list(LLM_PROVIDERS.values())
+    from .llm_catalog import list_providers as _active_llm_providers
+    out["llm_providers"] = _active_llm_providers()
     out["llm_models"] = LLM_MODELS
     out["llm_by_provider"] = {pid: [m for m in LLM_MODELS if m["provider"] == pid] for pid in LLM_PROVIDERS}
     return out

@@ -46,6 +46,9 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 # Default provider credentials (used as fallbacks / examples)
 # ---------------------------------------------------------------------------
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", GOOGLE_API_KEY)
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # OpenRouter routes many providers through one OpenAI-compatible endpoint. Set
