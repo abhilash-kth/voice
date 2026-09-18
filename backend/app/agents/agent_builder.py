@@ -366,23 +366,24 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
 
     # Completion-token budget for a voice reply. Non-reasoning models: 80 is
     # plentiful (~60 spoken words) and keeps replies short. REASONING models
-    # (gpt-5 family) spend HIDDEN reasoning tokens from the SAME budget — with
-    # a cap of 80 the reasoning pass consumed everything, the API closed the
-    # stream with finish_reason='length' and ZERO visible text: every user turn
-    # ended in silence until the 6s rescue line ("Sorry, there is a temporary
-    # technical problem") fired. Reasoning models need ~500 (think + reply).
+    # (gpt-5 family) spend HIDDEN reasoning tokens from the SAME budget —
+    # first failure at cap 80, then AGAIN at cap 500 on a vague question
+    # (2026-09-19 04:19: output=500/finish_reason=length with ZERO visible text
+    # -> 6s watchdog apology). Diffuse prompts can burn >500 tokens of thinking;
+    # 800 leaves headroom for think + reply without turning typical turns slow
+    # (the model still stops early at natural completion).
     _cap_override = overrides.get("max_tokens")
     _reasoning_mdl = bool((meta or {}).get("reasoning_supported"))
     if _cap_override:
         _cap = int(_cap_override)
-        if _reasoning_mdl and _cap < 300:
+        if _reasoning_mdl and _cap < 500:
             logger.warning(
                 f"⚠️ max_tokens={_cap} is too small for reasoning model {model_id}: the cap is spent on "
-                "hidden reasoning tokens leaving ZERO text for the spoken reply (agent went silent). Raising to 500."
+                "hidden reasoning tokens leaving ZERO text for the spoken reply (agent went silent). Raising to 800."
             )
-            _cap = 500
+            _cap = 800
     else:
-        _cap = 500 if _reasoning_mdl else 80
+        _cap = 800 if _reasoning_mdl else 80
 
     # Build client with exact base_url and model, no silent replacement.
     # Only OpenAI-compatible providers ride on an AsyncOpenAI client: Gemini's
