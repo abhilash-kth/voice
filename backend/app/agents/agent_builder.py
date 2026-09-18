@@ -1282,6 +1282,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
         "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
+        "SCRIPT RULE (critical for the voice engine): when the caller writes or speaks Hindi, write your ENTIRE answer in Devanagari script (देवनागरी) only — NEVER in Roman/Latin letters like 'Iske details nahi hain'. Roman-script Hindi sounds broken when spoken aloud. Phone numbers, digits and email addresses may stay as digits/Latin (Sarvam reads them correctly).",
         "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
