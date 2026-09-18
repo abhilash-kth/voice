@@ -74,6 +74,18 @@ from livekit.plugins import silero    # noqa: E402,F401  (VAD)
 from livekit.plugins import google    # noqa: E402,F401  (STT/TTS)
 from livekit.plugins import deepgram  # noqa: E402,F401  (STT)
 from livekit.plugins import openai    # noqa: E402,F401  (LLM)
+# Sarvam (LLM/STT/TTS) self-registers AT IMPORT TIME, and LiveKit only allows
+# registration on the MAIN thread. Importing it here — the top level of the
+# worker module, which every job child process re-imports on its main thread
+# (Windows spawn) — means agent_builder's lazy
+#   "from livekit.plugins.sarvam import TTS/STT/LLM"
+# just binds the already-registered module from sys.modules. Without this, the
+# first Sarvam-using call ran the import on a to_thread worker and died with
+# "RuntimeError: Plugins must be registered on the main thread".
+try:  # noqa: E402
+    from livekit.plugins import sarvam as _sarvam_plugin  # noqa: F401
+except ImportError:  # package is optional (pip install livekit-plugins-sarvam)
+    _sarvam_plugin = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("voice-agent-saas-worker")
@@ -1511,7 +1523,26 @@ async def entrypoint(ctx):
             #
             # The 1359ms SSL block this hack was working around is already fixed
             # globally by the cached httpx/SSL-context patch at import time, so
-            # connecting on-loop is cheap now.
+            # connecting on-loop is cheap now. One synchronous piece remains in
+            # connect(): prisma_client first verifies the engine binary with
+            # `prisma-engine --version` via subprocess (~200ms on Windows).
+            # Run that check off the audio loop once, before connecting.
+            try:
+                def _ensure_prisma_engine_binary() -> bool:
+                    import importlib
+                    for mod_base in ("prisma_client", "prisma"):
+                        try:
+                            paths = importlib.import_module(f"{mod_base}.binaries.paths")
+                            utils = importlib.import_module(f"{mod_base}.engine.utils")
+                            utils.ensure(paths.BINARY_PATHS.query_engine)
+                            return True
+                        except Exception:
+                            continue
+                    return False
+                if await asyncio.to_thread(_ensure_prisma_engine_binary):
+                    logger.info("🔥 Prewarm: Prisma engine binary verified off-loop (avoids ~200ms subprocess spawn on agent loop during DB connect)")
+            except Exception:
+                pass  # db_init() will do the check itself; never block the call
             await asyncio.wait_for(db_init(), timeout=8)
             _DB_INIT_DONE = True
             db_just_initialized = True
