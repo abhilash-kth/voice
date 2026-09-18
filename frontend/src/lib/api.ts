@@ -103,6 +103,8 @@ export interface Agent {
   agent_mode?: string;
   announce_text?: string;
   fallback_response?: string;
+  no_response_timeout_seconds?: number;
+  no_response_message?: string;
   providers: {
     llm: { id: string; config: Record<string, unknown> };
     stt: { id: string; config: Record<string, unknown> };
