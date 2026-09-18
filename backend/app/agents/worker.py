@@ -1255,22 +1255,28 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             "turn_detection": turn_detection_mode,
             "endpointing": {"min_delay": min_delay, "max_delay": max_delay},
             # Barge-in tuning (production logs 20260918):
-            # Root cause: greeting is ~7s long; with the previous defaults
-            # (min_duration 0.25, min_words 1) the user could barge in on a
-            # 0.25s fragment ("Hi", "भैया") which triggered the framework's
-            # 5s speech-cancel watchdog mid-greeting. The user then heard a
-            # partial greeting + dead air + state listening (no LLM call)
-            # and hung up.
-            # Fix: require 0.6s of user speech AND 2 words before barge-in
-            # fires. Filters out greetings ("Hi", "नमस्ते", "हैलो") and
-            # utterance-end phonemes while still catching real interruptions
-            # (e.g. "wait actually" = 2 words ~0.8s). Env-overridable via
-            # VOICE_BARGE_IN_MIN_DURATION / VOICE_BARGE_IN_MIN_WORDS.
+            # Problem: "speech not done in time after interruption, cancelling the
+            # speech arbitrarily" (5.0s INTERRUPTION_TIMEOUT in LiveKit's
+            # speech_handle.py; by design per longcw's PR #5425 closure 2026-09-14).
+            # Fires when user interrupts mid-TTS-synthesis; the framework force-cancels
+            # the in-progress audio after 5s instead of resuming.
+            #
+            # Two-step fix:
+            # (a) Filter false interruptions: require 0.6s + 2 words before barge-in.
+            #     Greetings ("Hi", "नमस्ते", "हैलो", "हां") won't trip it. Real
+            #     interruptions ("wait actually", "रुकिए ज़रा") still trip it.
+            # (b) Auto-resume cancelled speech: false_interruption_timeout=3.0s waits
+            #     3s of silence after the interruption before declaring it "false"
+            #     (user wasn't really trying to interrupt), then resumes the cancelled
+            #     TTS. This eliminates the 5s watchdog warning for noisy Hindi lines.
+            # Env-overridable: VOICE_BARGE_IN_MIN_DURATION / _MIN_WORDS / _RESUME_TIMEOUT
             "interruption": {
                 "enabled": True,
                 "mode": "vad",
                 "min_duration": float(os.getenv("VOICE_BARGE_IN_MIN_DURATION", "0.6")),
                 "min_words": int(os.getenv("VOICE_BARGE_IN_MIN_WORDS", "2")),
+                "false_interruption_timeout": float(os.getenv("VOICE_BARGE_IN_RESUME_TIMEOUT", "3.0")),
+                "resume_false_interruption": True,
             },
             "preemptive_generation": {
                 "enabled": preemptive_enabled,
