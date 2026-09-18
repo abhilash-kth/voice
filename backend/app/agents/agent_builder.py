@@ -1345,7 +1345,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
 
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
-        "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
+        "CRITICAL LANGUAGE RULE (highest priority): ALWAYS reply in the EXACT same language and script as the caller's latest message. If the caller speaks in Devanagari Hindi (e.g. 'हाँ', 'क्या', 'बताओ'), reply in Devanagari Hindi. If the caller writes in Roman Hindi/Hinglish (e.g. 'haan', 'kya', 'batayein'), reply in Roman Hindi/Hinglish. If the caller speaks in English, reply entirely in natural English. When in doubt, mirror the caller's script. NEVER auto-translate the caller into English — translate the FACTS (KB/FAQ/owner instructions) into the caller's language instead.",
         "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
@@ -1443,14 +1443,19 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             lines.append("")
             lines.append(
                 "Frequently asked questions. When the caller asks something that "
-                "matches one of these, answer with its official answer VERBATIM "
-                "(do not paraphrase or add extra info):"
+                "matches one of these, use the official FACTS (the answer's "
+                "meaning) and rephrase them in the caller's language. Do NOT "
+                "echo the FAQ answer VERBATIM if it is in a different language "
+                "than the caller — that would force the caller to hear English. "
+                "Keep the same facts (phone numbers, names, prices); translate "
+                "only the connecting words."
             )
             lines.extend(faq_lines)
 
     lines.append("")
     lines.append("FINAL CRITICAL RULES - ALWAYS FOLLOW:")
     lines.append("- After answering, STOP. Do NOT add 'Aur kuch jaanana chahenge?' / 'Aur kuch poochna hai?' / 'Kya aapko aur koi madad chahiye?' unless you are actively collecting required project info. One answer = stop speaking and wait for caller.")
+    lines.append("- LANGUAGE: When the caller writes/speaks in Hindi or Hinglish (Devanagari or Roman), you MUST reply in Hindi/Hinglish — even if the Business facts, FAQ entries, or owner instructions above are in English. Translate the FACTS into the caller's language; do NOT echo English verbatim. Numbers, URLs, and proper nouns (Kriscent, Kota, names) stay as-is.")
     lines.append("- If caller asks for contact number/email, use ONLY the numbers/emails given in 'Instructions from the business owner' above. Never say you don't have them if they are in the owner instructions. Primary phone is +91-8947027625, sales email sales@kriscent.in, info email info@kriscent.in. Provide them exactly when asked.")
     lines.append("- If caller says 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', 'नहीं और कोई मदद नहीं चाहिए', 'bas ho gaya', 'that's all', 'no more questions', 'ok thank you' as final, call end_call tool immediately — do not ask another follow-up.")
     lines.append("- Keep every reply to 1-2 short sentences, under 25 words. No lists unless caller explicitly asks for list.")
@@ -1895,7 +1900,9 @@ def build_voice_agent(
                     role="system",
                     content=(
                         f"{_RAG_PREFIX} Relevant business facts for THIS specific "
-                        f"question:\n{hits}"
+                        f"question. Reply to the caller in their own language "
+                        f"(Hindi/Hinglish/English) by translating THESE FACTS; "
+                        f"do NOT echo them verbatim in English.\n{hits}"
                     ),
                 )
                 self._last_rag = hits
