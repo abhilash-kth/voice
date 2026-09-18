@@ -1254,7 +1254,24 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         turn_handling={
             "turn_detection": turn_detection_mode,
             "endpointing": {"min_delay": min_delay, "max_delay": max_delay},
-            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 1},
+            # Barge-in tuning (production logs 20260918):
+            # Root cause: greeting is ~7s long; with the previous defaults
+            # (min_duration 0.25, min_words 1) the user could barge in on a
+            # 0.25s fragment ("Hi", "भैया") which triggered the framework's
+            # 5s speech-cancel watchdog mid-greeting. The user then heard a
+            # partial greeting + dead air + state listening (no LLM call)
+            # and hung up.
+            # Fix: require 0.6s of user speech AND 2 words before barge-in
+            # fires. Filters out greetings ("Hi", "नमस्ते", "हैलो") and
+            # utterance-end phonemes while still catching real interruptions
+            # (e.g. "wait actually" = 2 words ~0.8s). Env-overridable via
+            # VOICE_BARGE_IN_MIN_DURATION / VOICE_BARGE_IN_MIN_WORDS.
+            "interruption": {
+                "enabled": True,
+                "mode": "vad",
+                "min_duration": float(os.getenv("VOICE_BARGE_IN_MIN_DURATION", "0.6")),
+                "min_words": int(os.getenv("VOICE_BARGE_IN_MIN_WORDS", "2")),
+            },
             "preemptive_generation": {
                 "enabled": preemptive_enabled,
                 "preemptive_tts": preemptive_tts_enabled,
