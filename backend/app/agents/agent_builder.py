@@ -1192,6 +1192,21 @@ _FAQ_BUDGET_CHARS_VOICE_RAG = 400
 _OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 2000
 _PRIOR_MEMORY_BUDGET_CHARS_VOICE_RAG = 800
 
+# Voice latency v3 (20260918-115000): user-reported 1192ms avg TTFT on gpt-4.1
+# Production logs show avg breakdown of 1776ms total: STT 250 / endpoint 4 / LLM 977 / push 48 / TTS 492.
+# LLM TTFT dominates (~55%); cutting input tokens directly shortens prefill and
+# drops TTFT 200-400ms on flagship chat models (gpt-4.1 / 4o / claude). Static
+# v2 (KB 800 / FAQ 400 / owner 2000 / prior 800) sent ~2400 input tokens after
+# RAG injection and trim. v3 halves every static budget while keeping the
+# prompt-cache contract (still built once per session -> byte-identical ->
+# prefix cache hit on every turn) and the per-turn RAG system-message channel
+# (still dynamic, still bounded). Result: ~1200 input tokens, 200-400ms TTFT
+# cut, no new files, no provider/model/fallback override.
+_KB_BUDGET_CHARS_VOICE_V3 = 500
+_FAQ_BUDGET_CHARS_VOICE_V3 = 300
+_OWNER_PROMPT_BUDGET_CHARS_VOICE_V3 = 1200
+_PRIOR_MEMORY_BUDGET_CHARS_VOICE_V3 = 500
+
 # Legacy module-level constants kept for backward compat / logging, but
 # build_instructions now uses provider-aware effective budgets.
 _KB_BUDGET_CHARS = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_DEFAULT)))
@@ -1222,12 +1237,21 @@ def _effective_budgets(cfg: AgentConfig) -> tuple[int, int, int]:
     else:
         # Voice latency optimization: when RAG enabled, use smaller static budgets to reduce 3500-3700 input tokens
         # RAG provides relevant facts per-turn (27-105ms), so static KB can be smaller without hurting quality
-        # v2: 800/400/2000 + prior_memory 800 (was 1200/800/2500) saves additional ~1000 chars
+        # v3 is the new default for OpenAI (production logs 20260918: 1192ms avg TTFT on gpt-4.1,
+        # breakdown STT 250 / LLM 977 / TTS 492; cutting input tokens 2400->1200 saves 200-400ms TTFT).
+        # v2 (800/400/2000/800) remains selectable via VOICE_LATENCY_V3=0 for KB-heavy deployments.
         if rag_enabled:
-            kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_VOICE_RAG)))
-            faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_VOICE_RAG)))
-            owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG)))
-            logger.info(f"🔧 Voice latency budgets v2 (RAG enabled): KB {kb} (was 4000), FAQ {faq} (was 2000), owner {owner} (was 4000), prior_memory 800 - reduces 3500-3700 -> ~2000-2500, TTFT 1203/894/1189/882ms should improve")
+            _v3_on = (os.getenv("VOICE_LATENCY_V3", "1").strip().lower() not in ("0", "false", "off"))
+            if _v3_on:
+                kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_VOICE_V3)))
+                faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_VOICE_V3)))
+                owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_VOICE_V3)))
+                logger.info(f"🔧 Voice latency v3 (default, RAG enabled): KB {kb} (was 4000), FAQ {faq} (was 2000), owner {owner} (was 4000), prior_memory {_PRIOR_MEMORY_BUDGET_CHARS_VOICE_V3} (was 800), history 6 - cuts input 2400->~1200 tokens, TTFT -200-400ms on chat models (gpt-4.1/o, claude). Set VOICE_LATENCY_V3=0 to revert to v2.")
+            else:
+                kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_VOICE_RAG)))
+                faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_VOICE_RAG)))
+                owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG)))
+                logger.info(f"🔧 Voice latency budgets v2 (RAG enabled, VOICE_LATENCY_V3=0): KB {kb} (was 4000), FAQ {faq} (was 2000), owner {owner} (was 4000), prior_memory 800 - reduces 3500-3700 -> ~2000-2500, TTFT 1203/894/1189/882ms should improve")
         else:
             kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_DEFAULT)))
             faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_DEFAULT)))
@@ -1609,14 +1633,17 @@ def build_voice_agent(
             ),
         )
     if prior_memory:
-        # Voice latency: truncate prior_memory to 800 chars when RAG enabled (was unlimited 40 turns ~4000 tokens)
-        # Preserves recent cross-call memory (name, preferences) without bloating input tokens 3500-3700
+        # Voice latency v3: prior_memory 500 chars (was 800) for OpenAI RAG-enabled.
+        # Preserves recent cross-call memory (name, preferences) without bloating input tokens.
+        # Trimming 800->500 saves ~75 tokens per turn on top of the v3 budget cuts.
         try:
             import os as _os_pm
             _rag_pm = (_os_pm.getenv("VOICE_RAG_PER_TURN") or "").strip().lower() not in ("0", "false", "off")
-            _pm_budget = int(_os_pm.getenv("VOICE_PRIOR_MEMORY_BUDGET_CHARS", "800")) if _rag_pm else 2000
+            _v3_pm = (_os_pm.getenv("VOICE_LATENCY_V3", "1").strip().lower() not in ("0", "false", "off"))
+            _default_pm = 500 if _v3_pm else 800
+            _pm_budget = int(_os_pm.getenv("VOICE_PRIOR_MEMORY_BUDGET_CHARS", str(_default_pm))) if _rag_pm else 2000
         except Exception:
-            _pm_budget = 800
+            _pm_budget = 500
         _pm_truncated = prior_memory
         if len(prior_memory) > _pm_budget:
             # Keep last _pm_budget chars (most recent)
@@ -1788,18 +1815,18 @@ def build_voice_agent(
                 try:
                     target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
                     items = getattr(target_ctx, "items", None)
-                    # Voice latency optimization v2: keep 8 dialogue max for OpenAI when RAG enabled (was 12) to reduce 3500-3700 tokens further
-                    # Billing shows avg 4 turns per call, 8 covers full call. prior_memory 800 chars handles cross-call memory.
-                    # Saves additional ~4*150=600 tokens vs 12. Groq still 16 for TPM safety (reduced from 20), OpenAI 8 for latency.
-                    # Determine history limit based on provider
+                    # Voice latency optimization v3: keep 6 dialogue max for OpenAI (was 8) to cut input tokens further.
+                    # Billing shows avg 4 turns per call; 6 covers the whole call comfortably. prior_memory 500
+                    # chars handles cross-call memory. Saves ~2*150=300 tokens vs v2 (8-dialogue). Groq stays 16
+                    # for TPM safety.
                     try:
                         _llm_id_hist = (cfg.providers.llm.id or "").lower() if cfg.providers and cfg.providers.llm else ""
                         _is_groq_hist = _llm_id_hist.startswith("groq")
-                        _history_limit = 16 if _is_groq_hist else 8
-                        _trim_threshold = 20 if _is_groq_hist else 12
+                        _history_limit = 16 if _is_groq_hist else 6
+                        _trim_threshold = 20 if _is_groq_hist else 10
                     except Exception:
-                        _history_limit = 8
-                        _trim_threshold = 12
+                        _history_limit = 6
+                        _trim_threshold = 10
                     if isinstance(items, list) and len(items) > _trim_threshold:
                         system_items = [m for m in items if getattr(m, "role", "") == "system"]
                         dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
@@ -1841,13 +1868,35 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
+                # Voice latency v3: top_k 1 (was 2). Production logs show 1295 chars per turn -> 324 tokens.
+                # Halving top_k keeps only the most-relevant chunk; savings ~600-700 chars / 150-180 tokens
+                # per turn on OpenAI, ~50-80ms off TTFT per turn. Still grounded, just leaner.
+                _rag_top_k = 1
+                try:
+                    _rk_env = os.getenv("VOICE_RAG_TOP_K", "").strip()
+                    if _rk_env:
+                        _rag_top_k = max(1, min(int(_rk_env), 3))
+                except Exception:
+                    pass
                 # Async RAG to avoid blocking event loop
                 try:
-                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
+                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, _rag_top_k)
                     hits = (hits or "").strip()
                 except Exception:
                     # Fallback sync if to_thread fails
-                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
+                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=_rag_top_k) or "").strip()
+                # Cap per-turn RAG output to keep prompt-cache savings stable even when
+                # a single chunk is large. 700 chars (~175 tokens) covers a phone number,
+                # 1-2 short answers, or a service description; larger hits are noise.
+                _rag_max_chars = 700
+                try:
+                    _rm_env = os.getenv("VOICE_RAG_MAX_CHARS", "").strip()
+                    if _rm_env:
+                        _rag_max_chars = max(100, int(_rm_env))
+                except Exception:
+                    pass
+                if len(hits) > _rag_max_chars:
+                    hits = _truncate(hits, _rag_max_chars)
                 _rag_elapsed = (_time.time() - _rag_t0) * 1000
                 if _rag_elapsed > 200:
                     logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
