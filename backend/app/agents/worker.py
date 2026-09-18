@@ -2369,7 +2369,10 @@ async def entrypoint(ctx):
                 # Previous bug: set state to listening even though LLM active, allowing new listening->thinking and second REQUEST START
                 # This caused 0/0 failed requests (Request 1 and 5) even though preemptive disabled
                 # New: keep state as thinking, don't allow new turn until LLM completes
-                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {now-request_start:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - keeping thinking, waiting for stream to finish (prevents duplicate REQUEST START)")
+                # request_start may be 0 (timing not yet stamped); guard so the
+                # log doesn't print epoch seconds like "1789768698.62s ago".
+                _rs_ago = now - request_start if request_start else 0.0
+                logger.info(f"⏳ Ignoring thinking->listening (0.04s race): LLM still active request_start {_rs_ago:.2f}s ago, first_token={turn_timing.get('first_token',0)>0}, gen_complete={gen_complete>0}, has_output={has_output} - keeping thinking, waiting for stream to finish (prevents duplicate REQUEST START)")
                 # Do NOT update state_tracker, keep as thinking, do NOT reset timing, keep active request alive
                 # This ensures exactly one valid LLM request per completed user turn
                 return
