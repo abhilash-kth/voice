@@ -604,6 +604,8 @@ async def entrypoint(ctx):
     def _on_user_transcribed(ev):
         if bool(getattr(ev, "is_final", False)):
             turn_timing["stt_final"] = time.time()
+            transcript = getattr(ev, "transcript", "") or ""
+            logger.info("🎙️ STT final: %s", transcript)
 
     # Older LiveKit releases may not emit one of these optional events.  Event
     # registration itself is intentionally best-effort so runtime version drift
