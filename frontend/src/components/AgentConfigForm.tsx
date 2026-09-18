@@ -128,16 +128,22 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [systemPrompt, setSystemPrompt] = useState(editing?.knowledge?.system_prompt || "");
   const [faq, setFaq] = useState<FaqItem[]>(editing?.knowledge?.faq || []);
   
-  // V2 LLM state: provider → multiple models
-  const llmProviders: LLMProvider[] = (catalog as any).llm_providers || [];
-  const llmModels: LLMModel[] = (catalog as any).llm_models || [];
+  // V2 LLM state: provider → multiple models.
+  // Tolerate either an array or an id-keyed object from /api/catalog so the
+  // form can never crash after a backend/shape mismatch (never iterate blindly).
+  const asList = <T,>(v: any): T[] =>
+    Array.isArray(v) ? v : v && typeof v === "object" ? (Object.values(v) as T[]) : [];
+  const llmProviders: LLMProvider[] = asList<LLMProvider>((catalog as any).llm_providers);
+  const llmModels: LLMModel[] = asList<LLMModel>((catalog as any).llm_models);
   const llmByProvider: Record<string, LLMModel[]> = (catalog as any).llm_by_provider || {};
   // Includes deprecated models so an agent saved against one still renders its
   // real metadata instead of being silently switched to a different model.
-  const llmModelsAll: LLMModel[] = (catalog as any).llm_models_all || llmModels;
+  const llmModelsAll: LLMModel[] = asList<LLMModel>((catalog as any).llm_models_all).length
+    ? asList<LLMModel>((catalog as any).llm_models_all)
+    : llmModels;
   const llmProvidersAll: LLMProvider[] = [
     ...llmProviders,
-    ...(((catalog as any).llm_legacy_providers || []) as LLMProvider[]),
+    ...asList<LLMProvider>((catalog as any).llm_legacy_providers),
   ];
   
   const isV2 = llmProviders.length > 0 && llmModels.length > 0;
