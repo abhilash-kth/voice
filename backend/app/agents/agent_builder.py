@@ -364,6 +364,26 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         logger.info(f"🔧 Downgrading reasoning_effort {reasoning} -> low for voice model {model_id} to reduce TTFT")
         reasoning = "low"
 
+    # Completion-token budget for a voice reply. Non-reasoning models: 80 is
+    # plentiful (~60 spoken words) and keeps replies short. REASONING models
+    # (gpt-5 family) spend HIDDEN reasoning tokens from the SAME budget — with
+    # a cap of 80 the reasoning pass consumed everything, the API closed the
+    # stream with finish_reason='length' and ZERO visible text: every user turn
+    # ended in silence until the 6s rescue line ("Sorry, there is a temporary
+    # technical problem") fired. Reasoning models need ~500 (think + reply).
+    _cap_override = overrides.get("max_tokens")
+    _reasoning_mdl = bool((meta or {}).get("reasoning_supported"))
+    if _cap_override:
+        _cap = int(_cap_override)
+        if _reasoning_mdl and _cap < 300:
+            logger.warning(
+                f"⚠️ max_tokens={_cap} is too small for reasoning model {model_id}: the cap is spent on "
+                "hidden reasoning tokens leaving ZERO text for the spoken reply (agent went silent). Raising to 500."
+            )
+            _cap = 500
+    else:
+        _cap = 500 if _reasoning_mdl else 80
+
     # Build client with exact base_url and model, no silent replacement.
     # Only OpenAI-compatible providers ride on an AsyncOpenAI client: Gemini's
     # plugin builds its own SDK client and would reject these kwargs.
@@ -371,7 +391,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     client = None if _native_google else AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     llm_kwargs = {
         "model": model_id,  # EXACT model as selected, no rewriting
-        "max_completion_tokens": int(overrides.get("max_tokens", 80)),
+        "max_completion_tokens": _cap,
     }
     if client is not None:
         llm_kwargs["client"] = client
@@ -452,7 +472,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
                     if api_key:
                         resp_kwargs["api_key"] = api_key
                     # max_output_tokens -> max_output_tokens for responses
-                    resp_kwargs["max_output_tokens"] = int(overrides.get("max_tokens", 80))
+                    resp_kwargs["max_output_tokens"] = _cap
                     llm_instance = openai_responses.LLM(**resp_kwargs)
                     logger.info(f"✅ Built openai.responses.LLM successfully for {model_id} reasoning={reasoning} (transmitted to /v1/responses API, reasoning object)")
                     return llm_instance
