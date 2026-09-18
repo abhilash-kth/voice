@@ -155,7 +155,7 @@ export default function CampaignPanel({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. EMI reminder — Jan batch"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
             <div>
@@ -163,7 +163,7 @@ export default function CampaignPanel({
               <select
                 value={agentId}
                 onChange={(e) => setAgentId(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               >
                 {agents.map((a) => (
                   <option key={a.id} value={a.id}>
@@ -182,7 +182,7 @@ export default function CampaignPanel({
                   min={1}
                   value={concurrency}
                   onChange={(e) => setConcurrency(Number(e.target.value))}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                  className="input mt-1"
                 />
               </div>
               <div>
@@ -193,7 +193,7 @@ export default function CampaignPanel({
                   value={sipTrunkId}
                   onChange={(e) => setSipTrunkId(e.target.value)}
                   placeholder="default / ST_xxxx"
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                  className="input mt-1"
                 />
               </div>
             </div>
@@ -201,12 +201,25 @@ export default function CampaignPanel({
               <label className="text-xs text-gray-400 font-medium">
                 Lead file (.csv / .xlsx)
               </label>
-              <input
-                type="file"
-                accept=".csv,.xlsx,.xls"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
-                className="block w-full text-sm text-gray-400 mt-1 file:mr-3 file:rounded-lg file:border-0 file:bg-gray-700 file:px-3 file:py-2 file:text-white"
-              />
+              <label className={`mt-1 flex items-center gap-3 rounded-xl border border-dashed px-4 py-3 cursor-pointer transition-colors ${file ? "border-emerald-500/40 bg-emerald-500/5" : "border-gray-700 bg-gray-800/40 hover:border-gray-600 hover:bg-gray-800/70"}`}>
+                <span className={`w-9 h-9 rounded-lg flex items-center justify-center text-base shrink-0 ${file ? "bg-emerald-500/15" : "bg-gray-700/60"}`}>
+                  {file ? "✅" : "📄"}
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-white truncate">
+                    {file ? file.name : "Choose lead file"}
+                  </span>
+                  <span className="block text-[11px] text-gray-500">
+                    {file ? "Ready to upload" : "CSV or Excel with one row per lead"}
+                  </span>
+                </span>
+                <input
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  onChange={(e) => setFile(e.target.files?.[0] || null)}
+                  className="hidden"
+                />
+              </label>
               <p className="text-[11px] text-gray-500 mt-1">
                 Columns become the dynamic script placeholders —{" "}
                 <code className="text-blue-300">{"{name}"}</code>{" "}
@@ -218,7 +231,7 @@ export default function CampaignPanel({
                 value={phoneColumn}
                 onChange={(e) => setPhoneColumn(e.target.value)}
                 placeholder="Phone column (optional)"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
             {err && (
@@ -240,22 +253,41 @@ export default function CampaignPanel({
         <div className="space-y-4">
           <h2 className="text-xl font-bold">Your Campaigns</h2>
           {topCard.length === 0 && (
-            <div className="bg-gray-900 p-8 rounded-2xl border border-gray-800 text-center text-gray-500">
-              No campaigns yet. Create one on the left.
+            <div className="bg-gray-900 rounded-2xl border border-dashed border-gray-800 p-12 text-center">
+              <div className="w-14 h-14 rounded-2xl bg-gray-800 flex items-center justify-center text-2xl mx-auto mb-4">📣</div>
+              <p className="text-sm font-semibold text-gray-300">No campaigns yet</p>
+              <p className="text-xs text-gray-500 mt-1 max-w-[260px] mx-auto leading-relaxed">
+                Upload a lead file on the left — your agent will dial every number and bill from your wallet.
+              </p>
             </div>
           )}
-          {topCard.map((c) => (
+          {topCard.map((c) => {
+            const pct =
+              c.summary.total > 0
+                ? Math.round(((c.summary.done + c.summary.failed) / c.summary.total) * 100)
+                : 0;
+            return (
             <div
               key={c.id}
-              className="bg-gray-900 p-5 rounded-2xl border border-gray-800"
+              className="group bg-gray-900 p-5 rounded-2xl border border-gray-800 hover:border-gray-700 transition-all hover:shadow-xl hover:shadow-black/20 animate-fade-in-up"
             >
               <div className="flex items-center justify-between mb-2">
-                <h3 className="font-bold">{c.name}</h3>
+                <h3 className="font-bold truncate pr-3">{c.name}</h3>
                 <span
-                  className={`text-[11px] px-2 py-0.5 rounded-full ${STATUS_COLOR[c.status]}`}
+                  className={`text-[11px] px-2.5 py-1 rounded-full font-semibold shrink-0 ${STATUS_COLOR[c.status]} ${c.status === "running" ? "animate-pulse" : ""}`}
                 >
                   {c.status}
                 </span>
+              </div>
+              {/* progress */}
+              <div className="flex items-center gap-2 mb-3">
+                <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-blue-500 to-emerald-500 rounded-full transition-all duration-700"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <span className="text-[11px] text-gray-500 font-medium whitespace-nowrap">{pct}%</span>
               </div>
               {active?.id === c.id && c.leads ? (
                 <LeadTable leads={c.leads} phoneColumn={c.phone_column} />
@@ -329,7 +361,8 @@ export default function CampaignPanel({
                 </button>
               </div>
             </div>
-          ))}
+          );
+          })}
         </div>
       </div>
     </div>

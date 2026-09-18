@@ -60,20 +60,21 @@ function AgentView({ onEnded }: { onEnded?: () => void }) {
 
   if (ended) {
     return (
-      <div className="flex flex-col items-center gap-4 p-8 bg-gray-900 rounded-2xl border border-gray-800 shadow-2xl max-w-md w-full">
-        <div className="w-20 h-20 rounded-full bg-gray-700 flex items-center justify-center text-3xl">
+      <div className="flex flex-col items-center gap-4 p-8 bg-gray-900 rounded-2xl border border-gray-800 shadow-2xl max-w-md w-full animate-fade-in-up">
+        <div className="w-20 h-20 rounded-full bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-3xl">
           ✅
         </div>
         <div className="text-center">
           <h2 className="text-xl font-bold text-white">Call Ended</h2>
           <p className="text-gray-400 text-sm mt-1">The agent has ended the call. Thank you!</p>
+          <p className="text-gray-600 text-[11px] mt-2">Transcript &amp; billing are in the Calls tab.</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col items-center gap-6 p-8 bg-gray-900 rounded-2xl border border-gray-800 shadow-2xl max-w-md w-full">
+      <div className="flex flex-col items-center gap-6 p-8 bg-gray-900 rounded-2xl border border-gray-800 shadow-2xl max-w-md w-full animate-fade-in-up">
       <div
         className={`w-36 h-36 rounded-full flex items-center justify-center text-6xl transition-all duration-300 ${
           state === "speaking"
@@ -253,7 +254,7 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
         <select
           value={agentId}
           onChange={(e) => setAgentId(e.target.value)}
-          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1 mb-4"
+          className="input mt-1 mb-4"
         >
           {agents.map((a) => (
             <option key={a.id} value={a.id}>
@@ -263,16 +264,24 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
         </select>
 
         <label className="text-xs text-gray-400 font-medium">Call mode</label>
-        <div className="flex gap-2 mt-1 mb-4">
+        <div className="grid grid-cols-2 gap-1 mt-1 mb-4 bg-gray-800/80 border border-gray-700/50 p-1 rounded-xl">
           <button
             onClick={() => setMode("browser")}
-            className={`flex-1 py-2 rounded-lg text-sm font-semibold ${mode === "browser" ? "bg-green-600" : "bg-gray-800"}`}
+            className={`py-2.5 rounded-lg text-sm font-semibold transition-all ${
+              mode === "browser"
+                ? "bg-emerald-600 text-white shadow-md"
+                : "text-gray-400 hover:text-white"
+            }`}
           >
             🌐 Browser (free)
           </button>
           <button
             onClick={() => setMode("sip")}
-            className={`flex-1 py-2 rounded-lg text-sm font-semibold ${mode === "sip" ? "bg-blue-600" : "bg-gray-800"}`}
+            className={`py-2.5 rounded-lg text-sm font-semibold transition-all ${
+              mode === "sip"
+                ? "bg-blue-600 text-white shadow-md"
+                : "text-gray-400 hover:text-white"
+            }`}
           >
             📞 SIP (real phone)
           </button>
@@ -286,7 +295,7 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
                 placeholder="+91804xxxxxxx"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
             <div>
@@ -295,7 +304,7 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
                 value={trunkId}
                 onChange={(e) => setTrunkId(e.target.value)}
                 placeholder="sip trunk id registered in LiveKit"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mt-1"
+                className="input mt-1"
               />
             </div>
             <p className="text-[11px] text-gray-500">Requires a LiveKit SIP trunk + carrier credentials on the backend.</p>
