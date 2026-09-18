@@ -1838,7 +1838,9 @@ async def entrypoint(ctx):
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                logger.warning(f"🛟 fallback say failed: {e}")
+                # str(e) is EMPTY for asyncio.TimeoutError — log the type so a
+                # 15s session.say hang is diagnosable ("fallback say failed: " blank).
+                logger.warning(f"🛟 fallback say failed: {type(e).__name__}: {e!r}")
         try:
             old = reply_tracker.get("fallback_say")
             if old is not None and not old.done():
@@ -1857,6 +1859,24 @@ async def entrypoint(ctx):
                 reply_tracker["pending"] = None
         if reply_tracker["last_assistant_ts"] >= turn_ts or closing_requested["done"]:
             return  # closing turns must never receive a delayed fallback
+        # REAL-stream markers (immediate) vs conversation_item_added (lags 5-15s
+        # on reasoning-tool models like gpt-5-nano): _mark_reply only fires from
+        # item_added, so a reply that already generated and STARTED PLAYING was
+        # still getting an apology over it (2026-09-19 04:19: real answer played
+        # at +3.3s, 'Sorry, technical problem' followed at +15s). If this turn's
+        # LLM request exists and any immediate marker is set, the reply is alive.
+        try:
+            _rs = turn_timing.get("request_start", 0)
+            if _rs and _rs >= turn_ts - 2:
+                _m = max(
+                    turn_timing.get("first_token", 0), turn_timing.get("tts_request", 0),
+                    turn_timing.get("first_tts_audio", 0), turn_timing.get("first_audio", 0),
+                )
+                if _m >= _rs:
+                    logger.info("🛟 silence watchdog suppressed: reply already streaming/speaking per REAL stream markers (item_added lag)")
+                    return
+        except Exception:
+            pass
         logger.warning(
             f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
             "(rate-limited 429 or failed generation) — speaking a fallback line "
