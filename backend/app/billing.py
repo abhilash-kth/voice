@@ -35,10 +35,21 @@ def _get_llm_cost_v2(provider: str, model_id: str, input_tokens: int, cached_inp
             # We will use USD pricing converted to INR at ~83 INR/USD for billing, but log USD too.
             # For simplicity, we will use the USD pricing as cost basis and convert to INR.
             USD_TO_INR = 83.0
-            input_cost_inr = costs["input_cost"] * USD_TO_INR
-            cached_cost_inr = costs["cached_input_cost"] * USD_TO_INR
-            output_cost_inr = costs["output_cost"] * USD_TO_INR
-            total_inr = costs["total_llm_cost"] * USD_TO_INR
+            # Providers that bill natively in INR (Sarvam) declare price_inr_per_1m;
+            # use those rupee figures directly instead of USD -> INR round-tripping.
+            inr_price = model.get("price_inr_per_1m") or model.get("pricing_inr")
+            if inr_price:
+                def _per_m(key: str) -> float:
+                    return float(inr_price.get(key, 0.0)) / 1_000_000.0
+                input_cost_inr = input_tokens * _per_m("input")
+                cached_cost_inr = cached_input_tokens * _per_m("cached_input")
+                output_cost_inr = output_tokens * _per_m("output")
+                total_inr = input_cost_inr + cached_cost_inr + output_cost_inr
+            else:
+                input_cost_inr = costs["input_cost"] * USD_TO_INR
+                cached_cost_inr = costs["cached_input_cost"] * USD_TO_INR
+                output_cost_inr = costs["output_cost"] * USD_TO_INR
+                total_inr = costs["total_llm_cost"] * USD_TO_INR
             return {
                 "input_cost_inr": input_cost_inr,
                 "cached_input_cost_inr": cached_cost_inr,
@@ -52,6 +63,8 @@ def _get_llm_cost_v2(provider: str, model_id: str, input_tokens: int, cached_inp
                     "input_per_1m": model["input_price_per_1m"],
                     "cached_per_1m": model["cached_input_price_per_1m"],
                     "output_per_1m": model["output_price_per_1m"],
+                    "currency": model.get("price_currency", "USD"),
+                    "inr_per_1m": inr_price,
                 }
             }
     except Exception as e:

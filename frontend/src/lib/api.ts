@@ -93,7 +93,11 @@ export interface Agent {
   description: string;
   greeting: string;
   language: string;
+  // female | male | neutral — selects the spoken voice (Chirp 3 / Bulbul speaker)
+  gender: string;
   voice_personality: string;
+  no_response_timeout_seconds?: number;
+  no_response_message?: string;
   client_rate_per_min: number;
   memory_enabled: boolean;
   recording_enabled: boolean;

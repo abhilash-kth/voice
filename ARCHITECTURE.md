@@ -110,6 +110,38 @@ loop so the plugin rebuilds it on the right one), and `warm_tts_off_loop()` whic
 does both. `app/db.py` tracks the loop it connected on and reconnects if asked
 from a different one. `backend/tests/` covers both.
 
+### 4.1 Event-loop rules (why calls used to die silently)
+
+The agent process pre-warms expensive startup work (SSL context, service-account
+JSON/RSA, VAD model, provider SDK imports) so callers hear the greeting fast.
+Two classes of "pre-warm" used to instead poison every call — they are the root
+cause of `RuntimeError: Event loop is closed` in `grpc/aio/_call.py` and of the
+first-query 3s timeouts. The rules the code now follows (enforced in practice by
+`backend/app/agents/loop_safety.py`, the inline warm/guard calls in `worker.py`,
+`backend/app/db.py`, and `backend/tests/`):
+
+| Safe off-loop (thread) | Must happen ON the agent loop |
+| --- | --- |
+| `ssl.create_default_context()` (cached, patched into http_context / httpx **and** `httpx._transports.default`, which imports the name at module time — patching `httpx._config` alone never took effect) | `grpc.aio` client construction (`texttospeech.TextToSpeechAsyncClient`, i.e. Google plugin `_ensure_client()`) |
+| service-account JSON + RSA parse (`loop_safety.warm_google_credentials`, cached per key-file + scope) | every async provider client that a plugin binds to a channel/session |
+| silero VAD load, tokenizer/hyphenator warm, module imports | `prisma.connect()` (`app/db.py` — a client connected from a foreign loop makes the first query hang to ~3s) |
+| `build_stt/build_llm/build_tts` *constructors* (they are lazy) | `AgentSession.start()` |
+
+A gRPC-aio channel keeps a reference to the loop running when it was
+constructed. Building one inside `asyncio.new_event_loop()` on a throwaway loop,
+then closing that loop, leaves a client that fails every later call with
+`Event loop is closed` — the agent joins, listens, transcribes, and never
+speaks. Never prewarm async clients; warm only credentials and imports, and let
+`warm_tts_off_loop()` drop any cached client bound to a dead/foreign loop so the
+plugin rebuilds it on the right one.
+
+Turn-taking is likewise API-owned: LiveKit `await`s the `on_user_turn_completed`
+hook, so the old 2s busy-wait there stalled interruption handling and triggered
+`speech not done in time after interruption, cancelling the speech arbitrarily`
+(livekit/agents #5359). The hook is now log-only; endpointing/VAD/STT are tuned
+in one place (`_vad_tuning()` + `VOICE_ENDPOINTING_*`/`VOICE_VAD_*`/`VOICE_STT_*`
+envs) so the three layers agree on what 300–350ms of silence means.
+
 ## 5. Storage (Prisma)
 
 `backend/schema.prisma` is the schema source of truth; the generated client
