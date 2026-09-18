@@ -399,6 +399,135 @@ def _build_conn_options():
     )
 
 
+# ---------------------------------------------------------------------------
+# Loop-local Google TTS guard.
+#
+# google-cloud-texttospeech's AsyncClient holds a grpc.aio channel bound to
+# the event loop that created it (Channel._loop; every RPC then does
+# _loop.create_task in grpc/aio/_call.py). A cached client created on any
+# other (now closed) loop makes the first streaming_synthesize on the job
+# loop crash with `RuntimeError: Event loop is closed`.
+# _ensure_loop_local_google_tts() drops such a stale cached client
+# (_client/_async_client = None) so the plugin lazily rebuilds a fresh
+# channel on the active session loop. Called before every synthesize() and
+# stream() in the TTS wrappers below. Best-effort and fail-open.
+# (Mirrors the same guard in app/agents/agent_builder.py; both files keep a
+# local copy so the runtime path never depends on a cross-module import.)
+# ---------------------------------------------------------------------------
+def _iter_tts_leaves(tts_obj):
+    """Yield leaf plugin TTS objects, unwrapping delegating wrappers and FallbackAdapters."""
+    seen = set()
+    stack = [tts_obj]
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        try:
+            inner = getattr(obj, "_inner", None)
+        except Exception:
+            inner = None
+        if inner is not None and (hasattr(inner, "synthesize") or hasattr(inner, "stream")):
+            stack.append(inner)
+            continue
+        descended = False
+        for _attr in ("_tts_instances", "tts_instances", "_instances", "instances"):
+            try:
+                _lst = getattr(obj, _attr, None)
+            except Exception:
+                _lst = None
+            if isinstance(_lst, (list, tuple)) and _lst:
+                stack.extend(_lst)
+                descended = True
+                break
+        if not descended:
+            yield obj
+
+
+def _grpc_client_has_stale_loop(client_obj, running_loop, _depth=0, _seen=None) -> bool:
+    """True if client_obj embeds an asyncio loop that is closed or != running_loop.
+
+    Walks the holder chain of google-cloud async clients / grpc.aio channels
+    (client -> _transport -> _grpc_channel -> _loop). Bounded, exception-proof,
+    and returns False when nothing loop-like is found (fresh or non-gRPC
+    clients are kept untouched).
+    """
+    if _seen is None:
+        _seen = set()
+    if client_obj is None or id(client_obj) in _seen or _depth > 5:
+        return False
+    _seen.add(id(client_obj))
+    try:
+        if isinstance(client_obj, asyncio.AbstractEventLoop):
+            return client_obj.is_closed() or client_obj is not running_loop
+    except Exception:
+        pass
+    for _attr in ("_loop", "loop", "_grpc_channel", "grpc_channel",
+                  "_channel", "channel", "_transport", "transport",
+                  "_client", "_async_client"):
+        try:
+            _child = getattr(client_obj, _attr, None)
+        except Exception:
+            continue
+        if _child is None or isinstance(_child, (str, bytes, int, float, bool)):
+            continue
+        try:
+            if _grpc_client_has_stale_loop(_child, running_loop, _depth + 1, _seen):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _ensure_loop_local_google_tts(tts_instance) -> None:
+    """Drop any cached TTS gRPC client bound to a stale event loop.
+
+    Must be called on the session loop immediately before synthesize() /
+    stream(). If a cached _client/_async_client embeds a loop that is closed
+    or differs from asyncio.get_running_loop(), it is cleared so the plugin
+    rebuilds a fresh channel on the active loop. Fail-open: any error (or no
+    running loop, e.g. a build thread) leaves the instance untouched.
+    """
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        leaves = list(_iter_tts_leaves(tts_instance))
+    except Exception:
+        return
+    for leaf in leaves:
+        holders = [leaf]
+        try:
+            _parent = getattr(leaf, "_tts", None)
+        except Exception:
+            _parent = None
+        if _parent is not None and _parent is not leaf:
+            holders.append(_parent)
+        for holder in holders:
+            for _attr in ("_client", "_async_client"):
+                try:
+                    _client = getattr(holder, _attr, None)
+                except Exception:
+                    continue
+                if _client is None:
+                    continue
+                try:
+                    stale = _grpc_client_has_stale_loop(_client, running_loop)
+                except Exception:
+                    continue
+                if stale:
+                    try:
+                        setattr(holder, _attr, None)
+                    except Exception:
+                        continue
+                    logger.info(
+                        "🔧 Dropped stale Google TTS client (bound to closed/foreign "
+                        "event loop) — fresh gRPC channel will be created on the "
+                        "active session loop"
+                    )
+
+
 def _create_tts_timing_wrapper(tts_instance, timing_dict):
     """Wrap TTS instance to measure actual TTS pipeline timing.
     
@@ -427,6 +556,9 @@ def _create_tts_timing_wrapper(tts_instance, timing_dict):
             return getattr(self._inner, name)
 
         async def synthesize(self, text, **kwargs):
+            # Loop-local guard: drop any cached gRPC client bound to a
+            # closed/foreign loop so synthesis runs on this session loop.
+            _ensure_loop_local_google_tts(self._inner)
             now = time.time()
             if self._timing.get("first_token", 0) > 0 and self._timing.get("tts_request", 0) == 0:
                 self._timing["tts_request"] = now
@@ -481,6 +613,9 @@ def _create_tts_timing_wrapper(tts_instance, timing_dict):
                 raise
 
         def stream(self, **kwargs):
+            # Loop-local guard: runs on the session loop (stream() is called
+            # synchronously from async code), drops stale cached clients.
+            _ensure_loop_local_google_tts(self._inner)
             inner_stream = self._inner.stream(**kwargs)
             timing = self._timing
 
@@ -494,6 +629,8 @@ def _create_tts_timing_wrapper(tts_instance, timing_dict):
                     return getattr(self._inner_stream, name)
 
                 async def __aenter__(self):
+                    # Belt-and-braces: re-check right before the gRPC stream opens.
+                    _ensure_loop_local_google_tts(self._inner_stream)
                     await self._inner_stream.__aenter__()
                     return self
 
@@ -905,40 +1042,16 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             asyncio.to_thread(build_tts, cfg),
         )
         logger.info(f"⏱️ provider build async parallel {time.time()-build_t0:.2f}s")
-        # Prewarm TTS client off loop to avoid 163ms google.auth credential/RSA block on first audio
-        # The blocking load_credentials_from_file happens in _ensure_client during first streaming_synthesize (on event loop)
-        # Move it off loop now, after build, before session start
-        try:
-            # tts_inst may be FallbackAdapter, get inner Google TTS
-            tts_to_prewarm = tts_inst
-            try:
-                inner_list = getattr(tts_inst, '_tts_instances', None) or getattr(tts_inst, 'tts_instances', None) or getattr(tts_inst, '_instances', None)
-                if inner_list and len(inner_list) > 0:
-                    tts_to_prewarm = inner_list[0]
-            except Exception:
-                pass
-            # Try to ensure client off loop via to_thread with new event loop
-            def _ensure_tts_client_sync():
-                try:
-                    import asyncio as _aio
-                    loop = _aio.new_event_loop()
-                    _aio.set_event_loop(loop)
-                    try:
-                        # _tts is internal google client wrapper, has _ensure_client async
-                        inner = getattr(tts_to_prewarm, '_tts', None) or tts_to_prewarm
-                        if hasattr(inner, '_ensure_client'):
-                            loop.run_until_complete(inner._ensure_client())
-                            logger.info("🔧 TTS client prewarmed off loop after build (avoids 163ms RSA block on first audio)")
-                    finally:
-                        loop.close()
-                        _aio.set_event_loop(None)
-                except Exception as _e:
-                    logger.debug(f"TTS off-loop prewarm after build failed: {_e}")
-
-            await asyncio.wait_for(asyncio.to_thread(_ensure_tts_client_sync), timeout=3)
-            logger.info("🔧 TTS client off-loop prewarm completed (fixes 163ms google.auth block)")
-        except Exception as e:
-            logger.debug(f"TTS prewarm after build failed: {e}")
+        # NOTE: Off-loop Google TTS client prewarm was REMOVED — it caused
+        # `RuntimeError: Event loop is closed` on the first greeting. Calling
+        # _ensure_client() on a temp loop binds the grpc.aio channel to that
+        # loop; the temp loop is then closed and the first
+        # streaming_synthesize on the job loop crashes (grpc/aio/_call.py).
+        # The plugin now creates its channel lazily on the active session
+        # loop at first synthesis. Credentials stay fast via the cached
+        # load_credentials_from_file patched at import time (no RSA re-parse
+        # on the loop), and the TTS wrappers below drop any stale cached
+        # client whose _loop is closed or mismatched.
         # Log LLM provider details for 404 debugging and wrap with timing + failure logging
         try:
             llm_type = str(type(llm_inst))
@@ -2605,7 +2718,8 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
-    # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
+    # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop.
+    # Google TTS is import-only here (no TTS() / _ensure_client() / gRPC channels).
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
     # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU
     global _VAD_CACHE
@@ -2655,51 +2769,31 @@ def prewarm(proc):
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
 
-    # Prewarm Google TTS client completely before first customer response to avoid 340-437ms TTS latency + 198ms auth block
-    # Move blocking Google auth/import work off event loop
+    # Google TTS: module imports + STATIC credential preload ONLY.
+    # NEVER instantiate TTS() / _ensure_client() / gRPC channels here — a
+    # channel created on this prewarm thread's temp loop is later reused on
+    # the job loop and crashes with `RuntimeError: Event loop is closed`.
+    # The async client is created lazily by the plugin on the active session
+    # loop at first synthesis; preloading the credentials file only warms the
+    # (patched, cached) RSA parse so first audio stays fast. No loop binding.
     try:
-        from livekit.plugins.google import TTS as _GoogleTTS
-        import os as _os_tts
-        creds = _os_tts.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds:
-            # Create dummy TTS to trigger client creation off loop
-            # Use to_thread to avoid blocking, but prewarm_fnc is sync, so we do sync prewarm
-            # The TTS __init__ is lightweight, _ensure_client is heavy and does load_credentials_from_file
-            # We prewarm by importing and creating client in thread
-            def _prewarm_google_tts():
-                try:
-                    import asyncio as _aio
-                    loop = _aio.new_event_loop()
-                    _aio.set_event_loop(loop)
-                    try:
-                        # Create TTS instance
-                        tts = _GoogleTTS(
-                            voice_name="en-IN-Chirp3-HD-Leda",
-                            language="en-IN",
-                            credentials_file=creds,
-                        )
-                        # Try to ensure client (loads credentials)
-                        async def _ensure():
-                            try:
-                                await tts._tts._ensure_client()
-                            except Exception:
-                                pass
-                        loop.run_until_complete(_ensure())
-                        logger.info("🔥 Prewarm: Google TTS client fully prewarmed (credentials loaded, avoids 198ms auth block + reduces 340-437ms TTS)")
-                    finally:
-                        loop.close()
-                        _aio.set_event_loop(None)
-                except Exception as _e:
-                    logger.debug(f"Google TTS client prewarm thread failed: {_e}")
-            import threading as _thr
-            t = _thr.Thread(target=_prewarm_google_tts, daemon=True)
-            t.start()
-            t.join(timeout=3)  # Wait up to 3s for prewarm
-            logger.info("🔥 Prewarm: Google TTS client prewarm attempted (off loop)")
-        else:
-            logger.info("🔥 Prewarm: GOOGLE_APPLICATION_CREDENTIALS not set, skipping Google TTS client prewarm")
+        import google.cloud.texttospeech as _tts_module  # noqa: F401 (import only, no client)
+        logger.info("🔥 Prewarm: google.cloud.texttospeech imported (module only, no gRPC channel)")
+        try:
+            import google.auth as _ga_prewarm
+            _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if _creds_path and os.path.isfile(_creds_path):
+                # Sync file read + RSA parse; populates the cached
+                # load_credentials_from_file patched at import time. The
+                # resulting credentials object holds no event loop.
+                _ga_prewarm.load_credentials_from_file(_creds_path)
+                logger.info("🔥 Prewarm: Google credentials preloaded (static file read, no gRPC channel)")
+            else:
+                logger.info("🔥 Prewarm: GOOGLE_APPLICATION_CREDENTIALS not set, skipping static credential preload")
+        except Exception as _e:
+            logger.debug(f"Google static credential preload skipped: {_e}")
     except Exception as e:
-        logger.debug(f"Google TTS prewarm failed: {e}")
+        logger.debug(f"Google TTS module prewarm failed: {e}")
     
     # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
     # "Event loop is closed" on next Prisma call -> 1.73s retry. DB now cached per process

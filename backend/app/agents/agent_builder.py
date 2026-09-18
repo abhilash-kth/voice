@@ -445,6 +445,12 @@ def build_llm(cfg: AgentConfig) -> Any:
     Primary and fallback both support multiple models.
     Provider and model remain separate fields, no silent substitution.
     Logs explicit provider/model/base_url/fallback for 404 debugging.
+
+    Turn-timing: this path stays non-blocking for fast job startup. All
+    catalog/metadata lookups below (resolve_llm_provider_model,
+    validate_provider_model, get_llm_model) are in-memory scans — no network
+    I/O — and every provider ctor is lazy (no connect on build).
+    max_completion_tokens stays 80 for short, fast voice replies.
     """
     # Get primary and fallback using new V2 methods if available
     try:
@@ -759,6 +765,168 @@ def build_stt(cfg: AgentConfig) -> Any:
         return primary
 
 
+# ---------------------------------------------------------------------------
+# Loop-local Google TTS guard.
+#
+# google-cloud-texttospeech's AsyncClient holds a grpc.aio channel bound to
+# the event loop that created it (Channel._loop; every RPC then does
+# _loop.create_task in grpc/aio/_call.py). A cached client created on any
+# other (now closed) loop makes the first streaming_synthesize on the job
+# loop crash with `RuntimeError: Event loop is closed`.
+# ensure_loop_local_google_tts() drops such a stale cached client
+# (_client/_async_client = None) so the plugin lazily rebuilds a fresh
+# channel on the active session loop. _LoopLocalTTSWrapper runs it before
+# every synthesize() and stream(). Best-effort and fail-open.
+# (Mirrors the same guard in app/agents/worker.py; both files keep a local
+# copy so the runtime path never depends on a cross-module import.)
+# ---------------------------------------------------------------------------
+def _iter_tts_leaves(tts_obj):
+    """Yield leaf plugin TTS objects, unwrapping delegating wrappers and FallbackAdapters."""
+    seen = set()
+    stack = [tts_obj]
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        try:
+            inner = getattr(obj, "_inner", None)
+        except Exception:
+            inner = None
+        if inner is not None and (hasattr(inner, "synthesize") or hasattr(inner, "stream")):
+            stack.append(inner)
+            continue
+        descended = False
+        for _attr in ("_tts_instances", "tts_instances", "_instances", "instances"):
+            try:
+                _lst = getattr(obj, _attr, None)
+            except Exception:
+                _lst = None
+            if isinstance(_lst, (list, tuple)) and _lst:
+                stack.extend(_lst)
+                descended = True
+                break
+        if not descended:
+            yield obj
+
+
+def _grpc_client_has_stale_loop(client_obj, running_loop, _depth=0, _seen=None) -> bool:
+    """True if client_obj embeds an asyncio loop that is closed or != running_loop.
+
+    Walks the holder chain of google-cloud async clients / grpc.aio channels
+    (client -> _transport -> _grpc_channel -> _loop). Bounded, exception-proof,
+    and returns False when nothing loop-like is found (fresh or non-gRPC
+    clients are kept untouched).
+    """
+    if _seen is None:
+        _seen = set()
+    if client_obj is None or id(client_obj) in _seen or _depth > 5:
+        return False
+    _seen.add(id(client_obj))
+    try:
+        if isinstance(client_obj, asyncio.AbstractEventLoop):
+            return client_obj.is_closed() or client_obj is not running_loop
+    except Exception:
+        pass
+    for _attr in ("_loop", "loop", "_grpc_channel", "grpc_channel",
+                  "_channel", "channel", "_transport", "transport",
+                  "_client", "_async_client"):
+        try:
+            _child = getattr(client_obj, _attr, None)
+        except Exception:
+            continue
+        if _child is None or isinstance(_child, (str, bytes, int, float, bool)):
+            continue
+        try:
+            if _grpc_client_has_stale_loop(_child, running_loop, _depth + 1, _seen):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def ensure_loop_local_google_tts(tts_instance) -> None:
+    """Drop any cached TTS gRPC client bound to a stale event loop.
+
+    Must be called on the session loop immediately before synthesize() /
+    stream(). If a cached _client/_async_client embeds a loop that is closed
+    or differs from asyncio.get_running_loop(), it is cleared so the plugin
+    rebuilds a fresh channel on the active loop. Fail-open: any error (or no
+    running loop, e.g. a build thread) leaves the instance untouched.
+    """
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        leaves = list(_iter_tts_leaves(tts_instance))
+    except Exception:
+        return
+    for leaf in leaves:
+        holders = [leaf]
+        try:
+            _parent = getattr(leaf, "_tts", None)
+        except Exception:
+            _parent = None
+        if _parent is not None and _parent is not leaf:
+            holders.append(_parent)
+        for holder in holders:
+            for _attr in ("_client", "_async_client"):
+                try:
+                    _client = getattr(holder, _attr, None)
+                except Exception:
+                    continue
+                if _client is None:
+                    continue
+                try:
+                    stale = _grpc_client_has_stale_loop(_client, running_loop)
+                except Exception:
+                    continue
+                if stale:
+                    try:
+                        setattr(holder, _attr, None)
+                    except Exception:
+                        continue
+                    logger.info(
+                        "🔧 Dropped stale Google TTS client (bound to closed/foreign "
+                        "event loop) — fresh gRPC channel will be created on the "
+                        "active session loop"
+                    )
+
+
+class _LoopLocalTTSWrapper:
+    """Thin delegating TTS wrapper enforcing loop-local Google gRPC channels.
+
+    Same delegation pattern as worker.py's timing wrapper (copies
+    capabilities/_opts/_label, delegates everything else). Before every
+    synthesize() and stream() it runs ensure_loop_local_google_tts() so a
+    cached client from a closed/foreign loop can never reach
+    streaming_synthesize. Non-Google providers pass through untouched (the
+    guard finds no embedded loop and keeps the client).
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        try:
+            self.capabilities = getattr(inner, "capabilities", None)
+            self._opts = getattr(inner, "_opts", None)
+            self._label = getattr(inner, "_label", None)
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def synthesize(self, text, **kwargs):
+        ensure_loop_local_google_tts(self._inner)
+        async for chunk in self._inner.synthesize(text, **kwargs):
+            yield chunk
+
+    def stream(self, **kwargs):
+        ensure_loop_local_google_tts(self._inner)
+        return self._inner.stream(**kwargs)
+
+
 def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
     sel = pair
     overrides = sel.config or {}
@@ -769,11 +937,19 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         default_language = "en-IN" if configured_language.startswith("en") else "hi-IN"
         language = overrides.get("language", default_language)
         voice = _resolve_tts_voice(language, overrides.get("voice"))
-        return TTS(
+        # NOTE: TTS() only builds the lightweight plugin object — the async
+        # gRPC client/channel is created lazily by the plugin on the active
+        # session loop at first synthesis. Never pre-create the client
+        # off-loop (it binds grpc.aio to the wrong loop and crashes with
+        # `RuntimeError: Event loop is closed`). The wrapper re-checks the
+        # cached client on every synthesize()/stream() and drops it if its
+        # loop is closed or mismatched.
+        tts = TTS(
             voice_name=voice,
             language=language,
             credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
         )
+        return _LoopLocalTTSWrapper(tts)
 
     if sel.id.startswith("elevenlabs"):
         from livekit.plugins.elevenlabs import TTS
