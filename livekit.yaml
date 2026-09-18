@@ -6,7 +6,7 @@ rtc:
   use_external_ip: false
   node_ip: "127.0.0.1"
 keys:
-  056e933fea9a30bb71f07a7967e8b037: a9824336bb4f0c646655b837af84b273f9c9a5598d217c85d1d5edf5305ca220
+  APIVXWGm6U8jdB2: CHAhA7ZTOtZj770TUMSOBwnLYEKXnByAQO3IblGbena
 logging:
   level: info
 room:

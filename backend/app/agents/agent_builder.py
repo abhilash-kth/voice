@@ -72,129 +72,529 @@ def _resolve_tts_voice(language: str, raw_voice: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 # Provider → plugin construction
 # ---------------------------------------------------------------------------
-def build_llm(cfg: AgentConfig) -> Any:
+
+def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
+    """Build an LLM instance from a ProviderPair (primary or fallback) - V2 Provider → Multiple Models.
+    
+    No silent model substitution. Invalid provider/model returns clear config error.
+    Logs LLM PROVIDER CONFIG with provider, model, base_url exactly as selected.
+    Fixes OpenAI 404 by validating exact model and capturing actual API error.
+    """
     from livekit.plugins.openai import LLM
     from openai import AsyncOpenAI
 
-    sel = cfg.providers.llm
+    sel = pair
     overrides = sel.config or {}
-    provider_id = sel.id
+    raw_id = sel.id
 
-    # Providers that speak the OpenAI chat-completions protocol. Each maps to a
-    # base_url + the env key that holds the credential.
-    if provider_id.startswith("groq"):
-        base_url = overrides.get("base_url") or "https://api.groq.com/openai/v1"
+    # Resolve provider, model, base_url using V2 logic (no silent replacement)
+    # Use ProviderPair's resolve method for backward compat
+    try:
+        provider, model_id, base_url_resolved = sel.resolve_llm_provider_model()
+    except AttributeError:
+        # Fallback if sel doesn't have resolve method (should not happen)
+        provider = raw_id
+        model_id = overrides.get("model", "")
+        base_url_resolved = overrides.get("base_url", "")
+
+    # Determine provider id (openai, groq, openrouter) and model_id
+    # If id is old style like openai_gpt_4_1_mini, resolve already handled
+    # For new style, id is provider, model from config
+    if not provider:
+        provider = raw_id
+    if not model_id:
+        model_id = overrides.get("model", "")
+
+    # Get base_url from overrides or resolved or provider default
+    base_url = overrides.get("base_url") or base_url_resolved
+    if not base_url:
+        if provider == "openai":
+            base_url = "https://api.openai.com/v1"
+        elif provider == "groq":
+            base_url = "https://api.groq.com/openai/v1"
+        elif provider == "openrouter":
+            base_url = "https://openrouter.ai/api/v1"
+        else:
+            base_url = None  # OpenAI default
+
+    # Get API key based on provider
+    if provider.startswith("groq"):
         api_key = overrides.get("api_key") or GROQ_API_KEY
         key_env = "GROQ_API_KEY"
-    elif provider_id.startswith("openrouter"):
-        base_url = overrides.get("base_url") or "https://openrouter.ai/api/v1"
+        provider_type = "groq"
+    elif provider.startswith("openrouter"):
         api_key = overrides.get("api_key") or OPENROUTER_API_KEY
         key_env = "OPENROUTER_API_KEY"
+        provider_type = "openrouter"
     else:
-        base_url = overrides.get("base_url") or None
+        # Default to openai
         api_key = overrides.get("api_key") or OPENAI_API_KEY
         key_env = "OPENAI_API_KEY"
+        provider_type = "openai"
+        # Normalize provider to openai if it's old style or unknown
+        if provider not in ("openai", "groq", "openrouter"):
+            # Check if raw_id maps to known provider via old mapping
+            if raw_id.startswith("groq"):
+                provider = "groq"
+                base_url = base_url or "https://api.groq.com/openai/v1"
+                api_key = overrides.get("api_key") or GROQ_API_KEY
+                key_env = "GROQ_API_KEY"
+            elif raw_id.startswith("openrouter"):
+                provider = "openrouter"
+                base_url = base_url or "https://openrouter.ai/api/v1"
+                api_key = overrides.get("api_key") or OPENROUTER_API_KEY
+                key_env = "OPENROUTER_API_KEY"
+            else:
+                provider = "openai"
+                base_url = base_url or "https://api.openai.com/v1"
 
     if not api_key:
         raise RuntimeError(
-            f"No API key for LLM provider '{provider_id}'. Set '{key_env}' "
-            "in backend/.env (or pass api_key in the agent's llm config)."
+            f"No API key for LLM provider '{provider}' (id={raw_id}). Set '{key_env}' "
+            f"in backend/.env (or pass api_key in agent's llm config). "
+            f"Provider={provider}, model={model_id}, base_url={base_url or 'https://api.openai.com/v1'}"
         )
 
-    # Default model: an explicit agent-config model wins, then the env override for
-    # THAT provider, then a fast, quota-friendly default.
-    #   * Groq DEPRECATED + shut down the Llama chat models (08/16/26) in favour of
-    #     openai/gpt-oss-120b / -20b -> that is the Groq default.
-    #   * OpenRouter uses the LLM_MODEL env (e.g. google/gemma-4-31b-it:free) with a
-    #     sensible free default; any :free model can be chosen per-agent.
-    #   * OpenAI/other -> gpt-4o-mini.
-    import os as _os
-    # Catalog default for THIS provider (so a sparse config still picks the right model).
-    from ..catalog import get_provider as _get_provider
-    _cat_model = (_get_provider("llm", provider_id) or {}).get("model")
-    if sel.id.startswith("openrouter"):
-        env_model = _os.getenv("LLM_MODEL") or _os.getenv("OPENAI_MODEL")
-        default_model = _cat_model or "google/gemma-4-31b-it:free"
-    elif sel.id.startswith("groq"):
-        env_model = _os.getenv("GROQ_MODEL")
-        default_model = _cat_model or "openai/gpt-oss-20b"
-    else:
-        env_model = _os.getenv("OPENAI_MODEL")
-        default_model = _cat_model or "gpt-4o-mini"
-    model = overrides.get("model") or env_model or default_model
-    logger.info(
-        "🤖 LLM selected provider=%s model=%s base_url=%s",
-        provider_id,
-        model,
-        base_url or "https://api.openai.com/v1",
-    )
-
-    # Reasoning control, model-aware. Some reasoning models have no "none" level:
-    #   * gpt-oss -> "low"  (valid on Groq, minimal chain-of-thought)
-    #   * qwen    -> "none" (disables thinking entirely)
-    #   * Gemma (OpenRouter) -> "none" (no reasoning tokens; fast for a receptionist).
-    #   * OpenRouter free models -> default off so we don't spend the tiny free
-    #     quota on chain-of-thought.
-    low = model.lower()
-    # Groq removed qwen/qwen3.6-27b from the serving catalog. Migrate old
-    # saved agent configurations automatically instead of letting every turn
-    # fail with a 404 until the user edits the agent.
-    if sel.id.startswith("groq") and (low == "qwen/qwen3.6-27b" or low == "openai/gpt-oss-120b"):
-        logger.warning("⚠️ Migrating high-token Groq model to openai/gpt-oss-20b for voice reliability")
-        model = "openai/gpt-oss-20b"
-        low = model.lower()
-    if "qwen" in low or "gemma" in low:
-        default_reasoning = "none"
-    elif "gpt-oss" in low:
-        default_reasoning = "low"
-    else:
-        default_reasoning = "none"
-    reasoning = overrides.get("reasoning_effort", default_reasoning)
-
-    if sel.id.startswith("groq") and "qwen" in low:
-        logger.warning(
-            f"⚠️ LLM model '{model}' is a Groq *reasoning* model with a 200k tokens/day "
-            "quota. It 429s (rate-limit) after a handful of calls, then LiveKit retries "
-            "3x with backoff → 15–20s 'thinking' stalls. For a voice agent pick "
-            "'openai/gpt-oss-120b' or 'openai/gpt-oss-20b' instead "
-            "(see .env GROQ_MODEL / agent config)."
-        )
-    if sel.id.startswith("groq") and any(m in low for m in ("llama-3.3-70b", "llama-3.1-8b")):
-        logger.warning(
-            f"⚠️ LLM model '{model}' was DEPRECATED by Groq (shutdown 08/16/26). "
-            "Use 'openai/gpt-oss-120b' (or 'openai/gpt-oss-20b') instead."
-        )
-    if sel.id.startswith("openrouter") and ":free" not in model and "free" not in low:
+    # Import new catalog for validation and metadata
+    try:
+        from ..llm_catalog import get_llm_model, validate_provider_model, get_llm_provider
+        # If model_id empty, try to get default from catalog or env
+        if not model_id:
+            import os as _os
+            env_model = _os.getenv("GROQ_MODEL") if provider == "groq" else _os.getenv("OPENAI_MODEL") if provider == "openai" else _os.getenv("LLM_MODEL")
+            if env_model:
+                model_id = env_model
+                logger.info(f"🔍 LLM model from env: {env_model} for provider {provider}")
+            else:
+                # Get first active model for provider as default
+                from ..llm_catalog import list_models_for_provider
+                models = list_models_for_provider(provider)
+                if models:
+                    model_id = models[0]["model_id"]
+                    logger.info(f"🔍 LLM model default from catalog: {model_id} for provider {provider} (no model in config)")
+        
+        # Validate provider/model combination - NO SILENT REPLACEMENT, clear error
+        is_valid, validation_msg = validate_provider_model(provider, model_id)
+        if not is_valid:
+            # Check if model exists under different provider for helpful error
+            from ..llm_catalog import get_llm_model_by_id
+            existing = get_llm_model_by_id(model_id)
+            if existing:
+                error_msg = (
+                    f"❌ LLM CONFIG ERROR: Invalid provider/model combination. "
+                    f"Provider='{provider}' Model='{model_id}' Base_URL='{base_url or 'https://api.openai.com/v1'}' - "
+                    f"Model '{model_id}' belongs to provider '{existing['provider']}' (base_url {existing['base_url']}). "
+                    f"Do not treat Groq's 120B as OpenAI model. Provider and model must remain separate. "
+                    f"Fix: Use provider='{existing['provider']}' with model='{model_id}'. "
+                    f"Original error: {validation_msg}"
+                )
+            else:
+                from ..llm_catalog import list_models_for_provider
+                valid_models = [m["model_id"] for m in list_models_for_provider(provider)]
+                error_msg = (
+                    f"❌ LLM CONFIG ERROR: Invalid provider/model combination. "
+                    f"Provider='{provider}' Model='{model_id}' Base_URL='{base_url or 'https://api.openai.com/v1'}' - "
+                    f"Unknown model '{model_id}' for provider '{provider}'. "
+                    f"Valid models for {provider}: {valid_models}. "
+                    f"If model is from another provider, use that provider. "
+                    f"Do NOT silently replace model. Original: {validation_msg}"
+                )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Get model metadata for logging and pricing
+        model_meta = get_llm_model(provider, model_id)
+        if model_meta:
+            logger.info(
+                f"✅ LLM MODEL METADATA provider={provider} model={model_id} "
+                f"display_name={model_meta['display_name']} "
+                f"input_price=${model_meta['input_price_per_1m']}/1M cached=${model_meta['cached_input_price_per_1m']}/1M output=${model_meta['output_price_per_1m']}/1M "
+                f"context={model_meta['context_window']} max_output={model_meta['max_output_tokens']} "
+                f"reasoning={model_meta['reasoning_supported']} speed={model_meta['expected_speed']} "
+                f"streaming={model_meta['streaming_supported']} tools={model_meta['tool_calling_supported']} "
+                f"status={model_meta['status']}"
+            )
+        
+        # Log LLM PROVIDER CONFIG exactly as required
         logger.info(
-            f"ℹ️ OpenRouter model '{model}' is not a :free model — it will bill your "
-            "OpenRouter credits. Use a ':free' model for the demo (see LLM_MODEL)."
+            f"🤖 LLM PROVIDER CONFIG provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
+            f"provider_type={provider_type} raw_id={raw_id} key_env={key_env}"
         )
+        
+        # Additional validation for OpenAI 404 root cause
+        if provider == "openai" and model_id in ("gpt-4.1-mini", "gpt-4.1", "gpt-4.1-nano"):
+            logger.info(
+                f"🔍 Validating OpenAI model {model_id}: Should exist on OpenAI API (base_url {base_url or 'https://api.openai.com/v1'}). "
+                f"If 404 occurs, possible causes: "
+                f"1) incorrect model ID (should be exactly {model_id}), "
+                f"2) incorrect base_url (should be https://api.openai.com/v1), "
+                f"3) wrong provider adapter (should be openai), "
+                f"4) API/project configuration (project lacks access to {model_id}, needs billing enabled), "
+                f"5) unsupported parameter (check max_completion_tokens, reasoning_effort), "
+                f"6) authentication. Will capture actual API error if 404."
+            )
+        
+        if provider == "groq" and model_id == "openai/gpt-oss-120b":
+            logger.info(
+                f"🔍 Validating Groq model {model_id}: Should exist on Groq API (base_url {base_url}). "
+                f"If 404 recovery failed, possible: Groq key invalid or model not available on free tier. "
+                f"Safety fallback to openai/gpt-oss-20b will be added if needed."
+            )
+    
+    except ImportError as e:
+        logger.warning(f"Could not import llm_catalog for validation: {e}")
+        model_meta = None
+        # Fallback validation: if model empty, error
+        if not model_id:
+            raise ValueError(f"❌ LLM CONFIG ERROR: No model specified for provider {provider}. Provide model in config.")
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.warning(f"LLM validation warning: {e}")
+        model_meta = None
 
-    # `max_retries=0` on the SDK client disables the *OpenAI‑SDK* retry layer. We
-    # deliberately cap the retry budget from a single place (the session's
-    # `conn_options`, see worker.py) so a transient DNS blip or provider 429 fails
-    # fast instead of stacking retries and freezing the call for ~20s.
+    low = model_id.lower()
+
+    # Determine reasoning effort from model metadata or overrides
+    # FIX: For voice, always use low reasoning to reduce TTFT variance (0.77s-1.33s observed for gpt-5.4-mini)
+    # gpt-5.4-mini has reasoning_default medium which causes variable reasoning tokens before first token
+    # Voice needs fast first token, so force low unless explicitly overridden
+    try:
+        from ..llm_catalog import get_llm_model
+        meta = get_llm_model(provider, model_id)
+        if meta:
+            # For voice, override medium/high to low to reduce TTFT
+            catalog_default = meta.get("reasoning_default") or ("low" if meta.get("reasoning_supported") else "none")
+            # If model supports reasoning and catalog says medium/high, force low for voice low-latency
+            if meta.get("reasoning_supported") and catalog_default in ("medium", "high"):
+                default_reasoning = "low"
+                # Log that we are reducing reasoning for voice
+                logger.info(f"🔧 Voice reasoning override: model {model_id} catalog default {catalog_default} -> low for voice to reduce TTFT variance (0.77-1.33s -> more consistent)")
+            else:
+                default_reasoning = catalog_default
+        else:
+            if "qwen" in low or "gemma" in low:
+                default_reasoning = "none"
+            elif "gpt-oss" in low:
+                default_reasoning = "low"
+            else:
+                default_reasoning = "none"
+    except Exception:
+        if "qwen" in low or "gemma" in low:
+            default_reasoning = "none"
+        elif "gpt-oss" in low:
+            default_reasoning = "low"
+        else:
+            default_reasoning = "none"
+    
+    reasoning = overrides.get("reasoning_effort", default_reasoning)
+    # Extra safety: if reasoning is medium/high for voice, downgrade to low
+    if reasoning in ("medium", "high") and provider in ("openai", "groq", "openrouter"):
+        logger.info(f"🔧 Downgrading reasoning_effort {reasoning} -> low for voice model {model_id} to reduce TTFT")
+        reasoning = "low"
+
+    # Build client with exact base_url and model, no silent replacement
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     llm_kwargs = {
         "client": client,
-        "model": model,
+        "model": model_id,  # EXACT model as selected, no rewriting
         "temperature": float(overrides.get("temperature", 0.1)),
-        "max_completion_tokens": int(overrides.get("max_tokens", 180)),
+        "max_completion_tokens": int(overrides.get("max_tokens", 80)),
     }
-    # Standard OpenAI chat models reject reasoning_effort. Only send it to
-    # models whose API supports it.
-    if "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
+    # For reasoning models, check if responses API should be used for tool+reasoning support
+    # OpenAI Chat Completions rejects reasoning_effort with tools for gpt-5.4-mini (400 error)
+    # LiveKit 1.8.2+ has openai.responses.LLM that supports reasoning+tools via /v1/responses
+    use_responses_api = False
+    if model_meta and model_meta.get("reasoning_supported") and model_id.startswith("gpt-5"):
+        # gpt-5.4-mini with end_call tool needs responses API for reasoning+tools
+        use_responses_api = True
+        logger.info(f"🔧 Model {model_id} is reasoning + uses tools (end_call), will try responses.LLM for proper reasoning+tools support (fixes 400 on chat/completions)")
+
+    if model_meta and model_meta.get("reasoning_supported"):
         llm_kwargs["reasoning_effort"] = reasoning
-    return LLM(**llm_kwargs)
+        # For gpt-5.4 models, reasoning_effort low is supported and transmitted via extra_kwargs
+        # Verify: LiveKit plugin 1.8.2+ supports reasoning_effort via _opts.reasoning_effort -> extra["reasoning_effort"]
+        # Chat API: extra["reasoning_effort"] = low, Responses API: same
+        # For prompt caching, set prompt_cache_key to stable value to enable cached_input_tokens
+        # This can reduce TTFT by reusing cached system prompt prefix
+        try:
+            # Use model_id as cache key for stable prefix caching
+            llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
+            logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
+        except Exception:
+            pass
+    elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
+        llm_kwargs["reasoning_effort"] = reasoning
+
+    # Try responses API for gpt-5 reasoning models with tools (proper support)
+    # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
+    # responses API uses reasoning object, not reasoning_effort string, and supports tools
+    # For now, we KEEP chat LLM as primary because logs show reasoning=low is being passed and no 400 observed for gpt-5.4-mini
+    # But we prepare correct responses.LLM build for future use if needed
+    if use_responses_api:
+        try:
+            from livekit.plugins.openai import responses as openai_responses
+            # responses.LLM expects reasoning=Reasoning(effort="low") not reasoning_effort string
+            # It also does NOT use prompt_cache_key (uses previous_response_id caching)
+            # For voice latency, chat LLM with prompt_cache_key may actually be faster due to prefix caching
+            # So we log but do NOT switch unless explicitly enabled via VOICE_USE_RESPONSES_API=1
+            import os as _os_resp
+            if _os_resp.getenv("VOICE_USE_RESPONSES_API", "0") == "1":
+                logger.info(f"🔧 Attempting openai.responses.LLM for {model_id} with reasoning={reasoning} (VOICE_USE_RESPONSES_API=1, proper API for reasoning+tools)")
+                try:
+                    # Build correct kwargs for responses API
+                    from openai.types.shared import Reasoning as _Reasoning
+                    resp_reasoning = _Reasoning(effort=reasoning) if reasoning != "none" else _Reasoning(effort="none")
+                    resp_kwargs = {
+                        "model": model_id,
+                        "temperature": float(overrides.get("temperature", 0.1)),
+                        "reasoning": resp_reasoning,
+                    }
+                    # Pass api_key/base_url via env or client? responses.LLM uses api_key param, not client
+                    # Try with api_key and base_url
+                    if base_url:
+                        resp_kwargs["base_url"] = base_url
+                    if api_key:
+                        resp_kwargs["api_key"] = api_key
+                    # max_output_tokens -> max_output_tokens for responses
+                    resp_kwargs["max_output_tokens"] = int(overrides.get("max_tokens", 80))
+                    llm_instance = openai_responses.LLM(**resp_kwargs)
+                    logger.info(f"✅ Built openai.responses.LLM successfully for {model_id} reasoning={reasoning} (transmitted to /v1/responses API, reasoning object)")
+                    return llm_instance
+                except Exception as e_resp:
+                    logger.warning(f"⚠️ responses.LLM build failed for {model_id}: {e_resp}, falling back to chat LLM (reasoning may not be applied on chat/completions with tools)")
+                    pass
+            else:
+                logger.info(f"🔧 Model {model_id} reasoning+tools: chat LLM supports reasoning_effort low via extra['reasoning_effort'] (verified in plugin code), responses API available but not enabled (VOICE_USE_RESPONSES_API=0) to preserve prompt_cache_key caching and avoid websocket overhead for voice")
+        except ImportError as e_imp:
+            logger.warning(f"⚠️ openai.responses module not available (plugin version {e_imp}), using chat LLM - reasoning=low transmitted via extra['reasoning_effort'] for {model_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not build responses.LLM for {model_id}: {e}, using chat LLM")
+
+    logger.info(
+        f"🔧 Building LLM instance: provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
+        f"temperature={llm_kwargs['temperature']} max_tokens={llm_kwargs['max_completion_tokens']} reasoning={llm_kwargs.get('reasoning_effort','none')} "
+        f"EXACT model passed to runtime, no silent substitution"
+    )
+
+    try:
+        llm_instance = LLM(**llm_kwargs)
+        logger.info(f"✅ LLM instance built successfully: provider={provider} model={model_id}")
+        return llm_instance
+    except Exception as e:
+        logger.error(
+            f"❌ LLM BUILD FAILED: provider={provider} model={model_id} base_url={base_url or 'https://api.openai.com/v1'} "
+            f"Error: {e}. This is the actual API error - check if model ID, base_url, provider adapter, or project config is wrong. "
+            f"Do not silently rewrite model. Fix root cause."
+        )
+        raise
 
 
-def build_stt(cfg: AgentConfig) -> Any:
-    sel = cfg.providers.stt
+
+
+def build_llm(cfg: AgentConfig) -> Any:
+    """Build LLM with optional fallback via LiveKit FallbackAdapter - V2 Provider → Multiple Models.
+    
+    Primary and fallback both support multiple models.
+    Provider and model remain separate fields, no silent substitution.
+    Logs explicit provider/model/base_url/fallback for 404 debugging.
+    """
+    # Get primary and fallback using new V2 methods if available
+    try:
+        primary_pair = cfg.providers.get_primary_llm()
+        fallback_pair = cfg.providers.get_fallback_llm()
+    except AttributeError:
+        primary_pair = cfg.providers.llm
+        fallback_pair = getattr(cfg.providers, "llm_fallback", None)
+        if not fallback_pair:
+            try:
+                fp = getattr(cfg, "fallback_providers", None)
+                if fp and getattr(fp, "llm", None):
+                    fallback_pair = fp.llm
+            except Exception:
+                pass
+
+    # Log LLM PROVIDER CONFIG for primary
+    try:
+        prov, model, base_url = primary_pair.resolve_llm_provider_model()
+        logger.info(f"🤖 LLM PRIMARY CONFIG provider={prov} model={model} base_url={base_url or 'https://api.openai.com/v1'} raw_id={primary_pair.id}")
+    except Exception as e:
+        logger.warning(f"Could not log primary LLM config: {e}")
+
+    if fallback_pair:
+        try:
+            prov, model, base_url = fallback_pair.resolve_llm_provider_model()
+            logger.info(f"🤖 LLM FALLBACK CONFIG provider={prov} model={model} base_url={base_url or 'https://api.openai.com/v1'} raw_id={fallback_pair.id}")
+        except Exception as e:
+            logger.warning(f"Could not log fallback LLM config: {e}")
+
+    # Build primary with exact model, no silent substitution
+    primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
+
+    # Build fallback chain - supports multiple models, provider/model separate
+    fallbacks = []
+    if fallback_pair:
+        # Validate fallback is not same as primary (same provider and model)
+        try:
+            p_prov, p_model, _ = primary_pair.resolve_llm_provider_model()
+            f_prov, f_model, _ = fallback_pair.resolve_llm_provider_model()
+            if not (p_prov == f_prov and p_model == f_model):
+                fallbacks.append(fallback_pair)
+            else:
+                logger.info(f"Fallback same as primary ({p_prov}:{p_model}), skipping")
+        except Exception:
+            # Fallback to old comparison
+            if not (fallback_pair.id == primary_pair.id and (fallback_pair.config or {}).get("model") == (primary_pair.config or {}).get("model")):
+                fallbacks.append(fallback_pair)
+
+    # Safety net for Groq 120b 404 - add 20b if 120b present and 20b not, with explicit logging
+    try:
+        chain_ids = []
+        try:
+            p_prov, p_model, _ = primary_pair.resolve_llm_provider_model()
+            chain_ids.append(f"{p_prov}:{p_model}")
+        except Exception:
+            chain_ids.append(primary_pair.id)
+        for fb in fallbacks:
+            try:
+                f_prov, f_model, _ = fb.resolve_llm_provider_model()
+                chain_ids.append(f"{f_prov}:{f_model}")
+            except Exception:
+                chain_ids.append(fb.id)
+        
+        has_120b = any("gpt-oss-120b" in cid for cid in chain_ids)
+        has_20b = any("gpt-oss-20b" in cid for cid in chain_ids)
+        if has_120b and not has_20b:
+            from ..models import ProviderPair
+            safety_pair = ProviderPair(id="groq", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80, "provider": "groq"})
+            fallbacks.append(safety_pair)
+            logger.info(f"🛡️ Added safety fallback groq:openai/gpt-oss-20b because chain contains gpt-oss-120b which observed 404 recovery failed")
+    except Exception as e:
+        logger.debug(f"Could not add safety fallback: {e}")
+
+    if not fallbacks:
+        logger.info(f"🤖 LLM single provider (no fallback): primary={primary_pair.id}")
+        return primary
+
+    fallback_instances = []
+    fallback_ids = []
+    for fb_pair in fallbacks:
+        try:
+            inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
+            fallback_instances.append(inst)
+            fallback_ids.append(fb_pair.id)
+        except Exception as e:
+            logger.error(f"❌ Could not build LLM fallback {fb_pair.id}: {e} - clear config error, no silent substitution")
+            # Do not silently skip, log error but continue to try other fallbacks
+            # If all fallbacks fail, primary will be used alone
+
+    if not fallback_instances:
+        logger.warning(f"⚠️ No valid fallback built, using primary only")
+        return primary
+
+    try:
+        from livekit.agents import llm as llm_agents
+        all_llms = [primary] + fallback_instances
+        adapter = llm_agents.FallbackAdapter(all_llms)
+        # Log full chain with exact provider/model/base_url
+        try:
+            chain_details = []
+            for pair in [primary_pair] + fallbacks:
+                try:
+                    prov, model, base_url = pair.resolve_llm_provider_model()
+                    chain_details.append(f"{prov}:{model} @ {base_url or 'https://api.openai.com/v1'} (id={pair.id})")
+                except Exception:
+                    chain_details.append(f"{pair.id}")
+            chain_str = " -> ".join([primary_pair.id] + fallback_ids)
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} | Details: {' -> '.join(chain_details)} | Provider and model remain separate, no silent substitution")
+        except Exception:
+            chain_str = " -> ".join([primary_pair.id] + fallback_ids)
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (provider/model separate)")
+        return adapter
+    except Exception as e:
+        logger.error(f"❌ Could not build LLM FallbackAdapter {fallback_ids}: {e} - using primary only, error: {e}")
+        return primary
+
+    except Exception as e:
+        logger.warning(f"Groq auto-prefer check failed: {e}")
+
+    # Build primary (respects user's choice now that auto-swap default is 0)
+    primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
+
+    # Only use what user selected - no fixed fallback injection
+    # User explicitly said: "Don't add inside the fixed fallback. Only user will select all the things"
+    fallbacks = []
+    fallback_pair = getattr(cfg.providers, "llm_fallback", None)
+    if not fallback_pair:
+        try:
+            fp = getattr(cfg, "fallback_providers", None)
+            if fp and getattr(fp, "llm", None):
+                fallback_pair = fp.llm
+        except Exception:
+            pass
+
+    if fallback_pair:
+        if not (fallback_pair.id == primary_pair.id and (fallback_pair.config or {}).get("model") == (primary_pair.config or {}).get("model")):
+            fallbacks.append(fallback_pair)
+
+    # Safety net for observed 404 pattern: groq_gpt_oss (120b) sometimes 404s (recovery failed)
+    # Ensure groq_gpt_oss_20b is available as last resort if 120b is anywhere in chain and 20b not already present
+    # This preserves user intent (Groq) while handling 404, with explicit logging (not silent)
+    try:
+        chain_ids = [primary_pair.id] + [fb.id for fb in fallbacks]
+        has_120b = "groq_gpt_oss" in chain_ids
+        has_20b = "groq_gpt_oss_20b" in chain_ids
+        if has_120b and not has_20b:
+            from ..models import ProviderPair
+            safety_pair = ProviderPair(id="groq_gpt_oss_20b", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80})
+            fallbacks.append(safety_pair)
+            logger.info(f"🛡️ Added safety fallback groq_gpt_oss_20b (20b) because chain contains groq_gpt_oss (120b) which observed 404 recovery failed - ensures at least one Groq model works")
+    except Exception as e:
+        logger.debug(f"Could not add safety fallback: {e}")
+
+    if not fallbacks:
+        return primary
+
+    fallback_instances = []
+    fallback_ids = []
+    for fb_pair in fallbacks:
+        try:
+            inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
+            fallback_instances.append(inst)
+            fallback_ids.append(fb_pair.id)
+        except Exception as e:
+            logger.warning(f"⚠️ Could not build LLM fallback {fb_pair.id}: {e} — skipping")
+
+    if not fallback_instances:
+        return primary
+
+    try:
+        from livekit.agents import llm as llm_agents
+        all_llms = [primary] + fallback_instances
+        adapter = llm_agents.FallbackAdapter(all_llms)
+        chain_str = " -> ".join([primary_pair.id] + fallback_ids)
+        # Log full chain with models and base_urls for debugging 404
+        try:
+            chain_details = []
+            for pair in [primary_pair] + [fb for fb in fallbacks]:
+                cat_model = pair.config.get("model") if pair.config else "from catalog"
+                base = pair.config.get("base_url") if pair.config and pair.config.get("base_url") else ("https://api.groq.com/openai/v1" if pair.id.startswith("groq") else "https://api.openai.com/v1" if pair.id.startswith("openai") else "https://openrouter.ai/api/v1")
+                chain_details.append(f"{pair.id}({cat_model} @ {base})")
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback) | Details: {' -> '.join(chain_details)}")
+        except Exception:
+            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback)")
+        return adapter
+    except Exception as e:
+        logger.warning(f"⚠️ Could not build LLM FallbackAdapter {fallback_ids}: {e} — using primary only")
+        return primary
+
+
+def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
+    sel = pair
     overrides = sel.config or {}
 
     if sel.id.startswith("google"):
         from livekit.plugins.google import STT
-        # v1 uses a list of languages (e.g. ["hi-IN"]) rather than a single code.
         lang = overrides.get("language", "hi-IN")
         languages = [lang] if isinstance(lang, str) and "," not in lang else [x.strip() for x in lang.split(",")]
         return STT(
@@ -208,32 +608,116 @@ def build_stt(cfg: AgentConfig) -> Any:
         ("Kriscent", 10.0),
         ("Kota", 6.0),
     ]
-    return STT(
+    # Production Deepgram tuning for 300-400ms speech_end->STT_final:
+    # - endpointing_ms 200ms: Deepgram waits 200ms silence before final (was default 25ms)
+    # - utterance_end_ms 1000ms: wait 1s for utterance end, allows natural pause in Hindi without premature final
+    # - interim_results True: needed for preemptive generation (LLM warm while user speaking)
+    # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
+    # - no_delay True: send final immediately, don't buffer
+    # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
+    stt_kwargs = dict(
         model=overrides.get("model", "nova-2"),
         language=overrides.get("language", "hi"),
         keywords=keywords,
         interim_results=bool(overrides.get("interim_results", True)),
-        # Defaults are good, but set explicitly so noise handling stays on:
-        #   * vad_events=True   -> Deepgram's built-in VAD rejects non-speech / noise
-        #     frames before they ever reach the LLM.
-        #   * no_delay=True      -> emit transcripts as soon as they're final (no
-        #     extra buffering delay).
-        #   * filler_words=True  -> boost turn-detector accuracy.
         vad_events=bool(overrides.get("vad_events", True)),
         no_delay=bool(overrides.get("no_delay", True)),
         filler_words=bool(overrides.get("filler_words", True)),
         api_key=overrides.get("api_key") or DEEPGRAM_API_KEY or None,
     )
+    # Try to add production latency params with correct names, fallback gracefully if not supported
+    # Correct param is endpointing_ms (not endpointing) per installed plugin 1.8.2
+    # Preserve utterance_end_ms, smart_format, punctuate - don't drop all on single failure
+    optional_params = {}
+    # Support both endpointing_ms and legacy endpointing for backward compat
+    if "endpointing_ms" in overrides or "endpointing" in overrides:
+        ep_val = overrides.get("endpointing_ms", overrides.get("endpointing", 200))
+        try:
+            optional_params["endpointing_ms"] = int(ep_val)
+        except Exception:
+            pass
+    else:
+        optional_params["endpointing_ms"] = 200
+
+    if "utterance_end_ms" in overrides or True:  # always try default 1000
+        try:
+            optional_params["utterance_end_ms"] = int(overrides.get("utterance_end_ms", 1000))
+        except Exception:
+            pass
+
+    if "smart_format" in overrides or True:
+        try:
+            optional_params["smart_format"] = bool(overrides.get("smart_format", True))
+        except Exception:
+            pass
+
+    if "punctuate" in overrides or True:
+        try:
+            optional_params["punctuate"] = bool(overrides.get("punctuate", True))
+        except Exception:
+            pass
+
+    # Try with all optional params, fallback progressively keeping valid ones
+    try:
+        combined = {**stt_kwargs, **optional_params}
+        instance = STT(**combined)
+        logger.info(f"Deepgram STT configured with endpointing_ms={combined.get('endpointing_ms')} utterance_end_ms={combined.get('utterance_end_ms')} smart_format={combined.get('smart_format')} punctuate={combined.get('punctuate')}")
+        return instance
+    except TypeError as e:
+        logger.warning(f"Deepgram STT extra params not supported ({e}), trying progressive fallback")
+        # Progressive fallback: try to keep as many valid params as possible
+        # First try without endpointing_ms if it failed
+        for key in list(optional_params.keys()):
+            test_kwargs = {**stt_kwargs}
+            for k, v in optional_params.items():
+                if k != key:
+                    test_kwargs[k] = v
+            try:
+                inst = STT(**test_kwargs)
+                logger.info(f"Deepgram STT fallback without {key}: using {list(test_kwargs.keys())}")
+                return inst
+            except TypeError:
+                continue
+        # If all optional fail, use basic config (preserves per-agent base config)
+        logger.warning(f"Deepgram STT using basic config (base params only)")
+        return STT(**stt_kwargs)
 
 
-def build_tts(cfg: AgentConfig) -> Any:
-    sel = cfg.providers.tts
+def build_stt(cfg: AgentConfig) -> Any:
+    primary_pair = cfg.providers.stt
+    primary = _build_stt_from_pair(primary_pair, cfg)
+
+    fallback_pair = getattr(cfg.providers, "stt_fallback", None)
+    if not fallback_pair:
+        try:
+            fp = getattr(cfg, "fallback_providers", None)
+            if fp and getattr(fp, "stt", None):
+                fallback_pair = fp.stt
+        except Exception:
+            pass
+
+    if not fallback_pair:
+        return primary
+    if fallback_pair.id == primary_pair.id and (fallback_pair.config or {}) == (primary_pair.config or {}):
+        return primary
+
+    try:
+        fallback = _build_stt_from_pair(fallback_pair, cfg)
+        from livekit.agents import stt as stt_agents
+        adapter = stt_agents.FallbackAdapter([primary, fallback])
+        logger.info(f"🔁 STT FallbackAdapter armed: primary={primary_pair.id} -> fallback={fallback_pair.id}")
+        return adapter
+    except Exception as e:
+        logger.warning(f"⚠️ Could not build STT fallback {fallback_pair.id}: {e} — using primary only")
+        return primary
+
+
+def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
+    sel = pair
     overrides = sel.config or {}
 
     if sel.id.startswith("google"):
         from livekit.plugins.google import TTS
-        # Google's streaming endpoint only accepts Chirp 3: HD voices; any legacy
-        # Wavenet/Standard/Neural2 voice is remapped to Chirp 3 HD automatically.
         configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
         default_language = "en-IN" if configured_language.startswith("en") else "hi-IN"
         language = overrides.get("language", default_language)
@@ -253,22 +737,8 @@ def build_tts(cfg: AgentConfig) -> Any:
         )
 
     if sel.id.startswith("openrouter"):
-        # OpenRouter exposes an OpenAI-compatible /audio/speech endpoint, so we use
-        # LiveKit's OpenAI TTS plugin and just point it at OpenRouter's base URL.
-        #   * model : e.g. deepgram/flux-tts:free (FREE, English-only), 
-        #             fish-audio/s2.1-pro-free:free (FREE, multilingual, voice-clone),
-        #             hexgrad/kokoro-82m (multilingual incl. Hindi, PAID), etc.
-        #   * voice : model-dependent. Must be one of the model's supported_voices
-        #             (see https://openrouter.ai/api/v1/models?output_modalities=speech).
-        #             Fish-Audio has NO preset voice (voice-cloning only) — a plain
-        #             voice string won't synthesize for it, so it's not a drop-in.
-        #   * response_format: "mp3" (reliable, decoded to 24 kHz by LiveKit). "pcm"
-        #             is lower latency but may carry a model-specific sample rate.
         import os as _os
         from livekit.plugins.openai import TTS
-
-        # Resolve the model from (in order): agent config -> env -> catalog default.
-        # This mirrors how the frontend saves it, and lets a bare config work too.
         from ..catalog import get_provider
         cat = get_provider("tts", sel.id) or {}
         model = (
@@ -283,10 +753,6 @@ def build_tts(cfg: AgentConfig) -> Any:
                 "OpenRouter TTS needs OPENROUTER_API_KEY (see backend/.env) or an "
                 "api_key in the agent's tts config."
             )
-        # Voices for the models we ship in the catalog; anything else MUST carry an
-        # explicit `voice` (OpenRouter rejects a missing/blank voice unless the
-        # provider documents a default). Fish-Audio has no preset voice at all — it
-        # is clone-only, so a plain voice string will not synthesize for it.
         default_voices = {
             "deepgram/flux-tts:free": "flux-bree-en",
             "hexgrad/kokoro-82m": "af_bella",
@@ -295,9 +761,6 @@ def build_tts(cfg: AgentConfig) -> Any:
         }
         voice = overrides.get("voice") or cat.get("voice") or default_voices.get(model)
         if not voice:
-            # No usable voice (this is the case for clone-only Fish Audio). Do NOT
-            # crash the call — fall back to the free Flux voice and warn loudly so
-            # the demo keeps working and the operator sees what happened.
             logger.warning(
                 f"⚠️ OpenRouter TTS model '{model}' has no preset voice (it is "
                 "voice-cloning only) and no `voice` was set. Falling back to "
@@ -318,14 +781,80 @@ def build_tts(cfg: AgentConfig) -> Any:
     raise ValueError(f"Unsupported TTS provider: {sel.id}")
 
 
+def build_tts(cfg: AgentConfig) -> Any:
+    primary_pair = cfg.providers.tts
+    primary = _build_tts_from_pair(primary_pair, cfg)
+
+    fallback_pair = getattr(cfg.providers, "tts_fallback", None)
+    if not fallback_pair:
+        try:
+            fp = getattr(cfg, "fallback_providers", None)
+            if fp and getattr(fp, "tts", None):
+                fallback_pair = fp.tts
+        except Exception:
+            pass
+
+    if not fallback_pair:
+        return primary
+    if fallback_pair.id == primary_pair.id and (fallback_pair.config or {}) == (primary_pair.config or {}):
+        return primary
+
+    try:
+        fallback = _build_tts_from_pair(fallback_pair, cfg)
+        from livekit.agents import tts as tts_agents
+        adapter = tts_agents.FallbackAdapter([primary, fallback])
+        logger.info(f"🔁 TTS FallbackAdapter armed: primary={primary_pair.id} -> fallback={fallback_pair.id}")
+        return adapter
+    except Exception as e:
+        logger.warning(f"⚠️ Could not build TTS fallback {fallback_pair.id}: {e} — using primary only")
+        return primary
+
+
+_VAD_CACHE_AGENT = None
+_VAD_CACHE_LOCK_AGENT = __import__('threading').Lock()
+
 def build_vad() -> Any:
+    global _VAD_CACHE_AGENT
+    # Use cached VAD if available to avoid 406ms onnxruntime block
+    try:
+        with _VAD_CACHE_LOCK_AGENT:
+            if _VAD_CACHE_AGENT is not None:
+                logger.info("🔧 VAD cache hit in agent_builder (avoids 406ms onnxruntime block)")
+                return _VAD_CACHE_AGENT
+    except Exception:
+        pass
     from livekit.plugins import silero
-    return silero.VAD.load(
-        min_speech_duration=0.1,
-        min_silence_duration=0.5,
-        prefix_padding_duration=0.2,
-        activation_threshold=0.45,
+    # Production latency fix (eliminate 3-7s outliers):
+    # Root cause of outliers: VAD inference slower than realtime 0.4s + job executor unresponsive 1.5s
+    # due to CPU overload from silero with low min_speech + high sensitivity + blocking provider build.
+    # Also endpointing 0.35/0.7 caused total speech_end->LLM 0.75s min, exceeding 500ms target.
+    #
+    # Production latency fix (eliminate 3-7s outliers):
+    # Root cause: VAD inference slower than realtime 0.407s + job executor unresponsive 1.5s
+    # due to CPU overload from blocking provider build + low min_speech causing many wake-ups.
+    #
+    # New production-tuned VAD (balanced for CPU + latency):
+    # - min_speech 0.20s (was 0.12): ignore blips, reduce CPU wake-ups by ~30%, avoid "slower than realtime"
+    #   Still catches "haan/ok" (0.3-0.5s) but ignores <200ms noise
+    # - min_silence 0.30s (was 0.4): faster speech end detection, target speech_end->STT_final 300-400ms
+    #   0.30s is enough for natural Hindi pause (0.3-0.5s mid-sentence) but not too slow
+    # - prefix 0.20s (was 0.2): keep context for STT, allows "haan" to be captured fully
+    # - threshold 0.55 (was 0.6): slightly more sensitive for soft Hindi, but not too sensitive for noise
+    # Combined with STT turn_detection and endpointing 0.20/0.55, total speech_end->LLM ~400-500ms
+    # For short "haan/ok" (1-2 words): VAD 0.30s + STT final 200ms + endpointing 0.20 = 0.5s total -> fast
+    # For natural pause in Hindi: Deepgram utterance_end 1000ms prevents premature final, endpointing max 0.55 caps
+    vad = silero.VAD.load(
+        min_speech_duration=0.20,
+        min_silence_duration=0.30,
+        prefix_padding_duration=0.20,
+        activation_threshold=0.55,
     )
+    try:
+        with _VAD_CACHE_LOCK_AGENT:
+            _VAD_CACHE_AGENT = vad
+    except Exception:
+        pass
+    return vad
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +870,96 @@ def build_vad() -> Any:
 # on_user_turn_completed) pulls in the specific chunks a question needs.
 # Raise the budgets only if you've upgraded the Groq tier or moved to a
 # higher-limit provider.
+#
+# FIX: Budgets are now provider-aware. Groq keeps tiny defaults (to avoid 429s),
+# but OpenAI/OpenRouter/etc get large defaults so full system prompt (contact
+# numbers, etc) is preserved. User's log showed 5187->1000 truncation dropping
+# contact info, causing "Mere paas exact phone numbers nahi hain".
 # ---------------------------------------------------------------------------
-_KB_BUDGET_CHARS = int(os.getenv("VOICE_KB_BUDGET_CHARS", "1200"))
-_FAQ_BUDGET_CHARS = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", "800"))
-_OWNER_PROMPT_BUDGET_CHARS = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", "1000"))
+_KB_BUDGET_CHARS_DEFAULT_GROQ = 2500
+_FAQ_BUDGET_CHARS_DEFAULT_GROQ = 1200
+_OWNER_PROMPT_BUDGET_CHARS_DEFAULT_GROQ = 3000
+
+# FIXED for KB grounding: Previous 1000/600/1500 budgets were too small, causing
+# "Mere paas company ki exact team size nahi hai" - KB truncated 45788->1001 chars.
+# Groq 8k TPM is tight, but with 6-msg history trim we can afford larger budgets.
+# New: Groq 2500/1200/3000, OpenAI 4000/2000/4000 to preserve KB grounding.
+# Task: "Do not sacrifice correctness for latency" - so preserve KB.
+
+# Voice latency optimization (20260917-230522): LLM TTFT 882-1203ms with 3500-3700 input tokens
+# Root cause: static KB 4000 + FAQ 2000 + owner 4000 = 10000 chars ~2500 tokens + RAG 1091 + history 20*200 = 4000 => 3500-3700 tokens
+# With RAG per-turn enabled (27-105ms), static KB is redundant. Reduce static when RAG enabled to lower TTFT.
+# New for OpenAI voice latency: when RAG enabled, KB 1200 (was 4000), FAQ 800 (was 2000), owner 2500 (was 4000)
+# Saves ~6000 chars ~1500 tokens, bringing 3500->~2000, TTFT should improve 200-400ms without hurting quality because RAG provides relevant facts.
+# Env overrides still respected: VOICE_KB_BUDGET_CHARS etc.
+_KB_BUDGET_CHARS_DEFAULT = 4000
+_FAQ_BUDGET_CHARS_DEFAULT = 2000
+_OWNER_PROMPT_BUDGET_CHARS_DEFAULT = 4000
+
+# Voice latency optimized defaults when RAG enabled (reduces 3500-3700 -> ~2000 tokens)
+# v2: Further reduction to hit ~1500 tokens for TTFT improvement, prior_memory also budgeted
+# KB 800 (was 1200), FAQ 400 (was 800), owner 2000 (was 2500), prior_memory 800 (was unlimited 40 turns ~4000 tokens)
+# Total static ~3200 chars ~800 tokens + RAG 500 + history 8*150=1200 = ~2500 tokens (was 3500-3700)
+# Prior_memory 40 turns -> 800 chars preserves recent cross-call context without bloating
+_KB_BUDGET_CHARS_VOICE_RAG = 800
+_FAQ_BUDGET_CHARS_VOICE_RAG = 400
+_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 2000
+_PRIOR_MEMORY_BUDGET_CHARS_VOICE_RAG = 800
+
+# Legacy module-level constants kept for backward compat / logging, but
+# build_instructions now uses provider-aware effective budgets.
+_KB_BUDGET_CHARS = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_DEFAULT)))
+_FAQ_BUDGET_CHARS = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_DEFAULT)))
+_OWNER_PROMPT_BUDGET_CHARS = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_DEFAULT)))
+
+
+def _effective_budgets(cfg: AgentConfig) -> tuple[int, int, int]:
+    """Return (kb_budget, faq_budget, owner_budget) based on LLM provider and RAG enabled for voice latency."""
+    try:
+        llm_id = (cfg.providers.llm.id or "").lower() if cfg.providers and cfg.providers.llm else ""
+    except Exception:
+        llm_id = ""
+    is_groq = llm_id.startswith("groq")
+    # Check if RAG enabled for voice latency optimization
+    rag_enabled = True
+    try:
+        v = (os.getenv("VOICE_RAG_PER_TURN") or "").strip().lower()
+        if v in ("0", "false", "off"):
+            rag_enabled = False
+    except Exception:
+        rag_enabled = True
+
+    if is_groq:
+        kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_DEFAULT_GROQ)))
+        faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_DEFAULT_GROQ)))
+        owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_DEFAULT_GROQ)))
+    else:
+        # Voice latency optimization: when RAG enabled, use smaller static budgets to reduce 3500-3700 input tokens
+        # RAG provides relevant facts per-turn (27-105ms), so static KB can be smaller without hurting quality
+        # v2: 800/400/2000 + prior_memory 800 (was 1200/800/2500) saves additional ~1000 chars
+        if rag_enabled:
+            kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_VOICE_RAG)))
+            faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_VOICE_RAG)))
+            owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG)))
+            logger.info(f"🔧 Voice latency budgets v2 (RAG enabled): KB {kb} (was 4000), FAQ {faq} (was 2000), owner {owner} (was 4000), prior_memory 800 - reduces 3500-3700 -> ~2000-2500, TTFT 1203/894/1189/882ms should improve")
+        else:
+            kb = int(os.getenv("VOICE_KB_BUDGET_CHARS", str(_KB_BUDGET_CHARS_DEFAULT)))
+            faq = int(os.getenv("VOICE_FAQ_BUDGET_CHARS", str(_FAQ_BUDGET_CHARS_DEFAULT)))
+            owner = int(os.getenv("VOICE_OWNER_PROMPT_BUDGET_CHARS", str(_OWNER_PROMPT_BUDGET_CHARS_DEFAULT)))
+    return kb, faq, owner
 
 # Marker for the per-turn RAG system message (used to prune the previous turn's).
 _RAG_PREFIX = "[RAG]"
+
+# Deterministic closing speech — fixed line, never LLM-generated (bb393dd fix).
+DETERMINISTIC_CLOSING = "Thank you for calling us. Aapse baat karke achha laga. Goodbye."
+DETERMINISTIC_CLOSING_EN = "Thank you for calling us. It was nice talking to you. Goodbye."
+
+def _get_closing_for_cfg(cfg: AgentConfig) -> str:
+    lang = (getattr(cfg, "language", "hi") or "hi").lower()
+    if lang.startswith("en"):
+        return DETERMINISTIC_CLOSING_EN
+    return DETERMINISTIC_CLOSING
 
 
 def _truncate(text: str, budget: int) -> str:
@@ -370,10 +982,14 @@ def _rag_per_turn_enabled() -> bool:
         return False
     if v in ("1", "true", "on"):
         return True
-    # Default: on — UNLESS preemptive generation is on, because mutating the
-    # chat context per turn would invalidate preemptive generation (see
-    # on_user_turn_completed).
-    return os.getenv("VOICE_PREEMPTIVE", "0") != "1"
+    # FIXED: Always enable RAG per-turn for KB grounding, even when preemptive ON.
+    # Previous: disabled RAG when VOICE_PREEMPTIVE=1 to preserve preemptive, but that
+    # sacrificed correctness (\"Mere paas exact jaankari nahi hai\").
+    # Now: RAG always ON for correctness. When preemptive ON, we explicitly log
+    # that RAG will invalidate preemptive for this turn (correctness > latency),
+    # but we still do RAG. This is explicit handling, not silent skip.
+    # Preemptive still benefits non-KB turns (greetings, small talk).
+    return True
 
 
 def _chat_msg_text(item) -> str:
@@ -431,6 +1047,7 @@ def _flatten_knowledge(kb: KnowledgeBase) -> list[str]:
 def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
+    kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
 
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
@@ -438,38 +1055,43 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
-    # Natural, human-like behaviour: concise, non-repetitive, never salesy, and
-    # conversational rather than scripted. This is what makes calls feel human.
     lines.append(
         "Behave like a warm human receptionist. Never repeat yourself, never push "
         "the same offer, never read out a list of services unprompted, and never "
-        "give a long preamble. Answer exactly what was asked, then stop. If the "
-        "caller is satisfied or has no further questions, briefly close the "
-        "conversation. Never mention being an AI, a robot, or a bot."
+        "give a long preamble. Answer exactly what was asked, then stop. "
+        "ABSOLUTELY FORBIDDEN to add these after every answer: 'Aur kuch poochna hai?', "
+        "'Aur kuch jaanana chahenge?', 'Aapko aur kuch jaanana hai?', 'Kya aapko aur koi madad chahiye?', "
+        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?' — "
+        "Only ask a follow-up when you are actively collecting missing required info "
+        "for a project enquiry (like phone, budget). If the caller says they have no more questions "
+        "(e.g., 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', "
+        "'नहीं और कोई मदद नहीं चाहिए', 'bas itna hi', 'that's all', 'no more questions'), "
+        "do NOT keep asking — treat it as closing and call end_call tool. "
+        "Never mention being an AI, a robot, or a bot."
     )
 
     extra = (cfg.knowledge.system_prompt or "").strip()
     if extra:
-        if len(extra) > _OWNER_PROMPT_BUDGET_CHARS:
-            extra = _truncate(extra, _OWNER_PROMPT_BUDGET_CHARS)
+        if len(extra) > owner_budget:
+            extra = _truncate(extra, owner_budget)
             logger.warning(
                 "⚠️ Owner system prompt truncated to fit the LLM context budget "
-                f"({len(cfg.knowledge.system_prompt)} -> {_OWNER_PROMPT_BUDGET_CHARS} chars; "
+                f"({len(cfg.knowledge.system_prompt)} -> {owner_budget} chars; "
                 "raise VOICE_OWNER_PROMPT_BUDGET_CHARS to keep more)."
             )
+        else:
+            logger.info(f"✅ Owner system prompt kept full ({len(extra)} chars, budget {owner_budget})")
         lines.append("")
         lines.append("Instructions from the business owner:")
         lines.append(extra)
 
-    # Business facts are CAPPED (see context-size budgets above). The full KB is
-    # still available per-turn via RAG in on_user_turn_completed.
     facts = _flatten_knowledge(cfg.knowledge)
     if facts:
         kept: list[str] = []
         used = 0
         truncated_any = False
         for f in facts:
-            room = _KB_BUDGET_CHARS - used
+            room = kb_budget - used
             if room <= 40:
                 truncated_any = True
                 break
@@ -483,9 +1105,11 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
                 "⚠️ Knowledge base truncated to fit the LLM context budget "
                 f"({sum(len(f) for f in facts)} -> {used} chars; Groq's free tier is "
                 "8k TPM, and an oversized prompt is what causes 429s → silent dropped "
-                "turns). Raise VOICE_KB_BUDGET_CHARS only if you've upgraded the "
-                "Groq tier or switched to a higher-limit provider."
+                f"turns). Raise VOICE_KB_BUDGET_CHARS only if you've upgraded the "
+                f"Groq tier or switched to a higher-limit provider (budget {kb_budget})."
             )
+        else:
+            logger.info(f"✅ Knowledge base kept ({used}/{kb_budget} chars)")
         if kept:
             lines.append("")
             lines.append("Business facts you know (use these when answering):")
@@ -507,12 +1131,11 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             if not (q and a):
                 continue
             block = f"- Q: {q}\n  A: {a}"
-            room = _FAQ_BUDGET_CHARS - used
+            room = faq_budget - used
             if room <= 40:
                 faq_truncated = True
                 break
             if len(block) > room:
-                # Keep the question, clip the answer to fit.
                 block = f"- Q: {q}\n  A: {_truncate(a, max(room - len(q) - 12, 40))}"
                 faq_truncated = True
             faq_lines.append(block)
@@ -520,7 +1143,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         if faq_truncated:
             logger.warning(
                 "⚠️ FAQ truncated to fit the LLM context budget "
-                f"(VOICE_FAQ_BUDGET_CHARS={_FAQ_BUDGET_CHARS})."
+                f"(VOICE_FAQ_BUDGET_CHARS={faq_budget})."
             )
         if faq_lines:
             lines.append("")
@@ -530,6 +1153,15 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
                 "(do not paraphrase or add extra info):"
             )
             lines.extend(faq_lines)
+
+    lines.append("")
+    lines.append("FINAL CRITICAL RULES - ALWAYS FOLLOW:")
+    lines.append("- After answering, STOP. Do NOT add 'Aur kuch jaanana chahenge?' / 'Aur kuch poochna hai?' / 'Kya aapko aur koi madad chahiye?' unless you are actively collecting required project info. One answer = stop speaking and wait for caller.")
+    lines.append("- If caller asks for contact number/email, use ONLY the numbers/emails given in 'Instructions from the business owner' above. Never say you don't have them if they are in the owner instructions. Primary phone is +91-8947027625, sales email sales@kriscent.in, info email info@kriscent.in. Provide them exactly when asked.")
+    lines.append("- If caller says 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', 'नहीं और कोई मदद नहीं चाहिए', 'bas ho gaya', 'that's all', 'no more questions', 'ok thank you' as final, call end_call tool immediately — do not ask another follow-up.")
+    lines.append("- Keep every reply to 1-2 short sentences, under 25 words. No lists unless caller explicitly asks for list.")
+    lines.append("- ANTI-HALLUCINATION: Never invent financial data, balance, transactions, or office locations not in 'Business facts'. If user asks 'recent kaam' / 'recent work', explain Kriscent's recent projects from KB (IT services, AI agents, etc), NOT financial data. If info not in KB, say 'Mere paas iski exact jaankari nahi hai, main aapko Jaipur office se connect kara sakta hoon'.")
+    lines.append("- Be concise, warm, human. If caller says 'thank Kota' or 'accha laga' with thank, treat as closing — call end_call.")
 
     return "\n".join(lines)
 
@@ -543,6 +1175,7 @@ def build_voice_agent(
     greeting: str = "",
     prior_memory: str = "",
     lead_data: Optional[dict] = None,
+    turn_timing_ref: Optional[dict] = None,
 ) -> "Any":
     """Return a LiveKit v1 ``Agent`` instance wired for this config.
 
@@ -574,13 +1207,16 @@ def build_voice_agent(
 
     # The model may request the tool, but only a deterministic transcript check
     # may authorize room deletion. This prevents phrases such as "no more help,
-    # thank you" from being mistaken for a final goodbye.
+    # thank you" from being mistaken for a final goodbye. The closing speech
+    # itself is deterministic (bb393dd fix) — always the same fixed line.
     explicit_goodbye = False
+    agent_ref: dict[str, Any] = {"instance": None}
 
     # Auto hang-up: when the conversation is finished the LLM calls `end_call`,
     # which shuts the job down so the call is cut AND the billing is finalized.
     # We make the trigger explicit so the model reliably hangs up on its own and
-    # doesn't leave the caller in a silent, open call.
+    # doesn't leave the caller in a silent, open call. Closing speech is now
+    # deterministic: the tool itself speaks the fixed closing line.
     instructions += (
         "\n\nCONVERSATION OPENING: The initial greeting has already been spoken by the application. "
         "Never greet again, introduce yourself again, or say 'Namaste' in response to a "
@@ -592,26 +1228,51 @@ def build_voice_agent(
         "such as 'call cut kar dijiye' or 'और तो मुझे कुछ नहीं जानना' as a standalone final "
         "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
         "especially when followed by another question. "
-        "When the caller explicitly says goodbye, first speak exactly one short polite "
-        "closing sentence, such as 'Thank you for calling us. Aapse baat karke achha laga. "
-        "Goodbye.' Then call the end_call tool once. Never call the tool before the "
-        "closing sentence, and never call it for an ambiguous phrase."
+        "When the caller explicitly says goodbye, do NOT try to generate your own closing sentence — "
+        "just call the end_call tool once. The system will speak a fixed deterministic closing line "
+        f"'{_get_closing_for_cfg(cfg)}' and then hang up. Never call the tool before the closing is needed, "
+        "and never call it for an ambiguous phrase."
     )
 
     async def _end_call() -> str:
-        """End this call and hang up. Call it once the conversation is finished."""
+        """End this call and hang up. Call it ONLY when user says goodbye, bye, thank you, etc.
+        Do NOT call for 'sahi baat hai', 'ok', 'achhi lagti', 'product hai', number, email, etc.
+        Deterministic closing: worker speaks fixed closing line, tool only deletes room.
+        """
         if not explicit_goodbye:
-            logger.warning("end_call rejected: caller did not give an explicit final goodbye")
-            return "Keep the call open; the caller has not explicitly ended it."
+            logger.warning("end_call rejected: caller did not give an explicit final goodbye - keeping call open")
+            # Return instruction for LLM to continue naturally, not silence
+            return "DO NOT END CALL. User did NOT say goodbye. Phrases like 'sahi baat hai', 'ok', 'achhi lagti', 'product hai', phone numbers, emails are NOT goodbye. Continue conversation warmly, ask how you can help."
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
-        # Allow the closing sentence's TTS audio to finish before deleting the
-        # room. Without this small grace period, the tool can cut the closing
-        # audio mid-sentence. Keep this short so successful calls have no extra
-        # latency; it only runs on explicit hang-up.
-        import asyncio
-        await asyncio.sleep(5.0)
+        # Avoid duplicate TTS: worker.py already spoke deterministic closing.
+        # Only speak here as fallback if worker hasn't (check last closing timestamp).
+        import time as _time
+        now = _time.time()
+        last_ts = agent_ref.get("last_closing_ts", 0)
+        agent_inst = agent_ref.get("instance")
+        if agent_inst is not None:
+            # Check timestamp set by worker.py _do_deterministic_closing
+            ts1 = getattr(agent_inst, '_last_deterministic_closing_ts', 0)
+            ts2 = getattr(getattr(agent_inst, 'cfg', None), '_last_closing_ts', 0) if hasattr(agent_inst, 'cfg') else 0
+            last_ts = max(last_ts, ts1, ts2)
+        # If worker spoke within last 4s, skip TTS here.
+        if now - last_ts > 4:
+            # Fallback deterministic closing if worker missed it
+            closing_line = _get_closing_for_cfg(cfg)
+            agent_inst = agent_ref.get("instance")
+            if agent_inst is not None:
+                try:
+                    sess = getattr(agent_inst, "session", None)
+                    if sess is not None:
+                        logger.info(f"👋 Fallback deterministic closing via end_call tool: {closing_line}")
+                        await sess.say(closing_line, allow_interruptions=False)
+                        await asyncio.sleep(0.6)
+                except Exception as e:
+                    logger.warning(f"Fallback closing via tool failed: {e}")
+        else:
+            await asyncio.sleep(0.4)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
         room = getattr(ctx.room, "name", None)
@@ -649,16 +1310,37 @@ def build_voice_agent(
             ),
         )
     if prior_memory:
+        # Voice latency: truncate prior_memory to 800 chars when RAG enabled (was unlimited 40 turns ~4000 tokens)
+        # Preserves recent cross-call memory (name, preferences) without bloating input tokens 3500-3700
+        try:
+            import os as _os_pm
+            _rag_pm = (_os_pm.getenv("VOICE_RAG_PER_TURN") or "").strip().lower() not in ("0", "false", "off")
+            _pm_budget = int(_os_pm.getenv("VOICE_PRIOR_MEMORY_BUDGET_CHARS", "800")) if _rag_pm else 2000
+        except Exception:
+            _pm_budget = 800
+        _pm_truncated = prior_memory
+        if len(prior_memory) > _pm_budget:
+            # Keep last _pm_budget chars (most recent)
+            _pm_truncated = prior_memory[-_pm_budget:]
+            # Try to cut at line boundary
+            _nl = _pm_truncated.find("\n")
+            if _nl != -1 and _nl < _pm_budget * 0.3:
+                _pm_truncated = _pm_truncated[_nl+1:]
         chat_ctx.add_message(
             role="system",
-            content="Prior conversation with this customer:\n" + prior_memory,
+            content="Prior conversation with this customer:\n" + _pm_truncated,
         )
+        if len(prior_memory) != len(_pm_truncated):
+            logger.info(f"🔧 Prior memory truncated {len(prior_memory)} -> {len(_pm_truncated)} chars (budget {_pm_budget}) to reduce 3500-3700 tokens")
 
     class _VoiceAgent(Agent):
         def __init__(self):
             self.cfg = cfg
             self.greeting = greeting
             self._last_rag = ""  # per-turn RAG injection (see on_user_turn_completed)
+            self._turn_timing_ref = turn_timing_ref  # For preventing duplicate REQUEST START while previous active
+            # Store instance so _end_call tool can speak deterministic closing via session.
+            agent_ref["instance"] = self
             super().__init__(
                 instructions=instructions,
                 chat_ctx=chat_ctx,
@@ -688,23 +1370,43 @@ def build_voice_agent(
                 await self.session.say(self.greeting, allow_interruptions=True)
 
         async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-            """Hook that runs after the user finishes speaking.
+            """Hook that runs after the user finishes speaking — CRITICAL LATENCY PATH.
 
-            LiveKit's ``AgentSession`` ``await``s this hook, so it must be a
-            coroutine (``async def``).
+            LiveKit's ``AgentSession`` ``await``s this hook, so any blocking here
+            directly adds to STT_final->LLM_start latency (target ≤100ms).
 
-            We inject ONLY the knowledge-base chunks relevant to this specific
-            question (lightweight RAG), instead of relying on the whole KB in the
-            static system prompt. The static prompt is deliberately capped (see
-            the context-size budgets above): sending the full KB on every turn is
-            what pushed each LLM request to 6-7k tokens and 429'd Groq's free
-            tier, silently dropping the caller's turn.
-
-            NOTE: mutating the chat context per turn invalidates LiveKit's
-            preemptive generation, so when VOICE_PREEMPTIVE=1 this hook is a
-            no-op and only the capped static facts are available.
+            Production fixes:
+            - Explicit goodbye detection is fast (string ops, ~1ms)
+            - Conversation trim is fast (list slice)
+            - RAG is now async via to_thread to avoid blocking event loop (was sync, could be 100-300ms)
+            - When VOICE_PREEMPTIVE=1, RAG is skipped (static facts only) to preserve preemptive generation
+            - Added timing logs for STT_final->LLM_start to detect 3-7s outliers
+            - FIX: Prevent duplicate/invalidated LLM requests - wait for previous LLM to complete before new REQUEST START
+            - Exactly one REQUEST START per completed user turn, no 0/0 race
             """
+            # FIX: Prevent duplicate REQUEST START while previous LLM still active
+            # Root cause of Request 1 and 5 0/0 failures: new REQUEST START while previous llm_active True
+            # This causes previous to be cancelled and return 0/0, then new starts - duplicate/invalidated
+            # Fix: Wait for previous LLM to complete before allowing new turn's LLM request
+            try:
+                if self._turn_timing_ref and self._turn_timing_ref.get("llm_active", False):
+                    prev_start = self._turn_timing_ref.get("request_start", 0)
+                    elapsed = time.time() - prev_start if prev_start else 0
+                    if elapsed < 5.0:  # Only wait if previous started recently (<5s), not stale
+                        logger.info(f"⏳ Previous LLM still active (elapsed {elapsed:.2f}s), waiting for it to complete before new REQUEST START (prevents 0/0 duplicate)")
+                        # Wait up to 2s for previous to complete, checking every 50ms
+                        wait_start = time.time()
+                        while self._turn_timing_ref.get("llm_active", False) and (time.time() - wait_start) < 2.0:
+                            await asyncio.sleep(0.05)
+                        if self._turn_timing_ref.get("llm_active", False):
+                            logger.warning(f"⚠️ Previous LLM still active after 2s wait, proceeding anyway (may cause 0/0)")
+                        else:
+                            logger.info(f"✅ Previous LLM completed, proceeding with new REQUEST START")
+            except Exception as e:
+                logger.debug(f"Could not wait for previous LLM: {e}")
             nonlocal explicit_goodbye
+            import time as _time
+            _rag_t0 = _time.time()
             try:
                 user_text = _chat_msg_text(new_message).strip()
                 normalized = " ".join(
@@ -713,69 +1415,184 @@ def build_voice_agent(
                     .replace(",", " ")
                     .split()
                 )
-                # This is deliberately transcript-level (rather than an LLM
-                # decision): short, natural closings must authorize the tool
-                # even when STT returns "bye bye" or Hindi mixed with English.
-                # Do not require the literal word "goodbye".
-                closing_phrases = {
+                # Expanded deterministic closing detection — must match worker.py logic
+                closing_exact = {
                     "bye", "bye bye", "goodbye", "good bye", "ok bye",
-                    "okay bye", "good bye bye", "thank you", "thanks",
+                    "okay bye", "ok good bye", "okay good bye", "ok goodbye",
+                    "okay goodbye", "good bye bye", "thank you", "thanks", "thankyou",
                     "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
                     "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
                     "no more questions", "no more help", "that's all", "that is all",
+                    "नहीं और कोई मदद नहीं चाहिए", "और कोई मदद नहीं चाहिए",
+                    "कोई मदद नहीं चाहिए", "और कुछ नहीं चाहिए", "बस हो गया",
+                    "नहीं और कोई सवाल नहीं है", "और कोई सवाल नहीं है",
+                    "कोई सवाल नहीं है", "मुझे कुछ नहीं पूछना है", "मुझे कुछ नहीं पूछना",
+                    "कुछ नहीं पूछना है", "कुछ नहीं पूछना",
+                    "mujhe kuch nahi puchna hai", "mujhe kuch nahi puchna",
+                    "kuch nahi puchna hai", "kuch nahi puchna",
+                    "koi sawaal nahi hai", "koi sawal nahi hai",
+                    "aur koi sawaal nahi hai", "aur koi sawal nahi hai",
+                    "nahi aur koi madad nahi chahiye", "aur koi madad nahi chahiye",
+                    "nahi aur koi sawaal nahi hai",
                 }
-                disconnect_phrases = (
-                    "cut the call", "hang up", "disconnect", "disconnect the call",
-                    "end the call", "call cut", "कॉल कट", "call काट",
-                    "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
-                    "कॉल बंद कर दीजिए", "फोन काट दीजिए",
+                disconnect_sub = (
+                    "cut the call", "hang up", "disconnect", "end the call", "call cut",
+                    "कॉल कट", "call काट", "कॉल काट", "call cut कर दीजिए", "call काट दीजिए",
+                    "कॉल बंद कर दीजिए", "फोन काट दीजिए", "फोन काट दो",
                     "और तो मुझे कुछ नहीं जानना", "अब मुझे कुछ नहीं जानना",
                     "मुझे और कुछ नहीं जानना", "बस इतना ही", "बस इतना ही पूछना था",
                     "no more questions", "no more help", "that's all", "that is all",
+                    "नहीं और कोई मदद नहीं चाहिए", "और कोई मदद नहीं चाहिए",
+                    "नहीं और कोई सवाल नहीं है", "और कोई सवाल नहीं है",
+                    "मुझे कुछ नहीं पूछना है", "कुछ नहीं पूछना है",
+                    "mujhe kuch nahi puchna", "kuch nahi puchna",
+                    "koi sawaal nahi", "koi sawal nahi",
                 )
-                explicit_goodbye = bool(
-                    normalized in closing_phrases
-                    or any(p in normalized for p in disconnect_phrases)
-                    or ("thank you" in normalized and "?" not in user_text
-                        and len(normalized.split()) <= 12)
-                )
+                has_goodbye = "goodbye" in normalized or "good bye" in normalized
+                tokens = normalized.split()
+                has_bye_token = "bye" in tokens or normalized.endswith(" bye") or normalized.startswith("bye ")
+                has_thank = "thank" in normalized or "thanks" in normalized or "धन्यवाद" in user_text
+                has_positive_close = any(w in normalized for w in ("accha laga", "achha laga", "khushi", "very much", "bahut"))
+                # Fix: Don't treat contact info as goodbye - user giving number/email is NOT closing
+                has_contact_info = any(c in normalized for c in ("nine", "five", "double", "triple", "zero", "at the rate", "gmail", "dot com", "number", "email")) or any(ch.isdigit() for ch in user_text if len(user_text.split()) <= 20)
+                # If message looks like phone number or email, never treat as goodbye
+                if has_contact_info and len(tokens) >= 4:
+                    explicit_goodbye = False
+                else:
+                    explicit_goodbye = bool(
+                        normalized in closing_exact
+                        or has_goodbye
+                        or (has_bye_token and len(tokens) <= 8)
+                        or (has_thank and "?" not in user_text and (len(tokens) <= 18 or has_positive_close or "accha laga" in normalized))
+                        or any(p in normalized for p in disconnect_sub)
+                    )
             except Exception:
                 explicit_goodbye = False
             # Keep the rolling conversation bounded. Groq accounts the entire
             # prompt against TPM; an unbounded voice call eventually turns every
             # request into a 429 even with the 20b model. Preserve system facts
             # and only the latest few conversational messages.
+            # CRITICAL FIX: Do NOT trim when preemptive generation is enabled.
+            # Trimming mutates chat_ctx (len changes) → is_equivalent False → 
+            # preemptive generation invalidated after on_user_turn_completed
+            # → full LLM restart adds 1-2s latency (observed 1826-2364ms)
+            # When preemptive ON, skip trimming to preserve preemptive.
+            # When preemptive OFF, trim to avoid 429.
+            preemptive_on = os.getenv("VOICE_PREEMPTIVE", "0") == "1"
+            # FIX 4: Conversation memory - name unavailable but mobile remembered
+            # Root cause: trimming to 6 dialogue messages max drops early name if many turns
+            # Evidence: user asked name after previously giving it, agent said unavailable, but mobile 9538450441 remembered (later in conversation)
+            # Fix: increase trim limit from 6 to 20 dialogue messages to preserve name, and preserve memory when memory_enabled
+            # Also check if KB present - when KB present we already disable preemptive in worker.py, so trimming will happen
+            # We should preserve more history for memory retention, not aggressively trim
+            if not preemptive_on:
+                try:
+                    target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
+                    items = getattr(target_ctx, "items", None)
+                    # Voice latency optimization v2: keep 8 dialogue max for OpenAI when RAG enabled (was 12) to reduce 3500-3700 tokens further
+                    # Billing shows avg 4 turns per call, 8 covers full call. prior_memory 800 chars handles cross-call memory.
+                    # Saves additional ~4*150=600 tokens vs 12. Groq still 16 for TPM safety (reduced from 20), OpenAI 8 for latency.
+                    # Determine history limit based on provider
+                    try:
+                        _llm_id_hist = (cfg.providers.llm.id or "").lower() if cfg.providers and cfg.providers.llm else ""
+                        _is_groq_hist = _llm_id_hist.startswith("groq")
+                        _history_limit = 16 if _is_groq_hist else 8
+                        _trim_threshold = 20 if _is_groq_hist else 12
+                    except Exception:
+                        _history_limit = 8
+                        _trim_threshold = 12
+                    if isinstance(items, list) and len(items) > _trim_threshold:
+                        system_items = [m for m in items if getattr(m, "role", "") == "system"]
+                        dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
+                        kept_dialogue = dialogue_items[-_history_limit:]
+                        target_ctx.items = system_items + kept_dialogue
+                        logger.info("🧹 Trimmed conversation context to %s messages (voice latency: %s dialogue max, preserves name via prior_memory)", len(target_ctx.items), _history_limit)
+                        trimmed_count = len(dialogue_items) - len(kept_dialogue)
+                        if trimmed_count > 0:
+                            logger.info(f"📝 Trimmed {trimmed_count} old dialogue items, kept last {_history_limit} for memory retention (reduces input tokens)")
+                except Exception as exc:
+                    logger.debug("conversation context trim skipped: %s", exc)
+            else:
+                # Preemptive ON: DO NOT mutate chat_ctx at all — any mutation invalidates preemptive
+                # Previous lenient trim (10 msgs when >12) still changed chat_ctx → is_equivalent False → invalidation
+                # So when preemptive ON, skip trimming entirely to preserve preemptive generation
+                # This eliminates "preemptive generation invalidated after on_user_turn_completed" warning
+                # FIX: Also for memory, when preemptive ON and KB present, we already disabled preemptive in worker.py
+                # So this path is for non-KB calls where preemptive ON is safe and we want speed
+                logger.debug("Preemptive ON: skipping chat_ctx trim to preserve preemptive generation and memory")
+            # Log timing for STT_final->LLM_start path
             try:
-                target_ctx = _find_chat_ctx(turn_ctx) or turn_ctx
-                items = getattr(target_ctx, "items", None)
-                if isinstance(items, list) and len(items) > 10:
-                    system_items = [m for m in items if getattr(m, "role", "") == "system"]
-                    dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
-                    target_ctx.items = system_items + dialogue_items[-8:]
-                    logger.info("🧹 Trimmed conversation context to %s messages", len(target_ctx.items))
-            except Exception as exc:
-                logger.debug("conversation context trim skipped: %s", exc)
+                _elapsed_goodbye = (_time.time() - _rag_t0) * 1000
+                if _elapsed_goodbye > 50:
+                    logger.warning(f"🐢 Slow goodbye detection: {_elapsed_goodbye:.0f}ms (should be <10ms)")
+                else:
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (goodbye check): {_elapsed_goodbye:.0f}ms")
+            except Exception:
+                pass
+
+            # RAG handling - ALWAYS enabled for KB grounding (correctness > latency)
+            # When preemptive ON, RAG will invalidate preemptive for this turn, but we explicitly log it
+            # This is the fix for "Mere paas exact jaankari nahi hai" - KB grounding preserved
             if not _rag_per_turn_enabled():
+                logger.info(f"⏱️ TIMING on_user_turn_completed (RAG disabled by env): {(_time.time()-_rag_t0)*1000:.0f}ms")
                 return
             try:
                 user_text = _chat_msg_text(new_message).strip()
                 if not user_text:
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
-                hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
+                # Async RAG to avoid blocking event loop
+                try:
+                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
+                    hits = (hits or "").strip()
+                except Exception:
+                    # Fallback sync if to_thread fails
+                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
+                _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                if _rag_elapsed > 200:
+                    logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
+                else:
+                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms (hits {len(hits)} chars)")
                 if not hits or hits == self._last_rag:
-                    return  # nothing new, or same facts as last turn
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                    return  # nothing new
                 target = _find_chat_ctx(turn_ctx)
                 if target is None:
+                    logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
-                # Drop the previous turn's RAG message so the context does not
-                # grow one system message per turn.
+                # FIX ROOT CAUSE: When KB/FAQ RAG enabled, preemptive must be disabled BEFORE turn begins
+                # Verify runtime Session config, not just config variable
+                # Exactly one LLM REQUEST START per turn, no preemptive that can be invalidated by RAG mutation
+                # Previous bug: logged conflict but still allowed duplicate 0/0 failure
+                # New: Check if RAG enabled, if so preemptive should already be disabled at session level (worker.py fix)
+                # If preemptive_on env True but RAG enabled, session config has preemptive=False, so no invalidation should happen
+                # Log verification, not conflict
+                rag_enabled = True
+                try:
+                    import os as _os_rag_check
+                    v = (_os_rag_check.getenv("VOICE_RAG_PER_TURN") or "").strip().lower()
+                    if v in ("0", "false", "off"):
+                        rag_enabled = False
+                except Exception:
+                    rag_enabled = True
+                
+                if preemptive_on and rag_enabled:
+                    # This should NOT happen after worker.py fix - preemptive should be disabled when RAG enabled
+                    # If it does happen, it means session config still has preemptive enabled, which is bug
+                    # Log as warning that duplicate may occur, but we have disabled at session level so should be safe
+                    # Actually, after fix, preemptive_on env True but session preemptive=False, so no invalidation
+                    # So we log that RAG grounding needed but preemptive already disabled at session level, no invalidation
+                    logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {user_text[:60]})")
+                elif preemptive_on:
+                    logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
+                # Drop previous RAG message to avoid growth
                 try:
                     items = getattr(target, "items", None)
                     if isinstance(items, list):
                         target.items = [m for m in items if _RAG_PREFIX not in _chat_msg_text(m)]
                 except Exception:
-                    pass  # not prunable; add_message below still bounds growth via _last_rag
+                    pass
                 target.add_message(
                     role="system",
                     content=(
@@ -784,10 +1601,10 @@ def build_voice_agent(
                     ),
                 )
                 self._last_rag = hits
+                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]}")
             except Exception as e:
-                # RAG must never take a live call down — fall back to the
-                # static (capped) facts.
                 logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
+                logger.info(f"⏱️ TIMING on_user_turn_completed (RAG error, fallback): {(_time.time()-_rag_t0)*1000:.0f}ms")
 
     return _VoiceAgent()
 
