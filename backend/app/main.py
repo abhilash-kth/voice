@@ -159,10 +159,14 @@ async def get_catalog():
 
 @app.get("/api/llm/providers")
 async def list_llm_providers():
-    from .llm_catalog import LLM_PROVIDERS, LLM_MODELS
+    from .llm_catalog import list_models_for_provider, list_providers, LLM_PROVIDERS
+    # Deprecated providers (openrouter) are excluded from the picker but returned
+    # under legacy_providers so an agent already using one still renders.
+    provs = list_providers()
     return {
-        "providers": list(LLM_PROVIDERS.values()),
-        "by_provider": {pid: [m for m in LLM_MODELS if m["provider"] == pid] for pid in LLM_PROVIDERS},
+        "providers": provs,
+        "legacy_providers": [p for p in LLM_PROVIDERS.values() if p.get("deprecated")],
+        "by_provider": {p["id"]: list_models_for_provider(p["id"]) for p in provs},
     }
 
 @app.get("/api/llm/providers/{provider_id}/models")

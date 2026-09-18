@@ -57,6 +57,8 @@ model Agent {
   description       String  @default("")
   greeting          String  @default("")
   language          String  @default("hi")
+  // female | male | neutral — selects the spoken voice (Google Chirp3 / Sarvam speaker)
+  gender            String  @default("female")
   voicePersonality  String  @default("friendly")
   clientRatePerMin  Float   @default(2.5)
   memoryEnabled     Boolean @default(true)
