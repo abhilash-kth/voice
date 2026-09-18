@@ -431,13 +431,19 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         # Verify: LiveKit plugin 1.8.2+ supports reasoning_effort via _opts.reasoning_effort -> extra["reasoning_effort"]
         # Chat API: extra["reasoning_effort"] = low, Responses API: same
         # For prompt caching, set prompt_cache_key to stable value to enable cached_input_tokens
-        # This can reduce TTFT by reusing cached system prompt prefix
-        try:
-            # Use model_id as cache key for stable prefix caching
-            llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-            logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
-        except Exception:
-            pass
+        # This can reduce TTFT by reusing cached system prompt prefix.
+        # NOTE: prompt_cache_key is an OPENAI-ONLY extension. Groq's OpenAI-compat
+        # endpoint hard-rejects it with 400 "property 'prompt_cache_key' is
+        # unsupported" on EVERY request (2026-09-19: gpt-oss-20b + qwen3.6-27b both
+        # 400'd all turns -> FallbackAdapter exhausted -> 6s watchdog apology).
+        # Only send it to api.openai.com.
+        if provider_type == "openai":
+            try:
+                # Use model_id as cache key for stable prefix caching
+                llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
+                logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
+            except Exception:
+                pass
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
         llm_kwargs["reasoning_effort"] = reasoning
 
