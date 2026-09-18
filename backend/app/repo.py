@@ -406,12 +406,33 @@ async def deduct(user_id: str, amount: float, note: str = "") -> dict:
     u = await db.user.find_unique(where={"id": user_id})
     if not u:
         raise ValueError("user not found")
+    # Idempotency: if a spend transaction for this exact call already exists, skip
+    if note:
+        try:
+            existing = await db.transaction.find_first(
+                where={"userId": user_id, "kind": "spend", "note": note}
+            )
+            if existing:
+                return await get_wallet(user_id)
+        except Exception:
+            pass
     new_balance = round(max((u.walletBalance or 0) - amount, 0.0), 2)
     await db.user.update(where={"id": user_id}, data={"walletBalance": new_balance})
     await db.transaction.create(
         data={"userId": user_id, "kind": "spend", "amount": -amount, "note": note, "ts": _ts()}
     )
     return await get_wallet(user_id)
+
+
+async def has_spend_for_call(user_id: str, call_id: str) -> bool:
+    db = get_prisma()
+    try:
+        existing = await db.transaction.find_first(
+            where={"userId": user_id, "kind": "spend", "note": {"contains": call_id}}
+        )
+        return existing is not None
+    except Exception:
+        return False
 
 
 async def get_usage(user_id: str, agent_id: Optional[str] = None) -> dict:

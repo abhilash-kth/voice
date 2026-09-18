@@ -62,6 +62,29 @@ export interface Catalog {
   };
   walletTopupAmounts: number[];
   server_cost_per_min?: number;
+  llm_providers?: { id: string; display_name: string; base_url: string; tier: string }[];
+  llm_models?: {
+    provider: string;
+    model_id: string;
+    display_name: string;
+    base_url: string;
+    input_price_per_1m: number;
+    cached_input_price_per_1m: number;
+    output_price_per_1m: number;
+    context_window: number;
+    max_output_tokens: number;
+    reasoning_supported: boolean;
+    reasoning_default: string;
+    streaming_supported: boolean;
+    tool_calling_supported: boolean;
+    structured_output_supported: boolean;
+    expected_speed: string;
+    status: string;
+    capabilities: string[];
+    notes: string;
+  }[];
+  llm_by_provider?: Record<string, any[]>;
+  llm_catalog?: any;
 }
 
 export interface Agent {
