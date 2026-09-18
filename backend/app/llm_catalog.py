@@ -423,7 +423,9 @@ LLM_MODELS: List[Dict[str, Any]] = [
         "expected_speed": "very_fast",
         "status": "active", "free_tier": True,
         "capabilities": ["chat", "safety"],
-        "notes": "Free on Groq. JoB guardrail model (content checks stay local); also solid as a general chat LLM with tools.", "tier": "free",
+        "notes": "SAFETY-CLASSIFIER, not a chat model: fine-tuned for content moderation, replies are erratic as a receptionist and it tried to end_call on 'Ok.'. Use openai/gpt-oss-20b instead (same speed/price). Retired from pickers 2026-09-19.",
+        "tier": "free",
+        "status": "deprecated",
     },
     # -------------------- Groq provider models (current, post-Jun-2026 deprecations) --------------------
     # llama-3.1-8b-instant + llama-3.3-70b-versatile retired 2026-08-16
