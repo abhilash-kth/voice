@@ -222,11 +222,15 @@ def build_tts(cfg: AgentConfig) -> Any:
         # Wavenet/Standard/Neural2 voice is remapped to Chirp 3 HD automatically.
         language = overrides.get("language", "hi-IN")
         voice = _resolve_tts_voice(language, overrides.get("voice"))
-        return TTS(
+        # The Google plugin's async gRPC client is lazy.  Keep this constructor
+        # client-free and guard the first streaming call so the client/channel is
+        # created on the LiveKit AgentSession loop, never in worker prewarm.
+        from .runtime import guard_google_tts
+        return guard_google_tts(TTS(
             voice_name=voice,
             language=language,
             credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
-        )
+        ))
 
     if sel.id.startswith("elevenlabs"):
         from livekit.plugins.elevenlabs import TTS
@@ -673,7 +677,14 @@ def build_voice_agent(
                 if not user_text:
                     return
                 from .. import rag  # local import: keep this module light
-                hits = (rag.build_context(cfg.knowledge, user_text, top_k=3) or "").strip()
+                # RAG rebuilds the index and scores the full KB synchronously.
+                # Running it inline blocks the LiveKit agent loop between turn
+                # detection and the actual LLM chat call (the ~986ms outlier).
+                # Offload only this CPU/text work; prompt contents and provider
+                # selection remain unchanged.
+                hits = (await asyncio.to_thread(
+                    rag.build_context, cfg.knowledge, user_text, top_k=3
+                ) or "").strip()
                 if not hits or hits == self._last_rag:
                     return  # nothing new, or same facts as last turn
                 target = _find_chat_ctx(turn_ctx)
