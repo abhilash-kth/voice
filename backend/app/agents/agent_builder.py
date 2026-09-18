@@ -755,8 +755,11 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # speech segment, flushing vad" and cut users off mid-sentence.
     _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300"))
     # utterance_end is the fallback final when endpointing never fires (long
-    # pause): 1000ms added a full second of dead air on slow speakers.
-    _dg_utterance_end_default = int(os.getenv("VOICE_STT_UTTERANCE_END_MS", "800"))
+    # pause): 1000ms added a full second of dead air on slow speakers — but
+    # Deepgram REJECTS utterance_end_ms below 1000 (WS handshake returns 400
+    # "Invalid response status", _stt_pump dies, the agent hears NOTHING — the
+    # user speaks, no reply, the no-response watchdog ends the call). Floor it.
+    _dg_utterance_end_default = max(1000, int(os.getenv("VOICE_STT_UTTERANCE_END_MS", "1000")))
     if "endpointing_ms" in overrides or "endpointing" in overrides:
         ep_val = overrides.get("endpointing_ms", overrides.get("endpointing", _dg_endpointing_default))
         try:
@@ -879,12 +882,25 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         # Gender selects the speaker unless one was chosen explicitly.
         gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
         model = overrides.get("model", "bulbul:v3")
-        default_speakers = (
-            {"female": "priya", "male": "shubh", "neutral": "priya"}
-            if model == "bulbul:v3"
-            else {"female": "anushka", "male": "abhilash", "neutral": "anushka"}
-        )
+        # Sarvam retired bulbul:v2 SERVER-SIDE (every request now errors with
+        # "400: Model 'bulbul:v2' has been deprecated. Please use 'bulbul:v3'
+        # instead."). Saved v2 configs must keep speaking — upgrade loudly and
+        # remap v2-only speakers to their closest bulbul:v3 counterparts.
+        if model == "bulbul:v2":
+            logger.warning(
+                "⚠️ Sarvam bulbul:v2 is RETIRED server-side (API returns 400 'deprecated'). "
+                "Upgrading this agent's TTS to bulbul:v3 with the closest v3 speaker. "
+                "Open the agent and pick 'Sarvam Bulbul v3' to silence this warning."
+            )
+            model = "bulbul:v3"
+        _v2_to_v3_speaker = {
+            "anushka": "priya", "vidya": "kavya", "manisha": "ritu",
+            "abhilash": "shubh", "hitesh": "ratan", "karun": "aditya", "arya": "rohan",
+        }
+        default_speakers = {"female": "priya", "male": "shubh", "neutral": "priya"}
         speaker = overrides.get("voice") or overrides.get("speaker") or default_speakers.get(gender, "priya")
+        if speaker and speaker.lower() in _v2_to_v3_speaker:
+            speaker = _v2_to_v3_speaker[speaker.lower()]
         kwargs = dict(
             model=model,
             target_language_code=target_language,
