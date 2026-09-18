@@ -81,6 +81,35 @@ successor to the removed `VoicePipelineAgent`). Then:
 - On disconnect `finalize_billing()` computes the cost breakdown, writes the call
   record (transcript, usage, cost, recording_url), and POSTs to `/api/billing/log`.
 
+### Event-loop rules for startup warm-up
+
+The worker aggressively pre-warms startup work (SSL context, VAD model, Google
+credentials, hyphenator, provider SDK imports) because a 150-400ms synchronous
+block on the agent loop delays audio and turn handling. Only **loop-independent**
+work may be moved off that loop:
+
+| Safe off-loop (thread) | Must stay on the agent loop |
+| --- | --- |
+| `ssl.create_default_context()` (cached, patched into httpx/livekit) | `texttospeech.TextToSpeechAsyncClient` (`_ensure_client()`) |
+| service-account JSON + RSA parse (`loop_safety.warm_google_credentials`) | any `grpc.aio` channel / async provider client |
+| silero VAD load, tokenizer/hyphenator warm, module imports | `prisma.connect()` (`app/db.py`) |
+| `build_stt/build_llm/build_tts` (constructors are lazy) | `AgentSession.start()` |
+
+An async gRPC channel keeps a reference to the loop that was running when it was
+constructed. Building one inside `asyncio.new_event_loop()` on a worker thread
+and then closing that loop leaves a client that fails every later call with
+`RuntimeError: Event loop is closed` (`grpc/aio/_call.py` → `loop.create_task`),
+which shows up as an agent that joins the room, transcribes fine, and never
+speaks. The same mistake with Prisma binds the process-wide engine/httpx pool to
+a dead loop, so the first query hangs until its timeout.
+
+`app/agents/loop_safety.py` holds the helpers that enforce this:
+`warm_google_credentials()` (blocking half only, cached per key-file + scope),
+`guard_tts_client_loop()` (drops a cached TTS client bound to a closed/foreign
+loop so the plugin rebuilds it on the right one), and `warm_tts_off_loop()` which
+does both. `app/db.py` tracks the loop it connected on and reconnects if asked
+from a different one. `backend/tests/` covers both.
+
 ## 5. Storage (Prisma)
 
 `backend/schema.prisma` is the schema source of truth; the generated client
