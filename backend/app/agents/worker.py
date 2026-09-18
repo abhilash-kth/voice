@@ -739,11 +739,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
 
     class TimingStreamWrapper:
         """Wraps LLMStream to measure first_token TTFT and generation_complete."""
-        def __init__(self, inner_stream, timing, prov_info, req_start):
+        def __init__(self, inner_stream, timing, prov_info, req_start, req_seq=0):
             self._inner_stream = inner_stream
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
+            self._req_seq = req_seq
+            self._cancelled = False
+            self._closed_early = False
             self._first_token = True
             self._input_tokens = 0
             self._output_tokens = 0
@@ -780,6 +783,16 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     except Exception:
                         pass
                     yield chunk
+            except _asyncio.CancelledError:
+                # Clean interruption: the framework cancelled this generation
+                # for a newer turn (revised final), a hangup, or session end.
+                # NOT a failure — mark it and re-raise (never swallow cancels).
+                self._cancelled = True
+                raise
+            except GeneratorExit:
+                # Consumer abandoned iteration early (superseded turn).
+                self._closed_early = True
+                raise
             except Exception as e:
                 # FIX: Log actual exception for 0/0 failures to diagnose root cause
                 # Previous 0/0 failures (Request 1 and 5) had no error logged, making root cause invisible
@@ -788,14 +801,22 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 raise
             finally:
                 gen_complete = _time.time()
-                self._timing["generation_complete"] = gen_complete
-                self._timing["llm_complete"] = gen_complete
+                # SUPERSEDE CHECK (interim-race fix): every chat() takes a
+                # monotonic request_seq. If a newer REQUEST START has taken over
+                # (seq mismatch), or this stream was cancelled/closed early by
+                # the framework, this request is a throwaway — it must NOT touch
+                # the shared current-turn fields (owned by the newer request).
+                _is_current = (self._timing.get("request_seq", 0) == self._req_seq)
+                _interrupted = self._cancelled or self._closed_early or not _is_current
                 gen_time = (gen_complete - self._req_start) * 1000
-                self._timing["generation_time_ms"] = gen_time
-                self._timing["input_tokens"] = self._input_tokens
-                self._timing["output_tokens"] = self._output_tokens
-                self._timing["cached_input_tokens"] = self._cached_tokens
-                self._timing["llm_active"] = False
+                if not _interrupted:
+                    self._timing["generation_complete"] = gen_complete
+                    self._timing["llm_complete"] = gen_complete
+                    self._timing["generation_time_ms"] = gen_time
+                    self._timing["input_tokens"] = self._input_tokens
+                    self._timing["output_tokens"] = self._output_tokens
+                    self._timing["cached_input_tokens"] = self._cached_tokens
+                    self._timing["llm_active"] = False
                 prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                 model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
                 # FIX: Separate deterministic closing (intentional 0/0) from genuine empty LLM turns
@@ -804,6 +825,11 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 is_deterministic_closing = is_closing and self._input_tokens == 0 and self._output_tokens == 0
                 # Only consider successful if output>0 or assistant_output_received, and not closing
                 is_success = (self._output_tokens > 0 or self._timing.get("assistant_output_received", False)) and not is_deterministic_closing
+                if _interrupted:
+                    # Throwaway request (cancelled/superseded): never a success
+                    # (its partial tokens belong to a dead turn) and never a
+                    # failure either — handled by the superseded branch below.
+                    is_success = False
                 if is_success:
                     # Update last_successful_metrics for billing preservation
                     try:
@@ -830,6 +856,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     "cached": self._cached_tokens,
                     "output": self._output_tokens,
                     "success": is_success,
+                    "superseded": _interrupted,
                     "ttft": self._timing.get("ttft_ms", 0),
                     "gen_time": gen_time,
                     "provider": prov,
@@ -837,8 +864,22 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     "is_closing": is_deterministic_closing,
                 }
                 self._timing["all_requests"].append(request_record)
-                
-                if is_success:
+
+                if _interrupted:
+                    if _is_current:
+                        # Turn died with no successor (hangup/session end) —
+                        # release llm_active so watchdogs don't strand. When a
+                        # newer request owns the turn, its llm_active=True is
+                        # left untouched.
+                        self._timing["llm_active"] = False
+                    _logger.info(
+                        f"↩️ LLM request superseded (interrupted, not failed): "
+                        f"input={self._input_tokens} output={self._output_tokens} "
+                        f"cancelled={self._cancelled} closed_early={self._closed_early} "
+                        f"current={_is_current} (failed count stays "
+                        f"{self._timing['failed_requests']})"
+                    )
+                elif is_success:
                     self._timing["aggregated_input"] += self._input_tokens
                     self._timing["aggregated_output"] += self._output_tokens
                     self._timing["aggregated_cached"] += self._cached_tokens
@@ -850,7 +891,10 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     self._timing["failed_requests"] += 1
                     _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
                 
-                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
+                if _interrupted:
+                    _logger.info(f"↩️ LLM SUPERSEDED (no billing impact) provider={prov} model={model} gen_time={gen_time:.0f}ms input={self._input_tokens} output={self._output_tokens} active={self._timing.get('llm_active', False)}")
+                else:
+                    _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
                     from app.llm_catalog import get_llm_model, calculate_llm_cost
                     model_meta = get_llm_model(prov, model) if prov and model else None
@@ -876,11 +920,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
 
     class TimingChatCM:
         """Async context manager that wraps inner LLM chat CM and returns TimingStreamWrapper."""
-        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start):
+        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start, req_seq=0):
             self._inner_orig = inner_cm_or_coro
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
+            self._req_seq = req_seq
             self._inner_cm = None
             self._inner_stream = None
 
@@ -896,7 +941,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             else:
                 stream = inner
             self._inner_stream = stream
-            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start)
+            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start, self._req_seq)
 
         async def __aexit__(self, exc_type, exc, tb):
             try:
@@ -927,19 +972,27 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
         def chat(self, *args, **kwargs):
             # This is the critical fix: chat is SYNC, returns async CM, not coroutine
             # So `async with llm.chat(...) as stream` works
-            # FIX: Prevent duplicate/invalidated LLM requests - exactly one REQUEST START per completed user turn
-            # Previous bug: Request 1 and 5 had input=0 output=0 success=False even though preemptive disabled
-            # Root cause: New REQUEST START while previous llm_active True, causing previous to be cancelled and return 0/0
-            # Fix: Check if previous LLM still active, if so log and ensure previous not counted as failed duplicate
+            # RACE FIX: every REQUEST START takes a monotonic request_seq. A stream
+            # whose seq no longer matches timing["request_seq"] when it ends was
+            # superseded by a newer turn (the framework interrupted it) — its
+            # finally records it as superseded (not failed) and leaves the shared
+            # current-turn fields to the newer request. (LiveKit commits the LLM
+            # only on endpointed/final turns — interim transcripts can never reach
+            # chat(). A second REQUEST START here means a revised final committed
+            # a new turn and the previous generation is being cancelled.)
             if self._timing.get("llm_active", False):
                 prev_start = self._timing.get("request_start", 0)
                 elapsed = _time.time() - prev_start if prev_start else 0
-                _logger.warning(f"⚠️ LLM REQUEST START while previous still active (elapsed {elapsed:.2f}s) - previous will be cancelled and return 0/0, this is duplicate/invalidated request. Ensuring exactly one valid per turn by marking previous as invalidated, not failed.")
-                # Mark previous as invalidated, not failed, to prevent duplicate counting
-                # Don't increment failed_requests for superseded preemptive/invalidated
-                # The new request will be the valid one for this turn
-            
+                _logger.warning(
+                    f"⚠️ LLM REQUEST START while previous still active (elapsed {elapsed:.2f}s) — "
+                    f"a revised final committed a new turn; the previous generation is being "
+                    f"interrupted and will be recorded as SUPERSEDED (not failed). This request "
+                    f"carries the settled transcript."
+                )
+
             request_start = _time.time()
+            self._timing["request_seq"] = self._timing.get("request_seq", 0) + 1
+            request_seq = self._timing["request_seq"]
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
             self._timing["llm_active"] = True
@@ -978,7 +1031,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             try:
                 inner_result = self._inner.chat(*args, **kwargs)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
-                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start)
+                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start, request_seq)
             except Exception as e:
                 error_time = _time.time()
                 prov = self._prov_info.get('provider', '') or 'unknown'
@@ -1123,7 +1176,14 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         except Exception as e:
             logger.warning(f"Could not apply TTS timing wrapper: {e}")
 
-    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.20"))
+    # Endpointing floor 0.35s (was 0.20): wait for the SETTLED final before the
+    # LLM fires. Natural Hindi mid-utterance pauses run 0.3-0.5s and Deepgram
+    # needs ~200ms to emit/ revise a final — a 0.20 floor commits on the first
+    # premature final, then a revised final commits a second turn 300-400ms
+    # later and the first LLM request is thrown away. 0.35 absorbs the pause +
+    # the revision so each utterance commits once (still faster than LiveKit's
+    # 0.5 default). Env-overridable via VOICE_ENDPOINTING_MIN/MAX.
+    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.35"))
     max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.55"))
     turn_detection_mode = os.getenv("VOICE_TURN_DETECTION", "stt").strip().lower()
     if turn_detection_mode not in ("vad", "stt", "realtime_llm", "manual"):
@@ -2388,7 +2448,7 @@ async def entrypoint(ctx):
                     llm_cached = aggregated_cached
                     logger.info(f"💰 FINAL BILLING using AGGREGATED successful usage: {successful_count} successful, {failed_count} failed/invalidated, input={llm_input} cached={llm_cached} output={llm_output} total_cost=${total_llm_cost:.6f} (from {len(all_reqs)} total requests)")
                     for i, req in enumerate(all_reqs):
-                        logger.info(f"  Request {i+1}: input={req['input']} cached={req['cached']} output={req['output']} success={req['success']} is_closing={req.get('is_closing',False)} TTFT={req['ttft']:.0f}ms gen={req['gen_time']:.0f}ms {req['provider']}:{req['model']}")
+                        logger.info(f"  Request {i+1}: input={req['input']} cached={req['cached']} output={req['output']} success={req['success']} superseded={req.get('superseded',False)} is_closing={req.get('is_closing',False)} TTFT={req['ttft']:.0f}ms gen={req['gen_time']:.0f}ms {req['provider']}:{req['model']}")
                     logger.info(f"📊 FINAL AGGREGATED BILLING successful_requests={successful_count} failed_requests={failed_count} total_input_tokens={aggregated_input} total_cached_tokens={aggregated_cached} total_output_tokens={aggregated_output} total_llm_cost=${total_llm_cost:.6f}")
                 else:
                     # Fallback to last if no aggregated

@@ -73,6 +73,63 @@ def _resolve_tts_voice(language: str, raw_voice: Optional[str]) -> str:
 # Provider → plugin construction
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Voice reasoning policy.
+#
+# Reasoning tokens add 1.5-2.0s of hidden TTFT before token 1, so real-time
+# voice defaults to the LOWEST effort each model family accepts — unless the
+# customer explicitly set `reasoning_effort` in the model's config, which is
+# always honored (validated against the family's accepted values; a value the
+# provider would 400 falls back to the voice default with a loud warning).
+#
+# Family support (OpenAI docs + Groq docs + livekit-plugins-openai 1.8.2):
+#   qwen3          none | default            (Groq accepts ONLY these two)
+#   gpt-oss        low | medium | high       (always-on reasoning, no none)
+#   o-series       low | medium | high       (no none/minimal)
+#   gpt-5.0        minimal | low | medium | high
+#   gpt-5.1+       none | low | medium | high | xhigh   ("none" is also the
+#                  recommended chat+tools setting — it fixes the 400 the chat
+#                  API returns for reasoning+tools combos on these models)
+# ---------------------------------------------------------------------------
+_REASONING_ACCEPTED = {
+    "qwen3": ("none", "default"),
+    "gpt-oss": ("low", "medium", "high"),
+    "o-series": ("low", "medium", "high"),
+    "gpt-5.0": ("minimal", "low", "medium", "high"),
+    "gpt-5.1+": ("none", "low", "medium", "high", "xhigh"),
+    "other": ("none", "minimal", "low", "medium", "high", "default"),
+}
+_REASONING_VOICE_DEFAULT = {
+    "qwen3": "none",
+    "gpt-oss": "low",
+    "o-series": "low",
+    "gpt-5.0": "low",
+    "gpt-5.1+": "none",
+    "other": "low",
+}
+
+
+def _reasoning_family(model_id: str) -> str:
+    """Map a model id to its reasoning family (see _REASONING_ACCEPTED)."""
+    low = (model_id or "").lower()
+    if "qwen" in low:
+        return "qwen3"
+    if "gpt-oss" in low:
+        return "gpt-oss"
+    base = low.split("/")[-1].split(":")[0]
+    if base.startswith(("o1", "o3", "o4")):
+        return "o-series"
+    m = re.match(r"^gpt-(\d+)(?:\.(\d+))?", base)
+    if m:
+        major = int(m.group(1))
+        minor = m.group(2)
+        if major >= 6 or (major == 5 and minor is not None and int(minor) >= 1):
+            return "gpt-5.1+"
+        if major == 5:
+            return "gpt-5.0"
+    return "other"
+
+
 def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     """Build an LLM instance from a ProviderPair (primary or fallback) - V2 Provider → Multiple Models.
     
@@ -302,43 +359,48 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
 
     low = model_id.lower()
 
-    # Determine reasoning effort from model metadata or overrides
-    # FIX: For voice, always use low reasoning to reduce TTFT variance (0.77s-1.33s observed for gpt-5.4-mini)
-    # gpt-5.4-mini has reasoning_default medium which causes variable reasoning tokens before first token
-    # Voice needs fast first token, so force low unless explicitly overridden
-    try:
-        from ..llm_catalog import get_llm_model
-        meta = get_llm_model(provider, model_id)
-        if meta:
-            # For voice, override medium/high to low to reduce TTFT
-            catalog_default = meta.get("reasoning_default") or ("low" if meta.get("reasoning_supported") else "none")
-            # If model supports reasoning and catalog says medium/high, force low for voice low-latency
-            if meta.get("reasoning_supported") and catalog_default in ("medium", "high"):
-                default_reasoning = "low"
-                # Log that we are reducing reasoning for voice
-                logger.info(f"🔧 Voice reasoning override: model {model_id} catalog default {catalog_default} -> low for voice to reduce TTFT variance (0.77-1.33s -> more consistent)")
-            else:
-                default_reasoning = catalog_default
+    # Voice reasoning: default to the lowest TTFT the model's family supports,
+    # unless the customer explicitly set reasoning_effort in the model config
+    # (SaaS rule: customer config is honored, never silently overridden).
+    # "none" eliminates reasoning tokens entirely (gpt-5.1+/qwen3 — also the
+    # recommended chat+tools setting); "low" is the floor where "none" would
+    # 400 (gpt-oss/o-series/gpt-5.0 are always-on reasoning).
+    family = _reasoning_family(model_id)
+    voice_default = _REASONING_VOICE_DEFAULT[family]
+    accepted = _REASONING_ACCEPTED[family]
+    explicit = overrides.get("reasoning_effort")
+    if explicit is not None and str(explicit).strip():
+        reasoning = str(explicit).strip().lower()
+        if reasoning not in accepted:
+            logger.warning(
+                f"⚠️ reasoning_effort '{explicit}' is not accepted for {model_id} "
+                f"(family {family} accepts {list(accepted)}) — the provider would "
+                f"400 every turn. Falling back to voice default '{voice_default}' "
+                f"for this call. Fix the model's reasoning_effort in agent config."
+            )
+            reasoning = voice_default
         else:
-            if "qwen" in low or "gemma" in low:
-                default_reasoning = "none"
-            elif "gpt-oss" in low:
-                default_reasoning = "low"
-            else:
-                default_reasoning = "none"
-    except Exception:
-        if "qwen" in low or "gemma" in low:
-            default_reasoning = "none"
-        elif "gpt-oss" in low:
-            default_reasoning = "low"
-        else:
-            default_reasoning = "none"
-    
-    reasoning = overrides.get("reasoning_effort", default_reasoning)
-    # Extra safety: if reasoning is medium/high for voice, downgrade to low
-    if reasoning in ("medium", "high") and provider in ("openai", "groq", "openrouter"):
-        logger.info(f"🔧 Downgrading reasoning_effort {reasoning} -> low for voice model {model_id} to reduce TTFT")
-        reasoning = "low"
+            logger.info(
+                f"🔧 Customer explicitly set reasoning_effort='{reasoning}' for "
+                f"{model_id} — honoring (higher effort adds TTFT before token 1)."
+            )
+    else:
+        try:
+            catalog_default = (model_meta or {}).get("reasoning_default")
+        except Exception:
+            catalog_default = None
+        if catalog_default and catalog_default != voice_default:
+            logger.info(
+                f"🔧 Voice reasoning override: {model_id} catalog default "
+                f"{catalog_default} -> {voice_default} (family {family}) to "
+                f"minimize reasoning-token TTFT lag (set reasoning_effort in "
+                f"model config to override)."
+            )
+        reasoning = voice_default
+        logger.info(
+            f"🔧 Voice reasoning default: {model_id} (family {family}) -> "
+            f"'{reasoning}'"
+        )
 
     # Build client with exact base_url and model, no silent replacement
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
@@ -351,27 +413,28 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # For reasoning models, check if responses API should be used for tool+reasoning support
     # OpenAI Chat Completions rejects reasoning_effort with tools for gpt-5.4-mini (400 error)
     # LiveKit 1.8.2+ has openai.responses.LLM that supports reasoning+tools via /v1/responses
+    # NOTE: skipped when reasoning resolves to "none" — with no reasoning there is
+    # no reasoning+tools conflict, and chat+none is the provider-recommended path.
     use_responses_api = False
-    if model_meta and model_meta.get("reasoning_supported") and model_id.startswith("gpt-5"):
-        # gpt-5.4-mini with end_call tool needs responses API for reasoning+tools
+    if model_meta and model_meta.get("reasoning_supported") and model_id.startswith("gpt-5") and reasoning != "none":
+        # gpt-5.x with active reasoning + end_call tool needs responses API for reasoning+tools
         use_responses_api = True
-        logger.info(f"🔧 Model {model_id} is reasoning + uses tools (end_call), will try responses.LLM for proper reasoning+tools support (fixes 400 on chat/completions)")
+        logger.info(f"🔧 Model {model_id} is reasoning ({reasoning}) + uses tools (end_call), will try responses.LLM for proper reasoning+tools support (fixes 400 on chat/completions)")
 
     if model_meta and model_meta.get("reasoning_supported"):
         llm_kwargs["reasoning_effort"] = reasoning
-        # For gpt-5.4 models, reasoning_effort low is supported and transmitted via extra_kwargs
-        # Verify: LiveKit plugin 1.8.2+ supports reasoning_effort via _opts.reasoning_effort -> extra["reasoning_effort"]
-        # Chat API: extra["reasoning_effort"] = low, Responses API: same
-        # For prompt caching, set prompt_cache_key to stable value to enable cached_input_tokens
-        # This can reduce TTFT by reusing cached system prompt prefix
-        try:
-            # Use model_id as cache key for stable prefix caching
-            llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-            logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
-        except Exception:
-            pass
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
         llm_kwargs["reasoning_effort"] = reasoning
+
+    # Prompt-cache key: stable per model so identical static prefixes hit the
+    # provider cache across turns/calls (see the prompt-cache contract on
+    # build_instructions). First-class param on OpenAI chat completions, so it
+    # is set for every OpenAI model; reasoning models on Groq/OpenRouter keep
+    # it (proven in prod for gpt-oss/qwen). Other OpenRouter free routes are
+    # left untouched (unknown tolerance for the param on those upstreams).
+    if provider == "openai" or (model_meta and model_meta.get("reasoning_supported")):
+        llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
+        logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (stable static prefix -> cache hits across turns)")
 
     # Try responses API for gpt-5 reasoning models with tools (proper support)
     # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
@@ -1268,6 +1331,14 @@ def _flatten_knowledge(kb: KnowledgeBase) -> list[str]:
 
 
 def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
+    # PROMPT-CACHE CONTRACT: this function's output must be byte-identical for
+    # every turn of a call. It is built ONCE per session (agent build) from
+    # cfg + env budgets only — no timestamps, no per-turn RAG, no caller state.
+    # Providers (OpenAI/Groq automatic prefix caching, keyed also by the
+    # stable prompt_cache_key) then serve the static prefix from cache on
+    # every turn, cutting TTFT. Per-turn dynamic content (RAG hits) MUST stay
+    # in the trailing system message appended by on_user_turn_completed, never
+    # inlined here — inlining would shift the whole prefix and nuke the cache.
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
     kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
@@ -1816,6 +1887,10 @@ def build_voice_agent(
                         target.items = [m for m in items if _RAG_PREFIX not in _chat_msg_text(m)]
                 except Exception:
                     pass
+                # Prompt-cache note: the RAG facts ride as a TRAILING system message
+                # (after the user turn), so the static instructions + history
+                # prefix stays byte-identical and keeps hitting the provider
+                # cache. Never inline per-turn hits into build_instructions.
                 target.add_message(
                     role="system",
                     content=(
