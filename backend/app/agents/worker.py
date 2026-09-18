@@ -42,9 +42,6 @@ if os.getenv("VOICE_THREAD_LIMITS", "1") == "1":
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("voice-agent-saas-worker")
-
 from app.config import (  # noqa: E402
     LIVEKIT_URL,
     LIVEKIT_API_KEY,
@@ -55,26 +52,13 @@ from app.config import (  # noqa: E402
     EGRESS_S3_REGION,
     EGRESS_PUBLIC_BASE_URL,
     BILLING_INTERNAL_TOKEN,
-    GOOGLE_APPLICATION_CREDENTIALS,
 )
-# Install this before importing app.db/prisma_client, which imports a direct
-# reference to httpx's SSL helper.
-from app.agents.bootstrap import install_ssl_context_cache  # noqa: E402
-install_ssl_context_cache()
 from app.db import init as db_init  # noqa: E402
 from app import repo  # noqa: E402
 from app.models import AgentConfig  # noqa: E402
 from app.billing import calculate_call_cost  # noqa: E402
 from app import memory  # noqa: E402
 from app import leadfile  # noqa: E402
-from app.agents.runtime import (  # noqa: E402
-    new_turn_timing,
-    prewarm_google_imports,
-    record_speech_end,
-    reset_turn_timing,
-    wrap_llm_for_timing,
-    wrap_tts_for_timing,
-)
 
 # ---------------------------------------------------------------------------
 # Register LiveKit plugins on the MAIN THREAD.
@@ -90,6 +74,9 @@ from livekit.plugins import silero    # noqa: E402,F401  (VAD)
 from livekit.plugins import google    # noqa: E402,F401  (STT/TTS)
 from livekit.plugins import deepgram  # noqa: E402,F401  (STT)
 from livekit.plugins import openai    # noqa: E402,F401  (LLM)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("voice-agent-saas-worker")
 
 FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
 # Spoken when a user turn gets NO LLM reply at all (provider 429 after the
@@ -232,69 +219,52 @@ def _build_conn_options():
     )
 
 
-def build_assistant_session(cfg: AgentConfig, timing: Optional[dict] = None):
-    """Full conversational session: STT + VAD + LLM + TTS, low-latency config.
-
-    Provider construction stays unchanged.  The optional wrappers only observe
-    scheduling/stream timing; Google TTS itself remains lazy and loop-local.
-    """
+def build_assistant_session(cfg: AgentConfig):
+    """Full conversational session: STT + VAD + LLM + TTS, low-latency config."""
     from livekit.agents import AgentSession
     from app.agents.agent_builder import build_vad, build_stt, build_llm, build_tts
 
-    stt_instance = build_stt(cfg)
-    vad_instance = build_vad()
-    llm_instance = build_llm(cfg)
-    tts_instance = build_tts(cfg)
-    if timing is not None:
-        llm_instance = wrap_llm_for_timing(llm_instance, timing)
-        tts_instance = wrap_tts_for_timing(tts_instance, timing)
-
-    # Respect the existing runtime configuration.  The previous hard-coded
-    # `turn_detection="vad"` ignored VOICE_TURN_DETECTION=stt and left the
-    # session stuck in listening when Silero was slower than realtime.
-    turn_detection = (os.getenv("VOICE_TURN_DETECTION", "vad") or "vad").strip().lower()
-    if turn_detection not in ("vad", "stt", "realtime_llm", "manual"):
-        turn_detection = "vad"
-    endpoint_min = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.6"))
-    endpoint_max = float(os.getenv("VOICE_ENDPOINTING_MAX", "1.2"))
-
     return AgentSession(
-        stt=stt_instance,
-        vad=vad_instance,
-        llm=llm_instance,
-        tts=tts_instance,
+        stt=build_stt(cfg),
+        vad=build_vad(),
+        llm=build_llm(cfg),
+        tts=build_tts(cfg),
         # Fail FAST on any LLM/STT/TTS provider error (see _build_conn_options).
         conn_options=_build_conn_options(),
-        # Turn-handling is set here (the session).  Interruption remains local
-        # VAD; only the already-configured end-of-turn detector is selected.
+        # Turn-handling is set here (the session). This is the SIMPLE, LOCAL, stable
+        # configuration that makes a self-hosted worker feel human:
+        #   * turn_detection = "vad"  -> end-of-turn from the local silero VAD, so STT
+        #     and VAD stop fighting (that fight was re-feeding audio into VAD and
+        #     backing its buffer up -> "inference is slower than realtime").
+        #   * interruption mode="vad" -> local VAD barge-in. Do NOT use the default
+        #     (adaptive): it calls LiveKit Cloud's barge-in service, which 401s on a
+        #     self-hosted worker and then falls back (adds lag + noise).
         turn_handling={
-            "turn_detection": turn_detection,
-            "endpointing": {"min_delay": endpoint_min, "max_delay": endpoint_max},
+            "turn_detection": "vad",
+            "endpointing": {"min_delay": 0.6, "max_delay": 1.2},
             "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.25, "min_words": 0},
-            # Preemptive generation remains disabled.  RAG is enabled separately
-            # with VOICE_RAG_PER_TURN=1 and must not be coupled to this flag.
+            # Preemptive generation (LLM answers while the user is still speaking) is
+            # great for latency, BUT here it was being invalidated almost every turn and
+            # adding speculative LLM work that starved the loop. Keep it OFF by default;
+            # re-enable with VOICE_PREEMPTIVE=1 only after the VAD backlog is gone.
             "preemptive_generation": {
-                "enabled": False,
+                "enabled": os.getenv("VOICE_PREEMPTIVE", "0") == "1",
                 "preemptive_tts": False,
             },
         },
     )
 
 
-def build_announcement_session(cfg: AgentConfig, timing: Optional[dict] = None):
+def build_announcement_session(cfg: AgentConfig):
     """Fixed-script "reminder" session: TTS only. No STT, no VAD, no LLM."""
     from livekit.agents import AgentSession
     from app.agents.agent_builder import build_tts
-
-    tts_instance = build_tts(cfg)
-    if timing is not None:
-        tts_instance = wrap_tts_for_timing(tts_instance, timing)
 
     return AgentSession(
         stt=None,
         vad=None,
         llm=None,
-        tts=tts_instance,
+        tts=build_tts(cfg),
         conn_options=_build_conn_options(),
         turn_handling={
             "endpointing": {"min_delay": 0.2, "max_delay": 0.5},
@@ -438,19 +408,14 @@ async def entrypoint(ctx):
     # (used by bulk-call campaigns so every call is personalized).
     greeting = leadfile.render_template(greeting, lead_data)
 
-    # Timing is observation-only.  In particular, speech_end is populated only
-    # from the LiveKit user-state transition below; it is never approximated from
-    # STT-final or conversation_item_added.
-    turn_timing = new_turn_timing()
-
     # ------------------------------------------------------------------
     # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
     # ------------------------------------------------------------------
     agent_mode = getattr(cfg, "agent_mode", "assistant") or "assistant"
     if agent_mode == "announcement":
-        session = build_announcement_session(cfg, timing=turn_timing)
+        session = build_announcement_session(cfg)
     else:
-        session = build_assistant_session(cfg, timing=turn_timing)
+        session = build_assistant_session(cfg)
 
     # ------------------------------------------------------------------
     # Silence watchdog.
@@ -530,21 +495,6 @@ async def entrypoint(ctx):
                 return
             last_user_transcript["text"] = text
             last_user_transcript["ts"] = now
-            # Start a new timing generation without erasing a real speech-end
-            # event that arrived just before the final transcript.  A speech-end
-            # older than the previous real audio belongs to an earlier turn and
-            # must not be carried forward.
-            speech_end = turn_timing.get("speech_end", 0.0)
-            previous_audio = turn_timing.get("first_audio", 0.0)
-            preserve_speech_end = speech_end if speech_end and (
-                not previous_audio or speech_end > previous_audio
-            ) else 0.0
-            reset_turn_timing(
-                turn_timing,
-                preserve_speech_end=preserve_speech_end,
-                preserve_stt_final=(turn_timing.get("stt_final", 0.0)
-                                    if preserve_speech_end else 0.0),
-            )
             words = max(len(text.split()), 1)
             usage["llm_input_tokens"] += int(words * 1.3)
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
@@ -588,46 +538,14 @@ async def entrypoint(ctx):
 
     session.on("conversation_item_added", on_item_added)
 
-    # These are observation hooks only.  A real user speaking->listening
-    # transition is the speech-end anchor; do not substitute STT-final or
-    # conversation_item_added time for it.
-    user_state_tracker = {"state": None}
-
-    def _on_user_state(ev):
-        now = time.time()
-        prev = user_state_tracker["state"]
-        new_state = getattr(ev, "new_state", None)
-        if prev in ("speaking", "user_speaking") and new_state in ("listening", "user_listening"):
-            record_speech_end(turn_timing, now)
-        user_state_tracker["state"] = new_state
-
-    def _on_user_transcribed(ev):
-        if bool(getattr(ev, "is_final", False)):
-            turn_timing["stt_final"] = time.time()
-            transcript = getattr(ev, "transcript", "") or ""
-            logger.info("🎙️ STT final: %s", transcript)
-
-    # Older LiveKit releases may not emit one of these optional events.  Event
-    # registration itself is intentionally best-effort so runtime version drift
-    # cannot stop a call from starting.
-    try:
-        session.on("user_state_changed", _on_user_state)
-        session.on("user_input_transcribed", _on_user_transcribed)
-    except Exception as e:
-        logger.debug(f"Optional timing events unavailable: {e}")
-
     def _on_state(ev):
         now = time.time()
         prev = state_tracker["state"]
         elapsed = now - state_tracker["since"]
         if prev == "thinking" and elapsed > 2.5:
             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
-        new_state = getattr(ev, "new_state", None)
-        logger.info(f"🔄 state {prev} -> {new_state} ({elapsed:.2f}s)")
-        if prev == "listening" and new_state == "thinking":
-            turn_timing["turn_detected"] = now
-            logger.info("TIMING turn_detected (agent listening->thinking)")
-        state_tracker["state"] = new_state
+        logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        state_tracker["state"] = ev.new_state
         state_tracker["since"] = now
 
     session.on("agent_state_changed", _on_state)
@@ -875,12 +793,7 @@ def prewarm(proc):
         prefix_padding_duration=0.2,
         activation_threshold=0.45,
     )
-    # Import/credential-module prewarming is safe.  Do NOT instantiate Google
-    # TTS or call its async _ensure_client here: prewarm runs outside the
-    # LiveKit AgentSession loop and an async gRPC channel created here would be
-    # reused after this loop/thread exits.
-    prewarm_google_imports(GOOGLE_APPLICATION_CREDENTIALS)
-    logger.info("🔥 Prewarm: VAD hot; Google credentials/RSA ready; async TTS client remains loop-local")
+    logger.info("🔥 Prewarm: VAD hot")
 
 
 if __name__ == "__main__":
