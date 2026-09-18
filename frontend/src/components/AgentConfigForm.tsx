@@ -87,15 +87,37 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   
   const isV2 = llmProviders.length > 0 && llmModels.length > 0;
   
+  // Legacy pre-V2 models dropped from the catalog → closest supported equivalent.
+  // Mirrors backend/app/llm_catalog.py LEGACY_MODEL_MIGRATION so editing an old
+  // agent (e.g. groq_qwen + qwen/qwen3.6-27b) preselects a valid V2 model
+  // instead of failing validation on save.
+  const LEGACY_MODEL_MAP: Record<string, { provider: string; model: string }> = {
+    "qwen/qwen3.6-27b": { provider: "groq", model: "qwen/qwen3-32b" },
+    "google/gemma-4-31b-it:free": { provider: "openrouter", model: "google/gemma-3-27b-it:free" },
+    "google/gemma-4-26b-a4b-it:free": { provider: "openrouter", model: "google/gemma-3-12b-it:free" },
+    "nvidia/nemotron-3-super-120b-a12b:free": { provider: "openrouter", model: "google/gemma-3-27b-it:free" },
+    "z-ai/glm-5.2:free": { provider: "openrouter", model: "google/gemma-3-27b-it:free" },
+    "openrouter/free": { provider: "openrouter", model: "google/gemma-3-27b-it:free" },
+    "gpt-oss-120b": { provider: "openai", model: "gpt-4o" },
+    "gpt-oss-20b": { provider: "openai", model: "gpt-4o-mini" },
+  };
+  const migrateLegacyModel = (provider: string, model: string) => {
+    const hit = LEGACY_MODEL_MAP[model];
+    if (hit) return hit;
+    return { provider, model };
+  };
+
   // Helper to parse old id like groq_gpt_oss_20b to provider/model
   const parseOldLlmId = (id: string, config: any) => {
     if (!id) return { provider: "groq", model: "openai/gpt-oss-20b" };
-    // If config has model and provider, use those
+    // If config has model and provider, use those (with legacy migration)
     if (config?.provider && config?.model) {
-      return { provider: config.provider, model: config.model };
+      return migrateLegacyModel(config.provider, config.model);
     }
     if (config?.model) {
       const m = config.model;
+      // Dropped pre-V2 model → migrate first, then detect provider
+      if (LEGACY_MODEL_MAP[m]) return LEGACY_MODEL_MAP[m];
       // Detect provider from model
       if (m.includes("gpt-oss") || m.startsWith("llama") || m.startsWith("qwen") || m.startsWith("meta-llama") || m.includes("kimi") || m.includes("moonshot")) {
         return { provider: "groq", model: m };
@@ -116,7 +138,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       }
       return { provider: "openai", model: m };
     }
-    // Parse id like openai_gpt_4_1_mini
+    // Parse id like openai_gpt_4_1_mini (incl. pre-V2 groq_qwen)
+    if (id === "groq_qwen" || id === "groq_qwen_3_8_27b") return { provider: "groq", model: "qwen/qwen3-32b" };
     if (id.startsWith("groq")) return { provider: "groq", model: config?.model || "openai/gpt-oss-20b" };
     if (id.startsWith("openrouter")) return { provider: "openrouter", model: config?.model || "google/gemma-3-27b-it:free" };
     if (id.startsWith("openai")) {

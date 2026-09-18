@@ -117,12 +117,71 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         else:
             base_url = None  # OpenAI default
 
+    # Normalize legacy provider ids to canonical openai/groq/openrouter.
+    # resolve_llm_provider_model() already handles known legacy ids, but this
+    # is defense-in-depth for any stored id with a known prefix (e.g. the
+    # pre-V2 `groq_qwen` id) so validation never sees `groq_qwen` as provider.
+    _prov_low = (provider or "").lower()
+    _raw_low = (raw_id or "").lower()
+    if provider not in ("openai", "groq", "openrouter"):
+        if _prov_low.startswith("groq") or _raw_low.startswith("groq"):
+            logger.warning(
+                f"⚠️ Legacy LLM provider id '{raw_id}' normalized to 'groq' "
+                f"(model={model_id}). Re-save the agent in the UI to persist V2 provider/model."
+            )
+            provider = "groq"
+        elif _prov_low.startswith("openrouter") or _raw_low.startswith("openrouter"):
+            logger.warning(
+                f"⚠️ Legacy LLM provider id '{raw_id}' normalized to 'openrouter' "
+                f"(model={model_id}). Re-save the agent in the UI to persist V2 provider/model."
+            )
+            provider = "openrouter"
+        elif _prov_low.startswith("openai") or _raw_low.startswith("openai"):
+            logger.warning(
+                f"⚠️ Legacy LLM provider id '{raw_id}' normalized to 'openai' "
+                f"(model={model_id}). Re-save the agent in the UI to persist V2 provider/model."
+            )
+            provider = "openai"
+
+    # Migrate dropped pre-V2 models (qwen3.6, gemma-4, bare gpt-oss) with an
+    # explicit warning — legacy compat, not silent substitution.
+    try:
+        from ..llm_catalog import migrate_legacy_llm
+        _mp, _mm, _migrated = migrate_legacy_llm(provider, model_id)
+        if _migrated:
+            logger.warning(
+                f"⚠️ Legacy LLM model '{model_id}' (provider '{provider}') migrated to "
+                f"'{_mp}:{_mm}' — the old model was removed from the catalog. "
+                f"Re-save the agent in the UI to persist the new model."
+            )
+            provider, model_id = _mp, _mm
+    except Exception:
+        pass
+
+    # Fix base_url/provider mismatch from legacy stored configs (e.g. groq
+    # model with openai base_url). Explicitly logged, not silent.
+    _canon_base = {
+        "openai": "https://api.openai.com/v1",
+        "groq": "https://api.groq.com/openai/v1",
+        "openrouter": "https://openrouter.ai/api/v1",
+    }
+    if provider in _canon_base:
+        if not base_url:
+            base_url = _canon_base[provider]
+        elif base_url != _canon_base[provider] and base_url in _canon_base.values():
+            logger.warning(
+                f"⚠️ base_url/provider mismatch: provider='{provider}' but "
+                f"base_url='{base_url}' — correcting to '{_canon_base[provider]}'. "
+                f"Re-save the agent in the UI to persist."
+            )
+            base_url = _canon_base[provider]
+
     # Get API key based on provider
-    if provider.startswith("groq"):
+    if provider == "groq":
         api_key = overrides.get("api_key") or GROQ_API_KEY
         key_env = "GROQ_API_KEY"
         provider_type = "groq"
-    elif provider.startswith("openrouter"):
+    elif provider == "openrouter":
         api_key = overrides.get("api_key") or OPENROUTER_API_KEY
         key_env = "OPENROUTER_API_KEY"
         provider_type = "openrouter"
@@ -131,22 +190,10 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         api_key = overrides.get("api_key") or OPENAI_API_KEY
         key_env = "OPENAI_API_KEY"
         provider_type = "openai"
-        # Normalize provider to openai if it's old style or unknown
         if provider not in ("openai", "groq", "openrouter"):
-            # Check if raw_id maps to known provider via old mapping
-            if raw_id.startswith("groq"):
-                provider = "groq"
-                base_url = base_url or "https://api.groq.com/openai/v1"
-                api_key = overrides.get("api_key") or GROQ_API_KEY
-                key_env = "GROQ_API_KEY"
-            elif raw_id.startswith("openrouter"):
-                provider = "openrouter"
-                base_url = base_url or "https://openrouter.ai/api/v1"
-                api_key = overrides.get("api_key") or OPENROUTER_API_KEY
-                key_env = "OPENROUTER_API_KEY"
-            else:
-                provider = "openai"
-                base_url = base_url or "https://api.openai.com/v1"
+            # Unknown provider with no recognizable prefix — keep it so
+            # validation below returns the clear config error.
+            base_url = base_url or "https://api.openai.com/v1"
 
     if not api_key:
         raise RuntimeError(

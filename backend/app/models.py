@@ -51,11 +51,34 @@ class ProviderPair(BaseModel):
             "groq_gpt_oss": ("groq", "openai/gpt-oss-120b", "https://api.groq.com/openai/v1"),
             "groq_gpt_oss_20b": ("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1"),
             "groq_llama_3_3_70b": ("groq", "llama-3.3-70b-versatile", "https://api.groq.com/openai/v1"),
+            # Pre-V2 id (<=04b0f28): groq_qwen with qwen3.6-27b. V2 previously
+            # only mapped the never-existent groq_qwen_3_8_27b, so real old
+            # agents crashed at call time. Keep both for safety.
+            "groq_qwen": ("groq", "qwen/qwen3-32b", "https://api.groq.com/openai/v1"),
             "groq_qwen_3_8_27b": ("groq", "qwen/qwen3-32b", "https://api.groq.com/openai/v1"),
             "openrouter_gemma": ("openrouter", "google/gemma-3-27b-it:free", "https://openrouter.ai/api/v1"),
             "openrouter_gemma_26b": ("openrouter", "google/gemma-3-12b-it:free", "https://openrouter.ai/api/v1"),
         }
-        
+
+        def _apply_legacy_model_migration(prov: str, model: str, base_url: str) -> tuple[str, str, str]:
+            """Remap dropped pre-V2 models (qwen3.6, gemma-4, bare gpt-oss) to
+            supported equivalents. Explicit legacy compat, not silent substitution:
+            callers log a warning when migrated=True."""
+            try:
+                from .llm_catalog import migrate_legacy_llm, get_llm_provider as _get_prov
+                new_prov, new_model, migrated = migrate_legacy_llm(prov, model)
+                if migrated:
+                    # Use the canonical base_url of the migrated provider unless
+                    # the stored base_url already matches that provider.
+                    meta = _get_prov(new_prov) or {}
+                    canon = meta.get("base_url", "")
+                    if not base_url or base_url == "https://api.openai.com/v1" and new_prov != "openai":
+                        base_url = canon or base_url
+                    return new_prov, new_model, base_url
+            except Exception:
+                pass
+            return prov, model, base_url
+
         # If id is old style, use mapping but preserve exact model from config if present
         if self.id in old_mapping:
             prov, model, base_url = old_mapping[self.id]
@@ -66,6 +89,7 @@ class ProviderPair(BaseModel):
             base_override = self.config.get("base_url")
             if base_override:
                 base_url = base_override
+            prov, model, base_url = _apply_legacy_model_migration(prov, model, base_url)
             return prov, model, base_url
         
         # New style: id is provider (openai, groq, openrouter)
@@ -85,21 +109,52 @@ class ProviderPair(BaseModel):
                     base_url = "https://api.groq.com/openai/v1"
                 elif provider == "openrouter":
                     base_url = "https://openrouter.ai/api/v1"
+            if model:
+                provider, model, base_url = _apply_legacy_model_migration(provider, model, base_url)
             return provider, model, base_url
-        
+
+        # Safety net: legacy/unknown ids with a known provider prefix
+        # (e.g. any future groq_* / openrouter_* / openai_* id missing from
+        # old_mapping). Infer the canonical provider instead of returning
+        # the raw id as provider (which hard-crashes validation).
+        _lid = (self.id or "").lower()
+        _prefix_prov = None
+        if _lid.startswith("groq"):
+            _prefix_prov = "groq"
+        elif _lid.startswith("openrouter"):
+            _prefix_prov = "openrouter"
+        elif _lid.startswith("openai"):
+            _prefix_prov = "openai"
+        if _prefix_prov:
+            model = self.config.get("model", "")
+            base_url = self.config.get("base_url", "")
+            if not base_url:
+                if _prefix_prov == "openai":
+                    base_url = "https://api.openai.com/v1"
+                elif _prefix_prov == "groq":
+                    base_url = "https://api.groq.com/openai/v1"
+                else:
+                    base_url = "https://openrouter.ai/api/v1"
+            if model:
+                _prefix_prov, model, base_url = _apply_legacy_model_migration(_prefix_prov, model, base_url)
+            return _prefix_prov, model, base_url
+
         # Fallback: treat id as provider if it matches known providers, or as model_id
         # For backward compat with direct model_id usage
         if self.id in ("openai", "groq", "openrouter"):
             return self.id, self.config.get("model", ""), self.config.get("base_url", "")
-        
+
         # If id looks like model_id (contains / or -), try to infer provider from config or mapping
         # This handles case where user selected model directly
         model_id = self.id
         # Check if config has provider
         prov_from_config = self.config.get("provider", "")
         if prov_from_config:
-            return prov_from_config, model_id, self.config.get("base_url", "")
-        
+            _p, _m, _b = _apply_legacy_model_migration(
+                prov_from_config, model_id, self.config.get("base_url", "")
+            )
+            return _p, _m, _b
+
         # Infer provider from model_id pattern
         if "/" in model_id and model_id.startswith("openai/"):
             # Could be groq model openai/gpt-oss-120b
@@ -109,7 +164,7 @@ class ProviderPair(BaseModel):
             return "openai", model_id, "https://api.openai.com/v1"
         if ":free" in model_id or "gemma" in model_id or "llama" in model_id.lower():
             return "openrouter", model_id, "https://openrouter.ai/api/v1"
-        
+
         # Last resort: return id as provider, model from config
         return self.id, self.config.get("model", ""), self.config.get("base_url", "")
 

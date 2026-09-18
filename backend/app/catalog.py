@@ -197,6 +197,8 @@ def _build_llm_catalog_v2_with_compat():
         "groq_gpt_oss": ("groq", "openai/gpt-oss-120b"),
         "groq_gpt_oss_20b": ("groq", "openai/gpt-oss-20b"),
         "groq_llama_3_3_70b": ("groq", "llama-3.3-70b-versatile"),
+        # Pre-V2 id (<=04b0f28). Keep the never-existent groq_qwen_3_8_27b too for safety.
+        "groq_qwen": ("groq", "qwen/qwen3-32b"),  # Map old qwen to new
         "groq_qwen_3_8_27b": ("groq", "qwen/qwen3-32b"),  # Map old qwen to new
         "openrouter_gemma": ("openrouter", "google/gemma-3-27b-it:free"),
         "openrouter_gemma_26b": ("openrouter", "google/gemma-3-12b-it:free"),

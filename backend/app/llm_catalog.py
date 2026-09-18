@@ -652,3 +652,43 @@ def catalog_summary_v2() -> Dict[str, Any]:
         "models": LLM_MODELS,
         "by_provider": {pid: list_models_for_provider(pid) for pid in LLM_PROVIDERS},
     }
+
+
+# ---------------------------------------------------------------------------
+# Legacy migration — pre-V2 agents stored in DB (NOT silent substitution)
+# ---------------------------------------------------------------------------
+# Pre-V2 catalog (<=04b0f28) had provider id `groq_qwen` with model
+# `qwen/qwen3.6-27b`, plus OpenRouter Gemma-4 free models and bare
+# `gpt-oss-*` OpenAI ids. V2 dropped those ids/models, which hard-crashes
+# old agents at call time (ValueError -> job exception -> caller stuck on
+# "Connecting to agent..."). These maps migrate legacy stored configs to
+# the closest currently-supported provider/model WITH an explicit warning
+# log at the call site, so old agents keep working until the owner re-saves
+# them in the UI. New/invalid selections still raise a clear config error.
+LEGACY_MODEL_MIGRATION: Dict[str, tuple[str, str]] = {
+    # Groq: qwen3.6-27b removed from Groq catalog, closest Qwen on Groq now
+    "qwen/qwen3.6-27b": ("groq", "qwen/qwen3-32b"),
+    # OpenRouter: Gemma-4 free models replaced by Gemma-3 free models
+    "google/gemma-4-31b-it:free": ("openrouter", "google/gemma-3-27b-it:free"),
+    "google/gemma-4-26b-a4b-it:free": ("openrouter", "google/gemma-3-12b-it:free"),
+    "nvidia/nemotron-3-super-120b-a12b:free": ("openrouter", "google/gemma-3-27b-it:free"),
+    "z-ai/glm-5.2:free": ("openrouter", "google/gemma-3-27b-it:free"),
+    "openrouter/free": ("openrouter", "google/gemma-3-27b-it:free"),
+    # OpenAI: bare gpt-oss ids were never valid OpenAI models
+    "gpt-oss-120b": ("openai", "gpt-4o"),
+    "gpt-oss-20b": ("openai", "gpt-4o-mini"),
+}
+
+
+def migrate_legacy_llm(provider: str, model_id: str) -> tuple[str, str, bool]:
+    """Map a legacy (provider, model) to a supported one.
+
+    Returns (provider, model_id, migrated). Only legacy models listed in
+    LEGACY_MODEL_MIGRATION are remapped; everything else passes through
+    unchanged so genuinely-invalid new selections still fail validation.
+    """
+    key = (model_id or "").strip()
+    if key in LEGACY_MODEL_MIGRATION:
+        new_prov, new_model = LEGACY_MODEL_MIGRATION[key]
+        return new_prov, new_model, True
+    return provider, model_id, False
