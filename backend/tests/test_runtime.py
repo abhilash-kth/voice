@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import types
 import unittest
 import warnings
 from pathlib import Path
@@ -17,6 +18,7 @@ from app.agents.runtime import (  # noqa: E402
     reset_turn_timing,
     wrap_tts_for_timing,
 )
+from app.agents import bootstrap  # noqa: E402
 from app.billing import calculate_call_cost  # noqa: E402
 
 
@@ -198,6 +200,76 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(timing["turn_id"], first_id + 1)
         self.assertEqual(timing["first_token"], 0.0)
         self.assertEqual(timing["tts_request"], 0.0)
+
+    def test_ssl_prewarm_covers_imported_httpx_references(self):
+        """The aliases captured by httpx modules must use the warm context too."""
+        original_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "livekit",
+                "livekit.agents",
+                "livekit.agents.utils",
+                "httpx",
+                "httpx._config",
+                "httpx._client",
+                "httpx._transports",
+                "httpx._transports.default",
+            )
+        }
+        bootstrap._cache.clear()
+        calls = []
+
+        def original_httpx(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("the blocking httpx SSL helper was called")
+
+        original_livekit = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("the blocking LiveKit SSL helper was called")
+        )
+        http_context = types.SimpleNamespace(_create_ssl_context=original_livekit)
+        fake_utils = types.ModuleType("livekit.agents.utils")
+        fake_utils.http_context = http_context
+        fake_livekit = types.ModuleType("livekit")
+        fake_livekit.__path__ = []
+        fake_agents = types.ModuleType("livekit.agents")
+        fake_agents.__path__ = []
+        fake_httpx = types.ModuleType("httpx")
+        fake_httpx.__path__ = []
+        fake_config = types.ModuleType("httpx._config")
+        fake_config.create_ssl_context = original_httpx
+        fake_client = types.ModuleType("httpx._client")
+        # Simulate ``from httpx._config import create_ssl_context`` before the
+        # worker's bootstrap runs.
+        fake_client.create_ssl_context = original_httpx
+        fake_transports = types.ModuleType("httpx._transports")
+        fake_transports.__path__ = []
+        fake_transport_default = types.ModuleType("httpx._transports.default")
+        fake_transport_default.create_ssl_context = original_httpx
+        fake_modules = {
+            "livekit": fake_livekit,
+            "livekit.agents": fake_agents,
+            "livekit.agents.utils": fake_utils,
+            "httpx": fake_httpx,
+            "httpx._config": fake_config,
+            "httpx._client": fake_client,
+            "httpx._transports": fake_transports,
+            "httpx._transports.default": fake_transport_default,
+        }
+        sys.modules.update(fake_modules)
+        try:
+            bootstrap.install_ssl_context_cache()
+            context = fake_config.create_ssl_context()
+            self.assertIs(context, fake_client.create_ssl_context())
+            self.assertIs(context, fake_transport_default.create_ssl_context())
+            self.assertIs(context, http_context._create_ssl_context())
+            self.assertEqual(calls, [])
+        finally:
+            bootstrap._cache.clear()
+            for name, old in original_modules.items():
+                if old is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = old
 
     def test_billing_calculation_remains_provider_based(self):
         result = calculate_call_cost(

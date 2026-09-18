@@ -42,6 +42,9 @@ if os.getenv("VOICE_THREAD_LIMITS", "1") == "1":
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("voice-agent-saas-worker")
+
 from app.config import (  # noqa: E402
     LIVEKIT_URL,
     LIVEKIT_API_KEY,
@@ -54,6 +57,10 @@ from app.config import (  # noqa: E402
     BILLING_INTERNAL_TOKEN,
     GOOGLE_APPLICATION_CREDENTIALS,
 )
+# Install this before importing app.db/prisma_client, which imports a direct
+# reference to httpx's SSL helper.
+from app.agents.bootstrap import install_ssl_context_cache  # noqa: E402
+install_ssl_context_cache()
 from app.db import init as db_init  # noqa: E402
 from app import repo  # noqa: E402
 from app.models import AgentConfig  # noqa: E402
@@ -83,61 +90,6 @@ from livekit.plugins import silero    # noqa: E402,F401  (VAD)
 from livekit.plugins import google    # noqa: E402,F401  (STT/TTS)
 from livekit.plugins import deepgram  # noqa: E402,F401  (STT)
 from livekit.plugins import openai    # noqa: E402,F401  (LLM)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("voice-agent-saas-worker")
-
-# LiveKit/httpx create their default SSL context synchronously the first time a
-# worker or provider opens an HTTP session.  On this Windows host that real
-# operation took 0.9–1.3s on the agent loop.  Build/cache only the default
-# context during module import (before LiveKit starts its loop), then reuse it
-# for the default trust-store path.  Custom verify/cert arguments still use the
-# library implementation.
-import ssl as _ssl_prewarm
-_ssl_context_cache: dict[tuple[str | None, str | None], object] = {}
-
-
-def _get_ssl_context(cafile=None, capath=None):
-    key = (cafile or os.getenv("SSL_CERT_FILE"), capath or os.getenv("SSL_CERT_DIR"))
-    cached = _ssl_context_cache.get(key)
-    if cached is not None:
-        return cached
-    context = _ssl_prewarm.create_default_context(cafile=key[0], capath=key[1])
-    _ssl_context_cache[key] = context
-    return context
-
-
-try:
-    _get_ssl_context()
-    from livekit.agents.utils import http_context as _http_context
-    _original_livekit_ssl = _http_context._create_ssl_context
-
-    def _cached_livekit_ssl(cafile=None, capath=None):
-        try:
-            return _get_ssl_context(cafile, capath)
-        except Exception:
-            return _original_livekit_ssl(cafile=cafile, capath=capath)
-
-    _http_context._create_ssl_context = _cached_livekit_ssl
-
-    try:
-        import httpx._config as _httpx_config
-        _original_httpx_ssl = _httpx_config.create_ssl_context
-
-        def _cached_httpx_ssl(verify=True, cert=None, trust_env=True, **kwargs):
-            if verify in (True, None) and cert is None:
-                return _get_ssl_context(
-                    os.getenv("SSL_CERT_FILE") if trust_env else None,
-                    os.getenv("SSL_CERT_DIR") if trust_env else None,
-                )
-            return _original_httpx_ssl(verify=verify, cert=cert, trust_env=trust_env, **kwargs)
-
-        _httpx_config.create_ssl_context = _cached_httpx_ssl
-    except Exception as _httpx_error:
-        logger.debug(f"Could not patch httpx SSL context: {_httpx_error}")
-    logger.info("🔧 SSL context prewarmed before the LiveKit agent loop")
-except Exception as _ssl_error:
-    logger.debug(f"SSL context prewarm skipped: {_ssl_error}")
 
 FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?"
 # Spoken when a user turn gets NO LLM reply at all (provider 429 after the
