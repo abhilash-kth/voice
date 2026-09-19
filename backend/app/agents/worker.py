@@ -549,6 +549,14 @@ FALLBACK_REPLY = "Sorry, mujhe yeh samajh nahi aaya. Aap dobara bata sakte hain?
 # fail-fast retries, or a failed/empty generation) so the caller is never left
 # in dead air — that silence is what made callers hang up.
 DEFAULT_FALLBACK_RESPONSE = "Sorry, there is a temporary technical problem. Please try again shortly."
+# Hindi twin of the line above (Devanagari — Roman Hindi breaks Sarvam
+# pronunciation; gender-neutral phrasing so it fits any agent voice).
+DEFAULT_FALLBACK_RESPONSE_HI = "माफ़ कीजिए, कुछ तकनीकी समस्या आ गई है। कृपया थोड़ी देर में फिर से बताइए।"
+# Spoken when the caller stays silent for no_response_timeout_seconds.
+# English default (kept for en agents) + Hindi twin (passive voice =
+# gender-neutral, Devanagari for Sarvam).
+DEFAULT_NO_RESPONSE_MESSAGE = "I did not hear a response, so I will end the call now. Thank you for calling."
+DEFAULT_NO_RESPONSE_MESSAGE_HI = "मुझे कोई जवाब नहीं सुनाई दिया, इसलिए अब कॉल समाप्त की जा रही है। कॉल करने के लिए धन्यवाद।"
 # Deterministic closing speech — always the same line, never LLM-generated.
 # This is the fix for non-deterministic goodbyes: the closing TTS is fixed so
 # every call ends with the same polite sentence in the caller's language.
@@ -560,6 +568,43 @@ def _get_deterministic_closing(cfg: AgentConfig) -> str:
     if lang.startswith("en"):
         return DETERMINISTIC_CLOSING_MESSAGE_EN
     return DETERMINISTIC_CLOSING_MESSAGE
+
+
+def _agent_is_english(cfg: AgentConfig) -> bool:
+    return ((getattr(cfg, "language", "hi") or "hi").strip().lower().startswith("en"))
+
+
+def _get_fallback_response(cfg: AgentConfig) -> str:
+    """Per-agent-language silence-watchdog line.
+
+    An explicit dashboard value always wins. Otherwise English agents get the
+    English default and every other agent gets the Hindi (Devanagari) default.
+    Agents saved before localization carry the legacy English default string —
+    treat that exact string as "unset" for non-English agents so old Hindi
+    agents heal without a DB migration (nobody re-saves them otherwise).
+    """
+    custom = (getattr(cfg, "fallback_response", "") or "").strip()
+    if custom and not (_agent_is_english(cfg) is False and custom == DEFAULT_FALLBACK_RESPONSE):
+        return custom
+    if _agent_is_english(cfg):
+        return DEFAULT_FALLBACK_RESPONSE
+    return DEFAULT_FALLBACK_RESPONSE_HI
+
+
+def _get_no_response_message(cfg: AgentConfig) -> str:
+    """Per-agent-language idle-timeout line (same legacy-default rule as above).
+
+    This is the fix for Hindi calls hearing "I did not hear a response, so I
+    will end the call now…" (2026-09-19): the English default was baked into
+    every agent row at creation time. Non-English agents whose message is empty
+    OR still exactly the legacy English default now hear the Hindi line.
+    """
+    custom = (getattr(cfg, "no_response_message", "") or "").strip()
+    if custom and not (_agent_is_english(cfg) is False and custom == DEFAULT_NO_RESPONSE_MESSAGE):
+        return custom
+    if _agent_is_english(cfg):
+        return DEFAULT_NO_RESPONSE_MESSAGE
+    return DEFAULT_NO_RESPONSE_MESSAGE_HI
 
 # How long to wait for the LLM to answer a user turn before speaking
 # FALLBACK_SILENCE. Groq's 429 backoff can be 7-45s, so 12s is a good balance:
@@ -1310,8 +1355,46 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # after 0.25s + 1 word) made the agent jump in on every breath and read as
     # robotic; worse, every false barge-in pushes a speech handle into LiveKit's
     # interrupt path — where the repeated 5s timeout errors came from.
-    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.35"))
-    max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
+    #
+    # SAFETY FLOOR (2026-09-19): a stale operator .env carried
+    # VOICE_ENDPOINTING_MIN=0.20 / MAX=0.55, which splits mid-sentence Hindi
+    # utterances (natural pauses are 0.3-0.5s) into phantom turns ("Ok,",
+    # "ठीक है." as separate turns). Each split wastes ~2.5k input tokens on a
+    # full LLM re-request AND creates LLM invalidate races (the phantom turn's
+    # reply nearly played over the real question). No env value may endpoint
+    # below these floors, whatever a stale .env contains.
+    _ENDPOINTING_MIN_FLOOR = 0.35
+    _ENDPOINTING_MAX_FLOOR = 0.70
+    try:
+        min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.35"))
+    except (TypeError, ValueError):
+        logger.warning("⚠️ VOICE_ENDPOINTING_MIN=%r is not a number — using 0.35" % os.getenv("VOICE_ENDPOINTING_MIN"))
+        min_delay = 0.35
+    try:
+        max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
+    except (TypeError, ValueError):
+        logger.warning("⚠️ VOICE_ENDPOINTING_MAX=%r is not a number — using 0.75" % os.getenv("VOICE_ENDPOINTING_MAX"))
+        max_delay = 0.75
+    if min_delay < _ENDPOINTING_MIN_FLOOR:
+        logger.warning(
+            f"⚠️ VOICE_ENDPOINTING_MIN={min_delay}s is below the safety floor "
+            f"{_ENDPOINTING_MIN_FLOOR}s (splits mid-sentence speech into phantom "
+            "turns) — clamping. Fix the operator .env to silence this."
+        )
+        min_delay = _ENDPOINTING_MIN_FLOOR
+    if max_delay < _ENDPOINTING_MAX_FLOOR:
+        logger.warning(
+            f"⚠️ VOICE_ENDPOINTING_MAX={max_delay}s is below the safety floor "
+            f"{_ENDPOINTING_MAX_FLOOR}s (cuts slow speakers mid-sentence) — "
+            "clamping. Fix the operator .env to silence this."
+        )
+        max_delay = _ENDPOINTING_MAX_FLOOR
+    if max_delay < min_delay:
+        logger.warning(
+            f"⚠️ VOICE_ENDPOINTING_MAX={max_delay}s < MIN={min_delay}s — "
+            f"raising MAX to {min_delay + 0.2:.2f}s."
+        )
+        max_delay = min_delay + 0.2
     # min_words is the knob that actually gates interruptions in LiveKit; a
     # 0.5s / 2-word floor filters coughs, "hmm", and echo without making the
     # agent feel un-interruptible.
@@ -1833,10 +1916,23 @@ async def entrypoint(ctx):
 
     def _spawn_say(text_to_say: str):
         async def _say():
+            # Hardened (2026-09-19: one `fallback say failed: TimeoutError`
+            # after 15s): never speak into a call that started closing after
+            # the watchdog fired — that is exactly when session.say hangs on a
+            # dead transport. No retry: a hung say would only stack a second
+            # 15s hang behind the first.
+            if call_closed["done"] or closing_requested["done"] or closing_in_progress["done"]:
+                logger.info("🛟 fallback say skipped: call started closing after the watchdog fired")
+                return
             try:
                 await asyncio.wait_for(session.say(text_to_say, allow_interruptions=True), timeout=15)
             except asyncio.CancelledError:
                 return
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "🛟 fallback say timed out after 15s (session.say hung — "
+                    "transport likely dead). Giving up, not retrying."
+                )
             except Exception as e:
                 # str(e) is EMPTY for asyncio.TimeoutError — log the type so a
                 # 15s session.say hang is diagnosable ("fallback say failed: " blank).
@@ -1882,7 +1978,7 @@ async def entrypoint(ctx):
             "(rate-limited 429 or failed generation) — speaking a fallback line "
             "so the call is not silent."
         )
-        _spawn_say(getattr(cfg, "fallback_response", "").strip() or DEFAULT_FALLBACK_RESPONSE)
+        _spawn_say(_get_fallback_response(cfg))
 
     def _schedule_silence_fallback(turn_ts: float):
         _cancel_pending()
@@ -1901,8 +1997,7 @@ async def entrypoint(ctx):
 
     async def _no_response_timeout_handler():
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-        no_response_msg = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+        no_response_msg = _get_no_response_message(cfg)
         try:
             await asyncio.sleep(idle_timeout)
         except asyncio.CancelledError:
@@ -1971,8 +2066,7 @@ async def entrypoint(ctx):
             return
         _cancel_no_response()
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-        no_response_msg = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+        no_response_msg = _get_no_response_message(cfg)
         no_response_state["last_activity"] = time.time()
         try:
             no_response_state["task"] = asyncio.ensure_future(_no_response_timeout_handler())
@@ -1983,8 +2077,7 @@ async def entrypoint(ctx):
     # Fallback loop monitor (kept for safety, primary is scheduled timer)
     async def _no_response_monitor():
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-        no_response_msg = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+        no_response_msg = _get_no_response_message(cfg)
         logger.info(f"⏱️ No-response loop watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}'")
         await asyncio.sleep(2)
         while not call_closed["done"] and not closing_in_progress["done"] and not no_response_state.get("triggered"):
@@ -2227,7 +2320,9 @@ async def entrypoint(ctx):
                 sys_closing_msgs = [
                     DETERMINISTIC_CLOSING_MESSAGE,
                     DETERMINISTIC_CLOSING_MESSAGE_EN,
-                    (getattr(cfg, "no_response_message", "") or "").strip(),
+                    _get_no_response_message(cfg),
+                    DEFAULT_NO_RESPONSE_MESSAGE,
+                    DEFAULT_NO_RESPONSE_MESSAGE_HI,
                 ]
                 # also check configured message truncated log comparison
                 if any(cleaned == m or text.strip() == m for m in sys_closing_msgs if m):
@@ -2821,8 +2916,7 @@ async def entrypoint(ctx):
             except asyncio.TimeoutError:
                 # Keep this deterministic and customer-configurable. Do not run
                 # the LLM for an idle caller; speak the saved line once, then hang up.
-                message = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
+                message = _get_no_response_message(cfg)
                 _cancel_pending()
                 _cancel_no_response()
                 no_response_state["triggered"] = True
@@ -2980,6 +3074,12 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
         return False
 
 
+# OPS NOTE (2026-09-19): run the production worker on Linux/WSL2, not Windows.
+# The Windows dev box shows ~130ms event-loop stalls from LiveKit's
+# speaking-rate FFT and reports livekit capacity warnings (load 0.91 > 0.7)
+# under even a single call — that stall budget comes straight out of TTFT.
+# Windows is fine for dashboard/API dev; voice latency work must be measured
+# on Linux.
 def prewarm(proc):
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import

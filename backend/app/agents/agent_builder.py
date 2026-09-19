@@ -359,6 +359,16 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             default_reasoning = "none"
     
     reasoning = overrides.get("reasoning_effort", default_reasoning)
+    # LATENCY EVALUATION (2026-09-19, voice TTFT): with the gpt-5 family in
+    # use, would forcing "minimal" beat "low"? Evaluated: NO as a forced
+    # default. "minimal" is only accepted by newer OpenAI reasoning models —
+    # older models and OpenAI-compat endpoints (Groq/Sarvam) 400 on an unknown
+    # effort string, and a 400 on every turn is far worse than ~200ms of extra
+    # TTFT. "low" is accepted everywhere and validated at ~1s TTFT on
+    # gpt-5.4-nano (2026-09-19 04:34 call: avg TTFT 1076ms, 7/7 turns). So an
+    # explicit per-agent "minimal" is HONOURED (pass-through, not downgraded),
+    # but the forced floor stays "low". Sub-second TTFT comes from the
+    # recommended default instead: Groq openai/gpt-oss-20b (see llm_catalog).
     # Extra safety: if reasoning is medium/high for voice, downgrade to low
     if reasoning in ("medium", "high") and provider in ("openai", "groq", "openrouter", "google", "sarvam"):
         logger.info(f"🔧 Downgrading reasoning_effort {reasoning} -> low for voice model {model_id} to reduce TTFT")
@@ -780,7 +790,9 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # endpointing (min_delay 0.35s). 200ms fired before silero's min_silence,
     # so LiveKit logged "stt end of speech received while vad is still in a
     # speech segment, flushing vad" and cut users off mid-sentence.
-    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300"))
+    # SAFETY FLOOR (2026-09-19): same stale-.env incident — never let an env
+    # value push Deepgram endpointing below 200ms (mid-sentence finals).
+    _dg_endpointing_default = max(200, int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300")))
     # utterance_end is the fallback final when endpointing never fires (long
     # pause): 1000ms added a full second of dead air on slow speakers — but
     # Deepgram REJECTS utterance_end_ms below 1000 (WS handshake returns 400
@@ -1045,11 +1057,25 @@ def _vad_tuning() -> dict:
     (VOICE_ENDPOINTING_MIN=0.35). VAD needing MORE silence than the endpointer
     is what produced "stt end of speech received while vad is still in a speech
     segment, flushing vad" — keep them in lock-step here."""
+    # SAFETY FLOOR (2026-09-19, same stale-.env incident as the endpointing
+    # clamp in worker.py): a too-small VOICE_VAD_MIN_SILENCE ends the speech
+    # segment mid-sentence, feeding the phantom-turn splits. 0.30 keeps VAD at
+    # or below the 0.35 endpointing floor (the safe direction per above).
+    try:
+        _min_silence = float(os.getenv("VOICE_VAD_MIN_SILENCE", "0.35"))
+    except (TypeError, ValueError):
+        _min_silence = 0.35
+    if _min_silence < 0.30:
+        logger.warning(
+            f"⚠️ VOICE_VAD_MIN_SILENCE={_min_silence}s is below the safety floor "
+            "0.30s (splits mid-sentence speech) — clamping. Fix the .env."
+        )
+        _min_silence = 0.30
     return {
         # ignore <200ms blips (lip noise, clicks) but keep "haan"/"ok"
         "min_speech_duration": float(os.getenv("VOICE_VAD_MIN_SPEECH", "0.20")),
         # aligned with VOICE_ENDPOINTING_MIN so STT and VAD agree on turn end
-        "min_silence_duration": float(os.getenv("VOICE_VAD_MIN_SILENCE", "0.35")),
+        "min_silence_duration": _min_silence,
         "prefix_padding_duration": float(os.getenv("VOICE_VAD_PREFIX_PADDING", "0.20")),
         "activation_threshold": float(os.getenv("VOICE_VAD_THRESHOLD", "0.55")),
     }
@@ -1187,6 +1213,58 @@ def _effective_budgets(cfg: AgentConfig) -> tuple[int, int, int]:
 
 # Marker for the per-turn RAG system message (used to prune the previous turn's).
 _RAG_PREFIX = "[RAG]"
+
+# Filler / backchannel turns: pure acknowledgments with no question and no
+# content ("Ok,", "ठीक है.", "हाँ जी", "hmm"). Firing RAG + a full LLM request
+# for these wastes tokens (2026-09-19: "Ok," pulled 1295 RAG chars into a
+# ~2.5k-token request) and — worse — the LLM answers a 1-word ack with company
+# info. RAG is skipped for these turns; the LLM still replies briefly from
+# history + static prompt (see the FILLER TURNS rule in build_instructions).
+#
+# Deliberately NOT in here: closings ("thanks", "thank you", "बस इतना ही",
+# "bye") — those take the deterministic-closing path, never the filler path —
+# and single content words ("कीमत?", "और?") which are real questions.
+_FILLER_TURNS = frozenset({
+    # Roman / English backchannels
+    "ok", "okay", "okk", "yes", "yeah", "yep", "yup", "hmm", "hmmm",
+    "uh", "uhh", "umm", "um", "right", "alright", "sure", "fine",
+    "good", "great", "nice", "cool", "haan", "ha", "han", "haa", "ji",
+    "haan ji", "ji haan", "ok ji", "haan ok", "ok haan",
+    "achha", "acha", "accha", "achcha", "achha ji",
+    "theek hai", "thik hai", "theek", "thik", "sahi hai", "bilkul",
+    "samajh gaya", "samajh gaye", "samajh gayi",
+    "hello", "hi", "hey", "namaste", "namaskar",
+    "good morning", "good afternoon", "good evening",
+    # Devanagari backchannels
+    "ठीक है", "ठीक", "ठीक है जी", "हाँ", "हां", "हा", "जी", "हाँ जी",
+    "जी हाँ", "हाँ ठीक है", "अच्छा", "अच्छा जी", "अच्छा ठीक है",
+    "सही है", "हम्म", "हूं", "हूँ", "ओके", "समझ गया", "समझ गए",
+    "समझ गई", "बिल्कुल", "नमस्ते", "नमस्कार", "हैलो", "हेलो",
+})
+# Single tokens that are pure ack on their own — lets repetitions like
+# "haan haan", "ok ok", "जी जी" match without enumerating every double.
+_FILLER_TOKENS = frozenset({
+    "ok", "okay", "okk", "yes", "yeah", "yep", "yup", "hmm", "hmmm",
+    "uh", "uhh", "umm", "um", "haan", "ha", "han", "haa", "ji",
+    "achha", "acha", "accha", "achcha", "theek", "thik", "sahi",
+    "bilkul", "samajh", "gaya", "gaye", "gayi",
+    "ठीक", "है", "हाँ", "हां", "हा", "जी", "अच्छा", "सही", "हम्म",
+    "हूं", "हूँ", "ओके", "समझ", "गया", "गए", "गई", "बिल्कुल",
+})
+_FILLER_STRIP_RE = re.compile(r"[.,!?;:।\-\"'()\[\]]+")
+
+
+def is_filler_turn(user_text: str) -> bool:
+    """True when the turn is a bare filler/backchannel with no real content."""
+    norm = " ".join(_FILLER_STRIP_RE.sub(" ", (user_text or "").lower()).split())
+    if not norm:
+        return False
+    if norm in _FILLER_TURNS:
+        return True
+    toks = norm.split()
+    if len(toks) <= 3 and all(t in _FILLER_TOKENS for t in toks):
+        return True
+    return False
 
 # Deterministic closing speech — fixed line, never LLM-generated (bb393dd fix).
 DETERMINISTIC_CLOSING = "Thank you for calling us. Aapse baat karke achha laga. Goodbye."
@@ -1403,6 +1481,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     lines.append("- Keep every reply to 1-2 short sentences, under 25 words. No lists unless caller explicitly asks for list.")
     lines.append("- ANTI-HALLUCINATION: Never invent financial data, balance, transactions, or office locations not in 'Business facts'. If user asks 'recent kaam' / 'recent work', explain Kriscent's recent projects from KB (IT services, AI agents, etc), NOT financial data. If info not in KB, say 'Mere paas iski exact jaankari nahi hai, main aapko Jaipur office se connect kara sakta hoon'.")
     lines.append("- Be concise, warm, human. If caller says 'thank Kota' or 'accha laga' with thank, treat as closing — call end_call.")
+    lines.append("- FILLER TURNS: if the caller says only a filler/backchannel ('ok', 'okay', 'ठीक है', 'हाँ', 'जी', 'अच्छा', 'hmm', 'hello') with no question, reply with a brief warm acknowledgement ONLY — one short sentence such as 'जी, बताइए।'. NEVER answer a 1-word acknowledgement with company info, services, offers, or contact details.")
 
     return "\n".join(lines)
 
@@ -1791,6 +1870,18 @@ def build_voice_agent(
                 user_text = _chat_msg_text(new_message).strip()
                 if not user_text:
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                    return
+                # Closing turns need no facts: the goodbye is deterministic and
+                # this turn's LLM request is superseded/interrupted anyway.
+                if explicit_goodbye:
+                    logger.info(f"⏭️ RAG skipped: closing turn, no facts needed ({(_time.time()-_rag_t0)*1000:.0f}ms)")
+                    return
+                # Filler/backchannel turns ("Ok,", "ठीक है.") carry no question:
+                # skip RAG so a 1-word ack is never answered with company info
+                # (2026-09-19: "Ok," fired RAG 1295 chars + a full LLM request).
+                # The LLM still replies briefly from history + static prompt.
+                if is_filler_turn(user_text):
+                    logger.info(f"⏭️ RAG skipped: filler/backchannel turn {user_text[:40]!r} — no KB lookup, brief ack only ({(_time.time()-_rag_t0)*1000:.0f}ms)")
                     return
                 from .. import rag  # local import: keep this module light
                 # Async RAG to avoid blocking event loop

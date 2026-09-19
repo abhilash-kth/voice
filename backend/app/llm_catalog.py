@@ -403,7 +403,8 @@ LLM_MODELS: List[Dict[str, Any]] = [
         "expected_speed": "very_fast",
         "status": "active", "free_tier": True,
         "capabilities": ["chat", "reasoning", "tools"],
-        "notes": "Groq fast, 20B, lower TPM cost, good for voice.",
+        "notes": "⭐ Recommended default for voice: sub-second TTFT on Groq LPU, 20B keeps TPM cost low. Prefer this over the gpt-5 family for live calls unless OpenAI quality is needed.",
+        "voice_recommended": True,
     },
     {
         "provider": "groq",
