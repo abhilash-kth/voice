@@ -23,8 +23,9 @@ import asyncio
 import logging
 import time
 import json
-import aiohttp
 from typing import Any, Iterator, Optional
+
+import aiohttp
 
 # ---------------------------------------------------------------------------
 # Thread limits. Cap the BLAS/math libs to 1 thread (avoids per-thread pool
@@ -709,7 +710,7 @@ def _build_conn_options():
 
 def _create_tts_timing_wrapper(tts_instance, timing_dict):
     """Wrap TTS instance to measure actual TTS pipeline timing.
-    
+
     Measures REAL pipeline (not LLM completion):
     - tts_request: when text first sent to TTS (first chunk)
     - first_tts_audio: when first audio chunk returned from TTS (REAL)
@@ -874,14 +875,14 @@ def _create_tts_timing_wrapper(tts_instance, timing_dict):
 
 def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
     """Fixed LLM timing wrapper that properly implements async context manager protocol.
-    
+
     LiveKit's LLM.chat returns an async context manager (LLMStream), used as:
         async with llm.chat(chat_ctx=...) as stream:
             async for chunk in stream:
-    
+
     Previous buggy version made chat async def returning StreamWrapper directly,
     causing TypeError: 'coroutine' object does not support async context manager.
-    
+
     Fixed version: chat is sync def returning a custom async CM that wraps inner CM,
     and whose __aenter__ returns a TimingStreamWrapper that measures TTFT.
     """
@@ -985,7 +986,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                         self._timing["last_cached"] = self._cached_tokens
                     except Exception:
                         pass
-                
+
                 # FIX: Aggregated billing using actual successful provider usage
                 # Ensure aggregated fields exist
                 if "aggregated_input" not in self._timing:
@@ -995,7 +996,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     self._timing["successful_requests"] = 0
                     self._timing["failed_requests"] = 0
                     self._timing["all_requests"] = []
-                
+
                 request_record = {
                     "input": self._input_tokens,
                     "cached": self._cached_tokens,
@@ -1008,7 +1009,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     "is_closing": is_deterministic_closing,
                 }
                 self._timing["all_requests"].append(request_record)
-                
+
                 if is_success:
                     self._timing["aggregated_input"] += self._input_tokens
                     self._timing["aggregated_output"] += self._output_tokens
@@ -1020,7 +1021,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 else:
                     self._timing["failed_requests"] += 1
                     _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
-                
+
                 _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
                     from app.llm_catalog import get_llm_model, calculate_llm_cost
@@ -1109,7 +1110,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 # Mark previous as invalidated, not failed, to prevent duplicate counting
                 # Don't increment failed_requests for superseded preemptive/invalidated
                 # The new request will be the valid one for this turn
-            
+
             request_start = _time.time()
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
@@ -1165,7 +1166,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
 
 def _create_llm_failure_logging_wrapper(llm_instance, cfg):
     """Wrap LLM to log failures with provider/model/base_url for 404 debugging.
-    
+
     Logs explicit provider/model/base_url when LLM fails, to debug 404 like:
     - openai_gpt_4_1_mini gpt-4.1-mini @ https://api.openai.com/v1 404
     - groq_gpt_oss openai/gpt-oss-120b @ https://api.groq.com/openai/v1 404
@@ -1244,7 +1245,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
                     logger.info(f"🤖 LLM fallback chain length: {len(inner)}")
             else:
                 logger.info(f"🤖 LLM single provider built: {llm_type}")
-            
+
             # Set provider/model in timing_dict for cost tracking and wrap with timing
             if turn_timing_ref is not None:
                 try:
@@ -1334,7 +1335,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # When KB empty, keep preemptive enabled for faster responses
     preemptive_tts_enabled = os.getenv("VOICE_PREEMPTIVE_TTS", "0") == "1"
     env_preemptive = os.getenv("VOICE_PREEMPTIVE", "1") == "1"
-    
+
     # Check if KB has content and if RAG enabled
     has_kb = False
     rag_enabled = True
@@ -1348,7 +1349,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             rag_enabled = True
     except Exception:
         rag_enabled = True
-    
+
     try:
         kb = getattr(cfg, 'knowledge', None)
         if kb:
@@ -1358,7 +1359,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             has_kb = has_text or has_docs or has_faq
     except Exception:
         has_kb = False
-    
+
     # FIX ROOT CAUSE: When KB/FAQ RAG is enabled, preemptive must be disabled BEFORE turn begins
     # Verify runtime Session config, not just config variable
     # Exactly one LLM REQUEST START per completed user turn, no preemptive that can be invalidated by RAG mutation
@@ -1372,10 +1373,10 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         logger.info(f"🔧 RAG+preemptive fix: KB present (has_kb={has_kb}), disabling preemptive to prevent duplicate LLM requests (was {env_preemptive} from env).")
     else:
         preemptive_enabled = env_preemptive
-    
+
     # Verify runtime Session config will have preemptive disabled
     logger.info(f"🔧 FINAL Session config verification: preemptive={preemptive_enabled} (env {env_preemptive}, rag_enabled {rag_enabled}, has_kb {has_kb}) - must be False when RAG enabled to prevent duplicate")
-    
+
     logger.info(
         f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), "
         f"preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, "
@@ -1686,7 +1687,7 @@ async def entrypoint(ctx):
         "all_requests": [],  # list of {input, cached, output, success, ttft, gen_time, provider, model, is_closing}
         "is_closing": False,  # True when deterministic closing in progress
     }
-    
+
     # Preserve last successful metrics for final billing (fix 0ms telemetry)
     last_successful_metrics = {
         "ttft_ms": 0.0,
@@ -2190,7 +2191,7 @@ async def entrypoint(ctx):
                 turn_timing["last_model"] = turn_timing.get("llm_model","")
             except Exception:
                 pass
-            
+
             # Log raw assistant item for debugging empty turns
             raw_text = _msg_text(item)
             is_tool = _item_is_tool_related(item)
@@ -2272,7 +2273,7 @@ async def entrypoint(ctx):
             # Only set llm_complete if REAL audio not yet happened, and don't log fallback if REAL already happened.
             now_llm_complete = time.time()
             has_real_audio = turn_timing.get("first_audio", 0) > 0 or turn_timing.get("first_tts_audio", 0) > 0 or turn_timing.get("last_speech_end_to_first_audio", 0) > 0
-            
+
             # Only set llm_complete if not already set AND real audio not yet happened (avoid delayed overwrite)
             if turn_timing.get("llm_complete", 0) == 0 and not has_real_audio:
                 turn_timing["llm_complete"] = now_llm_complete
@@ -2291,7 +2292,7 @@ async def entrypoint(ctx):
                 # Don't overwrite llm_complete if already set from REAL path
                 if turn_timing.get("llm_complete", 0) == 0:
                     turn_timing["llm_complete"] = now_llm_complete
-            
+
             # Fallback for say() calls without TTS wrapper - only if REAL audio never happened
             if turn_timing.get("first_tts_audio", 0) == 0 and turn_timing.get("first_audio", 0) == 0 and not has_real_audio:
                 if turn_timing["first_token"] > 0:
@@ -2369,7 +2370,7 @@ async def entrypoint(ctx):
                 # first_token already set by wrapper at actual TTFT time, preserve it
                 existing_age = (now - turn_timing["first_token"]) * 1000
                 logger.info(f"ℹ️ first_token already set {existing_age:.0f}ms ago by wrapper (TTFT {turn_timing.get('ttft_ms',0):.0f}ms), preserving authoritative")
-            
+
             if turn_timing["llm_start"] > 0:
                 llm_to_token = (now - turn_timing["llm_start"]) * 1000
                 logger.info(f"⏱️ TIMING LLM_start->first_token: {llm_to_token:.0f}ms (target ≤500ms) (wrapper TTFT {turn_timing.get('ttft_ms',0):.0f}ms is authoritative)")
@@ -2385,7 +2386,7 @@ async def entrypoint(ctx):
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
-            
+
             # Previous bug: detector fired before async LLM stream finished (0.04-0.08s)
             # Evidence: LLM REQUEST START, then thinking->listening 0.04s, then TTFT 800ms, then GENERATION COMPLETE
             # This means empty detection raced with active stream.
@@ -2394,7 +2395,7 @@ async def entrypoint(ctx):
             has_output = turn_timing.get("assistant_output_received", False) or turn_timing.get("first_token",0) > 0
             gen_complete = turn_timing.get("generation_complete",0)
             request_start = turn_timing.get("request_start",0)
-            
+
             if is_llm_active:
                 # LLM still streaming, don't treat as empty - this is the race fix
                 # FIX: Don't update state_tracker to listening, keep thinking to prevent new REQUEST START while previous active
@@ -2408,7 +2409,7 @@ async def entrypoint(ctx):
                 # Do NOT update state_tracker, keep as thinking, do NOT reset timing, keep active request alive
                 # This ensures exactly one valid LLM request per completed user turn
                 return
-            
+
             # Only if LLM terminated and no output, then it's truly empty
             # FIX: Check is_closing again before warning
             if turn_timing.get("is_closing", False):
@@ -2416,7 +2417,7 @@ async def entrypoint(ctx):
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
-            
+
             if not has_output and gen_complete == 0 and request_start > 0:
                 # LLM terminated with no output and no assistant item - check if it was 0-token generation
                 if turn_timing.get("output_tokens",0) == 0 and turn_timing.get("input_tokens",0) == 0:
@@ -2447,7 +2448,7 @@ async def entrypoint(ctx):
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
-            
+
             if turn_timing["speech_end"] != 0 and turn_timing["first_audio"] == 0 and not is_llm_active:
                 # Only reset if LLM not active
                 logger.info(f"🔄 Resetting turn_timing after confirmed empty turn (LLM terminated, no output) to avoid next-turn outlier")
@@ -2622,7 +2623,7 @@ async def entrypoint(ctx):
                 # Try current timing first, then last successful, then usage
                 llm_provider = turn_timing.get("llm_provider") or turn_timing.get("last_provider") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[0] if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm.id)
                 llm_model = turn_timing.get("llm_model") or turn_timing.get("last_model") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[1] if hasattr(cfg.providers, 'get_primary_llm') else (cfg.providers.llm.config or {}).get("model", ""))
-                
+
                 # FIX: Use aggregated successful provider usage, not last/preserved timing object's token counts
                 # Final billing must equal sum of successful requests
                 aggregated_input = turn_timing.get("aggregated_input", 0)
@@ -2631,7 +2632,7 @@ async def entrypoint(ctx):
                 successful_count = turn_timing.get("successful_requests", 0)
                 failed_count = turn_timing.get("failed_requests", 0)
                 all_reqs = turn_timing.get("all_requests", [])
-                
+
                 # Calculate total cost from aggregated
                 total_llm_cost = 0.0
                 try:
@@ -2644,7 +2645,7 @@ async def entrypoint(ctx):
                                 total_llm_cost += c['total_llm_cost']
                 except Exception as e:
                     logger.debug(f"Could not calculate total aggregated cost: {e}")
-                
+
                 if aggregated_input > 0 and successful_count > 0:
                     llm_input = aggregated_input
                     llm_output = aggregated_output
@@ -2660,11 +2661,11 @@ async def entrypoint(ctx):
                     llm_output = turn_timing.get("output_tokens", 0) or turn_timing.get("last_output", 0) or usage["llm_output_tokens"]
                     logger.warning(f"⚠️ FINAL BILLING no aggregated successful usage, fallback to last/word count: input={llm_input} output={llm_output} (successful {successful_count}, failed {failed_count})")
                     logger.info(f"📊 FINAL BILLING FALLBACK successful_requests={successful_count} failed_requests={failed_count} total_input_tokens={llm_input} total_cached_tokens={llm_cached} total_output_tokens={llm_output} total_llm_cost=${total_llm_cost:.6f}")
-                
+
                 # TTFT and gen_time: current, then last, preserve actual measured values
                 ttft = turn_timing.get("ttft_ms", 0) or turn_timing.get("last_ttft", 0)
                 gen_time = turn_timing.get("generation_time_ms", 0) or turn_timing.get("last_gen_time", 0)
-                
+
                 # For final billing, also log average TTFT/gen_time across successful
                 if all_reqs:
                     successful_reqs = [r for r in all_reqs if r['success']]
@@ -2672,10 +2673,10 @@ async def entrypoint(ctx):
                         avg_ttft = sum(r['ttft'] for r in successful_reqs) / len(successful_reqs)
                         avg_gen = sum(r['gen_time'] for r in successful_reqs) / len(successful_reqs)
                         logger.info(f"📊 FINAL BILLING averages across {len(successful_reqs)} successful: avg TTFT {avg_ttft:.0f}ms avg gen_time {avg_gen:.0f}ms last TTFT {ttft:.0f}ms last gen {gen_time:.0f}ms")
-                
+
                 if ttft == 0 and gen_time == 0:
                     logger.warning(f"⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")
-                
+
                 logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms successful={successful_count} failed={failed_count} total_cost=${total_llm_cost:.6f} (aggregated authoritative)")
             except Exception as e:
                 logger.debug(f"Could not get V2 billing info: {e}")
@@ -2897,7 +2898,7 @@ def _billing_report(costs, usage, duration, turn_timing_ref=None) -> str:
         display_output = usage['llm_output_tokens']
         successful = 0
         failed = 0
-    
+
     return (
         "\n" + "=" * 64 + "\n"
         f"📊 BILLING  duration={duration}s ({costs['duration_mins']} min)\n"
@@ -3004,7 +3005,7 @@ def prewarm(proc):
             logger.info(f"🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55) - cached in worker, agent_builder cache set failed: {_e}")
     except Exception as e:
         logger.warning(f"VAD prewarm failed: {e}")
-    
+
     # Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks
     try:
         import google.auth.crypt._cryptography_rsa as _crypt_rsa
@@ -3015,7 +3016,7 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: Google auth crypt + oauth2.credentials imported (avoids 176ms and 198ms blocks during TTS)")
     except Exception as e:
         logger.debug(f"Google auth prewarm failed: {e}")
-    
+
     # Prewarm hyphenator off loop to avoid 256ms/391ms block at re.split in _basic_hyphenator
     try:
         from livekit.agents.tokenize._basic_hyphenator import Hyphenator, PATTERNS, EXCEPTIONS
@@ -3023,7 +3024,7 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: Hyphenator hot (avoids 256ms/391ms re.split block in transcription synchronizer)")
     except Exception as e:
         logger.debug(f"Hyphenator prewarm failed: {e}")
-    
+
     # Prewarm async_toolset import off loop to avoid 101ms block
     try:
         import livekit.agents.llm.async_toolset as _async_toolset
@@ -3078,7 +3079,7 @@ def prewarm(proc):
             logger.info("🔥 Prewarm: no Google credentials file found, skipping TTS credential prewarm")
     except Exception as e:
         logger.debug(f"Google TTS prewarm failed: {e!r}")
-    
+
     # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
     # "Event loop is closed" on next Prisma call -> 1.73s retry. DB is cached per process
     # via the _DB_INIT_DONE global and connected ON the agent loop in entrypoint() (the
