@@ -64,8 +64,8 @@ frontend/.env.*
 # =========================================================
 
 # Google service account credentials
-google-key.json
-backend/google-key.json
+# google-key.json
+# backend/google-key.json
 
 # Private keys / certificates
 *.pem
