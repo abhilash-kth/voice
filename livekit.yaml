@@ -11,6 +11,10 @@ logging:
   level: info
 room:
   auto_create: true
+  # Close an abandoned room quickly, and close it soon after the browser
+  # hangs up so a stuck agent process cannot hold the worker.
+  empty_timeout: 60
+  departure_timeout: 10
 # --- SIP (needed only for real outbound phone calls) ---
 # Register a Telnyx / Twilio SIP trunk and point its "LiveKit SIP URI" here.
 # sip:
