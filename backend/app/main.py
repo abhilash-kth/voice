@@ -97,6 +97,17 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.exception("Unhandled server error: %s", exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -401,19 +412,22 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     # participants), NOT rows stuck in "in-progress". Falls back to the DB count if
     # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
     if mode == "browser":
-        existing_calls = await repo.list_calls(user.id, limit=5)
-        for prev in existing_calls:
-            if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
-                prev_room = prev.get("room")
-                if prev_room:
-                    try:
-                        await telephony.end_active_room(prev_room)
-                    except Exception:
-                        pass
-                await repo.update_call(prev["id"], {
-                    "status": "completed",
-                    "ended_at": time.strftime("%Y-%m-%d %H:%M"),
-                })
+        try:
+            existing_calls = await repo.list_calls(user.id, limit=5)
+            for prev in existing_calls:
+                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
+                    prev_room = prev.get("room")
+                    if prev_room:
+                        try:
+                            await telephony.end_active_room(prev_room)
+                        except Exception:
+                            pass
+                    await repo.update_call(prev["id"], {
+                        "status": "completed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+        except Exception as e:
+            logger.warning("Error auto-cleaning prior browser calls: %s", e)
 
     live_rooms = await telephony.list_live_active_rooms()
     active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
