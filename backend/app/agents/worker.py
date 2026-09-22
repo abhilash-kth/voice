@@ -3255,11 +3255,32 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            # Pre-warm one idle worker process so the first call connects fast
-            # instead of paying the plugin-import + VAD-load cost on every call.
-            # Bump this for more concurrent calls; set 0 to never pre-warm.
-            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "1")),
+            # Pre-warm idle worker processes so the first call connects fast
+            # instead of paying the plugin-import + VAD-load cost on every
+            # call, and so one busy call can never block the next.
+            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "2")),
             agent_name=WORKER_AGENT_NAME,
+            # ── Dispatch-starvation fix (2026-09-22) ─────────────────────────
+            # prod mode (`start`) defaults to load_threshold=0.7 measured as
+            # the *machine CPU load*, and _is_available() answers "busy" when
+            # effective load >= threshold — which also counts reserved slots, so
+            # a single accepted job at threshold/num_idle made the worker reject
+            # the next dispatch outright. On a dev laptop (browser + editor +
+            # AV + our own onnx VAD) CPU spikes past 0.7 routinely: LiveKit's
+            # dispatch got refused with ZERO log lines and the caller sat at
+            # "Connecting to agent…" (1 participant in room) while the worker
+            # was perfectly alive. "SBI worked with Sarvam but not Google", and
+            # "assistant hung on connecting after a working announcement", were
+            # both this — timing luck, not TTS/agent config.
+            #   load_threshold=inf  → _is_available() short-circuits True; the
+            #                         pool never throttles idle processes.
+            #   load_fnc→0.0        → telemetry to the server shows no load, so
+            #                         server-side selection never skips us.
+            # A self-service call volume like this never needed CPU gating.
+            # (start mode logs one "load_threshold ... must be less than 1"
+            # warning; harmless — validation is warning-only.)
+            load_threshold=float("inf"),
+            load_fnc=lambda: 0.0,
             # Windows doesn't support the default "forkserver" context; "spawn"
             # is portable and works on Windows/macOS/Linux alike.
             multiprocessing_context="spawn",
