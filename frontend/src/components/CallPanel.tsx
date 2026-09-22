@@ -12,7 +12,7 @@ import {
   useParticipants,
 } from "@livekit/components-react";
 import "@livekit/components-styles";
-import { Agent, startCall, getCall } from "@/lib/api";
+import { Agent, startCall, getCall, endCall } from "@/lib/api";
 
 function AgentView({ onEnded }: { onEnded?: () => void }) {
   const { state, audioTrack } = useVoiceAssistant();
@@ -204,9 +204,8 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
   }, [callId, session]);
 
   const handleRoomDisconnected = useCallback(() => {
-    // Don't cut immediately — allow goodbye TTS to finish playing
-    // The polling will clear session after 4s when call is marked completed
-    setCallEndedMsg("Disconnected from room — finishing goodbye TTS then auto-cutting...");
+    const curCallId = callId;
+    setCallEndedMsg("Disconnected from room — call ended.");
     setTimeout(() => {
       setSession(null);
       if (pollRef.current) {
@@ -214,28 +213,40 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
         pollRef.current = null;
       }
     }, 1500);
-  }, []);
+    if (curCallId) {
+      endCall(curCallId).catch(() => {});
+    }
+  }, [callId]);
 
   const handleAgentEnded = useCallback(() => {
+    const curCallId = callId;
     setCallEndedMsg("Agent ended the call");
-    // Don't immediately clear — let polling or user disconnect handle it, but show ended state
-    // After 2s clear session to show start screen again
     setTimeout(() => {
-      setSession((s) => {
-        if (s) {
-          // keep until disconnected event fires
-        }
-        return s;
-      });
-    }, 100);
-  }, []);
+      setSession(null);
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    }, 1500);
+    if (curCallId) {
+      endCall(curCallId).catch(() => {});
+    }
+  }, [callId]);
 
-  const endBrowserCall = () => {
+  const endBrowserCall = async () => {
+    const curCallId = callId;
     setSession(null);
     setCallEndedMsg("Call ended. Select an agent, then start a new call.");
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
+    }
+    if (curCallId) {
+      try {
+        await endCall(curCallId);
+      } catch (e) {
+        console.warn("Could not end call on backend:", e);
+      }
     }
   };
 

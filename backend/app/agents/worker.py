@@ -1551,6 +1551,7 @@ async def entrypoint(ctx):
     #    (configurable per agent, e.g. 30 sec), speak the agent's
     #    no_response_message and hang up. Requested by user.
     # ------------------------------------------------------------------
+    call_finished = asyncio.Event()
     call_closed = {"done": False}
     closing_requested = {"done": False}
     closing_in_progress = {"done": False}
@@ -1569,6 +1570,18 @@ async def entrypoint(ctx):
         "task": None,
         "triggered": False,
     }
+
+    @ctx.room.on("disconnected")
+    def _on_room_disconnected(*_):
+        logger.info("Room disconnected event received")
+        call_finished.set()
+
+    @session.on("close")
+    def _on_session_close(*_):
+        logger.info("Session close event received")
+        call_finished.set()
+
+    ctx.add_shutdown_callback(lambda *_: call_finished.set())
 
     async def _do_deterministic_closing():
         # Prevent duplicate closings, but allow if already closing to ensure completion
@@ -1633,10 +1646,18 @@ async def entrypoint(ctx):
             session.shutdown(drain=False)
         except Exception:
             pass
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
         try:
             ctx.shutdown()
         except Exception:
             pass
+        call_finished.set()
 
     def _schedule_deterministic_closing():
         if closing_in_progress["done"]:
@@ -1796,10 +1817,18 @@ async def entrypoint(ctx):
             session.shutdown(drain=False)
         except Exception:
             pass
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
         try:
             ctx.shutdown()
         except Exception:
             pass
+        call_finished.set()
 
     def _schedule_no_response():
         # Announcement mode reads a script and hangs up. A silence timer would
@@ -1819,34 +1848,6 @@ async def entrypoint(ctx):
             logger.info(f"⏱️ No-response watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}' (scheduled)")
         except Exception as e:
             logger.warning(f"Could not arm no-response watchdog: {e}")
-
-    # Fallback loop monitor (kept for safety, primary is scheduled timer)
-    async def _no_response_monitor():
-        if agent_mode == "announcement":
-            return
-        idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-        no_response_msg = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
-        logger.info(f"⏱️ No-response loop watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}'")
-        await asyncio.sleep(2)
-        while not call_closed["done"] and not closing_in_progress["done"] and not no_response_state.get("triggered"):
-            try:
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                return
-            if closing_requested["done"] or closing_in_progress["done"] or call_closed["done"]:
-                continue
-            elapsed = time.time() - no_response_state.get("last_activity", 0)
-            cur_state = state_tracker.get("state")
-            if cur_state not in ("listening", None):
-                if cur_state in ("speaking", "thinking"):
-                    no_response_state["last_activity"] = time.time()
-                continue
-            if elapsed >= idle_timeout and not no_response_state.get("triggered"):
-                if no_response_state.get("task") is None or no_response_state["task"].done():
-                    logger.info(f"⏱️ Loop detected no response {elapsed:.0f}s — triggering")
-                    await _no_response_timeout_handler()
-                return
 
     def on_item_added(ev):
         # Allow system closing/no-response messages even after call_closed is set
@@ -2410,34 +2411,29 @@ async def entrypoint(ctx):
             from livekit import rtc
             from livekit.agents.voice import room_io
             room_options = room_io.RoomOptions(
-                close_on_disconnect=False,
+                close_on_disconnect=True,
+                delete_room_on_close=True,
                 input_options=room_io.RoomInputOptions(
                     noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
-                )
+                ),
             )
-            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=False).")
+            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=True, delete_room_on_close=True).")
         except Exception as e:
             logger.warning(
-                "Krisp noise cancellation unavailable (%s). To enable it on LiveKit "
-                "Cloud: pip install livekit-krisp-noise-cancellation and set "
-                "NOISE_CANCELLATION=krisp. For a self-hosted demo, leave it unset — "
-                "browser calls get WebRTC noise suppression and Deepgram VAD filters "
-                "non-speech.", e,
+                "Krisp noise cancellation unavailable (%s). For self-hosted, browser calls get WebRTC noise suppression.", e,
             )
-            # Fallback: still ensure close_on_disconnect=False even if Krisp fails
             try:
                 from livekit.agents.voice import room_io as _rio
-                room_options = _rio.RoomOptions(close_on_disconnect=False)
-                logger.info("🎤 RoomOptions(close_on_disconnect=False) armed as fallback after Krisp failure.")
+                room_options = _rio.RoomOptions(close_on_disconnect=True, delete_room_on_close=True)
             except Exception:
                 pass
     else:
         try:
             from livekit.agents.voice import room_io as _rio
-            room_options = _rio.RoomOptions(close_on_disconnect=False)
-            logger.info("🎤 RoomOptions(close_on_disconnect=False) armed (TTS goodbye protected).")
+            room_options = _rio.RoomOptions(close_on_disconnect=True, delete_room_on_close=True)
+            logger.info("🎤 RoomOptions(close_on_disconnect=True, delete_room_on_close=True) armed.")
         except Exception as e:
-            logger.warning(f"Could not set RoomOptions close_on_disconnect=False: {e}")
+            logger.warning(f"Could not set RoomOptions: {e}")
         if nc_mode:
             logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
 
@@ -2587,27 +2583,21 @@ async def entrypoint(ctx):
             except Exception as e:
                 logger.warning(f"Local call update failed: {e}")
 
-            # Safety net: ALWAYS check wallet deduction — if backend failed or returned non-200,
-            # deduct directly via DB (idempotent, checks existing spend transaction)
-            if real_call:
+            # Fallback direct wallet deduct only if backend /api/billing/log failed
+            if real_call and not billing_posted:
                 try:
                     has_spend = False
                     try:
                         has_spend = await repo.has_spend_for_call(call_record.get("user_id", user_id), call_record["id"])
                     except Exception as he:
                         logger.warning(f"has_spend check failed: {he}")
-                        has_spend = False
                     if not has_spend:
                         charge = float(costs.get("client_price_inr", 0) or 0)
                         if charge > 0:
                             wallet = await repo.deduct(call_record.get("user_id", user_id), charge, note=f"Call {call_record['id']}")
-                            logger.info(f"💸 Wallet auto-deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)} (billing_posted={billing_posted})")
-                        else:
-                            logger.info(f"Call {call_record['id']} has zero charge, no deduction needed")
-                    else:
-                        logger.info(f"💰 Wallet already deducted for call {call_record['id']} (billing_posted={billing_posted}) — skipping direct deduct")
+                            logger.info(f"💸 Wallet fallback deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)}")
                 except Exception as de:
-                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}", exc_info=True)
+                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}")
 
         except Exception as e:
             logger.exception(f"finalize_billing error: {e}")
@@ -2684,18 +2674,20 @@ async def entrypoint(ctx):
             except Exception as e:
                 logger.warning("session.shutdown on caller leave failed: %r", e)
 
-            async def _force_exit():
-                await asyncio.sleep(4)
-                logger.warning("job still running 4s after caller left — forcing shutdown")
+            room_name = getattr(ctx.room, "name", None)
+            if room_name:
                 try:
-                    ctx.shutdown()
-                except Exception as e:
-                    logger.warning("ctx.shutdown failed: %r", e)
+                    from app.telephony import end_active_room
+                    await end_active_room(room_name)
+                except Exception:
+                    pass
 
             try:
-                asyncio.create_task(_force_exit())
-            except Exception:
-                pass
+                ctx.shutdown()
+            except Exception as e:
+                logger.warning("ctx.shutdown failed: %r", e)
+
+            call_finished.set()
 
         def _on_connected(participant):
             if not _is_human(participant):
@@ -2786,21 +2778,20 @@ async def entrypoint(ctx):
 
     opening_backup = asyncio.create_task(_backup_opening_line())
     watchdog = asyncio.create_task(watch_call_end())
-    # Primary: scheduled timer (resets on activity), fallback: loop monitor
-    loop_monitor_task = asyncio.create_task(_no_response_monitor())
 
     start_kwargs: dict = {"agent": agent, "room": ctx.room}
     if room_options is not None:
         start_kwargs["room_options"] = room_options
     try:
         await session.start(**start_kwargs)
+        # Keep entrypoint alive until the call completes so background watchdogs run
+        await call_finished.wait()
     except Exception as e:
         logger.exception("session.start failed — job will exit so the worker can take the next call: %r", e)
         raise
     finally:
         opening_backup.cancel()
         watchdog.cancel()
-        loop_monitor_task.cancel()
         _cancel_no_response()
         if egress_task is not None:
             egress_task.cancel()
