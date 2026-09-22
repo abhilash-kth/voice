@@ -106,6 +106,7 @@ export interface Agent {
   created_at: string;
   agent_mode?: string;
   announce_text?: string;
+  end_after_announcement?: boolean;
   fallback_response?: string;
   providers: {
     llm: { id: string; config: Record<string, unknown> };

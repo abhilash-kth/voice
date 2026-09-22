@@ -256,6 +256,7 @@ class AgentConfig(BaseModel):
     enabled: bool = True
     agent_mode: str = "assistant"
     announce_text: str = ""
+    end_after_announcement: bool = False
     fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
     no_response_timeout_seconds: int = 30
     no_response_message: str = "I did not hear a response, so I will end the call now. Thank you for calling."
@@ -279,6 +280,7 @@ class AgentCreate(BaseModel):
     enabled: bool = True
     agent_mode: str = "assistant"
     announce_text: str = ""
+    end_after_announcement: bool = False
     fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
     no_response_timeout_seconds: int = 30
     no_response_message: str = "I did not hear a response, so I will end the call now. Thank you for calling."
@@ -300,6 +302,7 @@ class AgentUpdate(BaseModel):
     enabled: Optional[bool] = None
     agent_mode: Optional[str] = None
     announce_text: Optional[str] = None
+    end_after_announcement: Optional[bool] = None
     fallback_response: Optional[str] = None
     no_response_timeout_seconds: Optional[int] = None
     no_response_message: Optional[str] = None

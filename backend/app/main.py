@@ -488,6 +488,7 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
 
 @app.post("/api/calls/{call_id}/end")
 async def end_call(call_id: str, user=Depends(auth.get_current_user)):
+    logger.info("[CALL_END_REQUESTED] source=user call_id=%s user_id=%s", call_id, user.id)
     rec = await repo.get_call(call_id, user.id)
     if not rec:
         raise HTTPException(404, "Call not found")
@@ -502,6 +503,7 @@ async def end_call(call_id: str, user=Depends(auth.get_current_user)):
             "status": "completed",
             "ended_at": time.strftime("%Y-%m-%d %H:%M"),
         })
+    logger.info("[CALL_ENDED] call_id=%s reason=user_ended", call_id)
     return {"ok": True, "call_id": call_id}
 
 

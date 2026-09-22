@@ -109,6 +109,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   );
   const [mode, setMode] = useState(editing?.agent_mode || "assistant");
   const [announceText, setAnnounceText] = useState(editing?.announce_text || "");
+  const [endAfterAnnouncement, setEndAfterAnnouncement] = useState(
+    editing?.end_after_announcement ?? false
+  );
   const [personality, setPersonality] = useState(editing?.voice_personality || "friendly");
   const [language, setLanguage] = useState(editing?.language || "hi");
   // Spoken-voice gender: picks the Google Chirp 3 speaker / Sarvam Bulbul speaker.
@@ -627,6 +630,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         voice_personality: personality,
         agent_mode: mode,
         announce_text: mode === "announcement" ? announceText : "",
+        end_after_announcement: mode === "announcement" ? endAfterAnnouncement : false,
         fallback_response: fallbackResponse.trim(),
         no_response_timeout_seconds: Math.max(15, Number(noResponseTimeout) || 30),
         no_response_message: noResponseMessage.trim(),
@@ -768,14 +772,22 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         </div>
 
         {mode === "announcement" && (
-          <div>
-            <label className="text-xs text-gray-400 font-medium">Fixed script (announcement)</label>
-            <textarea
-              value={announceText}
-              onChange={(e) => setAnnounceText(e.target.value)}
-              rows={3}
-              placeholder="Namaste! Ye ek reminder hai..."
-              className="w-full bg-gray-800 border border-blue-600/40 rounded-lg px-3 py-2 text-sm mt-1"
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-gray-400 font-medium">Fixed script (announcement)</label>
+              <textarea
+                value={announceText}
+                onChange={(e) => setAnnounceText(e.target.value)}
+                rows={3}
+                placeholder="Namaste! Ye ek reminder hai..."
+                className="w-full bg-gray-800 border border-blue-600/40 rounded-lg px-3 py-2 text-sm mt-1"
+              />
+            </div>
+            <Toggle
+              on={endAfterAnnouncement}
+              set={setEndAfterAnnouncement}
+              label="End call after announcement"
+              hint="Automatically hang up when script finishes (default: keep call open)"
             />
           </div>
         )}

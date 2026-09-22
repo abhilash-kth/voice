@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   LiveKitRoom,
   VoiceAssistantControlBar,
@@ -30,27 +30,40 @@ interface Props {
   onPresetConsumed?: () => void;
 }
 
+const STATIC_AUDIO_OPTIONS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
 function ActiveSession({
   agent,
   callId,
   roomName,
   onStateChange,
+  onAnnouncementFinished,
 }: {
   agent?: Agent;
   callId: string;
   roomName: string;
   onStateChange: (state: CallState) => void;
+  onAnnouncementFinished: () => void;
 }) {
   const room = useRoomContext();
   const { state: vaState, audioTrack } = useVoiceAssistant();
   const participants = useParticipants();
   const [agentJoined, setAgentJoined] = useState(false);
   const [waitingLogged, setWaitingLogged] = useState(false);
+  const announcementSpokeRef = useRef(false);
+  const announcementFinishedRef = useRef(false);
+  const [announcementDone, setAnnouncementDone] = useState(false);
 
-  // Auto-start browser audio playout once room context is available
+  // Auto-start browser audio playout once room is connected
   useEffect(() => {
-    room.startAudio().catch(() => {});
-  }, [room]);
+    if (room.state === "connected") {
+      room.startAudio().catch(() => {});
+    }
+  }, [room, room.state]);
 
   // Track room connection and mic publication
   useEffect(() => {
@@ -82,6 +95,24 @@ function ActiveSession({
     }
   }, [participants, agentJoined, roomName, agent, waitingLogged, onStateChange]);
 
+  // Track announcement playback state
+  useEffect(() => {
+    if (agent?.agent_mode === "announcement") {
+      if (vaState === "speaking") {
+        announcementSpokeRef.current = true;
+      } else if (
+        announcementSpokeRef.current &&
+        !announcementFinishedRef.current &&
+        (vaState === "idle" || vaState === "listening")
+      ) {
+        announcementFinishedRef.current = true;
+        setAnnouncementDone(true);
+        console.log(`[ANNOUNCEMENT_FINISHED] room=${roomName}`);
+        onAnnouncementFinished();
+      }
+    }
+  }, [vaState, agent, roomName, onAnnouncementFinished]);
+
   return (
     <div className="flex flex-col items-center gap-6 p-8 bg-gray-900 rounded-2xl border border-gray-800 shadow-2xl max-w-md w-full animate-fade-in-up">
       <div
@@ -94,7 +125,9 @@ function ActiveSession({
                 ? "bg-yellow-500 shadow-lg shadow-yellow-500/30 animate-pulse"
                 : !agentJoined
                   ? "bg-amber-600 animate-pulse"
-                  : "bg-gray-700"
+                  : announcementDone
+                    ? "bg-indigo-600 shadow-lg shadow-indigo-500/30"
+                    : "bg-gray-700"
         }`}
       >
         {vaState === "speaking"
@@ -105,7 +138,9 @@ function ActiveSession({
               ? "💭"
               : !agentJoined
                 ? "⏳"
-                : "🤖"}
+                : announcementDone
+                  ? "📢"
+                  : "🤖"}
       </div>
 
       <div className="text-center">
@@ -121,15 +156,20 @@ function ActiveSession({
           {!agentJoined
             ? "Waiting for agent to connect..."
             : vaState === "speaking"
-              ? "Agent is speaking..."
-              : vaState === "listening"
-                ? "Listening to you..."
-                : vaState === "thinking"
-                  ? "Thinking..."
-                  : "Connected to agent"}
+              ? agent?.agent_mode === "announcement"
+                ? "Playing announcement script..."
+                : "Agent is speaking..."
+              : announcementDone
+                ? "Announcement completed. Call is active."
+                : vaState === "listening"
+                  ? "Listening to you..."
+                  : vaState === "thinking"
+                    ? "Thinking..."
+                    : "Connected to agent"}
         </p>
         <p className="text-[11px] text-gray-500 mt-1">
           {participants.length} participant{participants.length !== 1 ? "s" : ""} in room
+          {announcementDone && " • You can stay connected or press End Call"}
         </p>
       </div>
 
@@ -176,6 +216,7 @@ export default function CallPanel({
   const [callEndedMsg, setCallEndedMsg] = useState("");
 
   const isDisconnectingRef = useRef(false);
+  const callEndReasonRef = useRef<string | null>(null);
 
   // Preselect an agent when presetAgentId is provided or initialize with first agent
   useEffect(() => {
@@ -187,6 +228,8 @@ export default function CallPanel({
       setAgentId(agents[0].id);
     }
   }, [agents, presetAgentId, agentId, onPresetConsumed]);
+
+  const selected = useMemo(() => agents.find((a) => a.id === agentId), [agents, agentId]);
 
   const fetchCallSummary = async (cid: string) => {
     if (!cid) {
@@ -209,11 +252,12 @@ export default function CallPanel({
   const endBrowserCall = async () => {
     if (isDisconnectingRef.current) return;
     isDisconnectingRef.current = true;
+    callEndReasonRef.current = "user_ended";
+    console.log(`[CALL_END_REQUESTED] source=user call_id=${callId}`);
     setCallState("ending");
 
     const curCallId = callId;
     const curRoom = session?.room || "";
-    console.log(`[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=user_ended`);
 
     try {
       if (curCallId) {
@@ -224,31 +268,58 @@ export default function CallPanel({
     } catch {
       // ignore backend error on end
     } finally {
+      console.log(`[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=user_ended`);
       setTimeout(() => {
         setSession(null);
         setCallState("ended");
         isDisconnectingRef.current = false;
+        callEndReasonRef.current = null;
         fetchCallSummary(curCallId);
-      }, 350);
+      }, 300);
     }
   };
 
-  const handleRoomDisconnected = useCallback(() => {
-    if (isDisconnectingRef.current) return;
-    isDisconnectingRef.current = true;
-    const curCallId = callId;
-    const curRoom = session?.room || "";
-    console.log(
-      `[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=room_disconnected`
-    );
+  const handleAnnouncementFinished = useCallback(() => {
+    if (!selected) return;
+    if (selected.agent_mode === "announcement" && selected.end_after_announcement) {
+      console.log(`[CALL_END_REQUESTED] source=announcement call_id=${callId}`);
+      callEndReasonRef.current = "announcement_completed";
+    }
+  }, [selected, callId]);
 
-    setTimeout(() => {
-      setSession(null);
-      setCallState("ended");
-      isDisconnectingRef.current = false;
-      fetchCallSummary(curCallId);
-    }, 200);
-  }, [callId, session]);
+  const handleRoomDisconnected = useCallback(
+    (reason?: any) => {
+      if (isDisconnectingRef.current) return;
+      isDisconnectingRef.current = true;
+      const curCallId = callId;
+      const curRoom = session?.room || "";
+
+      let finalReason = callEndReasonRef.current;
+      if (!finalReason) {
+        if (selected?.agent_mode === "announcement" && selected?.end_after_announcement) {
+          finalReason = "announcement_completed";
+        } else if (reason === 5 || String(reason).includes("5") || String(reason).includes("ROOM_DELETED")) {
+          finalReason = "completed";
+        } else if (reason === 7 || String(reason).includes("7") || String(reason).includes("JOIN_FAILURE")) {
+          finalReason = "connection_error";
+        } else {
+          finalReason = "room_disconnected";
+        }
+      }
+
+      console.log(`[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=${finalReason}`);
+
+      setCallState("ending");
+      setTimeout(() => {
+        setSession(null);
+        setCallState("ended");
+        isDisconnectingRef.current = false;
+        callEndReasonRef.current = null;
+        fetchCallSummary(curCallId);
+      }, 250);
+    },
+    [callId, session, selected]
+  );
 
   const go = async () => {
     setErr("");
@@ -353,8 +424,6 @@ export default function CallPanel({
       callState === "ending") &&
     session !== null;
 
-  const selected = agents.find((a) => a.id === agentId);
-
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800">
@@ -386,8 +455,10 @@ export default function CallPanel({
         {selected ? (
           <p className="text-[11px] text-gray-400 mb-4">
             {selected.agent_mode === "announcement"
-              ? "Announcement mode: on connect the agent reads its script, then completes the call."
-              : "Assistant mode: on connect the agent greets you, then listens and replies conversational."}
+              ? selected.end_after_announcement
+                ? "Announcement mode: plays fixed script, then automatically ends the call."
+                : "Announcement mode: plays fixed script and keeps call open until you end it."
+              : "Assistant mode: greets you on connect, then listens and converses across turns."}
           </p>
         ) : (
           <p className="text-[11px] text-gray-500 mb-4">
@@ -510,12 +581,8 @@ export default function CallPanel({
           <LiveKitRoom
             token={session.token}
             serverUrl={session.url}
-            connect={true}
-            audio={{
-              noiseSuppression: true,
-              echoCancellation: true,
-              autoGainControl: true,
-            }}
+            connect={!isDisconnectingRef.current && (callState === "connecting" || callState === "waiting_for_agent" || callState === "connected")}
+            audio={STATIC_AUDIO_OPTIONS}
             video={false}
             onDisconnected={handleRoomDisconnected}
             onError={(error) => {
@@ -528,6 +595,7 @@ export default function CallPanel({
               callId={callId}
               roomName={session.room}
               onStateChange={(st) => setCallState(st)}
+              onAnnouncementFinished={handleAnnouncementFinished}
             />
             <RoomAudioRenderer />
           </LiveKitRoom>
