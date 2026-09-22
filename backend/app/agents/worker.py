@@ -2636,10 +2636,43 @@ async def entrypoint(ctx):
                 logger.warning(f"⚠️ Egress unavailable; continuing without recording: {e}")
         egress_task = asyncio.create_task(_start_egress_later())
 
+    # Announcement play-outcome tracking (2026-09-22 silent-billed fix): the fixed
+    # script can FAIL (TTS auth outage, missing google-key.json) leaving the
+    # caller in silence. _AnnounceAgent.on_enter records spoken_ok/error here;
+    # finalize_billing uses it to bill played scripts fairly AND mark unplayed
+    # ones "failed" so the customer is NOT billed. Defined for both modes so
+    # the finalize closure always sees the name.
+    announce_tracker: dict = {"script": "", "spoken_ok": False, "chars": 0, "error": ""}
+
     if agent_mode == "announcement":
         script = getattr(cfg, "announce_text", "") or greeting
         script = leadfile.render_template(script, lead_data)
-        agent = build_announce_agent(cfg, announce_text=script)
+        if not script.strip():
+            # No script at all (empty Fixed script + empty greeting): fail fast
+            # HERE, before the session exists — build_announce_agent would raise
+            # ValueError past the point where finalize_billing is registered,
+            # leaving the call stuck "in-progress" forever.
+            logger.error("📢 Announcement agent has NO script (announce_text and greeting both empty) — marking call failed, customer NOT billed. Set the Fixed script on the agent.")
+            try:
+                if egress_task is not None:
+                    egress_task.cancel()
+            except Exception:
+                pass
+            try:
+                await repo.update_call(call_record["id"], {
+                    "status": "failed",
+                    "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    "duration_seconds": int(time.time() - call_start),
+                    "transcripts": [],
+                    "usage": usage,
+                    "cost": {},
+                    "recording_url": None,
+                })
+            except Exception as e:
+                logger.warning(f"Could not mark script-less announcement call failed: {e}")
+            return
+        announce_tracker["script"] = script
+        agent = build_announce_agent(cfg, announce_text=script, tracker=announce_tracker)
         logger.info("📢 mode=announcement (fixed-script only, no STT/LLM)")
     else:
         agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing)
@@ -2710,6 +2743,25 @@ async def entrypoint(ctx):
         _finalized["done"] = True
         try:
             duration = int(time.time() - call_start)
+            # Announcement accounting (2026-09-22 silent-billed fix): session.say()
+            # emits no conversation_item_added, so without this a PLAYED script
+            # contributed 0 TTS chars (under-billed on success) while a FAILED
+            # (silent) play still billed the ₹1 minimum via duration >= 3s. The
+            # tracker set by _AnnounceAgent.on_enter is authoritative for both.
+            if agent_mode == "announcement":
+                if announce_tracker.get("spoken_ok"):
+                    _script_chars = int(announce_tracker.get("chars", 0) or 0)
+                    usage["tts_chars"] += _script_chars
+                    _script_text = announce_tracker.get("script", "")
+                    if _script_text:
+                        usage["transcripts"].append({"role": "agent", "text": _script_text[:4000]})
+                    logger.info(f"📢 Announcement accounting: script played OK, +{_script_chars} TTS chars (billed fairly).")
+                else:
+                    logger.error(
+                        "📢 Announcement accounting: script NEVER played "
+                        f"(error: {announce_tracker.get('error') or 'unknown — job ended before on_enter finished'}) — "
+                        "marking call failed, customer will NOT be billed."
+                    )
             # V2: Use actual LLM provider/model and cached tokens + TTFT for cost tracking - FIXED 0ms telemetry
             # Previous bug: turn_timing reset after each turn, so final billing showed 0ms TTFT/gen_time
             # Fix: Preserve last successful metrics in turn_timing["last_*"] and use them if current is 0
@@ -2804,6 +2856,11 @@ async def entrypoint(ctx):
             # Only treat it as a real call if something was said or it ran long
             # enough. Otherwise mark it failed so it isn't billed.
             real_call = (duration >= _FAIL_THRESHOLD_SECONDS) or (usage["user_speech_seconds"] > 0)
+            # Announcement override (2026-09-22): a script that never played is
+            # NEVER a real call, however long the room stayed open — the caller
+            # heard silence, so no charge. Assistant mode is untouched.
+            if agent_mode == "announcement" and not announce_tracker.get("spoken_ok"):
+                real_call = False
             status = "completed" if real_call else "failed"
 
             # FIX: Pass turn_timing_ref for authoritative billing display

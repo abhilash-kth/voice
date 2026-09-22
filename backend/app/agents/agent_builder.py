@@ -895,10 +895,22 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
         voice = _resolve_tts_voice(language, overrides.get("voice"), gender)
         logger.info(f"🎙️ Google TTS: voice={voice} language={language} gender={gender}")
+        creds_file = overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None
+        # Fail LOUD at build time (2026-09-22: "Appointment Remainder" went
+        # fully silent because google-key.json was missing on the box — the
+        # first symptom was a dead call, not this line). Not a hard raise:
+        # metadata-server / ADC environments legitimately have no file.
+        if creds_file and not os.path.exists(creds_file):
+            logger.error(
+                f"❌ Google TTS credentials file NOT FOUND: {creds_file} — every say() "
+                "will fail (announcement calls go fully silent, assistant turns error). "
+                "Place google-key.json on this machine (or mount it at this path in "
+                "Docker) or fix GOOGLE_APPLICATION_CREDENTIALS."
+            )
         return TTS(
             voice_name=voice,
             language=language,
-            credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
+            credentials_file=creds_file,
         )
 
     if sel.id.startswith("sarvam"):
@@ -1958,12 +1970,18 @@ def build_announce_agent(
     cfg: AgentConfig,
     *,
     announce_text: str = "",
+    tracker: Optional[dict] = None,
 ) -> "Any":
     """Return a LiveKit v1 ``Agent`` that only plays a fixed script and hangs up.
 
     Used for "reminder"/"inform-only" calls: the agent answers, reads the script
     aloud via TTS, then ends the call. It never listens (no STT) and never
     generates a reply (no LLM). The customer is not billed for STT/LLM.
+
+    ``tracker`` (a worker-owned dict) records the play outcome for billing:
+    ``spoken_ok``/``chars`` on success, ``error`` on failure. Without it a TTS
+    failure was indistinguishable from a played script — the caller heard
+    nothing and was still billed the ₹1 minimum (2026-09-22).
     """
     from livekit.agents import Agent
     from livekit.agents import llm
@@ -1996,13 +2014,33 @@ def build_announce_agent(
                     await asyncio.wait_for(room_io.wait_for_ready(), timeout=60)
             except Exception as e:
                 logger.warning(f"wait_for_ready failed; playing announcement anyway: {e}")
-            # Play the fixed script, then end the call gracefully. We delete the
-            # LiveKit room so the caller is physically disconnected (otherwise the
-            # browser/SIP participant would be left in a silent, open call), then
-            # shut the job down — which runs the worker's finalize_billing shutdown
-            # callback so the call is marked completed.
-            speech = self.session.say(text, allow_interruptions=False)
-            await speech
+            # Play the fixed script. This await is the failure point that used to
+            # go silent: a TTS outage (missing google-key.json, bad key,
+            # provider 429/500) raises here, the teardown below was SKIPPED,
+            # the caller heard NOTHING — and finalize_billing still marked the
+            # call completed (duration >= 3s) and billed the ₹1 minimum
+            # (2026-09-22: "Appointment Remainder" silent + billed). Now: track
+            # the outcome for billing, and ALWAYS run the teardown so the
+            # caller is never stranded in a silent open call.
+            try:
+                speech = self.session.say(text, allow_interruptions=False)
+                await asyncio.wait_for(speech, timeout=120)
+                if tracker is not None:
+                    tracker["spoken_ok"] = True
+                    tracker["chars"] = len(text)
+                logger.info(f"📢 Announcement played OK ({len(text)} chars) — closing call.")
+            except asyncio.TimeoutError:
+                if tracker is not None:
+                    tracker["error"] = "TTS say timed out after 120s"
+                logger.error("📢 Announcement TTS FAILED: say timed out after 120s — caller heard nothing (or partial audio). Marking failed, customer will NOT be billed.")
+            except Exception as e:
+                if tracker is not None:
+                    tracker["error"] = f"{type(e).__name__}: {e}"
+                logger.error(f"📢 Announcement TTS FAILED: {type(e).__name__}: {e} — caller heard nothing. Marking failed, customer will NOT be billed. Check TTS credentials (google-key.json) and provider status.")
+            # Tear down unconditionally: delete the LiveKit room so the caller
+            # is physically disconnected (otherwise the browser/SIP participant
+            # would be left in a silent, open call), then shut the job down —
+            # which runs the worker's finalize_billing shutdown callback.
             try:
                 from livekit.agents import get_job_context
                 ctx = get_job_context(required=False)
@@ -2017,7 +2055,8 @@ def build_announce_agent(
                     ctx.shutdown()
                 else:
                     self.session.shutdown(drain=True)
-                logger.info("📢 Announcement finished — closing call.")
+                _ok = bool((tracker or {}).get("spoken_ok"))
+                logger.info(f"📢 Announcement {'finished' if _ok else 'failed'} — closing call.")
             except Exception as e:
                 logger.warning(f"could not close announcement session: {e}")
 
