@@ -637,79 +637,6 @@ def build_llm(cfg: AgentConfig) -> Any:
         logger.error(f"❌ Could not build LLM FallbackAdapter {fallback_ids}: {e} - using primary only, error: {e}")
         return primary
 
-    except Exception as e:
-        logger.warning(f"Groq auto-prefer check failed: {e}")
-
-    # Build primary (respects user's choice now that auto-swap default is 0)
-    primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
-
-    # Only use what user selected - no fixed fallback injection
-    # User explicitly said: "Don't add inside the fixed fallback. Only user will select all the things"
-    fallbacks = []
-    fallback_pair = getattr(cfg.providers, "llm_fallback", None)
-    if not fallback_pair:
-        try:
-            fp = getattr(cfg, "fallback_providers", None)
-            if fp and getattr(fp, "llm", None):
-                fallback_pair = fp.llm
-        except Exception:
-            pass
-
-    if fallback_pair:
-        if not (fallback_pair.id == primary_pair.id and (fallback_pair.config or {}).get("model") == (primary_pair.config or {}).get("model")):
-            fallbacks.append(fallback_pair)
-
-    # Safety net for observed 404 pattern: groq_gpt_oss (120b) sometimes 404s (recovery failed)
-    # Ensure groq_gpt_oss_20b is available as last resort if 120b is anywhere in chain and 20b not already present
-    # This preserves user intent (Groq) while handling 404, with explicit logging (not silent)
-    try:
-        chain_ids = [primary_pair.id] + [fb.id for fb in fallbacks]
-        has_120b = "groq_gpt_oss" in chain_ids
-        has_20b = "groq_gpt_oss_20b" in chain_ids
-        if has_120b and not has_20b:
-            from ..models import ProviderPair
-            safety_pair = ProviderPair(id="groq_gpt_oss_20b", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80})
-            fallbacks.append(safety_pair)
-            logger.info(f"🛡️ Added safety fallback groq_gpt_oss_20b (20b) because chain contains groq_gpt_oss (120b) which observed 404 recovery failed - ensures at least one Groq model works")
-    except Exception as e:
-        logger.debug(f"Could not add safety fallback: {e}")
-
-    if not fallbacks:
-        return primary
-
-    fallback_instances = []
-    fallback_ids = []
-    for fb_pair in fallbacks:
-        try:
-            inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
-            fallback_instances.append(inst)
-            fallback_ids.append(fb_pair.id)
-        except Exception as e:
-            logger.warning(f"⚠️ Could not build LLM fallback {fb_pair.id}: {e} — skipping")
-
-    if not fallback_instances:
-        return primary
-
-    try:
-        from livekit.agents import llm as llm_agents
-        all_llms = [primary] + fallback_instances
-        adapter = llm_agents.FallbackAdapter(all_llms)
-        chain_str = " -> ".join([primary_pair.id] + fallback_ids)
-        # Log full chain with models and base_urls for debugging 404
-        try:
-            chain_details = []
-            for pair in [primary_pair] + [fb for fb in fallbacks]:
-                cat_model = pair.config.get("model") if pair.config else "from catalog"
-                base = pair.config.get("base_url") if pair.config and pair.config.get("base_url") else ("https://api.groq.com/openai/v1" if pair.id.startswith("groq") else "https://api.openai.com/v1" if pair.id.startswith("openai") else "https://openrouter.ai/api/v1")
-                chain_details.append(f"{pair.id}({cat_model} @ {base})")
-            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback) | Details: {' -> '.join(chain_details)}")
-        except Exception:
-            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback)")
-        return adapter
-    except Exception as e:
-        logger.warning(f"⚠️ Could not build LLM FallbackAdapter {fallback_ids}: {e} — using primary only")
-        return primary
-
 
 def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     sel = pair
@@ -1410,6 +1337,60 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
 # ---------------------------------------------------------------------------
 # v1 Agent (subclass) — static knowledge + cross-call memory + greeting
 # ---------------------------------------------------------------------------
+
+async def wait_until_caller_can_hear(session, timeout: float = 12.0) -> None:
+    """Wait until the caller is linked, then give the browser time to subscribe.
+
+    Opening speech that starts before the browser attaches its audio element is
+    generated and dropped. The call looks connected and stays silent.
+    """
+    room_io = getattr(session, "room_io", None)
+    if room_io is not None and hasattr(room_io, "wait_for_ready"):
+        try:
+            await asyncio.wait_for(room_io.wait_for_ready(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for the caller audio path — speaking anyway.")
+        except Exception as e:
+            logger.warning(f"wait_for_ready failed; speaking anyway: {e}")
+    # RoomIO "ready" is earlier than the browser attaching <audio>.
+    await asyncio.sleep(0.8)
+
+
+async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> None:
+    """Play one opening line and wait until playout finishes.
+
+    Interruptions stay off for this line only. The browser mic opens at the
+    same moment the agent starts, and that burst used to cancel the greeting
+    before any audio reached the caller.
+    """
+    text = (text or "").strip()
+    if not text:
+        logger.warning("Opening line is empty — nothing to speak")
+        return
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            handle = session.say(text, allow_interruptions=False)
+            if handle is None:
+                return
+            waiter = getattr(handle, "wait_for_playout", None)
+            if callable(waiter):
+                await asyncio.wait_for(waiter(), timeout=timeout)
+            else:
+                await asyncio.wait_for(handle, timeout=timeout)
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "opening line attempt %s failed: %s: %r",
+                attempt, type(e).__name__, e,
+            )
+            if attempt == 1:
+                await asyncio.sleep(0.4)
+    if last_error is not None:
+        raise last_error
+
+
 def build_voice_agent(
     cfg: AgentConfig,
     *,
@@ -1580,6 +1561,8 @@ def build_voice_agent(
         def __init__(self):
             self.cfg = cfg
             self.greeting = greeting
+            self._opening_started = False
+            self._opening_done = False
             self._last_rag = ""  # per-turn RAG injection (see on_user_turn_completed)
             self._turn_timing_ref = turn_timing_ref  # For preventing duplicate REQUEST START while previous active
             # Store instance so _end_call tool can speak deterministic closing via session.
@@ -1598,19 +1581,20 @@ def build_voice_agent(
             )
 
         async def on_enter(self) -> None:
-            if self.greeting:
-                # Wait until a participant is linked and audio output is ready
-                # before speaking, so outbound/SIP greetings aren't lost while
-                # the number is still ringing.
-                try:
-                    room_io = getattr(self.session, "room_io", None)
-                    if room_io is not None and hasattr(room_io, "wait_for_ready"):
-                        await asyncio.wait_for(room_io.wait_for_ready(), timeout=60)
-                except asyncio.TimeoutError:
-                    logger.warning("Timed out waiting for a participant to join — greeting anyway.")
-                except Exception as e:
-                    logger.warning(f"wait_for_ready failed; greeting anyway: {e}")
-                await self.session.say(self.greeting, allow_interruptions=True)
+            # Assistant mode: greet as soon as the caller can hear, then listen.
+            self._opening_started = True
+            try:
+                if not (self.greeting or "").strip():
+                    logger.warning("Assistant has no greeting — skipping opening line")
+                    return
+                logger.info("🗣️ Assistant connected — speaking greeting once the caller can hear")
+                await wait_until_caller_can_hear(self.session)
+                await speak_opening_line(self.session, self.greeting, timeout=45)
+                logger.info("✅ Greeting finished — now listening")
+            except Exception as e:
+                logger.warning(f"Greeting failed: {type(e).__name__}: {e!r}")
+            finally:
+                self._opening_done = True
 
         async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
             """Hook that runs after the user finishes speaking — CRITICAL LATENCY PATH.
@@ -1886,6 +1870,8 @@ def build_announce_agent(
     class _AnnounceAgent(Agent):
         def __init__(self):
             self.cfg = cfg
+            self._opening_started = False
+            self._opening_done = False
             super().__init__(
                 # No LLM: a still/empty instruction set. Everything is hardcoded.
                 instructions="You are a one-way announcement. Do not use tools.",
@@ -1898,20 +1884,20 @@ def build_announce_agent(
             )
 
         async def on_enter(self) -> None:
-            # Wait for the participant/audio to be ready so the script isn't cut off.
+            # Announcement mode: read the fixed script, then hang up. No STT, no LLM.
+            # The room is deleted only after playout has flushed — deleting it
+            # immediately is what made these calls sound silent.
+            self._opening_started = True
             try:
-                room_io = getattr(self.session, "room_io", None)
-                if room_io is not None and hasattr(room_io, "wait_for_ready"):
-                    await asyncio.wait_for(room_io.wait_for_ready(), timeout=60)
+                logger.info("📢 Announcement connected — reading the script once the caller can hear")
+                await wait_until_caller_can_hear(self.session)
+                await speak_opening_line(self.session, text, timeout=120)
+                logger.info("✅ Announcement script finished")
+                await asyncio.sleep(1.2)
             except Exception as e:
-                logger.warning(f"wait_for_ready failed; playing announcement anyway: {e}")
-            # Play the fixed script, then end the call gracefully. We delete the
-            # LiveKit room so the caller is physically disconnected (otherwise the
-            # browser/SIP participant would be left in a silent, open call), then
-            # shut the job down — which runs the worker's finalize_billing shutdown
-            # callback so the call is marked completed.
-            speech = self.session.say(text, allow_interruptions=False)
-            await speech
+                logger.warning(f"Announcement playback failed: {type(e).__name__}: {e!r}")
+            finally:
+                self._opening_done = True
             try:
                 from livekit.agents import get_job_context
                 ctx = get_job_context(required=False)
