@@ -227,11 +227,14 @@ def _call_dict(c: Any) -> dict:
     }
 
 
-async def list_calls(user_id: str, agent_id: Optional[str] = None) -> list[dict]:
+async def list_calls(user_id: str, agent_id: Optional[str] = None, limit: Optional[int] = None) -> list[dict]:
     where: dict = {"userId": user_id}
     if agent_id:
         where["agentId"] = agent_id
-    rows = await get_prisma().call.find_many(where=where, order={"startedAt": "desc"})
+    find_args: dict = {"where": where, "order": {"startedAt": "desc"}}
+    if limit is not None:
+        find_args["take"] = limit
+    rows = await get_prisma().call.find_many(**find_args)
     return [_call_dict(c) for c in rows]
 
 
