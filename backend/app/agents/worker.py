@@ -1388,9 +1388,10 @@ async def entrypoint(ctx):
     phone = meta.get("phone")
     call_id = meta.get("call_id", "")
     user_id = meta.get("user_id", "")
-    # Per-lead data for dynamic scripts (bulk-call campaigns). Every lead's columns
-    # can be referenced in the greeting/announcement text as {column_name}.
     lead_data = meta.get("lead_data") or {}
+
+    logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
+    logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
 
     rec = None
     # Always load the agent the user just selected. A 30s cache made
@@ -1418,15 +1419,24 @@ async def entrypoint(ctx):
                     await asyncio.sleep(0.15)
 
     if rec is None:
-        # fall back to the default demo agent so the worker never crashes
-        logger.error(
-            "❌ Could not load agent_id=%s — the worker is still running, but this "
-            "call will use the demo agent. End it and start again with the agent you selected.",
-            agent_id,
-        )
+        if agent_id and agent_id != "demo":
+            logger.error(
+                "[CALL_ERROR] room=%s Agent '%s' not found for user %s. Refusing silent fallback.",
+                getattr(ctx.room, "name", ""), agent_id, user_id,
+            )
+            if call_id and user_id:
+                try:
+                    await repo.update_call(call_id, {
+                        "status": "failed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+                except Exception:
+                    pass
+            return
+        logger.info("[AGENT_SELECTED] room=%s Using default demo agent config", getattr(ctx.room, "name", ""))
         from app.sample import default_config
         cfg = default_config()
-        agent_id = agent_id or "demo"
+        agent_id = "demo"
     else:
         cfg = AgentConfig(**rec)
 
@@ -1533,11 +1543,10 @@ async def entrypoint(ctx):
     # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
     # ------------------------------------------------------------------
     agent_mode = getattr(cfg, "agent_mode", "assistant") or "assistant"
+    logger.info("[AGENT_WAITING] room=%s agent_id=%s name=%s agent_mode=%s", getattr(ctx.room, "name", ""), agent_id, cfg.name, agent_mode)
     if agent_mode == "announcement":
         session = build_announcement_session(cfg)
     else:
-        # Async build to avoid blocking job executor (was 3.46s sync -> unresponsive)
-        # Pass turn_timing_ref to enable TTS timing wrapper (measures real TTS audio)
         session = await build_assistant_session(cfg, turn_timing_ref=turn_timing)
 
     # ------------------------------------------------------------------
@@ -2390,11 +2399,12 @@ async def entrypoint(ctx):
         if not (script or "").strip():
             script = greeting or f"Hello, this is {cfg.name}."
         agent = build_announce_agent(cfg, announce_text=script)
-        logger.info("📢 mode=announcement — will read the script when the caller can hear, then hang up")
+        logger.info("[ANNOUNCEMENT_STARTED] room=%s agent_id=%s script=%s", getattr(ctx.room, "name", ""), agent_id, script[:60])
     else:
         agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing)
-        logger.info("💬 mode=assistant — will greet when the caller can hear, then listen")
+        logger.info("[ASSISTANT_STARTED] room=%s agent_id=%s greeting=%s", getattr(ctx.room, "name", ""), agent_id, greeting[:60])
     agent_holder["agent"] = agent
+    logger.info("[AGENT_STARTED] room=%s agent_id=%s agent_mode=%s", getattr(ctx.room, "name", ""), agent_id, agent_mode)
 
     # Server-side noise cancellation. Two tiers:
     #   * NOISE_CANCELLATION=krisp -> server-side Krisp (BVC) filter. Only works on
@@ -2405,36 +2415,15 @@ async def entrypoint(ctx):
     #     and Deepgram STT uses its built-in VAD (`vad_events=True`), which rejects
     #     non-speech/noise frames before they reach the LLM.
     room_options = None
-    nc_mode = os.getenv("NOISE_CANCELLATION", "").strip().lower()
-    if nc_mode == "krisp":
-        try:
-            from livekit import rtc
-            from livekit.agents.voice import room_io
-            room_options = room_io.RoomOptions(
-                close_on_disconnect=False,
-                input_options=room_io.RoomInputOptions(
-                    noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
-                ),
-            )
-            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=False).")
-        except Exception as e:
-            logger.warning(
-                "Krisp noise cancellation unavailable (%s). For self-hosted, browser calls get WebRTC noise suppression.", e,
-            )
-            try:
-                from livekit.agents.voice import room_io as _rio
-                room_options = _rio.RoomOptions(close_on_disconnect=False)
-            except Exception:
-                pass
-    else:
-        try:
-            from livekit.agents.voice import room_io as _rio
-            room_options = _rio.RoomOptions(close_on_disconnect=False)
-            logger.info("🎤 RoomOptions(close_on_disconnect=False) armed.")
-        except Exception as e:
-            logger.warning(f"Could not set RoomOptions: {e}")
-        if nc_mode:
-            logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
+    try:
+        from livekit.agents.voice import room_io as _rio
+        room_options = _rio.RoomOptions(
+            close_on_disconnect=False,
+            delete_room_on_close=False,
+        )
+        logger.info("🎤 RoomOptions(close_on_disconnect=False, delete_room_on_close=False) armed.")
+    except Exception as e:
+        logger.warning(f"Could not set RoomOptions: {e}")
 
     # ------------------------------------------------------------------
     # Finalization (idempotent) + call-end watchdog.
@@ -2657,8 +2646,8 @@ async def entrypoint(ctx):
             released["done"] = True
             call_closed["done"] = True
             logger.info(
-                "👋 Caller left (%s) — ending this job. The worker stays up for the next agent.",
-                reason,
+                "[CALL_ENDED] room=%s agent_id=%s Caller left (%s) — ending job.",
+                getattr(ctx.room, "name", ""), agent_id, reason,
             )
             _cancel_pending()
             _cancel_no_response()
@@ -2666,8 +2655,6 @@ async def entrypoint(ctx):
             if fallback_task is not None and not fallback_task.done():
                 fallback_task.cancel()
             reply_tracker["fallback_say"] = None
-            # Do not speak into a transport the browser has already closed.
-            # That await is what kept the job (and the worker slot) stuck.
             try:
                 session.shutdown(drain=False)
             except Exception as e:
@@ -2693,7 +2680,7 @@ async def entrypoint(ctx):
                 return
             saw_human["yes"] = True
             gone_since["t"] = 0.0
-            logger.info("👤 caller joined: %s", getattr(participant, "identity", "?"))
+            logger.info("[AGENT_JOINED] room=%s Caller joined: %s", getattr(room, "name", ""), getattr(participant, "identity", "?"))
 
         def _on_disconnected(participant):
             if not _is_human(participant):
@@ -2701,16 +2688,24 @@ async def entrypoint(ctx):
             if _humans():
                 return
             gone_since["t"] = time.time()
-            logger.info("👤 caller left: %s", getattr(participant, "identity", "?"))
+            logger.info("👤 Caller disconnected: %s (grace period active)", getattr(participant, "identity", "?"))
 
         room.on("participant_connected", _on_connected)
         room.on("participant_disconnected", _on_disconnected)
-        if _humans():
+        initial_humans = _humans()
+        if initial_humans:
             saw_human["yes"] = True
-            logger.info("👤 caller already in the room (%s)", len(_humans()))
+            logger.info("[AGENT_JOINED] room=%s Caller already in room (%d): %s", getattr(room, "name", ""), len(initial_humans), [p.identity for p in initial_humans])
+
         try:
             while not released["done"]:
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.5)
+                # Announcement agent manages its own completion — don't interfere while it's playing
+                if agent_mode == "announcement":
+                    ag = agent_holder.get("agent")
+                    if ag is not None and getattr(ag, "_opening_started", False) and not getattr(ag, "_opening_done", False):
+                        continue
+
                 humans = _humans()
                 if humans:
                     saw_human["yes"] = True
@@ -2721,10 +2716,8 @@ async def entrypoint(ctx):
                 if gone_since["t"] == 0.0:
                     gone_since["t"] = time.time()
                     continue
-                # Long enough for a browser remount to rejoin the same room,
-                # short enough that "end call, pick another agent, start" gets
-                # a free worker process.
-                if time.time() - gone_since["t"] >= 1.5:
+                # Generous 12-second grace period (NOT 1.5s!) before deciding caller is truly gone
+                if time.time() - gone_since["t"] >= 12.0:
                     await _release("no caller in the room")
                     return
         except asyncio.CancelledError:

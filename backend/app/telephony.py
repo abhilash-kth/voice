@@ -82,6 +82,9 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
         .to_jwt()
     )
 
+    logger.info("[ROOM_CREATED] room=%s agent_id=%s mode=browser", room, agent_id)
+    logger.info("[TOKEN_CREATED] room=%s identity=%s", room, identity)
+
     return {"token": token, "url": LIVEKIT_URL, "room": room, "mode": "browser"}
 
 
@@ -132,6 +135,8 @@ async def create_sip_call(
         )
     finally:
         await client.aclose()
+
+    logger.info("[ROOM_CREATED] room=%s agent_id=%s mode=sip phone=%s", room, agent_id, phone)
 
     return {
         "room": room,
