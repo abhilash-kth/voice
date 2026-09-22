@@ -16,7 +16,6 @@ import { Agent, startCall, getCall, endCall } from "@/lib/api";
 
 function AgentView({ onEnded }: { onEnded?: () => void }) {
   const { state, audioTrack } = useVoiceAssistant();
-  const room = useRoomContext();
   const participants = useParticipants();
   const [hasHadRemote, setHasHadRemote] = useState(false);
   const [ended, setEnded] = useState(false);
@@ -40,24 +39,6 @@ function AgentView({ onEnded }: { onEnded?: () => void }) {
       onEnded?.();
     }
   }, [participants, hasHadRemote, ended, onEnded, state]);
-
-  // Also listen to room disconnected — delay to allow goodbye TTS to finish
-  useEffect(() => {
-    const handleDisconnected = () => {
-      if (!ended) {
-        // If disconnect happens during speaking (goodbye), give it time
-        const delay = state === "speaking" ? 2500 : 500;
-        setTimeout(() => {
-          setEnded(true);
-          onEnded?.();
-        }, delay);
-      }
-    };
-    room.on("disconnected", handleDisconnected);
-    return () => {
-      room.off("disconnected", handleDisconnected);
-    };
-  }, [room, ended, onEnded, state]);
 
   if (ended) {
     return (
@@ -151,6 +132,7 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
   const [callId, setCallId] = useState("");
   const [callEndedMsg, setCallEndedMsg] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Preselect an agent when the user pressed "Call" on a card
   useEffect(() => {
@@ -204,43 +186,41 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
   }, [callId, session]);
 
   const handleRoomDisconnected = useCallback(() => {
-    const curCallId = callId;
-    setCallEndedMsg("Disconnected from room — call ended.");
-    setTimeout(() => {
+    setCallEndedMsg("Call ended. Select an agent, then start a new call.");
+    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+    disconnectTimerRef.current = setTimeout(() => {
       setSession(null);
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
     }, 1500);
-    if (curCallId) {
-      endCall(curCallId).catch(() => {});
-    }
-  }, [callId]);
+  }, []);
 
   const handleAgentEnded = useCallback(() => {
-    const curCallId = callId;
     setCallEndedMsg("Agent ended the call");
-    setTimeout(() => {
+    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+    disconnectTimerRef.current = setTimeout(() => {
       setSession(null);
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
     }, 1500);
-    if (curCallId) {
-      endCall(curCallId).catch(() => {});
-    }
-  }, [callId]);
+  }, []);
 
   const endBrowserCall = async () => {
     const curCallId = callId;
-    setSession(null);
-    setCallEndedMsg("Call ended. Select an agent, then start a new call.");
+    if (disconnectTimerRef.current) {
+      clearTimeout(disconnectTimerRef.current);
+      disconnectTimerRef.current = null;
+    }
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
+    setSession(null);
+    setCallEndedMsg("Call ended. Select an agent, then start a new call.");
     if (curCallId) {
       try {
         await endCall(curCallId);
@@ -253,6 +233,10 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
   const go = async () => {
     setErr("");
     setCallEndedMsg("");
+    if (disconnectTimerRef.current) {
+      clearTimeout(disconnectTimerRef.current);
+      disconnectTimerRef.current = null;
+    }
     if (mode === "browser" && session) {
       return setErr("End the current call before starting another.");
     }

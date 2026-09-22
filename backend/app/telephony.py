@@ -49,31 +49,35 @@ def _metadata(agent_id: str, mode: str, phone: str = "", call_id: str = "",
 # ---------------------------------------------------------------------------
 # Browser mode: return a join token that also dispatches the agent into the room
 # ---------------------------------------------------------------------------
-def create_browser_room(agent_id: str, phone: str = "", call_id: str = "", user_id: str = "",
-                        lead_data: Optional[dict] = None) -> dict:
-    """Creates a room + a browser participant token, dispatching the agent."""
+async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "", user_id: str = "",
+                              lead_data: Optional[dict] = None) -> dict:
+    """Creates a room on the LiveKit server with agent dispatch + returns a browser participant token."""
     from livekit import api
 
     _req_creds()
     room = make_room_name()
     identity = "caller-" + uuid.uuid4().hex[:6]
+    metadata = _metadata(agent_id, "browser", phone, call_id, user_id, lead_data)
+
+    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        await client.room.create_room(
+            api.CreateRoomRequest(
+                name=room,
+                empty_timeout=300,
+                departure_timeout=30,
+                agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
+            )
+        )
+    finally:
+        await client.aclose()
 
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(identity)
         .with_ttl(timedelta(minutes=30))
         .with_grants(
-            api.VideoGrants(room=room, room_join=True, can_publish=True, can_subscribe=True)
-        )
-        .with_room_config(
-            api.RoomConfiguration(
-                agents=[
-                    api.RoomAgentDispatch(
-                        agent_name=AGENT_NAME,
-                        metadata=_metadata(agent_id, "browser", phone, call_id, user_id, lead_data),
-                    )
-                ]
-            )
+            api.VideoGrants(room=room, room_join=True, room_create=True, can_publish=True, can_subscribe=True)
         )
         .to_jwt()
     )

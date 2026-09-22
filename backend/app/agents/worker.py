@@ -2411,27 +2411,26 @@ async def entrypoint(ctx):
             from livekit import rtc
             from livekit.agents.voice import room_io
             room_options = room_io.RoomOptions(
-                close_on_disconnect=True,
-                delete_room_on_close=True,
+                close_on_disconnect=False,
                 input_options=room_io.RoomInputOptions(
                     noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
                 ),
             )
-            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=True, delete_room_on_close=True).")
+            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=False).")
         except Exception as e:
             logger.warning(
                 "Krisp noise cancellation unavailable (%s). For self-hosted, browser calls get WebRTC noise suppression.", e,
             )
             try:
                 from livekit.agents.voice import room_io as _rio
-                room_options = _rio.RoomOptions(close_on_disconnect=True, delete_room_on_close=True)
+                room_options = _rio.RoomOptions(close_on_disconnect=False)
             except Exception:
                 pass
     else:
         try:
             from livekit.agents.voice import room_io as _rio
-            room_options = _rio.RoomOptions(close_on_disconnect=True, delete_room_on_close=True)
-            logger.info("🎤 RoomOptions(close_on_disconnect=True, delete_room_on_close=True) armed.")
+            room_options = _rio.RoomOptions(close_on_disconnect=False)
+            logger.info("🎤 RoomOptions(close_on_disconnect=False) armed.")
         except Exception as e:
             logger.warning(f"Could not set RoomOptions: {e}")
         if nc_mode:
