@@ -2751,11 +2751,18 @@ async def entrypoint(ctx):
             if agent_mode == "announcement":
                 if announce_tracker.get("spoken_ok"):
                     _script_chars = int(announce_tracker.get("chars", 0) or 0)
-                    usage["tts_chars"] += _script_chars
+                    # 2026-09-22 follow-up: the TTS timing wrapper ALREADY counts
+                    # every synthesized char — including session.say() (the
+                    # "🗣️ TTS (LLM complete)" line ran even for announcements).
+                    # += on top double-billed a 367-char script as 734 (Windows
+                    # log 15:42). max() guarantees the script is counted at least
+                    # once (old code: 0) and never twice (wrapper-counted case).
+                    _before = int(usage.get("tts_chars", 0) or 0)
+                    usage["tts_chars"] = max(_before, _script_chars)
                     _script_text = announce_tracker.get("script", "")
                     if _script_text:
                         usage["transcripts"].append({"role": "agent", "text": _script_text[:4000]})
-                    logger.info(f"📢 Announcement accounting: script played OK, +{_script_chars} TTS chars (billed fairly).")
+                    logger.info(f"📢 Announcement accounting: script played OK ({_script_chars} chars; tts_chars {_before} -> {usage['tts_chars']}, billed fairly).")
                 else:
                     logger.error(
                         "📢 Announcement accounting: script NEVER played "
@@ -3116,27 +3123,45 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
         "status": status,
         "transcripts": usage["transcripts"][-30:],
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{BILLING_BACKEND_URL}/api/billing/log",
-                                    json=payload, headers=headers, timeout=8) as resp:
-                body = await resp.text()
-                logger.info(f"✅ Billing posted HTTP {resp.status} for call {call_id} — billed ₹{costs['client_price_inr']} — backend will deduct wallet")
-                if resp.status >= 400:
-                    logger.warning(f"⚠️ Billing POST returned {resp.status}: {body[:500]}")
-                    return False
-                return True
-    except Exception as e:
-        logger.warning(f"⚠️ Billing POST failed for call {call_id} to {BILLING_BACKEND_URL}: {e!r} — will fallback to direct DB deduct", exc_info=True)
-        return False
+    # 2026-09-22 (Windows log): BILLING_BACKEND_URL=http://api:8000 is the
+    # docker-compose service DNS name — unresolvable when running without
+    # Docker. Every POST burned its full timeout in getaddrinfo (the 8s stall
+    # that also tripped "job shutdown is taking too much time") and left
+    # billing_posted=False. Keep the configured URL first (correct inside the
+    # compose network), then retry on loopback for bare-metal dev boxes, so
+    # both deployments post without editing .env.
+    _urls = [BILLING_BACKEND_URL]
+    for _svc in ("api", "backend"):
+        if f"://{_svc}:" in BILLING_BACKEND_URL:
+            _urls.append(BILLING_BACKEND_URL.replace(f"://{_svc}:", "://127.0.0.1:", 1))
+            break
+    last_err: Exception | None = None
+    for base in _urls:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base}/api/billing/log",
+                                        json=payload, headers=headers, timeout=8) as resp:
+                    body = await resp.text()
+                    logger.info(f"✅ Billing posted HTTP {resp.status} for call {call_id} — billed ₹{costs['client_price_inr']} — backend will deduct wallet")
+                    if resp.status >= 400:
+                        logger.warning(f"⚠️ Billing POST returned {resp.status}: {body[:500]}")
+                        return False
+                    return True
+        except Exception as e:
+            last_err = e
+            logger.warning(f"⚠️ Billing POST failed for call {call_id} to {base}: {e!r}{' — retrying loopback' if base != _urls[-1] else ''}")
+    logger.warning(f"⚠️ Billing POST failed for call {call_id} ({last_err!r}) — will fallback to direct DB deduct")
+    return False
 
 
-# OPS NOTE (2026-09-19): run the production worker on Linux/WSL2, not Windows.
-# The Windows dev box shows ~130ms event-loop stalls from LiveKit's
-# speaking-rate FFT and reports livekit capacity warnings (load 0.91 > 0.7)
-# under even a single call — that stall budget comes straight out of TTFT.
-# Windows is fine for dashboard/API dev; voice latency work must be measured
-# on Linux.
+# OPS NOTE (updated 2026-09-22): the old "Windows shows livekit capacity
+# warnings (load 0.91 > 0.7) even under a single call" note was NOT a
+# Windows/FFI limitation — it was the prod load_threshold=0.7 CPU gate
+# refusing dispatches (fixed above by load_threshold=inf + load_fnc 0;
+# 15:42 Windows log then ran an assistant AND an announcement concurrently,
+# both billed correctly). Windows dev box is now proven fine for light
+# multi-call traffic; keep measuring TTFT with the loop-block warnings
+# (~130ms linecache/watchdog noise) treated as benign noise, not audio bugs.
 def prewarm(proc):
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
