@@ -5,6 +5,7 @@ import {
   LiveKitRoom,
   VoiceAssistantControlBar,
   RoomAudioRenderer,
+  StartAudio,
   useVoiceAssistant,
   BarVisualizer,
   useRoomContext,
@@ -113,6 +114,21 @@ function AgentView({ onEnded }: { onEnded?: () => void }) {
   );
 }
 
+function HearAgent() {
+  const room = useRoomContext();
+  useEffect(() => {
+    // The Start button's click is over by the time the room connects, so the
+    // browser may block agent audio until this runs (or the user taps the button).
+    room.startAudio().catch(() => {});
+  }, [room]);
+  return (
+    <StartAudio
+      label="Click to hear the agent"
+      className="mt-3 rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-black"
+    />
+  );
+}
+
 interface Props {
   agents: Agent[];
   onStarted: () => void;
@@ -214,14 +230,40 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
     }, 100);
   }, []);
 
+  const endBrowserCall = () => {
+    setSession(null);
+    setCallEndedMsg("Call ended. Select an agent, then start a new call.");
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
   const go = async () => {
     setErr("");
-    setSession(null);
     setCallEndedMsg("");
+    if (mode === "browser" && session) {
+      return setErr("End the current call before starting another.");
+    }
     if (!agentId) return setErr("Select an agent first.");
     if (mode === "sip" && !phone) return setErr("Enter a phone number for SIP calling.");
     setBusy(true);
     try {
+      if (mode === "browser") {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          });
+          stream.getTracks().forEach((t) => t.stop());
+          const AC =
+            window.AudioContext ||
+            (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+          if (AC) await new AC().resume();
+        } catch {
+          setErr("Allow microphone access, then press Start Voice Call again.");
+          return;
+        }
+      }
       const res = await startCall({
         agent_id: agentId,
         mode,
@@ -245,6 +287,9 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
     }
   };
 
+  const browserLive = mode === "browser" && session !== null;
+  const selected = agents.find((a) => a.id === agentId);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800">
@@ -253,21 +298,34 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
         <label className="text-xs text-gray-400 font-medium">Agent</label>
         <select
           value={agentId}
+          disabled={browserLive}
           onChange={(e) => setAgentId(e.target.value)}
-          className="input mt-1 mb-4"
+          className="input mt-1 mb-2"
         >
+          <option value="">Select an agent…</option>
           {agents.map((a) => (
             <option key={a.id} value={a.id}>
-              {a.name}
+              {a.name} — {a.agent_mode === "announcement" ? "Announcement" : "Assistant"}
             </option>
           ))}
         </select>
+        {selected ? (
+          <p className="text-[11px] text-gray-400 mb-4">
+            {selected.agent_mode === "announcement"
+              ? "Announcement mode: on connect the agent reads its script, then hangs up. It does not listen."
+              : "Assistant mode: on connect the agent greets you, then listens and replies."}
+          </p>
+        ) : (
+          <p className="text-[11px] text-gray-500 mb-4">Create an agent, then select it here. The call uses only the agent you pick.</p>
+        )}
 
         <label className="text-xs text-gray-400 font-medium">Call mode</label>
         <div className="grid grid-cols-2 gap-1 mt-1 mb-4 bg-gray-800/80 border border-gray-700/50 p-1 rounded-xl">
           <button
+            type="button"
+            disabled={browserLive}
             onClick={() => setMode("browser")}
-            className={`py-2.5 rounded-lg text-sm font-semibold transition-all ${
+            className={`py-2.5 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${
               mode === "browser"
                 ? "bg-emerald-600 text-white shadow-md"
                 : "text-gray-400 hover:text-white"
@@ -276,8 +334,10 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
             🌐 Browser (free)
           </button>
           <button
+            type="button"
+            disabled={browserLive}
             onClick={() => setMode("sip")}
-            className={`py-2.5 rounded-lg text-sm font-semibold transition-all ${
+            className={`py-2.5 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${
               mode === "sip"
                 ? "bg-blue-600 text-white shadow-md"
                 : "text-gray-400 hover:text-white"
@@ -320,11 +380,31 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
 
         <button
           onClick={go}
-          disabled={busy}
-          className="w-full bg-green-600 hover:bg-green-500 text-white font-bold text-lg py-3 rounded-xl mt-4 disabled:opacity-50"
+          disabled={busy || browserLive || !agentId}
+          className="w-full bg-green-600 hover:bg-green-500 text-white font-bold text-lg py-3 rounded-xl mt-4 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {busy ? "Connecting..." : mode === "browser" ? "📞 Start Voice Call" : "📲 Dial Number"}
+          {busy
+            ? "Connecting..."
+            : browserLive
+              ? "Call connected"
+              : mode === "browser"
+                ? "📞 Start Voice Call"
+                : "📲 Dial Number"}
         </button>
+        {browserLive && (
+          <>
+            <button
+              type="button"
+              onClick={endBrowserCall}
+              className="w-full mt-2 border border-gray-600 text-gray-200 font-semibold py-2.5 rounded-xl hover:bg-gray-800"
+            >
+              End call
+            </button>
+            <p className="text-xs text-amber-200/90 mt-2">
+              Connected. Start Voice Call stays disabled until you end this call. Then pick another agent and start again.
+            </p>
+          </>
+        )}
 
         {mode === "browser" && session && (
           <p className="text-xs text-gray-500 mt-3">
@@ -353,6 +433,7 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
             className="w-full flex items-center justify-center"
           >
             <AgentView onEnded={handleAgentEnded} />
+            <HearAgent />
             <RoomAudioRenderer />
           </LiveKitRoom>
         ) : (
@@ -368,7 +449,7 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
               <>
                 <div className="text-6xl mb-3">🎙️</div>
                 <p className="text-sm">
-                  Configure an agent above, then press <b>Start Voice Call</b>.
+                  Select an agent, then press <b>Start Voice Call</b>. The agent speaks when the call connects.
                 </p>
               </>
             ) : (
