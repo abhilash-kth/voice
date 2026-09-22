@@ -457,7 +457,7 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         if mode == "sip":
             result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
         else:
-            result = telephony.create_browser_room(agent_id, phone, call["id"], user.id)
+            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
     except ModuleNotFoundError:
         raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
     except ValueError as e:
