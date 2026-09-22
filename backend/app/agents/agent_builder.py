@@ -2024,7 +2024,6 @@ def build_announce_agent(
             # the outcome for billing, and ALWAYS run the teardown so the
             # caller is never stranded in a silent open call.
             speak_t0 = time.monotonic()
-            _audio_probe = tracker.get("audio_bytes") if tracker is not None else None
             try:
                 speech = self.session.say(text, allow_interruptions=False)
                 await asyncio.wait_for(speech, timeout=120)
@@ -2032,24 +2031,32 @@ def build_announce_agent(
                     # Audio-bytes proof (2026-09-22, SBI EMI): the Google plugin
                     # can swallow an input-side failure, end the stream with zero
                     # audio AND still let say() return normally — silent + billed.
-                    # The worker taps synthesize() with tracker["audio_bytes"];
-                    # success now requires it (when the probe is installed).
-                    if _audio_probe is not None and int(tracker.get("audio_bytes", 0) or 0) <= 0:
+                    # The worker taps synthesize() with tracker["audio_bytes"].
+                    # Fail-OPEN: reject only when the tap itself observed the
+                    # synthesize call; a blind/mis-mounted probe must NEVER mark
+                    # a played call failed (15:59 regression: the instance-
+                    # mutation probe silently no-op'd and falsely failed a real
+                    # 21s playback). Mount state now logged by the worker (🔬).
+                    _saw_call = int(tracker.get("tts_synth_calls", 0) or 0) > 0
+                    _bytes = int(tracker.get("audio_bytes", 0) or 0)
+                    if _saw_call and _bytes <= 0:
                         tracker["error"] = ("say() returned normally but the TTS stream produced ZERO "
                                             "audio bytes — provider produced silence without raising")
                         logger.error(
                             "📢 Announcement TTS FAILED: zero audio bytes despite say() success (silent "
                             "provider stream). Marking failed, customer will NOT be billed. Check the "
-                            "provider 'error occurred while streaming input' traceback just above; common "
-                            "cause: TTS-hostile characters in the script (now sanitized by the worker)."
+                            "provider 'error occurred while streaming input' traceback just above."
                         )
                     else:
                         tracker["spoken_ok"] = True
                         tracker["chars"] = len(text)
-                        logger.info(
-                            f"📢 Announcement played OK ({len(text)} chars, "
-                            f"{int(tracker.get('audio_bytes', 0) or 0)} audio bytes) — closing call."
-                        )
+                        if _saw_call:
+                            logger.info(
+                                f"📢 Announcement played OK ({len(text)} chars, {_bytes} audio bytes) "
+                                "— closing call."
+                            )
+                        else:
+                            logger.info(f"📢 Announcement played OK ({len(text)} chars; audio probe inactive — trusting say()) — closing call.")
             except asyncio.TimeoutError:
                 if tracker is not None:
                     tracker["error"] = "TTS say timed out after 120s"

@@ -1522,29 +1522,34 @@ def build_announcement_session(cfg: AgentConfig, tracker: Optional[dict] = None)
     # produced NOTHING: the google plugin swallows input-side exceptions in
     # input_generator (tts.py: "an error occurred while streaming input to
     # google TTS") and the output loop then ends with zero chunks — say()
-    # never raises. That was the exact SBI-EMI "silent but billed" path after
-    # the key fix. Tap synthesize() on every real provider (FallbackAdapter
-    # internals when present, like the assistant timing wrapper at
-    # _create_tts_timing_wrapper; else the outer instance) and count audio
-    # bytes into the tracker. on_enter must see >0 to mark the call played.
+    # never raises. That was the SBI-EMI "silent but billed" path. Tap the
+    # session's TTS synthesize() and count audio bytes into the tracker.
+    # NOTE (15:59 log): mutating tts_inst.synthesize in place silently no-op'd
+    # (provider class rejects attribute assignment); use the SAME proxy-object
+    # pattern as _create_tts_timing_wrapper above, which is proven in the
+    # assistant path. Guard is fail-open: on_enter only rejects when the tap
+    # actually observed a synthesize call ("tts_synth_calls") AND zero bytes.
     if tracker is not None:
         try:
-            tracker["audio_bytes"] = 0  # marker: probe installed → enforce in on_enter
-            inner_list = None
-            try:
-                inner_list = (getattr(tts_inst, "_tts_instances", None)
-                              or getattr(tts_inst, "tts_instances", None)
-                              or getattr(tts_inst, "_instances", None))
-            except Exception:
-                inner_list = None
+            tracker["audio_bytes"] = 0
+            tracker["tts_synth_calls"] = 0
 
-            def _make_probed(tts_obj):
-                _orig_syn = getattr(tts_obj, "synthesize", None)
-                if _orig_syn is None:
-                    return tts_obj
+            class _AudioProbeTTS:
+                def __init__(self, inner):
+                    self._inner = inner
+                    try:
+                        self.capabilities = getattr(inner, "capabilities", None)
+                        self._opts = getattr(inner, "_opts", None)
+                        self._label = getattr(inner, "_label", None)
+                    except Exception:
+                        pass
 
-                async def _probed(text, **kw):
-                    async for chunk in _orig_syn(text, **kw):
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+                async def synthesize(self, text, **kw):
+                    tracker["tts_synth_calls"] = int(tracker.get("tts_synth_calls", 0) or 0) + 1
+                    async for chunk in self._inner.synthesize(text, **kw):
                         try:
                             frame = getattr(chunk, "frame", None)
                             data = (getattr(frame, "data", None)
@@ -1552,26 +1557,17 @@ def build_announcement_session(cfg: AgentConfig, tracker: Optional[dict] = None)
                             n = len(data)
                         except Exception:
                             n = 0
-                        # Any chunk that reaches us from the synthesizer is an
-                        # audible unit; unknown shapes count as 1KB so a shape
-                        # change can never fake the zero-bytes guard.
+                        # Any chunk we yield is an audible unit; unknown shapes
+                        # count as 1KB so a shape change can never fake the guard.
                         tracker["audio_bytes"] = int(tracker.get("audio_bytes", 0) or 0) + (n if n > 0 else 1024)
                         yield chunk
 
-                try:
-                    tts_obj.synthesize = _probed
-                except Exception:
-                    pass
-                return tts_obj
-
-            if inner_list:
-                for idx, inner_tts in enumerate(inner_list):
-                    inner_list[idx] = _make_probed(inner_tts)
-            else:
-                tts_inst = _make_probed(tts_inst)
+            tts_inst = _AudioProbeTTS(tts_inst)
+            logger.info("🔬 Announcement audio probe mounted (synthesize tap active)")
         except Exception as e:
             tracker.pop("audio_bytes", None)
-            logger.warning(f"announce audio probe not installed ({e}) — say() success trusted as before")
+            tracker.pop("tts_synth_calls", None)
+            logger.warning(f"Announce audio probe not mounted ({e}) — trusting say() success as before")
 
     return AgentSession(
         stt=None,
