@@ -1490,16 +1490,94 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     )
 
 
-def build_announcement_session(cfg: AgentConfig):
+_RUPEE_NUM_RE = re.compile(r"₹\s*([\d][\d,]*(?:\.\d+)?)")
+
+
+def _sanitize_announce_script(text: str) -> str:
+    """Make a fixed script safe for streaming TTS (2026-09-22, SBI EMI agent):
+
+    - "₹8,500" -> "8,500 rupees": bare ₹ is the one glyph Google's Chirp
+      streaming endpoint handles inconsistently, and a poisoned chunk inside
+      the plugin's swallow-everything input_generator (google/tts.py, where an
+      input error only logs and the stream closes with ZERO audio) is exactly
+      how a script silently bills as "played OK".
+    - strips <speak>/<break>/HTML pasted from docs — Google's streaming mode
+      hard-rejects SSML (ValueError at TTS build) and garbles stray tags.
+    """
+    out = _RUPEE_NUM_RE.sub(r"\1 rupees", text or "")
+    out = out.replace("₹", " rupees ")
+    out = re.sub(r"</?(?:speak|break|prosody|emphasis|say-as|p|br|div|span|b|i|u)\b[^>]*>", " ", out, flags=re.I)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
+
+
+def build_announcement_session(cfg: AgentConfig, tracker: Optional[dict] = None):
     """Fixed-script "reminder" session: TTS only. No STT, no VAD, no LLM."""
     from livekit.agents import AgentSession
     from app.agents.agent_builder import build_tts
+
+    tts_inst = build_tts(cfg)
+    # ── Audio-bytes proof for billing honesty (2026-09-22) ─────────────────
+    # session.say() resolves "successfully" even when the provider's stream
+    # produced NOTHING: the google plugin swallows input-side exceptions in
+    # input_generator (tts.py: "an error occurred while streaming input to
+    # google TTS") and the output loop then ends with zero chunks — say()
+    # never raises. That was the exact SBI-EMI "silent but billed" path after
+    # the key fix. Tap synthesize() on every real provider (FallbackAdapter
+    # internals when present, like the assistant timing wrapper at
+    # _create_tts_timing_wrapper; else the outer instance) and count audio
+    # bytes into the tracker. on_enter must see >0 to mark the call played.
+    if tracker is not None:
+        try:
+            tracker["audio_bytes"] = 0  # marker: probe installed → enforce in on_enter
+            inner_list = None
+            try:
+                inner_list = (getattr(tts_inst, "_tts_instances", None)
+                              or getattr(tts_inst, "tts_instances", None)
+                              or getattr(tts_inst, "_instances", None))
+            except Exception:
+                inner_list = None
+
+            def _make_probed(tts_obj):
+                _orig_syn = getattr(tts_obj, "synthesize", None)
+                if _orig_syn is None:
+                    return tts_obj
+
+                async def _probed(text, **kw):
+                    async for chunk in _orig_syn(text, **kw):
+                        try:
+                            frame = getattr(chunk, "frame", None)
+                            data = (getattr(frame, "data", None)
+                                    if frame is not None else None) or getattr(chunk, "data", None) or b""
+                            n = len(data)
+                        except Exception:
+                            n = 0
+                        # Any chunk that reaches us from the synthesizer is an
+                        # audible unit; unknown shapes count as 1KB so a shape
+                        # change can never fake the zero-bytes guard.
+                        tracker["audio_bytes"] = int(tracker.get("audio_bytes", 0) or 0) + (n if n > 0 else 1024)
+                        yield chunk
+
+                try:
+                    tts_obj.synthesize = _probed
+                except Exception:
+                    pass
+                return tts_obj
+
+            if inner_list:
+                for idx, inner_tts in enumerate(inner_list):
+                    inner_list[idx] = _make_probed(inner_tts)
+            else:
+                tts_inst = _make_probed(tts_inst)
+        except Exception as e:
+            tracker.pop("audio_bytes", None)
+            logger.warning(f"announce audio probe not installed ({e}) — say() success trusted as before")
 
     return AgentSession(
         stt=None,
         vad=None,
         llm=None,
-        tts=build_tts(cfg),
+        tts=tts_inst,
         conn_options=_build_conn_options(),
         turn_handling={
             "endpointing": {"min_delay": 0.2, "max_delay": 0.5},
@@ -1785,8 +1863,13 @@ async def entrypoint(ctx):
     # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
     # ------------------------------------------------------------------
     agent_mode = getattr(cfg, "agent_mode", "assistant") or "assistant"
+    # Announcement play-outcome tracking — created BEFORE the session so the
+    # audio-bytes probe (build_announcement_session) can fill it. finalize
+    # (below) reads spoken_ok/chars/error; "audio_bytes" is written by the
+    # TTS tap and is the proof that audio actually reached the room.
+    announce_tracker: dict = {"script": "", "spoken_ok": False, "chars": 0, "error": ""}
     if agent_mode == "announcement":
-        session = build_announcement_session(cfg)
+        session = build_announcement_session(cfg, tracker=announce_tracker)
     else:
         # Async build to avoid blocking job executor (was 3.46s sync -> unresponsive)
         # Pass turn_timing_ref to enable TTS timing wrapper (measures real TTS audio)
@@ -2636,17 +2719,18 @@ async def entrypoint(ctx):
                 logger.warning(f"⚠️ Egress unavailable; continuing without recording: {e}")
         egress_task = asyncio.create_task(_start_egress_later())
 
-    # Announcement play-outcome tracking (2026-09-22 silent-billed fix): the fixed
-    # script can FAIL (TTS auth outage, missing google-key.json) leaving the
-    # caller in silence. _AnnounceAgent.on_enter records spoken_ok/error here;
-    # finalize_billing uses it to bill played scripts fairly AND mark unplayed
-    # ones "failed" so the customer is NOT billed. Defined for both modes so
-    # the finalize closure always sees the name.
-    announce_tracker: dict = {"script": "", "spoken_ok": False, "chars": 0, "error": ""}
+    # announce_tracker was created above (before the session) so the TTS
+    # audio-bytes probe can fill it; _AnnounceAgent.on_enter records
+    # spoken_ok/error; finalize_billing bills played scripts fairly and marks
+    # unplayed ones "failed" (no bill).
 
     if agent_mode == "announcement":
         script = getattr(cfg, "announce_text", "") or greeting
         script = leadfile.render_template(script, lead_data)
+        _raw_script = script
+        script = _sanitize_announce_script(script)
+        if script != _raw_script:
+            logger.info(f"🧹 Announcement script sanitized for streaming TTS ({len(_raw_script)} -> {len(script)} chars; ₹/tag removal).")
         if not script.strip():
             # No script at all (empty Fixed script + empty greeting): fail fast
             # HERE, before the session exists — build_announce_agent would raise
