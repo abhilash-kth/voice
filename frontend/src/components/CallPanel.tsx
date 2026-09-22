@@ -202,16 +202,21 @@ export default function CallPanel({ agents, onStarted, presetAgentId, onPresetCo
 
   const handleAgentEnded = useCallback(() => {
     setCallEndedMsg("Agent ended the call");
-    // Don't immediately clear — let polling or user disconnect handle it, but show ended state
-    // After 2s clear session to show start screen again
+    // 2026-09-22 backstop: the status poller normally auto-cuts (clears the
+    // session ~4s after the row turns completed/failed) — but if the row is
+    // stuck "in-progress" (worker killed mid-call) or the agent never joined
+    // (stalled dispatch), nothing ever fires and this tab keeps the LiveKit
+    // room connected. A live room with a real participant COUNTS as the
+    // agent's call, so max-concurrent-calls=1 blocks every later dial with a
+    // 409. AgentView already waited ~3s for the goodbye TTS before calling
+    // onEnded, so unmounting (disconnecting) the room 4s from now is safe.
     setTimeout(() => {
-      setSession((s) => {
-        if (s) {
-          // keep until disconnected event fires
-        }
-        return s;
-      });
-    }, 100);
+      setSession(null);
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    }, 4000);
   }, []);
 
   const go = async () => {
