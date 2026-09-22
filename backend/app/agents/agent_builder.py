@@ -1593,12 +1593,13 @@ def build_voice_agent(
             self._opening_started = True
             try:
                 if not (self.greeting or "").strip():
-                    logger.warning("Assistant has no greeting — skipping opening line")
+                    logger.info("[ASSISTANT_STARTED] Assistant has no greeting — listening immediately")
                     return
-                logger.info("🗣️ Assistant connected — speaking greeting once the caller can hear")
+                logger.info("[ASSISTANT_STARTED] Assistant connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
+                logger.info("[ASSISTANT_STARTED] Speaking greeting: %s", self.greeting[:60])
                 await speak_opening_line(self.session, self.greeting, timeout=45)
-                logger.info("✅ Greeting finished — now listening")
+                logger.info("[ASSISTANT_STARTED] Greeting finished — now listening for caller speech")
             except Exception as e:
                 logger.warning(f"Greeting failed: {type(e).__name__}: {e!r}")
             finally:
@@ -1869,11 +1870,7 @@ def build_announce_agent(
     from livekit.agents import Agent
     from livekit.agents import llm
 
-    text = (announce_text or cfg.greeting or "").strip()
-    if not text:
-        raise ValueError(
-            "Announcement agent has no script. Set announce_text (or greeting) on the agent."
-        )
+    text = (announce_text or getattr(cfg, "announce_text", "") or cfg.greeting or f"Hello, this is {cfg.name} with an announcement.").strip()
 
     class _AnnounceAgent(Agent):
         def __init__(self):
@@ -1893,15 +1890,15 @@ def build_announce_agent(
 
         async def on_enter(self) -> None:
             # Announcement mode: read the fixed script, then hang up. No STT, no LLM.
-            # The room is deleted only after playout has flushed — deleting it
-            # immediately is what made these calls sound silent.
+            # The room is deleted only after playout has flushed cleanly to the caller.
             self._opening_started = True
             try:
-                logger.info("📢 Announcement connected — reading the script once the caller can hear")
+                logger.info("[ANNOUNCEMENT_STARTED] Announcement connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
+                logger.info("[ANNOUNCEMENT_STARTED] Reading announcement script: %s", text[:60])
                 await speak_opening_line(self.session, text, timeout=120)
-                logger.info("✅ Announcement script finished")
-                await asyncio.sleep(1.2)
+                logger.info("✅ Announcement script finished — waiting for playout buffer to flush")
+                await asyncio.sleep(2.5)
             except Exception as e:
                 logger.warning(f"Announcement playback failed: {type(e).__name__}: {e!r}")
             finally:
@@ -1910,7 +1907,7 @@ def build_announce_agent(
                 from livekit.agents import get_job_context
                 ctx = get_job_context(required=False)
                 try:
-                    self.session.shutdown(drain=False)
+                    self.session.shutdown(drain=True)
                 except Exception:
                     pass
                 if ctx is not None:
@@ -1922,7 +1919,7 @@ def build_announce_agent(
                         except Exception as e:
                             logger.warning(f"announcement: could not delete room {room}: {e}")
                     ctx.shutdown()
-                logger.info("📢 Announcement finished — closing call.")
+                logger.info("[CALL_ENDED] 📢 Announcement completed — closed call intentionally.")
             except Exception as e:
                 logger.warning(f"could not close announcement session: {e}")
 

@@ -408,6 +408,9 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     if not rec["enabled"]:
         raise HTTPException(400, "This agent is disabled")
 
+    logger.info("[CALL_START] agent_id=%s mode=%s user_id=%s", agent_id, mode, user.id)
+    logger.info("[AGENT_SELECTED] agent_id=%s name=%s mode=%s", agent_id, rec.get("name"), rec.get("agent_mode", "assistant"))
+
     # Concurrency = calls that are ACTUALLY live right now (LiveKit rooms with real
     # participants), NOT rows stuck in "in-progress". Falls back to the DB count if
     # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
