@@ -1499,6 +1499,14 @@ def build_voice_agent(
             await asyncio.sleep(0.4)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
+        agent_inst = agent_ref.get("instance")
+        if agent_inst is not None:
+            sess = getattr(agent_inst, "session", None)
+            if sess is not None:
+                try:
+                    sess.shutdown(drain=False)
+                except Exception:
+                    pass
         room = getattr(ctx.room, "name", None)
         if room:
             try:
@@ -1901,6 +1909,10 @@ def build_announce_agent(
             try:
                 from livekit.agents import get_job_context
                 ctx = get_job_context(required=False)
+                try:
+                    self.session.shutdown(drain=False)
+                except Exception:
+                    pass
                 if ctx is not None:
                     room = getattr(ctx.room, "name", None)
                     if room:
@@ -1910,8 +1922,6 @@ def build_announce_agent(
                         except Exception as e:
                             logger.warning(f"announcement: could not delete room {room}: {e}")
                     ctx.shutdown()
-                else:
-                    self.session.shutdown(drain=True)
                 logger.info("📢 Announcement finished — closing call.")
             except Exception as e:
                 logger.warning(f"could not close announcement session: {e}")

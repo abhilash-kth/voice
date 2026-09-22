@@ -97,6 +97,17 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.exception("Unhandled server error: %s", exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -400,6 +411,24 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     # Concurrency = calls that are ACTUALLY live right now (LiveKit rooms with real
     # participants), NOT rows stuck in "in-progress". Falls back to the DB count if
     # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
+    if mode == "browser":
+        try:
+            existing_calls = await repo.list_calls(user.id, limit=5)
+            for prev in existing_calls:
+                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
+                    prev_room = prev.get("room")
+                    if prev_room:
+                        try:
+                            await telephony.end_active_room(prev_room)
+                        except Exception:
+                            pass
+                    await repo.update_call(prev["id"], {
+                        "status": "completed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+        except Exception as e:
+            logger.warning("Error auto-cleaning prior browser calls: %s", e)
+
     live_rooms = await telephony.list_live_active_rooms()
     active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
     if active >= rec["max_concurrency"]:
@@ -452,6 +481,25 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
     if not rec:
         raise HTTPException(404, "Call not found")
     return rec
+
+
+@app.post("/api/calls/{call_id}/end")
+async def end_call(call_id: str, user=Depends(auth.get_current_user)):
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    room = rec.get("room")
+    if room:
+        try:
+            await telephony.end_active_room(room)
+        except Exception as e:
+            logger.warning(f"Could not close room before ending call {call_id}: {e}")
+    if rec.get("status") in ("planned", "in-progress"):
+        await repo.update_call(call_id, {
+            "status": "completed",
+            "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+        })
+    return {"ok": True, "call_id": call_id}
 
 
 @app.delete("/api/calls/{call_id}", status_code=204)
