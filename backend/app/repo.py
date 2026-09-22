@@ -88,6 +88,7 @@ def _agent_dict(a: Any) -> dict:
         "enabled": bool(a.enabled),
         "agent_mode": a.agentMode or "assistant",
         "announce_text": a.announceText or "",
+        "end_after_announcement": bool(getattr(a, "endAfterAnnouncement", False)) or bool(_load_dict(a.knowledge).get("end_after_announcement", False)),
         "fallback_response": getattr(a, "fallbackResponse", "") or "Sorry, there is a temporary technical problem. Please try again shortly.",
         "no_response_timeout_seconds": getattr(a, "noResponseTimeoutSeconds", 60) or 60,
         "no_response_message": getattr(a, "noResponseMessage", "") or "I did not hear a response, so I will end the call now. Thank you for calling.",
@@ -111,6 +112,9 @@ async def get_agent(agent_id: str, user_id: str) -> Optional[dict]:
 
 async def create_agent(user_id: str, data: dict) -> dict:
     db = get_prisma()
+    kn = data.get("knowledge") or {}
+    if isinstance(kn, dict) and "end_after_announcement" not in kn:
+        kn["end_after_announcement"] = bool(data.get("end_after_announcement", False))
     a = await db.agent.create(
         data={
             "userId": user_id,
@@ -158,6 +162,11 @@ async def update_agent(agent_id: str, user_id: str, patch: dict) -> Optional[dic
     existing = await get_agent(agent_id, user_id)
     if not existing:
         return None
+    if "end_after_announcement" in patch and "knowledge" not in data:
+        kn = existing.get("knowledge", {})
+        if isinstance(kn, dict):
+            kn["end_after_announcement"] = bool(patch["end_after_announcement"])
+            data["knowledge"] = _dump(kn)
     a = await get_prisma().agent.update(where={"id": agent_id}, data=data)
     return _agent_dict(a)
 

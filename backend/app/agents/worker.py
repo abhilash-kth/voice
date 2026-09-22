@@ -1649,7 +1649,7 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning(f"Deterministic closing outer failed: {e}")
             await asyncio.sleep(1.0)
-        # Now auto-cut the call
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         logger.info("✂️ Auto-cutting call after deterministic closing TTS")
         try:
             session.shutdown(drain=False)
@@ -1669,6 +1669,8 @@ async def entrypoint(ctx):
         call_finished.set()
 
     def _schedule_deterministic_closing():
+        if agent_mode == "announcement":
+            return
         if closing_in_progress["done"]:
             return
         if closing_task_ref["task"] is not None and not closing_task_ref["task"].done():
@@ -1821,6 +1823,7 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning(f"No-response outer failed: {e}")
             await asyncio.sleep(1.0)
+        logger.info("[CALL_END_REQUESTED] source=timeout reason=no_response")
         logger.info("✂️ Auto-cutting call after no-response TTS")
         try:
             session.shutdown(drain=False)
@@ -2640,14 +2643,14 @@ async def entrypoint(ctx):
             except Exception:
                 return []
 
-        async def _release(reason: str):
+        async def _release(reason: str, source: str = "timeout"):
             if released["done"]:
                 return
             released["done"] = True
             call_closed["done"] = True
             logger.info(
-                "[CALL_ENDED] room=%s agent_id=%s Caller left (%s) — ending job.",
-                getattr(ctx.room, "name", ""), agent_id, reason,
+                "[CALL_END_REQUESTED] source=%s reason=%s room=%s agent_id=%s",
+                source, reason, getattr(ctx.room, "name", ""), agent_id,
             )
             _cancel_pending()
             _cancel_no_response()
@@ -2673,6 +2676,7 @@ async def entrypoint(ctx):
             except Exception as e:
                 logger.warning("ctx.shutdown failed: %r", e)
 
+            logger.info("[CALL_ENDED] room=%s agent_id=%s reason=%s", getattr(ctx.room, "name", ""), agent_id, reason)
             call_finished.set()
 
         def _on_connected(participant):
@@ -2718,7 +2722,7 @@ async def entrypoint(ctx):
                     continue
                 # Generous 12-second grace period (NOT 1.5s!) before deciding caller is truly gone
                 if time.time() - gone_since["t"] >= 12.0:
-                    await _release("no caller in the room")
+                    await _release("user_ended", source="timeout")
                     return
         except asyncio.CancelledError:
             return

@@ -1470,6 +1470,7 @@ def build_voice_agent(
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         # Avoid duplicate TTS: worker.py already spoke deterministic closing.
         # Only speak here as fallback if worker hasn't (check last closing timestamp).
         import time as _time
@@ -1515,6 +1516,7 @@ def build_voice_agent(
             except Exception as e:
                 logger.warning(f"end_call: could not delete room {room}: {e}")
         ctx.shutdown()
+        logger.info("[CALL_ENDED] reason=completed")
         return "Call ended."
 
     # `name="end_call"` keeps the LLM-visible tool name in sync with the prompt
@@ -1871,6 +1873,7 @@ def build_announce_agent(
     from livekit.agents import llm
 
     text = (announce_text or getattr(cfg, "announce_text", "") or cfg.greeting or f"Hello, this is {cfg.name} with an announcement.").strip()
+    end_after_announcement = bool(getattr(cfg, "end_after_announcement", False))
 
     class _AnnounceAgent(Agent):
         def __init__(self):
@@ -1889,38 +1892,41 @@ def build_announce_agent(
             )
 
         async def on_enter(self) -> None:
-            # Announcement mode: read the fixed script, then hang up. No STT, no LLM.
-            # The room is deleted only after playout has flushed cleanly to the caller.
             self._opening_started = True
             try:
                 logger.info("[ANNOUNCEMENT_STARTED] Announcement connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
                 logger.info("[ANNOUNCEMENT_STARTED] Reading announcement script: %s", text[:60])
                 await speak_opening_line(self.session, text, timeout=120)
-                logger.info("✅ Announcement script finished — waiting for playout buffer to flush")
-                await asyncio.sleep(2.5)
+                logger.info("[ANNOUNCEMENT_FINISHED] Announcement script playback completed")
             except Exception as e:
                 logger.warning(f"Announcement playback failed: {type(e).__name__}: {e!r}")
             finally:
                 self._opening_done = True
-            try:
-                from livekit.agents import get_job_context
-                ctx = get_job_context(required=False)
+
+            if end_after_announcement:
+                logger.info("[CALL_END_REQUESTED] source=announcement reason=announcement_completed")
                 try:
-                    self.session.shutdown(drain=True)
-                except Exception:
-                    pass
-                if ctx is not None:
-                    room = getattr(ctx.room, "name", None)
-                    if room:
-                        try:
-                            from ..telephony import end_active_room
-                            await end_active_room(room)
-                        except Exception as e:
-                            logger.warning(f"announcement: could not delete room {room}: {e}")
-                    ctx.shutdown()
-                logger.info("[CALL_ENDED] 📢 Announcement completed — closed call intentionally.")
-            except Exception as e:
-                logger.warning(f"could not close announcement session: {e}")
+                    await asyncio.sleep(2.5)  # flush audio playout buffer to caller
+                    from livekit.agents import get_job_context
+                    ctx = get_job_context(required=False)
+                    try:
+                        self.session.shutdown(drain=True)
+                    except Exception:
+                        pass
+                    if ctx is not None:
+                        room = getattr(ctx.room, "name", None)
+                        if room:
+                            try:
+                                from ..telephony import end_active_room
+                                await end_active_room(room)
+                            except Exception as e:
+                                logger.warning(f"announcement: could not delete room {room}: {e}")
+                        ctx.shutdown()
+                    logger.info("[CALL_ENDED] reason=announcement_completed")
+                except Exception as e:
+                    logger.warning(f"could not close announcement session: {e}")
+            else:
+                logger.info("📢 Announcement finished — keeping call connected (end_after_announcement=False)")
 
     return _AnnounceAgent()
