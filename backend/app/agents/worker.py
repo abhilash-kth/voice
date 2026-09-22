@@ -707,171 +707,6 @@ def _build_conn_options():
     )
 
 
-def _create_tts_timing_wrapper(tts_instance, timing_dict):
-    """Wrap TTS instance to measure actual TTS pipeline timing.
-    
-    Measures REAL pipeline (not LLM completion):
-    - tts_request: when text first sent to TTS (first chunk)
-    - first_tts_audio: when first audio chunk returned from TTS (REAL)
-    - first_audio: first audible audio (REAL, set by wrapper)
-    - speech_end->first_audio: REAL total latency (target ~1-1.5s)
-    - Works with any TTS provider (Google, ElevenLabs, OpenRouter) - no hardcoding
-    - Verified preemptive_tts compatibility: wrapper preserves streaming interface
-    """
-    original_synthesize = getattr(tts_instance, 'synthesize', None)
-
-    class TTSTimingWrapper:
-        def __init__(self, inner, timing):
-            self._inner = inner
-            self._timing = timing
-            try:
-                self.capabilities = getattr(inner, 'capabilities', None)
-                self._opts = getattr(inner, '_opts', None)
-                self._label = getattr(inner, '_label', None)
-            except Exception:
-                pass
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-        async def synthesize(self, text, **kwargs):
-            now = time.time()
-            if self._timing.get("first_token", 0) > 0 and self._timing.get("tts_request", 0) == 0:
-                self._timing["tts_request"] = now
-                first_token = self._timing.get("first_token", 0)
-                if first_token > 0:
-                    logger.info(f"⏱️ TIMING first_token->tts_request (text_chunk→TTS): {(now-first_token)*1000:.0f}ms (text: {text[:50]})")
-                if self._timing.get("llm_start", 0) > 0:
-                    logger.info(f"⏱️ TIMING llm_start->tts_request: {(now-self._timing['llm_start'])*1000:.0f}ms")
-            first_chunk = True
-            try:
-                async for chunk in self._inner.synthesize(text, **kwargs):
-                    if first_chunk:
-                        now_audio = time.time()
-                        if self._timing.get("first_tts_audio", 0) == 0:
-                            self._timing["first_tts_audio"] = now_audio
-                            if self._timing.get("tts_request", 0) > 0:
-                                logger.info(f"⏱️ TIMING tts_request->first_tts_audio (TTS synthesis): {(now_audio-self._timing['tts_request'])*1000:.0f}ms")
-                            if self._timing.get("first_token", 0) > 0:
-                                logger.info(f"⏱️ TIMING first_token->first_tts_audio (REAL TTS): {(now_audio-self._timing['first_token'])*1000:.0f}ms")
-                                if self._timing.get("first_audio", 0) == 0:
-                                    self._timing["first_audio"] = now_audio
-                                    logger.info(f"⏱️ TIMING first_token->first_audio (REAL TTS audio): {(now_audio-self._timing['first_token'])*1000:.0f}ms")
-                                if self._timing.get("speech_end", 0) > 0:
-                                    total = (now_audio-self._timing['speech_end'])*1000
-                                    logger.info(f"⏱️ TIMING speech_end->first_audio (REAL total): {total:.0f}ms (target ~1-1.5s)")
-                                    self._timing["last_speech_end_to_first_audio"] = total
-                                    # Full breakdown with REAL TTS
-                                    if self._timing.get("stt_final",0) and self._timing.get("turn_detected",0) and self._timing.get("llm_start",0) and self._timing.get("first_token",0):
-                                        logger.info(
-                                            f"📊 TURN BREAKDOWN (REAL): speech_end->STT_final {(self._timing['stt_final']-self._timing['speech_end'])*1000:.0f}ms | "
-                                            f"STT_final->turn {(self._timing['turn_detected']-self._timing['stt_final'])*1000:.0f}ms | "
-                                            f"turn->LLM {(self._timing['llm_start']-self._timing['turn_detected'])*1000:.0f}ms | "
-                                            f"LLM->first_token {(self._timing['first_token']-self._timing['llm_start'])*1000:.0f}ms | "
-                                            f"first_token->tts_request {(self._timing.get('tts_request',0)-self._timing['first_token'])*1000:.0f}ms | "
-                                            f"tts_request->first_audio {(now_audio-self._timing.get('tts_request',now_audio))*1000:.0f}ms | "
-                                            f"TOTAL {total:.0f}ms"
-                                        )
-                                    # Reset for next turn after REAL audio
-                                    self._timing["speech_end"] = 0.0
-                                    self._timing["stt_final"] = 0.0
-                                    self._timing["turn_detected"] = 0.0
-                                    self._timing["llm_start"] = 0.0
-                                    self._timing["first_token"] = 0.0
-                                    self._timing["tts_request"] = 0.0
-                                    self._timing["first_tts_audio"] = 0.0
-                                    self._timing["llm_complete"] = 0.0
-                                    self._timing["first_audio"] = 0.0
-                        first_chunk = False
-                    yield chunk
-            except Exception as e:
-                logger.warning(f"TTS synthesize wrapper error: {e}")
-                raise
-
-        def stream(self, **kwargs):
-            inner_stream = self._inner.stream(**kwargs)
-            timing = self._timing
-
-            class StreamWrapper:
-                def __init__(self, inner_stream, timing):
-                    self._inner_stream = inner_stream
-                    self._timing = timing
-                    self._first_chunk = True
-
-                def __getattr__(self, name):
-                    return getattr(self._inner_stream, name)
-
-                async def __aenter__(self):
-                    await self._inner_stream.__aenter__()
-                    return self
-
-                async def __aexit__(self, *args):
-                    return await self._inner_stream.__aexit__(*args)
-
-                def push_text(self, text):
-                    now = time.time()
-                    if timing.get("first_token", 0) > 0 and timing.get("tts_request", 0) == 0 and text and text.strip():
-                        timing["tts_request"] = now
-                        logger.info(f"⏱️ TIMING first_token->tts_request (stream push): {(now-timing['first_token'])*1000:.0f}ms (chunk: {text[:50]})")
-                    return self._inner_stream.push_text(text)
-
-                async def __aiter__(self):
-                    async for chunk in self._inner_stream:
-                        if self._first_chunk:
-                            now_audio = time.time()
-                            if timing.get("first_tts_audio", 0) == 0:
-                                timing["first_tts_audio"] = now_audio
-                                if timing.get("tts_request", 0) > 0:
-                                    logger.info(f"⏱️ TIMING tts_request->first_tts_audio (stream): {(now_audio-timing['tts_request'])*1000:.0f}ms")
-                                if timing.get("first_token", 0) > 0:
-                                    logger.info(f"⏱️ TIMING first_token->first_tts_audio (REAL stream): {(now_audio-timing['first_token'])*1000:.0f}ms")
-                                    if timing.get("first_audio", 0) == 0:
-                                        timing["first_audio"] = now_audio
-                                        logger.info(f"⏱️ TIMING first_token->first_audio (REAL stream audio): {(now_audio-timing['first_token'])*1000:.0f}ms")
-                                    if timing.get("speech_end", 0) > 0:
-                                        total = (now_audio-timing['speech_end'])*1000
-                                        logger.info(f"⏱️ TIMING speech_end->first_audio (REAL stream total): {total:.0f}ms")
-                                        timing["last_speech_end_to_first_audio"] = total
-                                        if timing.get("stt_final",0) and timing.get("turn_detected",0) and timing.get("llm_start",0) and timing.get("first_token",0):
-                                            logger.info(
-                                                f"📊 TURN BREAKDOWN (REAL stream): speech_end->STT_final {(timing['stt_final']-timing['speech_end'])*1000:.0f}ms | "
-                                                f"STT_final->turn {(timing['turn_detected']-timing['stt_final'])*1000:.0f}ms | "
-                                                f"turn->LLM {(timing['llm_start']-timing['turn_detected'])*1000:.0f}ms | "
-                                                f"LLM->first_token {(timing['first_token']-timing['llm_start'])*1000:.0f}ms | "
-                                                f"first_token->tts_request {(timing.get('tts_request',0)-timing['first_token'])*1000:.0f}ms | "
-                                                f"tts_request->first_audio {(now_audio-timing.get('tts_request',now_audio))*1000:.0f}ms | "
-                                                f"TOTAL {total:.0f}ms"
-                                            )
-                                        timing["speech_end"] = 0.0
-                                        timing["stt_final"] = 0.0
-                                        timing["turn_detected"] = 0.0
-                                        timing["llm_start"] = 0.0
-                                        timing["first_token"] = 0.0
-                                        timing["tts_request"] = 0.0
-                                        timing["first_tts_audio"] = 0.0
-                                        timing["llm_complete"] = 0.0
-                                        timing["first_audio"] = 0.0
-                            self._first_chunk = False
-                        yield chunk
-
-                async def aclose(self):
-                    try:
-                        return await self._inner_stream.aclose()
-                    except Exception:
-                        pass
-
-                def close(self):
-                    try:
-                        return self._inner_stream.close()
-                    except Exception:
-                        pass
-
-            return StreamWrapper(inner_stream, timing)
-
-    return TTSTimingWrapper(tts_instance, timing_dict)
-
-
-
 def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
     """Fixed LLM timing wrapper that properly implements async context manager protocol.
     
@@ -1283,27 +1118,9 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
         logger.info(f"⏱️ provider build sync fallback {time.time()-build_t0:.2f}s")
 
-    # Wrap TTS with timing instrumentation if timing ref provided - works with any provider
-    if turn_timing_ref is not None:
-        try:
-            is_fallback = hasattr(tts_inst, '_tts_instances') or hasattr(tts_inst, 'tts_instances') or 'FallbackAdapter' in str(type(tts_inst))
-            if is_fallback:
-                try:
-                    inner_list = getattr(tts_inst, '_tts_instances', None) or getattr(tts_inst, 'tts_instances', None) or getattr(tts_inst, '_instances', None)
-                    if inner_list:
-                        for idx, inner_tts in enumerate(inner_list):
-                            inner_list[idx] = _create_tts_timing_wrapper(inner_tts, turn_timing_ref)
-                        logger.info(f"🔧 TTS timing wrapper applied to FallbackAdapter ({len(inner_list)} providers)")
-                    else:
-                        tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
-                except Exception as e:
-                    logger.warning(f"Could not wrap FallbackAdapter inner TTS: {e}, wrapping outer")
-                    tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
-            else:
-                tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
-                logger.info(f"🔧 TTS timing wrapper applied")
-        except Exception as e:
-            logger.warning(f"Could not apply TTS timing wrapper: {e}")
+    # Use the real TTS instance. A timing wrapper around synthesize/stream
+    # broke session.say() (opening line generated, nothing heard).
+    logger.info("🔧 TTS left unwrapped so the opening line can play")
 
     # Turn-taking: how long the agent waits before it assumes the user is done,
     # and how easily the user can barge in. The old values (0.20/0.55, interrupt
@@ -1550,7 +1367,15 @@ async def entrypoint(ctx):
         except Exception as exc:
             logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
     else:
-        logger.info(f"⏱️ DB init 0.00s (cached)")
+        # A reused job process gets a new event loop. db.init() reconnects when
+        # the previous client is bound to a dead loop; skipping it hangs the
+        # next call and the worker looks like it stopped.
+        try:
+            await asyncio.wait_for(db_init(), timeout=5)
+            logger.info("⏱️ DB init rechecked on this event loop")
+        except Exception as exc:
+            _DB_INIT_DONE = False
+            logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
 
     # Agent lookup cache (in-memory, 30s TTL) to avoid 1.13s DB hit per call
 
@@ -1568,12 +1393,9 @@ async def entrypoint(ctx):
     lead_data = meta.get("lead_data") or {}
 
     rec = None
-    cache_key = f"{agent_id}:{user_id}"
-    cache_entry = _AGENT_CACHE.get(cache_key) if agent_id and user_id else None
-    if cache_entry and (time.time() - cache_entry["ts"]) < _AGENT_CACHE_TTL:
-        rec = cache_entry["rec"]
-        logger.info(f"⏱️ agent lookup 0.00s (cached, age {time.time()-cache_entry['ts']:.1f}s)")
-    elif agent_id and user_id:
+    # Always load the agent the user just selected. A 30s cache made
+    # "hang up, pick another agent, call again" run the previous config.
+    if agent_id and user_id:
         lookup_t0 = time.time()
         # Right after a fresh connect the first query still pays the cold TLS
         # handshake to Postgres/Neon (~1.5-4s). Cancelling it at 3s and retrying
@@ -1584,7 +1406,6 @@ async def entrypoint(ctx):
             try:
                 rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
                 logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
-                _AGENT_CACHE[cache_key] = {"rec": rec, "ts": time.time()}
                 break
             except Exception as exc:
                 # %r, not %s: a bare TimeoutError stringifies to "" and the old
@@ -1598,6 +1419,11 @@ async def entrypoint(ctx):
 
     if rec is None:
         # fall back to the default demo agent so the worker never crashes
+        logger.error(
+            "❌ Could not load agent_id=%s — the worker is still running, but this "
+            "call will use the demo agent. End it and start again with the agent you selected.",
+            agent_id,
+        )
         from app.sample import default_config
         cfg = default_config()
         agent_id = agent_id or "demo"
@@ -1645,7 +1471,12 @@ async def entrypoint(ctx):
     memory_enabled = bool(getattr(cfg, "memory_enabled", True))
     prior_memory = memory.load(customer_key) if memory_enabled else ""
 
-    greeting = cfg.greeting or f"Namaste! Main {cfg.name} hoon. Aap kaise madad kar sakta hoon?"
+    if (cfg.greeting or "").strip():
+        greeting = cfg.greeting
+    elif (getattr(cfg, "language", "hi") or "hi").lower().startswith("en"):
+        greeting = f"Hello, this is {cfg.name}. How can I help you?"
+    else:
+        greeting = f"Namaste! Main {cfg.name} hoon. Aap kaise madad kar sakta hoon?"
     # Dynamic script: substitute {column} placeholders with this lead's values
     # (used by bulk-call campaigns so every call is personalized).
     greeting = leadfile.render_template(greeting, lead_data)
@@ -1909,6 +1740,11 @@ async def entrypoint(ctx):
             return
         if call_closed["done"] or closing_in_progress["done"] or closing_requested["done"] or no_response_state.get("triggered"):
             return
+        ag = agent_holder.get("agent")
+        if ag is not None and getattr(ag, "_opening_started", False) and not getattr(ag, "_opening_done", False):
+            logger.info("⏱️ No-response timer fired during the opening line — not interrupting it")
+            _schedule_no_response()
+            return
         elapsed = time.time() - no_response_state.get("last_activity", 0)
         # If user spoke during sleep, task would have been cancelled; double-check
         if elapsed < idle_timeout - 0.5:
@@ -1966,6 +1802,10 @@ async def entrypoint(ctx):
             pass
 
     def _schedule_no_response():
+        # Announcement mode reads a script and hangs up. A silence timer would
+        # interrupt that script or start a second goodbye.
+        if agent_mode == "announcement":
+            return
         if no_response_state.get("triggered") or call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
             logger.info("⏱️ Not arming no-response — call already closing/triggered")
             return
@@ -1982,6 +1822,8 @@ async def entrypoint(ctx):
 
     # Fallback loop monitor (kept for safety, primary is scheduled timer)
     async def _no_response_monitor():
+        if agent_mode == "announcement":
+            return
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
         no_response_msg = (getattr(cfg, "no_response_message", "") or
                            "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
@@ -2544,11 +2386,13 @@ async def entrypoint(ctx):
     if agent_mode == "announcement":
         script = getattr(cfg, "announce_text", "") or greeting
         script = leadfile.render_template(script, lead_data)
+        if not (script or "").strip():
+            script = greeting or f"Hello, this is {cfg.name}."
         agent = build_announce_agent(cfg, announce_text=script)
-        logger.info("📢 mode=announcement (fixed-script only, no STT/LLM)")
+        logger.info("📢 mode=announcement — will read the script when the caller can hear, then hang up")
     else:
         agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing)
-        logger.info("💬 mode=assistant (STT+LLM+TTS)")
+        logger.info("💬 mode=assistant — will greet when the caller can hear, then listen")
     agent_holder["agent"] = agent
 
     # Server-side noise cancellation. Two tiers:
@@ -2779,86 +2623,168 @@ async def entrypoint(ctx):
     # tab, network drop, or clicking "Leave"). Closing the session unblocks
     # session.start(), which lets the job shut down and run finalize_billing.
     async def watch_call_end():
+        """End this job only after the human caller has actually left.
+
+        close_on_disconnect is off so a goodbye can finish. That also meant a
+        hung-up browser could leave the only worker process stuck inside
+        session.start(). The next call — after the user picked a different
+        agent — was dispatched to nobody and stayed silent.
+
+        A caller who is still connected is not idle. Silence is the no-response
+        timer's job. This watcher only releases the job once the caller is gone.
+        """
         room = ctx.room
-        caller_joined = asyncio.Event()
-        caller_left = asyncio.Event()
+        released = {"done": False}
+        saw_human = {"yes": False}
+        gone_since = {"t": 0.0}
 
-        def _on_connected(participant):
-            if participant != room.local_participant:
-                caller_joined.set()
+        def _kind(participant) -> int:
+            kind = getattr(participant, "kind", 0)
+            try:
+                return int(kind)
+            except Exception:
+                return 0
 
-        def _on_disconnected(participant):
-            # If we are already in deterministic closing, don't trigger hangup watchdog
-            # — let closing TTS finish fully before cutting
-            if closing_in_progress["done"]:
-                logger.info("👋 Caller disconnected during deterministic closing — letting goodbye TTS finish before cut")
-                if not room.remote_participants:
-                    caller_left.set()
+        def _is_human(participant) -> bool:
+            if participant is None or participant == getattr(room, "local_participant", None):
+                return False
+            # 1 ingress, 2 egress, 4 agent — not the person on the call.
+            if _kind(participant) in (1, 2, 4):
+                return False
+            identity = (getattr(participant, "identity", "") or "").lower()
+            if identity.startswith("eg_") or "egress" in identity:
+                return False
+            return True
+
+        def _humans():
+            try:
+                return [p for p in room.remote_participants.values() if _is_human(p)]
+            except Exception:
+                return []
+
+        async def _release(reason: str):
+            if released["done"]:
                 return
+            released["done"] = True
             call_closed["done"] = True
-            # Cancel pending fallback speech immediately when the caller leaves.
-            # Otherwise the watchdog can try to speak into a closed AgentSession.
+            logger.info(
+                "👋 Caller left (%s) — ending this job. The worker stays up for the next agent.",
+                reason,
+            )
             _cancel_pending()
+            _cancel_no_response()
             fallback_task = reply_tracker.get("fallback_say")
             if fallback_task is not None and not fallback_task.done():
                 fallback_task.cancel()
             reply_tracker["fallback_say"] = None
-            # "remote participants" = the caller(s). When there are none left and
-            # we previously saw at least one caller, the call is over.
-            if not room.remote_participants:
-                caller_left.set()
+            # Do not speak into a transport the browser has already closed.
+            # That await is what kept the job (and the worker slot) stuck.
+            try:
+                session.shutdown(drain=False)
+            except Exception as e:
+                logger.warning("session.shutdown on caller leave failed: %r", e)
+
+            async def _force_exit():
+                await asyncio.sleep(4)
+                logger.warning("job still running 4s after caller left — forcing shutdown")
+                try:
+                    ctx.shutdown()
+                except Exception as e:
+                    logger.warning("ctx.shutdown failed: %r", e)
+
+            try:
+                asyncio.create_task(_force_exit())
+            except Exception:
+                pass
+
+        def _on_connected(participant):
+            if not _is_human(participant):
+                return
+            saw_human["yes"] = True
+            gone_since["t"] = 0.0
+            logger.info("👤 caller joined: %s", getattr(participant, "identity", "?"))
+
+        def _on_disconnected(participant):
+            if not _is_human(participant):
+                return
+            if _humans():
+                return
+            gone_since["t"] = time.time()
+            logger.info("👤 caller left: %s", getattr(participant, "identity", "?"))
 
         room.on("participant_connected", _on_connected)
         room.on("participant_disconnected", _on_disconnected)
+        if _humans():
+            saw_human["yes"] = True
+            logger.info("👤 caller already in the room (%s)", len(_humans()))
         try:
-            # The caller may already be in the room before this watcher attaches.
-            if room.remote_participants:
-                caller_joined.set()
-            await caller_joined.wait()
-            idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-            try:
-                await asyncio.wait_for(caller_left.wait(), timeout=idle_timeout)
-            except asyncio.TimeoutError:
-                # Keep this deterministic and customer-configurable. Do not run
-                # the LLM for an idle caller; speak the saved line once, then hang up.
-                message = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
-                _cancel_pending()
-                _cancel_no_response()
-                no_response_state["triggered"] = True
-                call_closed["done"] = True
-                closing_in_progress["done"] = True
-                fallback_task = reply_tracker.get("fallback_say")
-                if fallback_task is not None and not fallback_task.done():
-                    fallback_task.cancel()
-                try:
-                    await session.say(message, allow_interruptions=False)
-                except Exception as exc:
-                    logger.info("Idle timeout message could not be played because the session closed: %s", exc)
-                logger.info("⏱️ Caller inactive for %ss — ending call.", idle_timeout)
-                try:
-                    session.shutdown(drain=False)
-                except Exception:
-                    pass
-                try:
-                    ctx.shutdown()
-                except Exception:
-                    pass
-                return
-            logger.info("👋 Caller hang up — ending call.")
+            while not released["done"]:
+                await asyncio.sleep(0.4)
+                humans = _humans()
+                if humans:
+                    saw_human["yes"] = True
+                    gone_since["t"] = 0.0
+                    continue
+                if not saw_human["yes"]:
+                    continue
+                if gone_since["t"] == 0.0:
+                    gone_since["t"] = time.time()
+                    continue
+                # Long enough for a browser remount to rejoin the same room,
+                # short enough that "end call, pick another agent, start" gets
+                # a free worker process.
+                if time.time() - gone_since["t"] >= 1.5:
+                    await _release("no caller in the room")
+                    return
+        except asyncio.CancelledError:
+            return
         finally:
-            room.off("participant_connected", _on_connected)
-            room.off("participant_disconnected", _on_disconnected)
-        # Close the agent session so the job can wind down and finalize.
-        try:
-            session.shutdown(drain=False)
-        except Exception as e:
-            logger.warning(f"session.shutdown failed: {e}")
-        try:
-            ctx.shutdown()
-        except Exception as e:
-            logger.warning(f"could not trigger job shutdown: {e}")
+            try:
+                room.off("participant_connected", _on_connected)
+                room.off("participant_disconnected", _on_disconnected)
+            except Exception:
+                pass
 
+    async def _backup_opening_line():
+        """Speak the greeting/script if on_enter never started.
+
+        A connected browser call that stays silent is the bug this covers.
+        """
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            return
+        if call_closed["done"] or closing_in_progress["done"]:
+            return
+        ag = agent_holder.get("agent")
+        if ag is not None and getattr(ag, "_opening_started", False):
+            return
+        if state_tracker.get("state") == "speaking":
+            return
+        if any((t.get("text") or "").strip() and t.get("role") == "agent" for t in usage["transcripts"]):
+            return
+        if agent_mode == "announcement":
+            line = (getattr(cfg, "announce_text", "") or greeting or "").strip()
+        else:
+            line = (greeting or "").strip()
+        if not line:
+            logger.warning("🛟 No greeting or script configured — nothing to speak")
+            return
+        logger.warning("🛟 Opening line had not started — speaking it now (%s)", agent_mode)
+        try:
+            handle = session.say(line, allow_interruptions=False)
+            waiter = getattr(handle, "wait_for_playout", None)
+            if callable(waiter):
+                await asyncio.wait_for(waiter(), timeout=45)
+            elif handle is not None:
+                await asyncio.wait_for(handle, timeout=45)
+            logger.info("✅ Backup opening line finished")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("backup opening line failed: %s: %r", type(e).__name__, e)
+
+    opening_backup = asyncio.create_task(_backup_opening_line())
     watchdog = asyncio.create_task(watch_call_end())
     # Primary: scheduled timer (resets on activity), fallback: loop monitor
     loop_monitor_task = asyncio.create_task(_no_response_monitor())
@@ -2868,7 +2794,11 @@ async def entrypoint(ctx):
         start_kwargs["room_options"] = room_options
     try:
         await session.start(**start_kwargs)
+    except Exception as e:
+        logger.exception("session.start failed — job will exit so the worker can take the next call: %r", e)
+        raise
     finally:
+        opening_backup.cancel()
         watchdog.cancel()
         loop_monitor_task.cancel()
         _cancel_no_response()
@@ -3098,10 +3028,11 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            # Pre-warm one idle worker process so the first call connects fast
-            # instead of paying the plugin-import + VAD-load cost on every call.
-            # Bump this for more concurrent calls; set 0 to never pre-warm.
-            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "1")),
+            # Two idle processes so a call that is still winding down cannot
+            # block the next one. One stuck job used to make "change agent and
+            # call again" look like the worker had silently stopped.
+            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "2")),
+            shutdown_process_timeout=float(os.getenv("SHUTDOWN_PROCESS_TIMEOUT", "12")),
             agent_name=WORKER_AGENT_NAME,
             # Windows doesn't support the default "forkserver" context; "spawn"
             # is portable and works on Windows/macOS/Linux alike.

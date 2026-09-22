@@ -361,6 +361,15 @@ export default function Dashboard() {
                       {a.description || "—"}
                     </p>
                     <div className="flex flex-wrap gap-1.5 text-[11px] text-gray-400 mb-3">
+                      <span
+                        className={`rounded-full px-2.5 py-1 border ${
+                          a.agent_mode === "announcement"
+                            ? "bg-blue-500/10 text-blue-300 border-blue-500/20"
+                            : "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
+                        }`}
+                      >
+                        {a.agent_mode === "announcement" ? "announcement" : "assistant"}
+                      </span>
                       <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
                         LLM: {a.providers.llm.id.slice(0, 18)}
                       </span>
