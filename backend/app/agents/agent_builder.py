@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any, Optional
 
 from ..models import AgentConfig, KnowledgeBase
@@ -2022,6 +2023,7 @@ def build_announce_agent(
             # (2026-09-22: "Appointment Remainder" silent + billed). Now: track
             # the outcome for billing, and ALWAYS run the teardown so the
             # caller is never stranded in a silent open call.
+            speak_t0 = time.monotonic()
             try:
                 speech = self.session.say(text, allow_interruptions=False)
                 await asyncio.wait_for(speech, timeout=120)
@@ -2037,6 +2039,30 @@ def build_announce_agent(
                 if tracker is not None:
                     tracker["error"] = f"{type(e).__name__}: {e}"
                 logger.error(f"📢 Announcement TTS FAILED: {type(e).__name__}: {e} — caller heard nothing. Marking failed, customer will NOT be billed. Check TTS credentials (google-key.json) and provider status.")
+            # ── Hold the room open until the CLIENT has played the audio ──────
+            # 2026-09-22: "SBI EMI Remainder" was silent + auto-cut + billed ONLY
+            # with Google TTS; Sarvam TTS worked. Cause: say() resolves when the
+            # provider finishes *synthesizing*, not when the caller finishes
+            # *listening*. Chirp 3 HD returns the whole clip in ~1-2s, so the
+            # teardown below closed the room after ~4s — mid-sentence for a
+            # ~350-char script that needs ~30s to play. Sarvam streams at
+            # real-time pace, so it only returns after playback is done and was
+            # never affected. Keep the room alive for the remaining estimated
+            # playback time; a real-time-paced provider has already used it up
+            # (sleep ~0 — Sarvam behavior unchanged). Failed say() calls skip
+            # this and tear down at once — no pointless silent hold.
+            if tracker is not None and tracker.get("spoken_ok"):
+                _CHARS_PER_SEC = 11.0  # conservative avg for Hindi/Hinglish TTS speech
+                est_play_s = len(text) / _CHARS_PER_SEC + 2.5  # +lead-in/tail slack
+                elapsed = time.monotonic() - speak_t0
+                remaining = est_play_s - elapsed
+                if remaining > 0:
+                    logger.info(
+                        f"⏳ Announcement: TTS synthesized in {elapsed:.1f}s but playback needs "
+                        f"~{est_play_s:.1f}s — holding the call open {remaining:.1f}s so the "
+                        "caller hears the full script."
+                    )
+                    await asyncio.sleep(remaining)
             # Tear down unconditionally: delete the LiveKit room so the caller
             # is physically disconnected (otherwise the browser/SIP participant
             # would be left in a silent, open call), then shut the job down —
