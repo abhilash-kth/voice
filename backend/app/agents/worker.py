@@ -2775,6 +2775,26 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning("backup opening line failed: %s: %r", type(e).__name__, e)
 
+    # Deduplication check: if another agent has already connected to this room, exit immediately
+    try:
+        remote_agents = [
+            p for p in ctx.room.remote_participants.values()
+            if getattr(p, "kind", None) == 4
+            or getattr(p, "is_agent", False)
+            or (getattr(p, "identity", "") or "").startswith("agent-")
+        ]
+        if remote_agents:
+            logger.warning(
+                "⚠️ Duplicate agent already present in room %s (%s). Exiting this runner to prevent duplicate audio.",
+                getattr(ctx.room, "name", ""),
+                [getattr(p, "identity", "") for p in remote_agents],
+            )
+            call_closed["done"] = True
+            ctx.shutdown()
+            return
+    except Exception as e:
+        logger.debug("duplicate agent check: %r", e)
+
     opening_backup = asyncio.create_task(_backup_opening_line())
     watchdog = asyncio.create_task(watch_call_end())
 
