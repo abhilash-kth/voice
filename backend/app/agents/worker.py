@@ -782,11 +782,13 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
 
     class TimingStreamWrapper:
         """Wraps LLMStream to measure first_token TTFT and generation_complete."""
-        def __init__(self, inner_stream, timing, prov_info, req_start):
+        def __init__(self, inner_stream, timing, prov_info, req_start, gen=None):
             self._inner_stream = inner_stream
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
+            self._gen = gen
+            self._stale_logged = False
             self._first_token = True
             self._input_tokens = 0
             self._output_tokens = 0
@@ -801,17 +803,27 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     now = _time.time()
                     if self._first_token:
                         self._first_token = False
-                        first_token = now
-                        self._timing["first_token"] = first_token
-                        ttft = (first_token - self._req_start) * 1000
-                        self._timing["ttft_ms"] = ttft
-                        prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
-                        model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                        _logger.info(f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
-                        if self._timing.get("llm_start", 0) > 0:
-                            _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
-                        if self._timing.get("speech_end", 0) > 0:
-                            _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
+                        if self._gen is not None and int(self._timing.get("gen", 0)) != self._gen:
+                            # This stream was invalidated (barge-in / new turn)
+                            # after it started: the library still drains/cancels
+                            # it, but it must NOT write this turn's timing or
+                            # fire TTFT logs that would look like the NEW turn.
+                            # Billing below is untouched: a torn-down request
+                            # ends at 0/0 failed exactly as before.
+                            self._stale_logged = True
+                            _logger.info("🗑️ [STALE_GENERATION_DROPPED] callback_generation=%d current_generation=%s — late tokens from an invalidated turn are discarded", self._gen, self._timing.get("gen"))
+                        else:
+                            first_token = now
+                            self._timing["first_token"] = first_token
+                            ttft = (first_token - self._req_start) * 1000
+                            self._timing["ttft_ms"] = ttft
+                            prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
+                            model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
+                            _logger.info(f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                            if self._timing.get("llm_start", 0) > 0:
+                                _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
+                            if self._timing.get("speech_end", 0) > 0:
+                                _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
                     try:
                         usage = getattr(chunk, 'usage', None)
                         if usage:
@@ -892,7 +904,8 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 else:
                     self._timing["failed_requests"] += 1
                     _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
-                    _logger.info("🔇 [LLM_CANCELLED] reason=user_continued — superseded request never billed; the new completed turn owns the one live request")
+                    _bi_recent = (_time.time() - float(self._timing.get("last_bargein_ts", 0.0))) < 1.0
+                    _logger.info("🔇 [LLM_CANCELLED] reason=%s generation=%s — superseded request never billed; the new completed turn owns the one live request", "user_barge_in" if _bi_recent else "user_continued", self._timing.get("gen", 0))
                 
                 _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
@@ -920,11 +933,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
 
     class TimingChatCM:
         """Async context manager that wraps inner LLM chat CM and returns TimingStreamWrapper."""
-        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start):
+        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start, gen=None):
             self._inner_orig = inner_cm_or_coro
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
+            self._gen = gen
             self._inner_cm = None
             self._inner_stream = None
 
@@ -960,7 +974,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 )
                 raise
             self._inner_stream = stream
-            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start)
+            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start, self._gen)
 
         async def __aexit__(self, exc_type, exc, tb):
             try:
@@ -1007,6 +1021,11 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
             self._timing["llm_active"] = True
+            # Generation token: a barge-in bumps "gen"; this stream carries its
+            # birth gen so late callbacks can be identified as stale (see the
+            # [STALE_GENERATION_DROPPED] guard in TimingStreamWrapper).
+            _gen = int(self._timing.get("gen", 0)) + 1
+            self._timing["gen"] = _gen
             self._timing["assistant_output_received"] = False
             # Reset per-request metrics but preserve provider/model and aggregated billing
             # Preserve aggregated and is_closing
@@ -1042,7 +1061,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             try:
                 inner_result = self._inner.chat(*args, **kwargs)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
-                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start)
+                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start, _gen)
             except Exception as e:
                 error_time = _time.time()
                 prov = self._prov_info.get('provider', '') or 'unknown'
@@ -1741,6 +1760,7 @@ async def _entrypoint_body(ctx, setup_complete):
     # [USER_SPEECH_STARTED] edge detector state (mutable cell; updated from
     # the transcription handler, which is sync and loop-local).
     _last_tx_ts = [0.0]
+    _last_bargein_ts = [0.0]  # edge debounce for the immediate barge-in interrupt
 
     def _precompute_rag(text: str) -> None:
         try:
@@ -1787,11 +1807,60 @@ async def _entrypoint_body(ctx, setup_complete):
             # legacy "transcription" events used `.text`.
             text = getattr(ev, "transcript", None) or getattr(ev, "text", None) or ""
             is_final = bool(getattr(ev, "is_final", False))
-            # [AGENT_INTERRUPTED_BY_USER] marker (spec §10): the library does the
-            # actual interruption; this just records WHY the agent stopped.
+            # --- Immediate barge-in cancellation (2026-09-24 00:53 log) ---
+            # The library gates its own interruption behind min_words=2 +
+            # turn-commit logic, so "Ok" (1 word) at 00:53:34.191 was detected
+            # but the agent kept talking until 00:53:35.770 — 1.57s of
+            # non-interruptible output, with the (truncated) assistant item
+            # committing at 00:53:35.857. We keep the library gate as-is and
+            # add our own trigger on the FIRST transcript edge while the agent
+            # is speaking: session.interrupt() is the library's supported
+            # cancellation (AgentActivity.interrupt -> cancels preemptive
+            # generation + the live LLM/TTS tasks + flushes playback, commits
+            # only the already-played audio as the assistant item, then flips
+            # speaking->listening). force=False so protected speeches — the
+            # deterministic closing say() with allow_interruptions=False —
+            # keep playing. Stale-output protection: turn_timing["gen"] is
+            # bumped here BEFORE interrupting, and every LLM stream stamps its
+            # birth gen in the timing wrapper; a late callback from an
+            # invalidated generation logs [STALE_GENERATION_DROPPED] instead
+            # of touching this turn's timing.
             try:
                 if text.strip() and not is_final and state_tracker.get("state") == "speaking":
-                    logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech — agent output being interrupted")
+                    _now_b = time.time()
+                    if _now_b - _last_bargein_ts[0] <= 0.30:
+                        pass  # debounce: one cancellation per user-utterance onset
+                    elif turn_timing.get("is_closing", False):
+                        logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech during the protected closing speech — not interrupting")
+                    else:
+                        _gen0 = int(turn_timing.get("gen", 0))
+                        _llm_was = bool(turn_timing.get("llm_active", False))
+                        _last_bargein_ts[0] = _now_b
+                        turn_timing["last_bargein_ts"] = _now_b
+                        logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech — interrupting immediately (no wait for the min_words gate / turn commit)")
+                        logger.info("⚡ [INTERRUPTION_START] generation=%d transcript='%s'", _gen0, text.strip()[:40])
+                        if _llm_was:
+                            # interrupt() below tears the pipeline down; annotate the
+                            # intent up front so the completion log pairs read right.
+                            logger.info("🧠 [LLM_CANCELLED] reason=user_barge_in generation=%d", _gen0)
+                        logger.info("🔈 [TTS_CANCELLED] reason=user_barge_in generation=%d (playback flush + truncate via SpeechHandle)", _gen0)
+                        turn_timing["gen"] = _gen0 + 1
+                        logger.info("🚫 [GENERATION_INVALIDATED] generation=%d — current is now %d; late callbacks from %d cannot publish", _gen0, _gen0 + 1, _gen0)
+                        try:
+                            _fut = session.interrupt()
+
+                            def _barge_done(_f, _g=_gen0):
+                                try:
+                                    if not _f.cancelled() and _f.exception() is None:
+                                        logger.info("✅ [INTERRUPTION_COMPLETE] generation=%d — agent returned to listening", _g)
+                                except Exception:
+                                    pass
+
+                            _fut.add_done_callback(_barge_done)
+                        except RuntimeError as _ie:
+                            # session not running / current speech disallows
+                            # interruptions: nothing we should force past.
+                            logger.info("ℹ️ immediate interrupt skipped: %s", _ie)
             except Exception:
                 pass
             if text.strip():
@@ -2373,6 +2442,16 @@ async def _entrypoint_body(ctx, setup_complete):
             reply_tracker["empty_spoken"] = False
             _schedule_silence_fallback(now)
         elif role == "assistant":
+            # Post-barge-in clarity (00:53:35.857 log): when an interrupted
+            # generation still yields an assistant item, LiveKit commits ONLY
+            # the audio actually played before the interrupt (truncated text).
+            # That is correct library semantics — flag it so the log reads
+            # intentionally, not like a missed cancellation.
+            try:
+                if (time.time() - float(turn_timing.get("last_bargein_ts", 0.0))) < 1.5:
+                    logger.info("ℹ️ assistant item committed after a barge-in — truncated to played audio per LiveKit semantics (generation=%s)", turn_timing.get("gen", 0))
+            except Exception:
+                pass
             # Mark assistant output received for empty-turn race fix
             turn_timing["assistant_output_received"] = True
             # Preserve last successful turn metrics for final billing
