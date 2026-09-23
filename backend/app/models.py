@@ -51,7 +51,7 @@ class ProviderPair(BaseModel):
             "groq_gpt_oss": ("groq", "openai/gpt-oss-120b", "https://api.groq.com/openai/v1"),
             "groq_gpt_oss_20b": ("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1"),
             "groq_llama_3_3_70b": ("groq", "llama-3.3-70b-versatile", "https://api.groq.com/openai/v1"),
-            "groq_qwen_3_8_27b": ("groq", "qwen/qwen3-32b", "https://api.groq.com/openai/v1"),
+            "groq_qwen_3_8_27b": ("groq", "qwen/qwen3.8-27b", "https://api.groq.com/openai/v1"),  # was retired qwen3-32b; aligned to catalog 2026-09-24
             "openrouter_gemma": ("openrouter", "google/gemma-3-27b-it:free", "https://openrouter.ai/api/v1"),
             "openrouter_gemma_26b": ("openrouter", "google/gemma-3-12b-it:free", "https://openrouter.ai/api/v1"),
         }

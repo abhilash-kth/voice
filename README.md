@@ -188,7 +188,7 @@ so nothing is silently substituted at call time.
 | Provider | Models offered | Key in `backend/.env` | Notes |
 | --- | --- | --- | --- |
 | **OpenAI** | `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.4-mini`, `gpt-5.4-nano` | `OPENAI_API_KEY=` | Low-latency tier only. Full-size + o-series reasoning models are marked deprecated (multi-second TTFT) but still resolve for agents already using them. gpt-5* are reasoning models: no temperature knob; `reasoning_effort=low` is forced for voice. |
-| **Groq** | `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `openai/gpt-oss-safeguard-20b`, `qwen/qwen3.6-27b`, `meta-llama/llama-4-maverick-17b-128e-instruct`, `moonshotai/kimi-k2-instruct`, `minimaxai/minimax-m2.7` | `GROQ_API_KEY=` | Free tier ($0/token, rate-limited per model). Only current models: `llama-3.1-8b`, `llama-3.3-70b`, `qwen/qwen3-32b`, `llama-4-scout` were retired by Groq (Jul–Aug 2026) and are hidden. "Qwen/Qwen3.8-27B" does not exist on Groq — `qwen/qwen3.6-27b` is the real model. |
+| **Groq** | `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `openai/gpt-oss-safeguard-20b`, `qwen/qwen3.8-27b`, `meta-llama/llama-4-maverick-17b-128e-instruct`, `moonshotai/kimi-k2-instruct`, `minimaxai/minimax-m2.7` | `GROQ_API_KEY=` | Free tier ($0/token, rate-limited per model). Only current models: `llama-3.1-8b`, `llama-3.3-70b`, `qwen/qwen3-32b`, `llama-4-scout` were retired by Groq (Jul–Aug 2026) and are hidden. Groq's Qwen pick is `qwen/qwen3.8-27b` since 2026-09-24 (was `qwen/qwen3.6-27b`, kept callable-but-deprecated for saved agents). |
 | **Google Gemini** | `gemini-2.5-flash-lite` ⭐ (voice pick), `gemini-2.5-flash` | `GEMINI_API_KEY=` or `GOOGLE_API_KEY=` | Native `livekit.plugins.google.LLM` (plugin already pinned). Key from <https://aistudio.google.com/apikey>; has a free tier. |
 | **Sarvam AI** | `sarvam-30b` ⭐, `sarvam-30b-16k`, `sarvam-105b`, `sarvam-105b-32k` | `SARVAM_API_KEY=` | Indic stack (LLM + Saaras STT + Bulbul TTS in one key), billed in ₹. Best Hindi/Hinglish code-mix handling. |
 
@@ -346,7 +346,7 @@ directly, so adding a provider / changing its price is just editing this file.
 
 | Kind      | Free-tier                      | Paid                             |
 | --------- | ------------------------------ | -------------------------------- |
-| LLM       | Groq Llama 3.3 70B, Groq Qwen3 | OpenAI GPT-4o mini, GPT-OSS-120B |
+| LLM       | Groq Llama 3.3 70B, Groq Qwen3.8 | OpenAI GPT-4o mini, GPT-OSS-120B |
 | STT       | Deepgram Nova-2                | Deepgram Nova-3, Google STT      |
 | TTS       | Google WaveNet (hi-IN)         | Google Neural2, ElevenLabs       |
 | Telephony | Browser (free)                 | Telnyx, Twilio (SIP trunk)       |

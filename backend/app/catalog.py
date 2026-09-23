@@ -251,7 +251,7 @@ def _build_llm_catalog_v2_with_compat():
         "groq_gpt_oss": ("groq", "openai/gpt-oss-120b"),
         "groq_gpt_oss_20b": ("groq", "openai/gpt-oss-20b"),
         "groq_llama_3_3_70b": ("groq", "meta-llama/llama-4-maverick-17b-128e-instruct"),  # llama-3.3 retired 08/16/26 -> Llama 4 Maverick
-        "groq_qwen_3_8_27b": ("groq", "qwen/qwen3.6-27b"),  # was Qwen3 (deprecated), now current Qwen3.6 27B on Groq
+        "groq_qwen_3_8_27b": ("groq", "qwen/qwen3.8-27b"),  # Qwen3 (deprecated) -> Qwen3.6 (superseded 2026-09-24) -> Qwen3.8 27B, Groq's current
         # openrouter is deprecated: map its legacy ids onto live equivalents so an
         # agent saved against them keeps working (and stops rate-limiting).
         "openrouter_gemma": ("google", "gemini-2.5-flash-lite"),
