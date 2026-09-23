@@ -15,10 +15,11 @@ being installed in that interpreter.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 import logging
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from .config import (
     LIVEKIT_URL,
@@ -32,6 +33,24 @@ logger = logging.getLogger("voice-agent-saas-telephony")
 AGENT_NAME = "voice-agent-saas"
 
 
+async def _lk(coro: Any, timeout: float, op: str) -> Any:
+    """Run a LiveKit API call with a hard timeout.
+
+    Without this, a slow/unreachable LiveKit server (e.g. the PC losing reach to
+    the cloud SFU) hangs the *caller* of the call forever: start_call never
+    returns, the worker's call-end cleanup never completes, and the worker
+    process stays busy — so the NEXT call is dispatched to nobody and the room
+    goes silent. TimeoutError is raised to the caller so it can surface a real
+    error instead of an endless spinner.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"{op} timed out after {timeout:.0f}s (LiveKit server unreachable or overloaded)"
+        )
+
+
 def make_room_name() -> str:
     return f"saas-{uuid.uuid4().hex[:10]}"
 
@@ -40,8 +59,11 @@ def _metadata(agent_id: str, mode: str, phone: str = "", call_id: str = "",
               user_id: str = "", lead_data: Optional[dict] = None) -> str:
     import json
     return json.dumps({
-        "agent_id": agent_id, "mode": mode, "phone": phone,
-        "call_id": call_id, "user_id": user_id,
+        "agent_id": agent_id,
+        "mode": mode,
+        "phone": phone,
+        "call_id": call_id,
+        "user_id": user_id,
         "lead_data": lead_data or None,   # for dynamic-script substitution in the worker
     })
 
@@ -49,34 +71,68 @@ def _metadata(agent_id: str, mode: str, phone: str = "", call_id: str = "",
 # ---------------------------------------------------------------------------
 # Browser mode: return a join token that also dispatches the agent into the room
 # ---------------------------------------------------------------------------
-def create_browser_room(agent_id: str, phone: str = "", call_id: str = "", user_id: str = "",
-                        lead_data: Optional[dict] = None) -> dict:
-    """Creates a room + a browser participant token, dispatching the agent."""
+async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "", user_id: str = "",
+                              lead_data: Optional[dict] = None) -> dict:
+    """Creates a room + returns a browser participant token configured for automatic agent dispatch on join."""
     from livekit import api
 
     _req_creds()
     room = make_room_name()
     identity = "caller-" + uuid.uuid4().hex[:6]
+    metadata = _metadata(agent_id, "browser", phone, call_id, user_id, lead_data)
 
-    token = (
+    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    server_dispatched = False
+    try:
+        try:
+            await _lk(
+                client.room.create_room(
+                    api.CreateRoomRequest(
+                        name=room,
+                        empty_timeout=300,
+                        departure_timeout=30,
+                        agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
+                    )
+                ),
+                timeout=8.0,
+                op="CreateRoom",
+            )
+            server_dispatched = True
+            logger.info("[ROOM_CREATED] room=%s agent_id=%s mode=browser (server-dispatched)", room, agent_id)
+        except TimeoutError:
+            raise
+        except Exception as e:
+            logger.warning("[CREATE_ROOM_WARN] room=%s: %s", room, e)
+            # Room-create with inline agents= failed — fall back to an explicit
+            # dispatch (older servers may reject the inline form but accept this).
+            if await create_agent_dispatch(room, metadata) is not None:
+                server_dispatched = True
+    finally:
+        await client.aclose()
+
+    token_builder = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(identity)
         .with_ttl(timedelta(minutes=30))
         .with_grants(
             api.VideoGrants(room=room, room_join=True, can_publish=True, can_subscribe=True)
         )
-        .with_room_config(
+    )
+
+    if not server_dispatched:
+        token_builder = token_builder.with_room_config(
             api.RoomConfiguration(
                 agents=[
                     api.RoomAgentDispatch(
                         agent_name=AGENT_NAME,
-                        metadata=_metadata(agent_id, "browser", phone, call_id, user_id, lead_data),
+                        metadata=metadata,
                     )
                 ]
             )
         )
-        .to_jwt()
-    )
+
+    token = token_builder.to_jwt()
+    logger.info("[TOKEN_CREATED] room=%s identity=%s", room, identity)
 
     return {"token": token, "url": LIVEKIT_URL, "room": room, "mode": "browser"}
 
@@ -108,26 +164,48 @@ async def create_sip_call(
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         # 1) Create the room and auto-dispatch the LiveKit worker into it.
-        await client.room.create_room(
-            api.CreateRoomRequest(
-                name=room,
-                empty_timeout=300,   # seconds before an empty room auto-closes
-                agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
-            )
+        await _lk(
+            client.room.create_room(
+                api.CreateRoomRequest(
+                    name=room,
+                    empty_timeout=300,   # seconds before an empty room auto-closes
+                    agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
+                )
+            ),
+            timeout=8.0,
+            op="CreateRoom",
         )
 
-        # 2) Dial the number through the SIP trunk.
-        resp = await client.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                room_name=room,
-                participant_identity="phone-" + uuid.uuid4().hex[:6],
-                sip_call_to=phone,          # e.g. +9180XXXXXXX
-                krisp_enabled=False,
-            ),
-            trunk_id=trunk,
-        )
+        # 2) Dial the number through the SIP trunk. If this fails the room would
+        # otherwise sit with an agent dispatch and no caller — clean it up.
+        try:
+            resp = await _lk(
+                client.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=room,
+                        participant_identity="phone-" + uuid.uuid4().hex[:6],
+                        sip_call_to=phone,          # e.g. +9180XXXXXXX
+                        krisp_enabled=False,
+                    ),
+                    trunk_id=trunk,
+                ),
+                timeout=15.0,
+                op="CreateSIPParticipant",
+            )
+        except Exception:
+            try:
+                await _lk(
+                    client.room.delete_room(api.room_service.DeleteRoomRequest(room=room)),
+                    timeout=5.0,
+                    op="DeleteRoom",
+                )
+            except Exception:
+                pass
+            raise
     finally:
         await client.aclose()
+
+    logger.info("[ROOM_CREATED] room=%s agent_id=%s mode=sip phone=%s", room, agent_id, phone)
 
     return {
         "room": room,
@@ -156,7 +234,11 @@ async def list_live_active_rooms() -> Optional[set]:
         return None
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
-        resp = await client.room.list_rooms(api.room_service.ListRoomsRequest())
+        resp = await _lk(
+            client.room.list_rooms(api.room_service.ListRoomsRequest()),
+            timeout=5.0,
+            op="ListRooms",
+        )
     except Exception:
         return None
     finally:
@@ -184,7 +266,11 @@ async def end_active_room(room_name: str) -> bool:
         return False
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
-        await client.room.delete_room(api.room_service.DeleteRoomRequest(room=room_name))
+        await _lk(
+            client.room.delete_room(api.room_service.DeleteRoomRequest(room=room_name)),
+            timeout=8.0,
+            op="DeleteRoom",
+        )
         return True
     except Exception as e:
         logger.warning(f"end_active_room: delete_room failed for {room_name}: {e}")
@@ -196,6 +282,105 @@ async def end_active_room(room_name: str) -> bool:
             pass
 
 
+async def create_agent_dispatch(room_name: str, metadata: str) -> Optional[str]:
+    """Explicitly dispatch the agent into an EXISTING room; returns the dispatch id.
+
+    This is the self-healing path for "the server accepted the dispatch at room
+    creation but no worker ever got offered the job": self-hosted LiveKit drops
+    an agent dispatch when no worker is registered for the agent name at that
+    instant, and (server-version dependent) may not retry it when the worker
+    registers seconds later. Creating the dispatch again — once the worker IS
+    registered — is the exact, minimal remediation.
+    """
+    try:
+        from livekit import api
+        _req_creds()
+    except Exception:
+        return None
+    if not hasattr(api, "CreateAgentDispatchRequest"):
+        return None
+    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        if not hasattr(client, "agent_dispatch"):
+            return None
+        resp = await _lk(
+            client.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(
+                    agent_name=AGENT_NAME,
+                    room=room_name,
+                    metadata=metadata,
+                )
+            ),
+            timeout=6.0,
+            op="CreateAgentDispatch",
+        )
+        dispatch_id = getattr(getattr(resp, "agent_dispatch", resp), "id", "") or ""
+        logger.info(
+            "[AGENT_DISPATCH_SENT] room=%s agent=%s dispatch_id=%s",
+            room_name, AGENT_NAME, dispatch_id or "?",
+        )
+        return dispatch_id
+    except Exception as e:
+        logger.warning("[AGENT_DISPATCH_WARN] room=%s: %s", room_name, e)
+        return None
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
 def _req_creds() -> None:
     if not (LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise RuntimeError("LIVEKIT_API_KEY / LIVEKIT_API_SECRET not configured")
+
+
+async def room_agent_joined(room_name: str) -> Optional[bool]:
+    """True when a LiveKit **agent** participant is actually inside the room.
+
+    Room creation + agent dispatch succeeding only means the server ACCEPTED the
+    dispatch — a worker still has to pick the job up and join. This probe is how
+    the API learns that the dispatch realistically failed (worker stopped, busy,
+    or a stale second worker window eating jobs), instead of letting the caller
+    sit in a silent room. Returns None when LiveKit is unreachable, so callers
+    can treat "unknown" differently from a definitive miss.
+    """
+    if not room_name:
+        return None
+    try:
+        from livekit import api
+        _req_creds()
+    except Exception:
+        return None
+    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        resp = await _lk(
+            client.room.list_participants(api.ListParticipantsRequest(room=room_name)),
+            timeout=6.0,
+            op="ListParticipants",
+        )
+        Kind = getattr(api.ParticipantInfo, "Kind", None)
+        agent_enum = getattr(Kind, "AGENT", None) if Kind else None
+        for p in getattr(resp, "participants", []) or []:
+            kind = getattr(p, "kind", None)
+            if agent_enum is not None and kind == agent_enum:
+                return True
+            try:  # protobuf open enums are ints in some SDK releases (AGENT=4)
+                if int(kind) == 4:
+                    return True
+            except Exception:
+                pass
+            if "agent" in str(kind).lower():
+                return True
+            # defensive fallback for SDKs that do not expose ParticipantInfo.Kind
+            ident = (getattr(p, "identity", "") or "").lower()
+            if ident.startswith("agent"):
+                return True
+        return False
+    except Exception:
+        return None
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass

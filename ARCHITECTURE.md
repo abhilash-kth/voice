@@ -38,17 +38,95 @@ How the self-hosted platform is wired.
 
 `POST /api/calls`:
 1. Checks agent is enabled.
-2. Checks **concurrency**: `COUNT(calls WHERE agent_id AND status='in-progress')`
+2. **Preflights the agent config** (`app/preflight.py`): runs the worker's exact
+   config→runtime path — `AgentConfig(**rec)` + `build_stt/build_llm/build_tts`
+   (offline constructor build) — in a worker thread. A saved agent whose config
+   no longer builds (model removed from the catalog, provider/model mismatch,
+   missing API key) used to crash the worker job *after* the room existed: the
+   caller sat in a silent room forever with no error anywhere. Now the call is
+   rejected **before the room is created** with the real reason, which the UI
+   shows and the user can act on. (Campaigns are prefetched the same way at
+   start and on every dispatch tick, so a broken config can't burn wallet
+   credits lead by lead.)
+3. Checks **concurrency**: `COUNT(calls WHERE agent_id AND status='in-progress')`
    vs `max_concurrency` → 409 at limit.
-3. Checks wallet balance > ₹0 → else 402.
-4. Creates a `call` row (`status='planned'`), then:
+4. Checks wallet balance > ₹0 → else 402.
+5. Creates a `call` row (`status='planned'`), then:
    - **browser**: `telephony.create_browser_room()` → a join token with a
      `RoomAgentDispatch` (metadata = `{user_id, agent_id, call_id, mode, phone}`).
    - **sip**: `telephony.create_sip_call()` → creates the room **with an agent
      dispatch rule**, then dials the number via the LiveKit v1
      `LiveKitAPI.sip.create_sip_participant(..., trunk_id=trunk)`.
 
+   Every LiveKit API call (create room, dispatch, SIP dial, delete room, list
+   rooms) runs with a hard timeout (`telephony._lk`) so an unreachable LiveKit
+   server surfaces a 503 "LiveKit server did not respond" instead of hanging
+   the request / the worker's cleanup path forever.
+
 When the caller joins, LiveKit spawns the worker for `agent_name="voice-agent-saas"`.
+
+**Worker failure contract** (`worker.entrypoint`): *no silent failures.* Any
+exception during job setup (agent load, provider build, session start) is
+caught by the entrypoint wrapper, which (1) logs CRITICAL with the full
+traceback, (2) marks the call `failed` in the DB with the reason in
+`usage.error` (the UI polls the call while "waiting for agent" and shows the
+caller the real error), (3) deletes the room (the browser disconnects instead
+of hanging in a silent room), (4) shuts the job down (frees the worker process
+for the next dispatch). A 90-second setup watchdog force-fails jobs whose
+setup hangs, so one sick job cannot clog dispatch — the classic "first call
+works, second goes silent" symptom. The UI additionally applies a 30-second
+agent-join timeout with a "Try again" action for the case where no worker
+process picks up the dispatch at all.
+
+**Dispatch verification** (`_agent_join_watchdog` in `main.py`): after the room
+is created, a background task polls the room's participants
+(`telephony.room_agent_joined`, hard-timeout `ListParticipants`). Self-hosted
+LiveKit **drops an agent dispatch when no worker is registered for the agent
+name at that instant** (worker still booting or re-registering) and may not
+retry it — so ~8s with no agent triggers ONE explicit re-dispatch
+(`telephony.create_agent_dispatch`, logs `[DISPATCH_RETRY]` + dispatch id);
+by then a freshly (re)started worker is registered and picks it up. If the
+agent still has not joined within `DISPATCH_VERIFY_SECONDS` (default 18), the
+call row is marked `failed` with the real reason in `usage.error` — the UI's
+2s waiting-poll surfaces it immediately rather than letting the caller wait
+out the full 30s on a generic timeout. Typical root causes this catches:
+worker not running, a second stale worker window claiming jobs with old code,
+or the worker stuck draining a previous call. The worker logs `[JOB_RECEIVED]`
+as the first line of its entrypoint, so the full chain in logs reads:
+`[CALL_START]` → `[ROOM_CREATED]` → `[TOKEN_CREATED]` →
+`[AGENT_DISPATCH_SENT]` → `[JOB_RECEIVED]` → `[AGENT_STARTED]` →
+`[AGENT_JOINED]` → `[AGENT_JOIN_VERIFIED]`.
+
+**Logging discipline** (`config.setup_logging` / `purge_sync_root_handlers`):
+all console output goes through ONE async `QueueHandler`+`QueueListener`.
+LiveKit's CLI attaches its own synchronous JSON console handler to root after
+our setup (and job processes attach their IPC handler next to ours) — without
+the purge every record prints 2-3x and each synchronous Windows-console write
+stalls the asyncio loop 150-350ms (observed as "event loop blocked ... in
+emit" warnings). The purge runs in every job process (`prewarm`) and on the
+supervisor (piggybacked on the worker load tick).
+
+**Human-like interruption contract** (`turn_handling.interruption`): the
+2-word minimum (`min_words=2`) is the semantic gate — a lone "haan/hmm/ok"
+backchannel or a cough never cuts the agent mid-sentence, while a genuine 2+
+word barge-in stops it fast (`min_duration=0.35`, env
+`VOICE_MIN_INTERRUPTION_DURATION`). If a "barge-in" turns out to be noise,
+LiveKit resumes the agent's interrupted sentence automatically
+(`resume_false_interruption`, recovery within
+`VOICE_FALSE_INTERRUPTION_TIMEOUT=1.5s` of silence) — the human behavior of "oh,
+sorry, go on". Agents also begin every reply with a 1-3 word acknowledgment as
+its own first sentence (`VOICE_ACK_OPENERS=1` to disable): those first tokens
+reach the TTS almost immediately, so the caller hears a human-like reaction
+within ~1s while the full answer continues streaming.
+
+**RAG latency**: retrieval (BM25 over FAQ + KB) is precomputed from STT
+**interim** transcripts during the endpointing silence
+(`user_input_transcribed` event; the await-ed `on_user_turn_completed` hook
+then resolves it from a cache — "⚡ RAG PREFETCH HIT" in worker logs). OpenAI
+LLMs also get a stable `prompt_cache_key` so the static 1.5-2K-token prompt
+prefix (system + owner instructions + tool defs) hits OpenAI's automatic
+prefix cache from the second turn on (`cached>0` in the billing logs), cutting
+TTFT roughly in half on repeat turns.
 
 ## 4. Worker (the agent runtime)
 
@@ -65,6 +143,12 @@ successor to the removed `VoicePipelineAgent`). Then:
   the turn, pruning the previous turn's RAG message. RAG stands down when
   `VOICE_PREEMPTIVE=1` (per-turn context mutation would invalidate preemptive
   generation).
+  **Latency:** retrieval is *precomputed* from each STT **interim** (session
+  `transcription` event → BM25 in a thread, keyed by
+  `rag.normalize_query(text)`), so by the time the session `await`s
+  `on_user_turn_completed` before the LLM starts, the result is a cache hit
+  (~0ms) instead of 30–100ms+ on the critical path. A miss (final text diverged
+  from every interim) falls back to computing in the hook as before.
 - **Silence watchdog**: if no assistant reply lands within
   `VOICE_LLM_FALLBACK_DELAY` (default 12s) of a user turn — e.g. the LLM 429'd
   and the fail-fast retries gave up, or the model returned an empty completion —
