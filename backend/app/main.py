@@ -416,9 +416,9 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
     if mode == "browser":
         try:
-            existing_calls = await repo.list_calls(user.id, limit=5)
+            existing_calls = await repo.list_calls(user.id, limit=20)
             for prev in existing_calls:
-                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
+                if prev.get("agent_id") == agent_id and prev.get("status") in ("planned", "in-progress"):
                     prev_room = prev.get("room")
                     if prev_room:
                         try:
@@ -435,11 +435,14 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     live_rooms = await telephony.list_live_active_rooms()
     active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
     if active >= rec["max_concurrency"]:
-        raise HTTPException(
-            409,
-            f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
-            "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
-        )
+        if mode == "browser":
+            logger.info("Browser mode: overriding concurrency limit for agent %s on manual user start", agent_id)
+        else:
+            raise HTTPException(
+                409,
+                f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
+                "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
+            )
 
     wallet = await repo.get_wallet(user.id)
     if wallet["balance"] <= 0:
@@ -458,9 +461,9 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
     try:
         if mode == "sip":
-            result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
+            result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id, agent_config=rec)
         else:
-            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
+            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id, agent_config=rec)
     except ModuleNotFoundError:
         raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
     except ValueError as e:

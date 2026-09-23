@@ -168,9 +168,9 @@ class LLMProviderSelection(BaseModel):
 
 
 class ProviderSelection(BaseModel):
-    llm: ProviderPair
-    stt: ProviderPair
-    tts: ProviderPair
+    llm: Optional[ProviderPair] = None
+    stt: Optional[ProviderPair] = None
+    tts: Optional[ProviderPair] = None
     telephony: Optional[ProviderPair] = None
     # Optional fallback providers — used when primary hits 429/rate-limit
     llm_fallback: Optional[ProviderPair] = None
@@ -203,7 +203,7 @@ class ProviderSelection(BaseModel):
                 pass
         return self
     
-    def get_primary_llm(self) -> ProviderPair:
+    def get_primary_llm(self) -> Optional[ProviderPair]:
         """Get primary LLM as ProviderPair, preferring v2 if present."""
         if self.llm_v2:
             return self.llm_v2.to_provider_pair()
@@ -241,7 +241,7 @@ class AgentConfig(BaseModel):
     name: str
     description: str = ""
     greeting: str = ""
-    providers: ProviderSelection
+    providers: ProviderSelection = Field(default_factory=ProviderSelection)
     knowledge: KnowledgeBase = Field(default_factory=KnowledgeBase)
     language: str = "hi"
     # Voice gender: drives the TTS voice (Google Chirp3 speaker / Sarvam Bulbul speaker)

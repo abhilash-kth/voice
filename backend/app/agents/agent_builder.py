@@ -526,7 +526,7 @@ def build_llm(cfg: AgentConfig) -> Any:
         primary_pair = cfg.providers.get_primary_llm()
         fallback_pair = cfg.providers.get_fallback_llm()
     except AttributeError:
-        primary_pair = cfg.providers.llm
+        primary_pair = getattr(cfg.providers, "llm", None)
         fallback_pair = getattr(cfg.providers, "llm_fallback", None)
         if not fallback_pair:
             try:
@@ -535,6 +535,10 @@ def build_llm(cfg: AgentConfig) -> Any:
                     fallback_pair = fp.llm
             except Exception:
                 pass
+
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="openai_gpt4o_mini", config={})
 
     # Log LLM PROVIDER CONFIG for primary
     try:
@@ -768,7 +772,10 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_stt(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.stt
+    primary_pair = getattr(cfg.providers, "stt", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="deepgram_nova2", config={})
     primary = _build_stt_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "stt_fallback", None)
@@ -936,7 +943,10 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_tts(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.tts
+    primary_pair = getattr(cfg.providers, "tts", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="google_wavenet_hi", config={})
     primary = _build_tts_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "tts_fallback", None)
@@ -1363,7 +1373,7 @@ async def wait_until_caller_can_hear(session, timeout: float = 12.0) -> None:
         except Exception as e:
             logger.warning(f"wait_for_ready failed; speaking anyway: {e}")
     # RoomIO "ready" is earlier than the browser attaching <audio>.
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(0.2)
 
 
 async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> None:
