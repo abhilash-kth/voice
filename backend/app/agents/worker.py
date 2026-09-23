@@ -1517,6 +1517,10 @@ async def _entrypoint_body(ctx, setup_complete):
     call_id = meta.get("call_id", "")
     user_id = meta.get("user_id", "")
     lead_data = meta.get("lead_data") or {}
+    meta_agent_config = meta.get("agent_config")
+
+    logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
+    logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
 
     logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
     logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
