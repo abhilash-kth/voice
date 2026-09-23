@@ -1590,7 +1590,10 @@ async def entrypoint(ctx):
         logger.info("Session close event received")
         call_finished.set()
 
-    ctx.add_shutdown_callback(lambda *_: call_finished.set())
+    async def _on_job_shutdown(*_):
+        call_finished.set()
+
+    ctx.add_shutdown_callback(_on_job_shutdown)
 
     async def _do_deterministic_closing():
         # Prevent duplicate closings, but allow if already closing to ensure completion
