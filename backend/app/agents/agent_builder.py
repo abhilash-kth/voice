@@ -692,7 +692,10 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
     # - no_delay True: send final immediately, don't buffer
     # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
-    model_name = str(overrides.get("model", "nova-2")).strip()
+    from ..catalog import CATALOG
+    cat_stt = CATALOG.get("stt", {}).get(sel.id, {})
+    default_model = cat_stt.get("model") or ("nova-3" if "nova3" in sel.id or "nova-3" in sel.id else "nova-2")
+    model_name = str(overrides.get("model") or default_model).strip()
     stt_kwargs = dict(
         model=model_name,
         language=overrides.get("language", "hi"),
@@ -702,8 +705,13 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
         filler_words=bool(overrides.get("filler_words", True)),
         api_key=overrides.get("api_key") or DEEPGRAM_API_KEY or None,
     )
-    # Deepgram only supports keywords on nova-2; nova-3 uses keyterm prompting
-    if "nova-2" in model_name.lower():
+    # Deepgram API compatibility:
+    # - Nova-3 models require Keyterm Prompting (list of strings via 'keyterm' parameter)
+    # - Nova-2, Nova-1, Enhanced, Base models use Keywords (list of (keyword, boost) tuples via 'keywords')
+    if model_name.lower().startswith("nova-3"):
+        keyterms = [k[0] if isinstance(k, (tuple, list)) else str(k) for k in keywords]
+        stt_kwargs["keyterm"] = keyterms
+    elif "nova-2" in model_name.lower():
         stt_kwargs["keywords"] = keywords
     # Try to add production latency params with correct names, fallback gracefully if not supported
     # Correct param is endpointing_ms (not endpointing) per installed plugin 1.8.2
@@ -1423,12 +1431,13 @@ def warm_agent_builder_schemas() -> None:
     Calling this in prewarm() compiles the validators ahead of time.
     """
     try:
+        from livekit.agents.llm import chat_context
+        chat_context.ChatMessage.model_rebuild()
         from livekit.agents import llm
         warm_ctx = llm.ChatContext()
         warm_ctx.add_message(role="system", content="warmup")
         warm_ctx.add_message(role="user", content="warmup")
         warm_ctx.add_message(role="assistant", content="warmup")
-        _ = llm.ChatMessage(role="system", content="warmup")
         logger.info("🔥 Prewarm: llm.ChatContext / ChatMessage models compiled (0ms model_rebuild during call)")
     except Exception as exc:
         logger.debug("ChatContext schema prewarm note: %r", exc)
@@ -1985,3 +1994,11 @@ def build_announce_agent(
                 logger.info("📢 Announcement finished — keeping call connected (end_after_announcement=False)")
 
     return _AnnounceAgent()
+
+
+# Pre-compile schemas when agent_builder is imported
+try:
+    warm_agent_builder_schemas()
+except Exception:
+    pass
+

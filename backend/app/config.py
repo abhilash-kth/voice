@@ -29,14 +29,6 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Disable LiveKit agents loop block monitor by default (LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS=0).
-# On Windows and environments with synchronous console logging, the 10ms loop monitor
-# watchdog thread triggers false-positive warnings that stall the event loop for 1.3-7.2s,
-# causing WebRTC transport and STT WebSocket connection timeouts.
-# ---------------------------------------------------------------------------
-os.environ.setdefault("LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS", "0")
-
-# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent          # backend/
@@ -112,14 +104,47 @@ EGRESS_PUBLIC_BASE_URL = os.getenv("EGRESS_PUBLIC_BASE_URL", "")  # where record
 BILLING_INTERNAL_TOKEN = os.getenv("BILLING_INTERNAL_TOKEN", "")
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (Non-blocking QueueHandler + QueueListener)
 # ---------------------------------------------------------------------------
+_log_listener = None
+
+
 def setup_logging() -> None:
+    """Configure non-blocking asynchronous logging using QueueHandler and QueueListener.
+
+    Synchronous StreamHandler.emit calls (stream.write) can block the asyncio event
+    loop for 200ms–1300ms on Windows console, triggering severe WebRTC and IPC watchdog
+    starvation. Using QueueHandler places log records into an in-memory queue in microseconds,
+    while a dedicated background thread (QueueListener) performs the actual I/O writes.
+    """
+    global _log_listener
     import logging
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    import queue
+    import atexit
+    import sys
+    from logging.handlers import QueueHandler, QueueListener
+
+    if _log_listener is not None:
+        return
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    log_queue: queue.SimpleQueue = queue.SimpleQueue()
+    stream_handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(level)
+
+    _log_listener = QueueListener(log_queue, stream_handler, respect_handler_level=True)
+    _log_listener.start()
+    atexit.register(_log_listener.stop)
+
+    # Route root logger to the non-blocking QueueHandler
+    root.handlers = [QueueHandler(log_queue)]
 
 
 setup_logging()

@@ -27,15 +27,6 @@ import aiohttp
 from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
-# Disable LiveKit agents loop block monitor by default (LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS=0).
-# On Windows and environments with synchronous console logging, the 10ms loop monitor
-# watchdog thread triggers false-positive warnings that stall the event loop for 1.3-7.2s,
-# causing WebRTC transport and STT WebSocket connection timeouts.
-# MUST run before livekit is imported so child worker processes inherit it.
-# ---------------------------------------------------------------------------
-os.environ.setdefault("LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS", "0")
-
-# ---------------------------------------------------------------------------
 # Thread limits. Cap the BLAS/math libs to 1 thread (avoids per-thread pool
 # thrashing), but leave ONNX runtime UNTHROTTLED so the local silero VAD can use
 # all cores — throttling it to 1 thread is what made "inference is slower than
@@ -96,7 +87,8 @@ try:  # noqa: E402
 except ImportError:  # package is optional (pip install livekit-plugins-sarvam)
     _sarvam_plugin = None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from app.config import setup_logging
+setup_logging()
 logger = logging.getLogger("voice-agent-saas-worker")
 
 # FIX: 314ms synchronous SSL initialization block on LiveKit agent event loop
@@ -1490,7 +1482,7 @@ async def entrypoint(ctx):
     else:
         customer_key = ctx.room.name
     memory_enabled = bool(getattr(cfg, "memory_enabled", True))
-    prior_memory = memory.load(customer_key) if memory_enabled else ""
+    prior_memory = (await asyncio.to_thread(memory.load, customer_key)) if memory_enabled else ""
 
     if (cfg.greeting or "").strip():
         greeting = cfg.greeting
@@ -2932,13 +2924,7 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
-    os.environ["LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS"] = "0"
-    # Silence loop_monitor telemetry in runner processes to avoid slow synchronous console writes
-    try:
-        logging.getLogger("livekit.agents.telemetry").setLevel(logging.ERROR)
-        logging.getLogger("livekit.agents.telemetry.loop_monitor").setLevel(logging.ERROR)
-    except Exception:
-        pass
+    setup_logging()
 
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
@@ -3077,12 +3063,14 @@ def _worker_load(worker) -> float:
 
 
 if __name__ == "__main__":
-    os.environ["LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS"] = "0"
-    from livekit.agents import WorkerOptions, cli
+    setup_logging()
+    try:
+        from app.agents.agent_builder import warm_agent_builder_schemas
+        warm_agent_builder_schemas()
+    except Exception:
+        pass
 
-    # Silence runaway loop_monitor telemetry warnings that trigger synchronous console writes
-    logging.getLogger("livekit.agents.telemetry").setLevel(logging.ERROR)
-    logging.getLogger("livekit.agents.telemetry.loop_monitor").setLevel(logging.ERROR)
+    from livekit.agents import WorkerOptions, cli
 
     # livekit-agents v1 ships a Typer CLI that requires a subcommand
     # (start / dev / console). Default to `start` so that
