@@ -103,23 +103,10 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
             raise
         except Exception as e:
             logger.warning("[CREATE_ROOM_WARN] room=%s: %s", room, e)
-            if hasattr(client, "agent_dispatch") and hasattr(api, "CreateAgentDispatchRequest"):
-                try:
-                    await _lk(
-                        client.agent_dispatch.create_dispatch(
-                            api.CreateAgentDispatchRequest(
-                                agent_name=AGENT_NAME,
-                                room=room,
-                                metadata=metadata,
-                            )
-                        ),
-                        timeout=6.0,
-                        op="CreateAgentDispatch",
-                    )
-                    server_dispatched = True
-                    logger.info("[AGENT_DISPATCH_SENT] room=%s agent=%s", room, AGENT_NAME)
-                except Exception as de:
-                    logger.warning("[AGENT_DISPATCH_WARN] room=%s: %s", room, de)
+            # Room-create with inline agents= failed — fall back to an explicit
+            # dispatch (older servers may reject the inline form but accept this).
+            if await create_agent_dispatch(room, metadata) is not None:
+                server_dispatched = True
     finally:
         await client.aclose()
 
@@ -288,6 +275,54 @@ async def end_active_room(room_name: str) -> bool:
     except Exception as e:
         logger.warning(f"end_active_room: delete_room failed for {room_name}: {e}")
         return False
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+async def create_agent_dispatch(room_name: str, metadata: str) -> Optional[str]:
+    """Explicitly dispatch the agent into an EXISTING room; returns the dispatch id.
+
+    This is the self-healing path for "the server accepted the dispatch at room
+    creation but no worker ever got offered the job": self-hosted LiveKit drops
+    an agent dispatch when no worker is registered for the agent name at that
+    instant, and (server-version dependent) may not retry it when the worker
+    registers seconds later. Creating the dispatch again — once the worker IS
+    registered — is the exact, minimal remediation.
+    """
+    try:
+        from livekit import api
+        _req_creds()
+    except Exception:
+        return None
+    if not hasattr(api, "CreateAgentDispatchRequest"):
+        return None
+    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        if not hasattr(client, "agent_dispatch"):
+            return None
+        resp = await _lk(
+            client.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(
+                    agent_name=AGENT_NAME,
+                    room=room_name,
+                    metadata=metadata,
+                )
+            ),
+            timeout=6.0,
+            op="CreateAgentDispatch",
+        )
+        dispatch_id = getattr(getattr(resp, "agent_dispatch", resp), "id", "") or ""
+        logger.info(
+            "[AGENT_DISPATCH_SENT] room=%s agent=%s dispatch_id=%s",
+            room_name, AGENT_NAME, dispatch_id or "?",
+        )
+        return dispatch_id
+    except Exception as e:
+        logger.warning("[AGENT_DISPATCH_WARN] room=%s: %s", room_name, e)
+        return None
     finally:
         try:
             await client.aclose()

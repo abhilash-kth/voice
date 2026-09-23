@@ -80,14 +80,22 @@ process picks up the dispatch at all.
 
 **Dispatch verification** (`_agent_join_watchdog` in `main.py`): after the room
 is created, a background task polls the room's participants
-(`telephony.room_agent_joined`, hard-timeout `ListParticipants`). If no agent
-participant appears within `DISPATCH_VERIFY_SECONDS` (default 18), the call row
-is marked `failed` with the real reason in `usage.error` ("worker is not
-picking up the dispatch — run exactly one worker, close stale worker windows")
-— the UI's 2s waiting-poll surfaces it immediately rather than letting the
-caller wait out the full 30s on a generic timeout. Typical root causes this
-catches: worker not running, a second stale worker window claiming jobs with
-old code, or the worker stuck draining a previous call.
+(`telephony.room_agent_joined`, hard-timeout `ListParticipants`). Self-hosted
+LiveKit **drops an agent dispatch when no worker is registered for the agent
+name at that instant** (worker still booting or re-registering) and may not
+retry it — so ~8s with no agent triggers ONE explicit re-dispatch
+(`telephony.create_agent_dispatch`, logs `[DISPATCH_RETRY]` + dispatch id);
+by then a freshly (re)started worker is registered and picks it up. If the
+agent still has not joined within `DISPATCH_VERIFY_SECONDS` (default 18), the
+call row is marked `failed` with the real reason in `usage.error` — the UI's
+2s waiting-poll surfaces it immediately rather than letting the caller wait
+out the full 30s on a generic timeout. Typical root causes this catches:
+worker not running, a second stale worker window claiming jobs with old code,
+or the worker stuck draining a previous call. The worker logs `[JOB_RECEIVED]`
+as the first line of its entrypoint, so the full chain in logs reads:
+`[CALL_START]` → `[ROOM_CREATED]` → `[TOKEN_CREATED]` →
+`[AGENT_DISPATCH_SENT]` → `[JOB_RECEIVED]` → `[AGENT_STARTED]` →
+`[AGENT_JOINED]` → `[AGENT_JOIN_VERIFIED]`.
 
 **Logging discipline** (`config.setup_logging` / `purge_sync_root_handlers`):
 all console output goes through ONE async `QueueHandler`+`QueueListener`.
