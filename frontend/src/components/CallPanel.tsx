@@ -36,6 +36,8 @@ const STATIC_AUDIO_OPTIONS = {
   autoGainControl: true,
 };
 
+const LAST_AGENT_KEY = "voice_agent_last_selected_id";
+
 function ActiveSession({
   agent,
   callId,
@@ -218,16 +220,59 @@ export default function CallPanel({
   const isDisconnectingRef = useRef(false);
   const callEndReasonRef = useRef<string | null>(null);
 
-  // Preselect an agent when presetAgentId is provided or initialize with first agent
+  // Preselect an agent: preset > localStorage (last chosen) > first agent
   useEffect(() => {
     if (!agents.length) return;
+
     if (presetAgentId && agents.some((a) => a.id === presetAgentId)) {
       setAgentId(presetAgentId);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(LAST_AGENT_KEY, presetAgentId);
+        } catch {}
+      }
       onPresetConsumed?.();
-    } else if (!agentId || !agents.some((a) => a.id === agentId)) {
-      setAgentId(agents[0].id);
+      return;
+    }
+
+    if (agentId && agents.some((a) => a.id === agentId)) {
+      return;
+    }
+
+    let savedAgentId: string | null = null;
+    if (typeof window !== "undefined") {
+      try {
+        savedAgentId = localStorage.getItem(LAST_AGENT_KEY);
+      } catch {}
+    }
+
+    if (savedAgentId && agents.some((a) => a.id === savedAgentId)) {
+      setAgentId(savedAgentId);
+    } else {
+      const fallbackId = agents[0].id;
+      setAgentId(fallbackId);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(LAST_AGENT_KEY, fallbackId);
+        } catch {}
+      }
     }
   }, [agents, presetAgentId, agentId, onPresetConsumed]);
+
+  const handleAgentSelect = (newId: string) => {
+    setAgentId(newId);
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem(LAST_AGENT_KEY, newId);
+      } catch {}
+    }
+    const found = agents.find((a) => a.id === newId);
+    if (found) {
+      console.log(
+        `[AGENT_SELECTED] agent_id=${found.id} name=${found.name} mode=${found.agent_mode || "assistant"}`
+      );
+    }
+  };
 
   const selected = useMemo(() => agents.find((a) => a.id === agentId), [agents, agentId]);
 
@@ -236,14 +281,52 @@ export default function CallPanel({
       setCallEndedMsg("Call ended. Select an agent to start a new call.");
       return;
     }
+    setCallEndedMsg("Finalizing call & calculating billing summary…");
+
+    // Poll until billing is finalized and written to DB (up to 12s)
+    let attempts = 0;
+    const maxAttempts = 12;
+    while (attempts < maxAttempts) {
+      try {
+        await new Promise((r) => setTimeout(r, attempts === 0 ? 800 : 1200));
+        attempts++;
+        const c = await getCall(cid);
+        const costInr = (c.cost as any)?.client_price_inr;
+        const duration = c.duration_seconds ?? 0;
+        const isFinalized = c.status === "completed" || c.status === "failed";
+
+        // Check if billing is ready: either cost is posted or duration is > 0
+        if (costInr !== undefined && costInr !== null && (Number(costInr) > 0 || duration > 0)) {
+          const finalCost = Number(costInr) || 0;
+          setCallEndedMsg(
+            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`
+          );
+          onStarted(); // triggers refreshWallet() and refreshAgents() in parent
+          return;
+        }
+
+        if (isFinalized && duration > 0) {
+          const finalCost = Number(costInr || 0);
+          setCallEndedMsg(
+            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`
+          );
+          onStarted();
+          return;
+        }
+      } catch {
+        // continue polling on error
+      }
+    }
+
+    // Final attempt fallback
     try {
-      await new Promise((r) => setTimeout(r, 800));
       const c = await getCall(cid);
-      const costInr = (c.cost as any)?.client_price_inr ?? 0;
+      const costInr = Number((c.cost as any)?.client_price_inr || 0);
       const duration = c.duration_seconds ?? 0;
       setCallEndedMsg(
-        `Call completed (${c.status}) • ${duration}s • Billed ₹${costInr} • Remaining balance will update in Wallet`
+        `Call completed • ${duration}s • Billed ₹${costInr.toFixed(2)} • Wallet balance updated`
       );
+      onStarted();
     } catch {
       setCallEndedMsg("Call ended. Select an agent to start a new call.");
     }
@@ -433,15 +516,7 @@ export default function CallPanel({
         <select
           value={agentId}
           disabled={isCallActive}
-          onChange={(e) => {
-            setAgentId(e.target.value);
-            const found = agents.find((a) => a.id === e.target.value);
-            if (found) {
-              console.log(
-                `[AGENT_SELECTED] agent_id=${found.id} name=${found.name} mode=${found.agent_mode || "assistant"}`
-              );
-            }
-          }}
+          onChange={(e) => handleAgentSelect(e.target.value)}
           className="input mt-1 mb-2"
         >
           <option value="">Select an agent…</option>

@@ -60,6 +60,7 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
     metadata = _metadata(agent_id, "browser", phone, call_id, user_id, lead_data)
 
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    room_created = False
     try:
         try:
             await client.room.create_room(
@@ -70,10 +71,12 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
                     agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
                 )
             )
+            room_created = True
         except Exception as e:
             logger.warning("[CREATE_ROOM_WARN] room=%s: %s", room, e)
 
-        if hasattr(client, "agent_dispatch") and hasattr(api, "CreateAgentDispatchRequest"):
+        # Only dispatch via AgentDispatchService if create_room did not already succeed
+        if not room_created and hasattr(client, "agent_dispatch") and hasattr(api, "CreateAgentDispatchRequest"):
             try:
                 await client.agent_dispatch.create_dispatch(
                     api.CreateAgentDispatchRequest(
@@ -83,6 +86,7 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
                     )
                 )
                 logger.info("[AGENT_DISPATCH_SENT] room=%s agent=%s", room, AGENT_NAME)
+                room_created = True
             except Exception as e:
                 logger.debug("agent_dispatch call: %s", e)
     finally:
@@ -96,19 +100,21 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
             api.VideoGrants(room=room, room_join=True, room_create=True, can_publish=True, can_subscribe=True)
         )
     )
-    try:
-        token_builder = token_builder.with_room_config(
-            api.RoomConfiguration(
-                agents=[
-                    api.RoomAgentDispatch(
-                        agent_name=AGENT_NAME,
-                        metadata=metadata,
-                    )
-                ]
+    # Only if server-side room/agent dispatch failed, attach RoomConfiguration on the token
+    if not room_created:
+        try:
+            token_builder = token_builder.with_room_config(
+                api.RoomConfiguration(
+                    agents=[
+                        api.RoomAgentDispatch(
+                            agent_name=AGENT_NAME,
+                            metadata=metadata,
+                        )
+                    ]
+                )
             )
-        )
-    except Exception as e:
-        logger.warning("[TOKEN_ROOM_CONFIG_WARN] room=%s: %s", room, e)
+        except Exception as e:
+            logger.warning("[TOKEN_ROOM_CONFIG_WARN] room=%s: %s", room, e)
 
     token = token_builder.to_jwt()
 
@@ -152,19 +158,6 @@ async def create_sip_call(
                 agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
             )
         )
-
-        if hasattr(client, "agent_dispatch") and hasattr(api, "CreateAgentDispatchRequest"):
-            try:
-                await client.agent_dispatch.create_dispatch(
-                    api.CreateAgentDispatchRequest(
-                        agent_name=AGENT_NAME,
-                        room=room,
-                        metadata=metadata,
-                    )
-                )
-                logger.info("[AGENT_DISPATCH_SENT] room=%s agent=%s", room, AGENT_NAME)
-            except Exception as e:
-                logger.debug("agent_dispatch call: %s", e)
 
         # 2) Dial the number through the SIP trunk.
         resp = await client.sip.create_sip_participant(
