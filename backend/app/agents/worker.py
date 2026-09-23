@@ -1339,9 +1339,17 @@ async def entrypoint(ctx):
     logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
 
     rec = None
-    if meta_agent_config and isinstance(meta_agent_config, dict):
-        rec = meta_agent_config
-        logger.info("⚡ Fast-path: Agent '%s' loaded directly from dispatch metadata in 0ms (no DB delay)", rec.get("name", agent_id))
+    if agent_id:
+        try:
+            from app.config import DATA_DIR
+            cache_file = DATA_DIR / f"agent_{agent_id}.json"
+            if cache_file.exists():
+                rec = json.loads(cache_file.read_text(encoding="utf-8"))
+                logger.info("⚡ Fast-path: Agent '%s' loaded from local cache in 0ms (no DB delay)", rec.get("name", agent_id))
+        except Exception as exc:
+            logger.warning("Could not read agent cache file: %r", exc)
+
+    if rec is not None:
         # Warm DB connection in background so billing/cleanup at end of call is instant
         if not _DB_INIT_DONE:
             async def _bg_db_init():
