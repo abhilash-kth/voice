@@ -78,6 +78,18 @@ def _tokens(text: str) -> List[str]:
     return [t.lower() for t in _WORD_RE.findall(text)]
 
 
+def normalize_query(text: str) -> str:
+    """Lowercase, punctuation-free, whitespace-collapsed form of a query.
+
+    Used as the key for RAG prefetch results: the worker runs retrieval on STT
+    *interim* text and the turn hook looks it up with the *final* text — both
+    sides must normalise identically for the cache to hit. Strips everything
+    the tokeniser would drop (punctuation, digits-are-kept), Latin + Devanagari
+    word characters only, so "Kya, aapka rate?" and "kya aapka rate" collide.
+    """
+    return " ".join(_WORD_RE.findall((text or "").lower()))
+
+
 # ---------------------------------------------------------------------------
 # Scorer (BM25 or fallback)
 # ---------------------------------------------------------------------------

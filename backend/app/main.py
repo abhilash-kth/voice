@@ -13,6 +13,7 @@ The LiveKit worker (app.agents.worker) reports cost/usage/transcripts here.
 from __future__ import annotations
 
 import os
+import time
 import asyncio
 import logging
 from typing import Optional
@@ -45,6 +46,19 @@ from .config import WALLET_TOPUP_AMOUNT, LIVEKIT_URL, BILLING_INTERNAL_TOKEN, SE
 @asynccontextmanager
 async def lifespan(app):
     await init()
+
+    # Import the voice runtime (livekit agents + plugins) on the main thread in
+    # the background so the first start_call's preflight is instant and so the
+    # plugin-registration-on-main-thread rule is satisfied before any worker
+    # thread touches the plugin modules.
+    async def _warm_runtime():
+        try:
+            from . import preflight as _preflight
+            await _preflight.warm_voice_runtime()
+        except Exception as e:
+            logger.warning(f"voice runtime warm failed: {e!r}")
+
+    warm_task = asyncio.create_task(_warm_runtime())
 
     # Safety net: any "in-progress" call that never got finalized (worker crashed,
     # room never closed, caller vanished) is auto-marked "failed". We use LiveKit's
@@ -84,6 +98,7 @@ async def lifespan(app):
     finally:
         cleanup_task.cancel()
         campaign_task.cancel()
+        warm_task.cancel()
         await shutdown()
 
 
@@ -414,6 +429,25 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     if not rec["enabled"]:
         raise HTTPException(400, "This agent is disabled")
 
+    # PREFLIGHT: run the worker's exact config→runtime path BEFORE creating the
+    # room. A saved agent whose config no longer builds (model removed from the
+    # catalog, missing API key, unknown provider) used to crash the worker job
+    # after the room existed — the caller sat in a silent room forever with no
+    # error anywhere. Now the call fails here, immediately, with the real
+    # reason the UI can show.
+    from . import preflight as _preflight
+    cfg_err = await _preflight.preflight_agent_config(rec)
+    if cfg_err:
+        logger.error(
+            "[CALL_BLOCKED] agent_id=%s name=%s: config would crash the worker: %s",
+            agent_id, rec.get("name"), cfg_err,
+        )
+        raise HTTPException(
+            400,
+            f"Agent '{rec.get('name', agent_id)}' is not ready to take calls: {cfg_err}. "
+            "Open the agent, re-save its LLM/STT/TTS selection (and check the API keys in backend/.env), then retry.",
+        )
+
     logger.info("[CALL_START] agent_id=%s mode=%s user_id=%s", agent_id, mode, user.id)
     logger.info("[AGENT_SELECTED] agent_id=%s name=%s mode=%s", agent_id, rec.get("name"), rec.get("agent_mode", "assistant"))
 
@@ -482,6 +516,17 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except TimeoutError as e:
+        # LiveKit itself did not answer. Mark the call failed so the UI and the
+        # Calls tab show the truth instead of a stale "planned" row.
+        try:
+            await repo.update_call(call["id"], {
+                "status": "failed",
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+            })
+        except Exception:
+            pass
+        raise HTTPException(503, f"LiveKit server did not respond: {e}. Check that the LiveKit server is running and reachable, then retry.")
     except Exception as e:
         raise HTTPException(400, f"Call setup failed: {e}")
 
@@ -605,6 +650,17 @@ async def start_campaign(campaign_id: str, user=Depends(auth.get_current_user)):
     wallet = await repo.get_wallet(user.id)
     if (wallet.get("balance") or 0) <= 0:
         raise HTTPException(402, "Wallet balance is ₹0. Recharge to run a campaign.")
+    # Preflight the agent: a config that crashes the worker would fail EVERY
+    # dial in this campaign and still bill the failed minutes.
+    from . import preflight as _pf
+    agent_rec = await repo.get_agent(c["agent_id"], user.id)
+    if agent_rec:
+        err = await _pf.preflight_agent_config(agent_rec)
+        if err:
+            raise HTTPException(
+                400,
+                f"Campaign agent '{agent_rec.get('name')}' is not ready: {err}. Fix the agent config and retry.",
+            )
     c = campaign_store.set_status(user.id, campaign_id, "running")
     return c
 
