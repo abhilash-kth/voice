@@ -1314,6 +1314,79 @@ def _chat_msg_text(item) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Incomplete-turn fragment state machine — the 03:07 call fix.
+#
+# Production evidence (03:07:39→03:08:44): a held fragment "Ok और" was
+# merged into EVERY following turn — the buffer had no consume step, so it
+# accumulated duplicates ("merged 3 fragment(s): 'Ok और Ok और और इसका
+# office...'") and contaminated RAG queries for the rest of the call. Two
+# additional first-answer failures were visible in the same log: the real
+# K-exam question DID retrieve (2 hits), but its LLM request was clobbered
+# 104ms in by the caller's own next FINAL ("वह क्या है?" — one continuous
+# speech burst split by VAD), and that bare pronoun follow-up then went to
+# RAG alone → 0 hits → "मेरे पास जानकारी नहीं है". Repeats worked only
+# because the contaminated buffer accidentally carried the question text.
+#
+# Rules implemented here (per spec, no keyword special-casing):
+#   - fragments are TIMESTAMPED and CONSUMED (buffer cleared) when merged;
+#   - ACK turns and drops also clear — a new independent turn starts clean;
+#   - fragments older than _FRAGMENT_TTL_S never merge (stale evidence);
+#   - a turn whose request was superseded BEFORE producing any output is
+#     strong evidence the caller is still in the same utterance (worker tags
+#     it via turn_timing["overwritten_turn"] with its generation token); the
+#     just-killed question merges forward with the immediate continuation,
+#     so the FIRST valid question gets its retrieved context — with the same
+#     clean query the repeat had to fight for. The gen tag makes a late
+#     teardown unable to contaminate a turn two generations later.
+# ---------------------------------------------------------------------------
+_FRAGMENT_TTL_S = 12.0
+_SUPERSEDED_MERGE_MAX_AGE_S = 6.0
+
+
+def _frag_norm(p, now_ts):
+    if isinstance(p, (tuple, list)) and len(p) == 2:
+        try:
+            return str(p[0]), float(p[1] or 0.0)
+        except Exception:
+            return str(p[0]), now_ts
+    return str(p), now_ts
+
+
+def _frag_append_fresh(tt, texts, now_ts):
+    """Append texts to the fragment buffer after dropping TTL-stale entries."""
+    pend = []
+    for q in (tt.get("pending_fragments") or []):
+        t, ts = _frag_norm(q, now_ts)
+        if t and now_ts - ts <= _FRAGMENT_TTL_S:
+            pend.append((t, ts))
+    for t in texts:
+        if t:
+            pend.append((str(t), now_ts))
+    pend = pend[-4:]
+    if pend:
+        tt["pending_fragments"] = pend
+    else:
+        tt.pop("pending_fragments", None)
+    return pend
+
+
+def _frag_consume(tt, now_ts):
+    """TAKE the whole buffer and CLEAR it (the missing consume step).
+    Returns (fresh_texts, dropped_stale_count)."""
+    raw = list(tt.get("pending_fragments") or [])
+    if raw:
+        tt.pop("pending_fragments", None)
+    fresh, dropped = [], 0
+    for q in raw:
+        t, ts = _frag_norm(q, now_ts)
+        if t and now_ts - ts <= _FRAGMENT_TTL_S:
+            fresh.append(t)
+        else:
+            dropped += 1
+    return fresh, dropped
+
+
 def _find_chat_ctx(obj) -> Any:
     """Return the mutable ChatContext from a v1 turn context (defensively)."""
     candidates = [obj]
@@ -2076,24 +2149,52 @@ def build_voice_agent(
                         _is_inc = (not _is_ack) and _rag_rules.is_incomplete_turn(_gtext)
                     except Exception:
                         _is_ack = _is_inc = False
+                    _now_f = _time.time()
+                    _fb_before = len(list(_tt.get("pending_fragments") or []))
                     if _is_ack:
                         _tt["gov_turn_state"] = "ack"
                         _tt["ack_reply"] = {"text": _gtext, "reply": _rag_rules.ack_reply(_gtext)}
+                        # an ACK means the caller moved past whatever they were
+                        # composing — held fragments can never "continue" into
+                        # this turn; clear so the NEXT turn starts clean.
+                        _freshA, _dropA = _frag_consume(_tt, _now_f)
+                        if _freshA or _dropA:
+                            logger.info("🧹 fragments cleared on ACK turn (kept=%d dropped_stale=%d) — deterministic answer owns the floor", len(_freshA), _dropA)
                         logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s' → deterministic reply, no LLM", _gtext[:40])
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='' fragment_buffer_before=%d fragment_buffer_after=0 merged=no path=ack", _gtext[:70], _fb_before)
                         return
                     if _is_inc:
-                        _pend = list(_tt.get("pending_fragments") or [])
-                        _pend = (_pend + [_gtext])[-4:]
-                        _tt["pending_fragments"] = _pend
+                        _pend = _frag_append_fresh(_tt, [_gtext], _now_f)
                         _tt["gov_turn_state"] = "suppress"
-                        logger.info("⏸️ [INCOMPLETE_TURN] text='%s' waiting_for_continuation=true fragments=%d", _gtext[:60], len(_pend))
+                        logger.info("⏸️ [INCOMPLETE_TURN] text='%s' waiting_for_continuation=true fragments=%d (TTL=%.0fs)", _gtext[:60], len(_pend), _FRAGMENT_TTL_S)
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='' fragment_buffer_before=%d fragment_buffer_after=%d merged=no path=hold", _gtext[:70], _fb_before, len(_pend))
                         return
-                    _pend = list(_tt.get("pending_fragments") or [])
-                    if _pend:
-                        _combined = " ".join(_pend + [_gtext])
+                    # complete turn — strong-evidence continuation merge: a
+                    # previous question whose request was killed BEFORE any
+                    # output (worker-set overwritten_turn, generation-tagged)
+                    # joins the buffer as a fresh-in-time fragment.
+                    _ov = _tt.pop("overwritten_turn", None)
+                    _ov_used = False
+                    if isinstance(_ov, dict):
+                        _ovt = str(_ov.get("text") or "").strip()
+                        _ov_age = _now_f - float(_ov.get("ts") or 0.0)
+                        _ov_gen_ok = int(_ov.get("gen") or -1) == int(_tt.get("gen", 0) or 0)
+                        if _ovt and _ov_gen_ok and _ov_age <= _SUPERSEDED_MERGE_MAX_AGE_S and _ovt[:120] != _gtext[:120]:
+                            _old_p = list(_tt.get("pending_fragments") or [])
+                            _tt["pending_fragments"] = ([(_ovt, float(_ov.get("ts") or _now_f))] + _old_p)[-5:]
+                            _ov_used = True
+                            logger.info("🔗 [CONTINUATION_MERGE] caller's previous question was superseded %.1fs ago with zero output — treating '%s…' + '%s…' as ONE utterance", _ov_age, _ovt[:40], _gtext[:40])
+                    _kept, _dropped = _frag_consume(_tt, _now_f)
+                    if _dropped:
+                        logger.info("🧹 dropped %d stale fragment(s) (>%.0fs) — independent turn gets a clean query", _dropped, _FRAGMENT_TTL_S)
+                    if _kept:
+                        _combined = " ".join(_kept + [_gtext])
                         _tt["gov_turn_state"] = "complete"
                         _tt["combined_query"] = _combined
-                        logger.info("🧩 [COMPLETE_TURN] merged %d fragment(s): '%s'", len(_pend) + 1, _combined[:90])
+                        logger.info("🧩 [COMPLETE_TURN] merged %d fragment(s)%s: '%s'", len(_kept) + 1, " (incl. superseded continuation)" if _ov_used else "", _combined[:90])
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='%s' fragment_buffer_before=%d fragment_buffer_after=0 merged=%s", _gtext[:70], _combined[:70], _fb_before, "yes+continuation" if _ov_used else "yes")
+                    else:
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='%s' fragment_buffer_before=%d fragment_buffer_after=0 merged=no", _gtext[:70], _gtext[:70], _fb_before)
             # Keep the rolling conversation bounded. Groq accounts the entire
             # prompt against TPM; an unbounded voice call eventually turns every
             # request into a 429 even with the 20b model. Preserve system facts
@@ -2181,6 +2282,7 @@ def build_voice_agent(
                 # already cached. This hook is AWAITED by the session before the
                 # LLM starts, so a cache hit removes ~30-100ms from EVERY turn.
                 hits = ""
+                _rag_src = "normal"
                 # P3 ROOT-CAUSE FIX: initialize EVERY retrieval-result field
                 # before either branch. Previously kb_used/faq_used & friends
                 # were assigned ONLY on the cache-MISS path; the shared log
@@ -2211,6 +2313,7 @@ def build_voice_agent(
                 else:
                     hits = ""
                 if hits:
+                    _rag_src = "prefetch"
                     if isinstance(_prefetch_entry, dict):
                         kb_used = bool(_prefetch_entry.get("kb_used", False))
                         kb_chars = int(_prefetch_entry.get("kb_chars", 0) or 0)
@@ -2268,6 +2371,10 @@ def build_voice_agent(
                     if _rag_elapsed > 200:
                         logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
 
+                logger.info(
+                    "🔎 [RAG_QUERY] query='%s' source=%s result_count=%d relevant_context_found=%s",
+                    user_text[:70], _rag_src, int(kb_hits) + int(faq_hits), "yes" if hits else "no",
+                )
                 # NOTE: deliberately NO "same as last turn" dedupe here. This hook
                 # edits the per-turn copy of the chat context (temp_mutable_chat_ctx);
                 # the library discards it after generation, so the previous turn's
@@ -2277,6 +2384,7 @@ def build_voice_agent(
                 # model answered from generic priors). Same text = same injection cost
                 # (~600 tokens); correctness wins.
                 if not hits:
+                    logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", user_text[:70])
                     logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return  # nothing to inject
                 target = _find_chat_ctx(turn_ctx)
@@ -2307,6 +2415,7 @@ def build_voice_agent(
                     ),
                 )
                 logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
+                logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d)", user_text[:70], len(hits))
             except Exception as e:
                 # RAG only *enriches* the turn context: a retrieval failure must
                 # never gate or delay the LLM reply (brief P4). Log loudly with
