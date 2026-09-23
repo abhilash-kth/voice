@@ -259,7 +259,8 @@ export default function CallPanel({
       if (elapsed >= 30) {
         await failWait(
           "The agent did not join within 30 seconds. The agent worker may be stopped or busy — " +
-            "check that it is running (`python -m app.agents.worker`), then try again.",
+            "check that exactly ONE agent worker is running (`python -m app.agents.worker`), close any " +
+            "old worker windows, then try again.",
         );
         return;
       }

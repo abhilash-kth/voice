@@ -448,6 +448,18 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
         llm_kwargs["reasoning_effort"] = reasoning
 
+    # Prefix-cache pinning for OpenAI's AUTOMATIC 1024+ token prompt cache:
+    # without a stable prompt_cache_key, requests get load-balanced across
+    # backend machines and the big static prefix (system + owner prompt + tool
+    # defs, ~1.5-2K tokens) never hits — production logs showed cached=0 on
+    # every turn and TTFT 1.2-2.3s on gpt-4.1-mini. A stable key pins requests
+    # to the same machine, so turns 2+ reuse the cached prefix (~30-60% lower
+    # TTFT). OPENAI-ONLY: Groq/OpenRouter-compatible endpoints reject the field
+    # with a 400 on every request, so apply it only when provider_type=openai.
+    if provider_type == "openai" and "prompt_cache_key" not in llm_kwargs:
+        llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
+        logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 (prefix cache pinning — watch cached>0 from turn 2 on)")
+
     # Try responses API for gpt-5 reasoning models with tools (proper support)
     # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
     # responses API uses reasoning object, not reasoning_effort string, and supports tools
@@ -1253,6 +1265,20 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
+    # Human rhythm + real latency win: a 1-3 word acknowledgment spoken as its
+    # OWN first sentence reaches the TTS the moment the LLM emits its first
+    # tokens, so the caller hears a response within ~1s instead of waiting for a
+    # full synthesized sentence. This is also how human receptionists answer.
+    # Env kill switch: VOICE_ACK_OPENERS=0.
+    if os.getenv("VOICE_ACK_OPENERS", "1") == "1":
+        lines.append(
+            "CONVERSATION RHYTHM (critical): begin EVERY answer with a very short natural "
+            "acknowledgment as its OWN complete sentence, in the caller's language — for "
+            "example 'जी.' / 'हाँ जी.' / 'अच्छा.' in Hindi, 'Sure.' / 'Right.' / 'Of course.' "
+            "in English — then give the full answer starting from the next sentence. Keep the "
+            "acknowledgment to 1-3 words, vary it naturally, and never use the same "
+            "acknowledgment twice in a row."
+        )
     lines.append(
         "Behave like a warm human receptionist. Never repeat yourself, never push "
         "the same offer, never read out a list of services unprompted, and never "

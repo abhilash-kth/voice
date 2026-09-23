@@ -78,6 +78,48 @@ works, second goes silent" symptom. The UI additionally applies a 30-second
 agent-join timeout with a "Try again" action for the case where no worker
 process picks up the dispatch at all.
 
+**Dispatch verification** (`_agent_join_watchdog` in `main.py`): after the room
+is created, a background task polls the room's participants
+(`telephony.room_agent_joined`, hard-timeout `ListParticipants`). If no agent
+participant appears within `DISPATCH_VERIFY_SECONDS` (default 18), the call row
+is marked `failed` with the real reason in `usage.error` ("worker is not
+picking up the dispatch — run exactly one worker, close stale worker windows")
+— the UI's 2s waiting-poll surfaces it immediately rather than letting the
+caller wait out the full 30s on a generic timeout. Typical root causes this
+catches: worker not running, a second stale worker window claiming jobs with
+old code, or the worker stuck draining a previous call.
+
+**Logging discipline** (`config.setup_logging` / `purge_sync_root_handlers`):
+all console output goes through ONE async `QueueHandler`+`QueueListener`.
+LiveKit's CLI attaches its own synchronous JSON console handler to root after
+our setup (and job processes attach their IPC handler next to ours) — without
+the purge every record prints 2-3x and each synchronous Windows-console write
+stalls the asyncio loop 150-350ms (observed as "event loop blocked ... in
+emit" warnings). The purge runs in every job process (`prewarm`) and on the
+supervisor (piggybacked on the worker load tick).
+
+**Human-like interruption contract** (`turn_handling.interruption`): the
+2-word minimum (`min_words=2`) is the semantic gate — a lone "haan/hmm/ok"
+backchannel or a cough never cuts the agent mid-sentence, while a genuine 2+
+word barge-in stops it fast (`min_duration=0.35`, env
+`VOICE_MIN_INTERRUPTION_DURATION`). If a "barge-in" turns out to be noise,
+LiveKit resumes the agent's interrupted sentence automatically
+(`resume_false_interruption`, recovery within
+`VOICE_FALSE_INTERRUPTION_TIMEOUT=1.5s` of silence) — the human behavior of "oh,
+sorry, go on". Agents also begin every reply with a 1-3 word acknowledgment as
+its own first sentence (`VOICE_ACK_OPENERS=1` to disable): those first tokens
+reach the TTS almost immediately, so the caller hears a human-like reaction
+within ~1s while the full answer continues streaming.
+
+**RAG latency**: retrieval (BM25 over FAQ + KB) is precomputed from STT
+**interim** transcripts during the endpointing silence
+(`user_input_transcribed` event; the await-ed `on_user_turn_completed` hook
+then resolves it from a cache — "⚡ RAG PREFETCH HIT" in worker logs). OpenAI
+LLMs also get a stable `prompt_cache_key` so the static 1.5-2K-token prompt
+prefix (system + owner instructions + tool defs) hits OpenAI's automatic
+prefix cache from the second turn on (`cached>0` in the billing logs), cutting
+TTFT roughly in half on repeat turns.
+
 ## 4. Worker (the agent runtime)
 
 `app/agents/worker.py` reads the dispatch metadata, loads the agent + call from the

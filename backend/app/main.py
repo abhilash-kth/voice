@@ -416,6 +416,63 @@ def _parse_file(name: str, raw: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Start a call (browser or SIP)
 # ---------------------------------------------------------------------------
+_AGENT_JOIN_VERIFY_SECONDS = float(os.getenv("DISPATCH_VERIFY_SECONDS", "18"))
+
+
+async def _agent_join_watchdog(call_id: str, room: str, user_id: str) -> None:
+    """Fail the call loudly when the LiveKit dispatch never produces an agent.
+
+    Room creation + agent dispatch succeeding only means the server ACCEPTED the
+    dispatch — a worker still has to pick the job up and join. When that never
+    happens (worker stopped, stuck draining a previous call, or a stale second
+    worker window eating jobs with old code), the caller used to sit in a silent
+    room until the frontend's own 30s timeout. The UI polls the call row every
+    ~2s while waiting, so marking the row failed with the REAL reason here
+    surfaces it much earlier and much more precisely.
+    """
+    try:
+        await asyncio.sleep(3.0)  # dispatch head start; the agent normally joins in 2-8s
+        deadline = time.monotonic() + max(8.0, _AGENT_JOIN_VERIFY_SECONDS)
+        while time.monotonic() < deadline:
+            try:
+                row = await repo.get_call(call_id, user_id)
+            except Exception:
+                return
+            if not row or row.get("status") not in ("planned", "in-progress"):
+                return  # already completed/failed — user ended it or the worker did
+            joined = await telephony.room_agent_joined(room)
+            if joined is True:
+                logger.info("[AGENT_JOIN_VERIFIED] room=%s call=%s", room, call_id)
+                return
+            await asyncio.sleep(2.0)
+
+        # Final re-check before failing (the agent may have joined during the
+        # last sleep and flipped the row already).
+        try:
+            row = await repo.get_call(call_id, user_id)
+        except Exception:
+            return
+        if not row or row.get("status") not in ("planned", "in-progress"):
+            return
+        reason = (
+            f"the agent did not join the room within {int(max(8.0, _AGENT_JOIN_VERIFY_SECONDS))} seconds — "
+            "the agent worker is not picking up the dispatch. Make sure exactly ONE agent worker is running "
+            "(python -m app.agents.worker), that no old worker window is still open, and that the worker is "
+            "connected to the LiveKit server; then try again."
+        )
+        logger.error("[AGENT_JOIN_TIMEOUT] room=%s call=%s: %s", room, call_id, reason)
+        try:
+            await repo.update_call(call_id, {
+                "status": "failed",
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                "usage": {"error": reason},
+            })
+        except Exception as e:
+            logger.warning("could not mark call %s failed after agent-join timeout: %r", call_id, e)
+    except Exception as e:
+        logger.debug("agent-join watchdog stopped early for call %s: %r", call_id, e)
+
+
 @app.post("/api/calls")
 async def start_call(body: dict, user=Depends(auth.get_current_user)):
     agent_id = body.get("agent_id")
@@ -532,6 +589,16 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
     await repo.update_call(call["id"], {"room": result["room"]})
     result["call_id"] = call["id"]
+
+    # The room + dispatch are now accepted by LiveKit, but "accepted" is not
+    # "a worker actually joined". Watch it in the background so a dead/absent
+    # worker turns into a precise call failure (visible in the UI within ~2s
+    # via the waiting poll) instead of 30s of silence in an empty room.
+    try:
+        asyncio.create_task(_agent_join_watchdog(call["id"], result["room"], user.id))
+    except Exception as e:
+        logger.debug("agent-join watchdog not scheduled: %r", e)
+
     return result
 
 

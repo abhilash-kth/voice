@@ -1171,11 +1171,19 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # callers get cut off; drop toward 0.15 only if the agent feels slow.
     min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.25"))
     max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
-    # min_words is the knob that actually gates interruptions in LiveKit; a
-    # 0.5s / 2-word floor filters coughs, "hmm", and echo without making the
-    # agent feel un-interruptible.
-    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.5"))
+    # Interruption = the human barge-in contract:
+    #  * min_words=2 is the semantic gate — a lone "haan/hmm/ok" backchannel or a
+    #    cough must NOT cut the agent off mid-sentence (humans don't stop for
+    #    those either), while a real 2+ word barge-in stops it immediately.
+    #  * min_duration=0.35 (was 0.5) — once the gate passes, cut fast; a human
+    #    stops talking within ~200-400ms of being spoken over.
+    #  * resume_false_interruption keeps LiveKit's automatic recovery: if a
+    #    "barge-in" turns out to be noise (no words, silence), the agent resumes
+    #    its sentence instead of dying — false_interruption_timeout controls how
+    #    quickly it recovers (default SDK 2.0s felt like a freeze; 1.5s here).
+    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.35"))
     min_interruption_words = int(os.getenv("VOICE_MIN_INTERRUPTION_WORDS", "2"))
+    false_interruption_timeout = float(os.getenv("VOICE_FALSE_INTERRUPTION_TIMEOUT", "1.5"))
     allow_interruptions = os.getenv("VOICE_ALLOW_INTERRUPTIONS", "1") == "1"
     turn_detection_mode = os.getenv("VOICE_TURN_DETECTION", "stt").strip().lower()
     if turn_detection_mode not in ("vad", "stt", "realtime_llm", "manual"):
@@ -1240,7 +1248,8 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         f"preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, "
         f"endpointing={min_delay}/{max_delay}, "
         f"interruption={'on' if allow_interruptions else 'off'} "
-        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words})"
+        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words}, "
+        f"false_resume={false_interruption_timeout}s)"
     )
 
     return AgentSession(
@@ -1257,6 +1266,8 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
                 "mode": "vad",
                 "min_duration": min_interruption_duration,
                 "min_words": min_interruption_words,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": false_interruption_timeout,
             },
             "preemptive_generation": {
                 "enabled": preemptive_enabled,
@@ -1707,7 +1718,8 @@ async def _entrypoint_body(ctx, setup_complete):
 
     def _on_transcription(ev) -> None:
         try:
-            # v1 Transcription events carry `.transcript`; older releases used `.text`.
+            # v1 UserInputTranscribedEvent carries `.transcript` (+ `.is_final`);
+            # legacy "transcription" events used `.text`.
             text = getattr(ev, "transcript", None) or getattr(ev, "text", None) or ""
             if text.strip():
                 _precompute_rag(text)
@@ -1715,10 +1727,21 @@ async def _entrypoint_body(ctx, setup_complete):
             pass
 
     if agent_mode != "announcement":
-        try:
-            session.on("transcription", _on_transcription)
-        except Exception as e:
-            logger.debug(f"transcription hook unavailable (RAG precompute off): {e!r}")
+        # livekit-agents v1 emits "user_input_transcribed" for every STT interim
+        # and final; the older "transcription" event never fires on v1 (a dead
+        # listener = prefetch silently never runs, so attach BOTH defensively —
+        # duplicate fires are cheap, the key+inflight dedup handles them).
+        attached_events = []
+        for _ev_name in ("user_input_transcribed", "transcription"):
+            try:
+                session.on(_ev_name, _on_transcription)
+                attached_events.append(_ev_name)
+            except Exception:
+                continue
+        if attached_events:
+            logger.info(f"🔧 RAG precompute armed on STT events: {attached_events}")
+        else:
+            logger.debug("transcription hook unavailable (RAG precompute off)")
 
     # ------------------------------------------------------------------
     # Silence watchdog + No-response watchdog.
@@ -3114,6 +3137,14 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 def prewarm(proc):
     setup_logging()
+    # Job processes must keep ONLY livekit's IPC LogQueueHandler: our own
+    # QueueListener prints directly to the console too, so without this purge
+    # every job log line appears twice, all of it synchronously on the loop.
+    try:
+        from app.config import purge_sync_root_handlers
+        purge_sync_root_handlers(job_proc=True)
+    except Exception:
+        pass
 
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
@@ -3243,6 +3274,15 @@ def _worker_load(worker) -> float:
     falsely marking the worker as 'at full capacity, marking as unavailable' and
     dropping incoming calls.
     """
+    # Supervisor-side housekeeping, piggybacked on a tick that runs on the main
+    # loop: livekit's CLI adds a synchronous JSON console handler to root AFTER
+    # our async setup — every record would otherwise print twice and stall the
+    # loop 150-350ms per burst on Windows console writes.
+    try:
+        from app.config import purge_sync_root_handlers
+        purge_sync_root_handlers()
+    except Exception:
+        pass
     try:
         active = len(getattr(worker, "active_jobs", []) or [])
         max_jobs = int(os.getenv("MAX_CONCURRENT_CALLS", "10"))
