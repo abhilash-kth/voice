@@ -390,7 +390,52 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # Only OpenAI-compatible providers ride on an AsyncOpenAI client: Gemini's
     # plugin builds its own SDK client and would reject these kwargs.
     _native_google = provider_type == "google"
-    client = None if _native_google else AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+    # Task 1/5 (2026-09-24 02:12 evidence): max_retries=0 at SDK level AND
+    # llm_conn_options max_retry=0 in the worker mean every request is ONE
+    # HTTP attempt — so the 3549ms TTFT spike cannot be a client-side retry
+    # and could not be a backoff. To prove where that time actually sits we
+    # attach httpx event hooks: send->headers (provider queue+prefill for a
+    # streaming request; first bytes arrive with the first SSE chunk) and
+    # per-attempt counting (a livekit-level retry re-enters here and shows up
+    # as attempt#>1). Same api_key/base_url/model/max_retries as before — this
+    # does not alter behavior, only timestamps; limits/timeout mirror the
+    # plugin's own defaults exactly (livekit conn_options still override the
+    # per-request timeout via with_options).
+    _http_inst = {"n": 0, "send": 0.0}
+    import httpx as _httpx
+
+    def _on_http_send(_request):
+        _http_inst["n"] += 1
+        _http_inst["send"] = time.perf_counter()
+        if _http_inst["n"] > 1:
+            logger.info(
+                "\U0001f310 [HTTP_REQ] model=%s attempt#%d %s %s — multiple attempts on one client mean a livekit-level retry; with max_retries=0 the provider saw ONE request each time",
+                model_id, _http_inst["n"], _request.method, _request.url.path,
+            )
+
+    async def _on_http_headers(_response):
+        _el = (time.perf_counter() - _http_inst["send"]) * 1000.0
+        logger.info(
+            "\U0001f310 [HTTP_TTFB] model=%s send->headers=%.0fms status=%d — for streaming, headers arrive with the first chunk; if this ~ TTFT the delay is provider queue/prefill, not our stack",
+            model_id, _el, _response.status_code,
+        )
+
+    def _on_http_error(_request):
+        _el = (time.perf_counter() - _http_inst["send"]) * 1000.0
+        logger.warning(
+            "\U0001f310 [HTTP_ERROR] model=%s transport failure %.0fms after send (connect/pool/read) — not provider latency",
+            model_id, _el,
+        )
+
+    client = None if _native_google else AsyncOpenAI(
+        api_key=api_key, base_url=base_url, max_retries=0,
+        http_client=_httpx.AsyncClient(
+            event_hooks={"request": [_on_http_send], "response": [_on_http_headers], "error": [_on_http_error]},
+            follow_redirects=True,
+            limits=_httpx.Limits(max_connections=50, max_keepalive_connections=50, keepalive_expiry=120.0),
+            timeout=_httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
+        ),
+    )
     llm_kwargs = {
         "model": model_id,  # EXACT model as selected, no rewriting
         "max_completion_tokens": _cap,
