@@ -758,7 +758,7 @@ def _build_conn_options():
     )
 
 
-def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
+def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, inst_label=None):
     """Fixed LLM timing wrapper that properly implements async context manager protocol.
     
     LiveKit's LLM.chat returns an async context manager (LLMStream), used as:
@@ -785,7 +785,8 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 for idx, inner_llm in enumerate(inner_list):
                     # Avoid infinite recursion: only wrap if not already wrapped
                     if 'LLMTimingWrapper' not in str(type(inner_llm)):
-                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info)
+                        _lbl = "primary/0-of-%d" % len(inner_list) if idx == 0 else "fallback/%d-of-%d" % (idx, len(inner_list))
+                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info, inst_label=_lbl)
                 return llm_instance
     except Exception as e:
         _logger.debug(f"Could not wrap FallbackAdapter inner LLMs: {e}")
@@ -807,6 +808,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             self._input_tokens = 0
             self._output_tokens = 0
             self._cached_tokens = 0
+            # True iff the provider actually returned a usage object on this
+            # stream. Task 5 (2026-09-24): failed/invalidated requests have
+            # input=0 because NO usage came back — they must never be
+            # counted as cache misses; cache_status becomes an explicit
+            # "unknown" verdict driven by this flag.
+            self._usage_seen = False
 
         def __getattr__(self, name):
             return getattr(self._inner_stream, name)
@@ -834,6 +841,23 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
                             _logger.info(f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                            # Task 2 boundaries: join the two httpx hook
+                            # timestamps for THIS attempt (rid) to the first
+                            # decoded stream chunk, measured here — without
+                            # consuming or touching the stream (the stream
+                            # continues through this loop normally).
+                            try:
+                                from .http_timing import pop_for_model as _pop_ht
+                                _hrec = _pop_ht(str(model))
+                                if _hrec:
+                                    _t0 = _hrec["send_ts"]; _t1 = _hrec["headers_ts"]
+                                    _logger.info(
+                                        "\u23f1\ufe0f [HTTP_CHUNK] rid=%s model=%s request_start->first_stream_chunk=%.0fms response_headers->first_stream_chunk=%.0fms (first chunk = first SSE delta decoded by the SDK — application-level boundary, NOT to be quoted as provider TTFB)",
+                                        _hrec.get("rid", "?"), model,
+                                        (first_token - _t0) * 1000.0, (first_token - _t1) * 1000.0,
+                                    )
+                            except Exception:
+                                pass
                             if ttft > 1800:
                                 # Task 5 forensics: what was around this request?
                                 _logger.warning(f"🐢 [TTFT_SPIKE_CONTEXT] TTFT={ttft:.0f}ms inflight_llm={self._timing.get('inflight_llm',0)} overlapping_starts={self._timing.get('overlapping_starts',0)} head_sha={self._timing.get('head_sha','?')} — cross-check openai._base_client retry lines (429/timeout backoff) and [LOOP_LAG] events")
@@ -844,6 +868,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     try:
                         usage = getattr(chunk, 'usage', None)
                         if usage:
+                            self._usage_seen = True
                             self._input_tokens = getattr(usage, 'prompt_tokens', 0) or getattr(usage, 'input_tokens', 0) or self._input_tokens
                             self._output_tokens = getattr(usage, 'completion_tokens', 0) or getattr(usage, 'output_tokens', 0) or self._output_tokens
                             # ROOT CAUSE of "cached=0 on every request" (real call
@@ -975,7 +1000,17 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                         try:
                             _cached_now = int(self._cached_tokens or 0)
                             _is_openai = "openai" in str(prov).lower()
-                            if _is_openai:
+                            _uk = bool(getattr(self, "_usage_seen", False))
+                            if _is_openai and not _uk:
+                                # Task 5 (02:31 call): all 12 requests failed
+                                # before any usage chunk existed and were all
+                                # logged cache_status=miss + counted as misses,
+                                # turning a broken-instrumentation run into a
+                                # false "not_engaging" cache verdict. A request
+                                # with NO usage returns no verdict at all.
+                                _ck_key = f"voice-{model}-v1"
+                                _ck_status = "unknown/error (no usage returned by provider — request failed or was invalidated; NOT counted as miss)"
+                            elif _is_openai:
                                 _ck_key = f"voice-{model}-v1"
                                 _ck_status = "hit" if _cached_now > 0 else "miss"
                                 if _cached_now > 0:
@@ -984,7 +1019,8 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                                     self._timing["cache_misses"] = self._timing.get("cache_misses", 0) + 1
                             else:
                                 _ck_key, _ck_status = "n/a", "unsupported"
-                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_tokens_est={self._timing.get('head_est_tokens','?')} stable_head_chars={self._timing.get('head_chars_log','?')} head_sha={self._timing.get('head_sha','?')} head_same_as_previous={self._timing.get('head_stable_prev','?')} (status only reflects provider usage; hash is content-free)")
+                            _uk_s = "yes" if _uk else "NO"
+                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} usage_returned={_uk_s} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_tokens_est={self._timing.get('head_est_tokens','?')} stable_head_chars={self._timing.get('head_chars_log','?')} head_sha={self._timing.get('head_sha','?')} head_same_as_previous={self._timing.get('head_stable_prev','?')} (status only reflects provider usage; hash is content-free)")
                         except Exception:
                             pass
                 except Exception as e:
@@ -1199,7 +1235,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', '') or 'unknown'
             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', '') or getattr(self._inner, 'model', 'unknown') or 'unknown'
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
-            _logger.info(f"LLM REQUEST START [LLM_RESPONSE_STARTED] provider={prov} model={model} base_url={base_url} request_start={request_start}")
+            _logger.info(f"LLM REQUEST START [LLM_RESPONSE_STARTED] provider={prov} model={model} base_url={base_url} llm_instance={getattr(self, '_inst_label', 'single/1')} request_start={request_start} — a new line here on a DIFFERENT model+instance = LiveKit FallbackAdapter switching (mechanism B), NOT an SDK retry; duplicates on the same instance = invalidated-generation overlap (mechanism C)")
             try:
                 inner_result = self._inner.chat(*args, **kwargs)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
@@ -1214,7 +1250,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 _logger.error(f"Full traceback: {traceback.format_exc()}")
                 raise
 
-    return LLMTimingWrapper(llm_instance, timing_dict, provider_info)
+    _w = LLMTimingWrapper(llm_instance, timing_dict, provider_info)
+    try:
+        _w._inst_label = inst_label or "single/1"
+    except Exception:
+        pass
+    return _w
 
 
 def _create_llm_failure_logging_wrapper(llm_instance, cfg):
@@ -3342,11 +3383,13 @@ async def _entrypoint_body(ctx, setup_complete):
                     _openai_any = any("openai" in str(r.get("provider", "")).lower() for r in all_reqs)
                     if _ch > 0:
                         _cache_verdict = "working"
+                    elif _cm > 0:
+                        _cache_verdict = "not_engaging (key armed+verified; every usage-returning request reported 0 cached — stable prefix vs 1024-token minimum or no cache routing; see per-request [CACHE] lines)"
                     elif _openai_any:
-                        _cache_verdict = "not_engaging (key armed+verified; provider reports 0 cached — stable prefix likely below the 1024-token minimum or no cache routing; see per-request [CACHE] lines)"
+                        _cache_verdict = "unverifiable (no request returned usage — failed/invalidated requests are NOT cache misses; re-run when calls succeed)"
                     else:
                         _cache_verdict = "unsupported (no OpenAI path in this call)"
-                    logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} hits={_ch} misses={_cm} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
+                    logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} evaluated(hit+miss,usage-only)={_ch + _cm} hits={_ch} misses={_cm} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
                     logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 discarded=0 would_cancel={int(turn_timing.get('spec_would_cancel', 0) or 0)} overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
                     _ls = turn_timing.get("latency_samples", [])
                     if _ls:
