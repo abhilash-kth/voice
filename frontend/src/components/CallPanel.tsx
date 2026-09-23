@@ -219,6 +219,7 @@ export default function CallPanel({
 
   const isDisconnectingRef = useRef(false);
   const callEndReasonRef = useRef<string | null>(null);
+  const activeSummaryPollRef = useRef<number>(0);
 
   // Preselect an agent: preset > localStorage (last chosen) > first agent
   useEffect(() => {
@@ -261,6 +262,9 @@ export default function CallPanel({
 
   const handleAgentSelect = (newId: string) => {
     setAgentId(newId);
+    setCallEndedMsg("");
+    setErr("");
+    activeSummaryPollRef.current += 1;
     if (typeof window !== "undefined") {
       try {
         localStorage.setItem(LAST_AGENT_KEY, newId);
@@ -281,16 +285,20 @@ export default function CallPanel({
       setCallEndedMsg("Call ended. Select an agent to start a new call.");
       return;
     }
+    const pollId = ++activeSummaryPollRef.current;
     setCallEndedMsg("Finalizing call & calculating billing summary…");
 
     // Poll until billing is finalized and written to DB (up to 12s)
     let attempts = 0;
     const maxAttempts = 12;
     while (attempts < maxAttempts) {
+      if (activeSummaryPollRef.current !== pollId) return;
       try {
         await new Promise((r) => setTimeout(r, attempts === 0 ? 800 : 1200));
+        if (activeSummaryPollRef.current !== pollId) return;
         attempts++;
         const c = await getCall(cid);
+        if (activeSummaryPollRef.current !== pollId) return;
         const costInr = (c.cost as any)?.client_price_inr;
         const duration = c.duration_seconds ?? 0;
         const isFinalized = c.status === "completed" || c.status === "failed";
@@ -318,9 +326,11 @@ export default function CallPanel({
       }
     }
 
+    if (activeSummaryPollRef.current !== pollId) return;
     // Final attempt fallback
     try {
       const c = await getCall(cid);
+      if (activeSummaryPollRef.current !== pollId) return;
       const costInr = Number((c.cost as any)?.client_price_inr || 0);
       const duration = c.duration_seconds ?? 0;
       setCallEndedMsg(
@@ -328,7 +338,9 @@ export default function CallPanel({
       );
       onStarted();
     } catch {
-      setCallEndedMsg("Call ended. Select an agent to start a new call.");
+      if (activeSummaryPollRef.current === pollId) {
+        setCallEndedMsg("Call ended. Select an agent to start a new call.");
+      }
     }
   };
 
@@ -405,6 +417,7 @@ export default function CallPanel({
   );
 
   const go = async () => {
+    activeSummaryPollRef.current += 1;
     setErr("");
     setCallEndedMsg("");
     if (isDisconnectingRef.current) return;
@@ -604,7 +617,7 @@ export default function CallPanel({
             {err}
           </div>
         )}
-        {callEndedMsg && !err && (
+        {callEndedMsg && !callEndedMsg.startsWith("Finalizing") && !err && (
           <div className="text-green-300 text-sm bg-green-500/10 border border-green-500/30 rounded-lg p-3 mt-4">
             {callEndedMsg}
           </div>

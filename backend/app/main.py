@@ -303,6 +303,12 @@ async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_c
     rec = await repo.update_agent(agent_id, user.id, patch)
     if not rec:
         raise HTTPException(404, "Agent not found")
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception:
+        pass
     return rec
 
 
@@ -418,7 +424,7 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         try:
             existing_calls = await repo.list_calls(user.id, limit=20)
             for prev in existing_calls:
-                if prev.get("agent_id") == agent_id and prev.get("status") in ("planned", "in-progress"):
+                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
                     prev_room = prev.get("room")
                     if prev_room:
                         try:
@@ -451,6 +457,14 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     if mode == "sip" and not phone:
         raise HTTPException(400, "SIP mode requires a phone number")
 
+    # Cache the active agent config locally so worker can load in 0ms without DB delay
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception as e:
+        logger.warning("Could not cache agent config to data dir: %s", e)
+
     call = await repo.create_call({
         "user_id": user.id,
         "agent_id": agent_id,
@@ -461,9 +475,9 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
     try:
         if mode == "sip":
-            result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id, agent_config=rec)
+            result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
         else:
-            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id, agent_config=rec)
+            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
     except ModuleNotFoundError:
         raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
     except ValueError as e:
