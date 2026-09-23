@@ -37,27 +37,32 @@ def make_room_name() -> str:
 
 
 def _metadata(agent_id: str, mode: str, phone: str = "", call_id: str = "",
-              user_id: str = "", lead_data: Optional[dict] = None) -> str:
+              user_id: str = "", lead_data: Optional[dict] = None,
+              agent_config: Optional[dict] = None) -> str:
     import json
-    return json.dumps({
+    data = {
         "agent_id": agent_id, "mode": mode, "phone": phone,
         "call_id": call_id, "user_id": user_id,
         "lead_data": lead_data or None,   # for dynamic-script substitution in the worker
-    })
+    }
+    if agent_config:
+        data["agent_config"] = agent_config
+    return json.dumps(data)
 
 
 # ---------------------------------------------------------------------------
 # Browser mode: return a join token that also dispatches the agent into the room
 # ---------------------------------------------------------------------------
 async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "", user_id: str = "",
-                              lead_data: Optional[dict] = None) -> dict:
+                              lead_data: Optional[dict] = None,
+                              agent_config: Optional[dict] = None) -> dict:
     """Creates a room + returns a browser participant token configured for automatic agent dispatch on join."""
     from livekit import api
 
     _req_creds()
     room = make_room_name()
     identity = "caller-" + uuid.uuid4().hex[:6]
-    metadata = _metadata(agent_id, "browser", phone, call_id, user_id, lead_data)
+    metadata = _metadata(agent_id, "browser", phone, call_id, user_id, lead_data, agent_config=agent_config)
 
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
@@ -91,6 +96,7 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
 async def create_sip_call(
     agent_id: str, phone: str, sip_trunk_id: Optional[str] = None, call_id: str = "", user_id: str = "",
     lead_data: Optional[dict] = None,
+    agent_config: Optional[dict] = None,
 ) -> dict:
     """Places an outbound SIP call to `phone` and returns the room/token info.
 
@@ -107,7 +113,7 @@ async def create_sip_call(
         raise ValueError("No SIP trunk configured. Set DEFAULT_SIP_TRUNK_ID or pass sip_trunk_id.")
 
     room = make_room_name()
-    metadata = _metadata(agent_id, "sip", phone, call_id, user_id, lead_data)
+    metadata = _metadata(agent_id, "sip", phone, call_id, user_id, lead_data, agent_config=agent_config)
 
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:

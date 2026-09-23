@@ -1323,62 +1323,6 @@ async def entrypoint(ctx):
     except Exception as _e:
         logger.debug(f"SSL ensure failed: {_e!r}")
 
-    db_t0 = time.time()
-    db_just_initialized = False
-    if not _DB_INIT_DONE:
-        try:
-            # DB init MUST run on the agent's own event loop.
-            #
-            # An earlier version ran it as
-            #   asyncio.to_thread(lambda: asyncio.new_event_loop().run_until_complete(db_init()))
-            # which connected the *process-wide* Prisma singleton (engine +
-            # httpx connection pool) to a throwaway loop in a worker thread. The
-            # next real query — repo.get_agent() on the agent loop — then hung
-            # until the 3s lookup timeout, showing up as
-            #   "agent lookup attempt 1/2 failed (3.01s): "  (empty message = TimeoutError)
-            # and adding ~4.5s before the greeting.
-            #
-            # The 1359ms SSL block this hack was working around is already fixed
-            # globally by the cached httpx/SSL-context patch at import time, so
-            # connecting on-loop is cheap now. One synchronous piece remains in
-            # connect(): prisma_client first verifies the engine binary with
-            # `prisma-engine --version` via subprocess (~200ms on Windows).
-            # Run that check off the audio loop once, before connecting.
-            try:
-                def _ensure_prisma_engine_binary() -> bool:
-                    import importlib
-                    for mod_base in ("prisma_client", "prisma"):
-                        try:
-                            paths = importlib.import_module(f"{mod_base}.binaries.paths")
-                            utils = importlib.import_module(f"{mod_base}.engine.utils")
-                            utils.ensure(paths.BINARY_PATHS.query_engine)
-                            return True
-                        except Exception:
-                            continue
-                    return False
-                if await asyncio.to_thread(_ensure_prisma_engine_binary):
-                    logger.info("🔥 Prewarm: Prisma engine binary verified off-loop (avoids ~200ms subprocess spawn on agent loop during DB connect)")
-            except Exception:
-                pass  # db_init() will do the check itself; never block the call
-            await asyncio.wait_for(db_init(), timeout=8)
-            _DB_INIT_DONE = True
-            db_just_initialized = True
-            logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
-        except Exception as exc:
-            logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
-    else:
-        # A reused job process gets a new event loop. db.init() reconnects when
-        # the previous client is bound to a dead loop; skipping it hangs the
-        # next call and the worker looks like it stopped.
-        try:
-            await asyncio.wait_for(db_init(), timeout=5)
-            logger.info("⏱️ DB init rechecked on this event loop")
-        except Exception as exc:
-            _DB_INIT_DONE = False
-            logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
-
-    # Agent lookup cache (in-memory, 30s TTL) to avoid 1.13s DB hit per call
-
     try:
         meta = json.loads(ctx.job.metadata or "{}")
     except Exception:
@@ -1389,34 +1333,76 @@ async def entrypoint(ctx):
     call_id = meta.get("call_id", "")
     user_id = meta.get("user_id", "")
     lead_data = meta.get("lead_data") or {}
+    meta_agent_config = meta.get("agent_config")
 
     logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
     logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
 
     rec = None
-    # Always load the agent the user just selected. A 30s cache made
-    # "hang up, pick another agent, call again" run the previous config.
-    if agent_id and user_id:
-        lookup_t0 = time.time()
-        # Right after a fresh connect the first query still pays the cold TLS
-        # handshake to Postgres/Neon (~1.5-4s). Cancelling it at 3s and retrying
-        # just wastes 3s and can leave the engine's connection pool in a bad
-        # state, so give a cold first attempt more room.
-        timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
-        for attempt in range(2):  # Reduced from 3 to 2 attempts for faster fail
+    if meta_agent_config and isinstance(meta_agent_config, dict):
+        rec = meta_agent_config
+        logger.info("⚡ Fast-path: Agent '%s' loaded directly from dispatch metadata in 0ms (no DB delay)", rec.get("name", agent_id))
+        # Warm DB connection in background so billing/cleanup at end of call is instant
+        if not _DB_INIT_DONE:
+            async def _bg_db_init():
+                global _DB_INIT_DONE
+                try:
+                    await asyncio.wait_for(db_init(), timeout=10)
+                    _DB_INIT_DONE = True
+                    logger.info("⏱️ Background DB init completed ready for billing")
+                except Exception as exc:
+                    logger.warning("Background DB init failed: %r", exc)
+            asyncio.create_task(_bg_db_init())
+    else:
+        db_t0 = time.time()
+        db_just_initialized = False
+        if not _DB_INIT_DONE:
             try:
-                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
-                logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
-                break
+                try:
+                    def _ensure_prisma_engine_binary() -> bool:
+                        import importlib
+                        for mod_base in ("prisma_client", "prisma"):
+                            try:
+                                paths = importlib.import_module(f"{mod_base}.binaries.paths")
+                                utils = importlib.import_module(f"{mod_base}.engine.utils")
+                                utils.ensure(paths.BINARY_PATHS.query_engine)
+                                return True
+                            except Exception:
+                                continue
+                        return False
+                    if await asyncio.to_thread(_ensure_prisma_engine_binary):
+                        logger.info("🔥 Prewarm: Prisma engine binary verified off-loop")
+                except Exception:
+                    pass
+                await asyncio.wait_for(db_init(), timeout=8)
+                _DB_INIT_DONE = True
+                db_just_initialized = True
+                logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
             except Exception as exc:
-                # %r, not %s: a bare TimeoutError stringifies to "" and the old
-                # log line read "failed (3.01s): " with no reason at all.
-                logger.warning(
-                    "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
-                    attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
-                )
-                if attempt < 1:
-                    await asyncio.sleep(0.15)
+                logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
+        else:
+            try:
+                await asyncio.wait_for(db_init(), timeout=5)
+                logger.info("⏱️ DB init rechecked on this event loop")
+            except Exception as exc:
+                _DB_INIT_DONE = False
+                logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
+
+        if agent_id and user_id:
+            lookup_t0 = time.time()
+            timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
+            for attempt in range(2):
+                try:
+                    rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
+                    logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
+                        attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
+                    )
+                    if attempt < 1:
+                        await asyncio.sleep(0.15)
 
     if rec is None:
         if agent_id and agent_id != "demo":
@@ -1442,22 +1428,17 @@ async def entrypoint(ctx):
 
     logger.info(f"📞 agent={cfg.name} mode={mode} phone={phone} call={call_id}")
 
-    # Ensure the call record exists / is in-progress.
-    call_record = None
-    if call_id and user_id:
-        call_record = await repo.get_call(call_id, user_id)
-    if call_record is None:
-        call_record = await repo.create_call({
-            "user_id": user_id or "demo",
-            "agent_id": agent_id or "demo",
-            "mode": mode,
-            "phone": phone or None,
-            "room": ctx.room.name,
-            "status": "in-progress",
-            "started_at": time.strftime("%Y-%m-%d %H:%M"),
-        })
-    else:
-        await repo.update_call(call_record["id"], {"status": "in-progress", "room": ctx.room.name})
+    # Ensure the call record status is tracked in-progress asynchronously without blocking audio
+    call_record = {"id": call_id or f"call_{uuid.uuid4().hex[:8]}", "user_id": user_id}
+    async def _mark_call_in_progress():
+        try:
+            if not _DB_INIT_DONE:
+                await asyncio.wait_for(db_init(), timeout=10)
+            if call_id and user_id:
+                await repo.update_call(call_id, {"status": "in-progress", "room": getattr(ctx.room, "name", "")})
+        except Exception as e:
+            logger.warning("Could not mark call in-progress: %s", e)
+    asyncio.create_task(_mark_call_in_progress())
 
     usage = {"tts_chars": 0, "llm_input_tokens": 0, "llm_output_tokens": 0,
              "user_speech_seconds": 0.0, "transcripts": []}
