@@ -1742,6 +1742,8 @@ async def _entrypoint_body(ctx, setup_complete):
             return
         if len(key) < 4 or key in rag_prefetch or key in rag_prefetch_inflight:
             return
+        if _rag_mod.is_acknowledgement(text):
+            return  # "Ok," etc — the turn hook skips injection too; don't spend CPU
         rag_prefetch_inflight.add(key)
 
         async def _work():
@@ -2451,7 +2453,12 @@ async def _entrypoint_body(ctx, setup_complete):
             # conversation_item_added is delayed (after TTS speaking), so we should NOT treat it as authoritative for latency.
             # Only set llm_complete if REAL audio not yet happened, and don't log fallback if REAL already happened.
             now_llm_complete = time.time()
-            has_real_audio = turn_timing.get("first_audio", 0) > 0 or turn_timing.get("first_tts_audio", 0) > 0 or turn_timing.get("last_speech_end_to_first_audio", 0) > 0
+            # REAL audio only counts when the TTS wrapper (or the audio
+            # listener) stamped it; the assistant conversation-item event is
+            # transcript lag and must never masquerade as "audio" (the old
+            # last_speech_end_to_first_audio in this expression made every turn
+            # after the first inherit a bogus "REAL audio at 11431ms").
+            has_real_audio = turn_timing.get("first_audio", 0) > 0 or turn_timing.get("first_tts_audio", 0) > 0
             
             # Only set llm_complete if not already set AND real audio not yet happened (avoid delayed overwrite)
             if turn_timing.get("llm_complete", 0) == 0 and not has_real_audio:
@@ -2467,28 +2474,33 @@ async def _entrypoint_body(ctx, setup_complete):
                 if turn_timing["first_token"] > 0:
                     delay = (now_llm_complete - turn_timing["first_token"]) * 1000
                     if delay > 5000:
-                        logger.info(f"ℹ️ Delayed conversation_item_added {delay:.0f}ms after first_token (REAL audio already at {turn_timing.get('last_speech_end_to_first_audio',0):.0f}ms) - not authoritative, REAL stream is authoritative")
+                        logger.info(f"ℹ️ Delayed conversation_item_added {delay:.0f}ms after first_token (REAL audio already measured) - not authoritative, REAL stream is authoritative")
                 # Don't overwrite llm_complete if already set from REAL path
                 if turn_timing.get("llm_complete", 0) == 0:
                     turn_timing["llm_complete"] = now_llm_complete
             
-            # Fallback for say() calls without TTS wrapper - only if REAL audio never happened
+            # TTS is intentionally left unwrapped (so the greeting can play
+            # immediately), so most turns never get an audio timestamp. The
+            # numbers below then measure when the assistant's *transcript item*
+            # was committed — NOT when audio started. (Real human-perceived
+            # speech start is visible from [AGENT_STATE] -> speaking.) Never
+            # label these as first_audio again: turn 23:35:57 logged a bogus
+            # "first audio at 12015ms" that was pure item_added lag.
             if turn_timing.get("first_tts_audio", 0) == 0 and turn_timing.get("first_audio", 0) == 0 and not has_real_audio:
                 if turn_timing["first_token"] > 0:
-                    token_to_audio = (now_llm_complete - turn_timing["first_token"]) * 1000
-                    logger.info(f"⏱️ TIMING first_token->first_audio (fallback no wrapper): {token_to_audio:.0f}ms")
+                    token_to_item = (now_llm_complete - turn_timing["first_token"]) * 1000
+                    logger.info(f"⏱️ TIMING first_token->item_added (transcript lag, audio not measured): {token_to_item:.0f}ms")
                 if turn_timing["speech_end"] > 0:
-                    speech_to_audio = (now_llm_complete - turn_timing["speech_end"]) * 1000
-                    logger.info(f"⏱️ TIMING speech_end->first_audio (fallback): {speech_to_audio:.0f}ms")
-                    turn_timing["last_speech_end_to_first_audio"] = speech_to_audio
+                    speech_to_item = (now_llm_complete - turn_timing["speech_end"]) * 1000
+                    logger.info(f"⏱️ TIMING speech_end->item_added (transcript lag, audio not measured): {speech_to_item:.0f}ms")
                     if turn_timing["stt_final"] > 0 and turn_timing["turn_detected"] > 0 and turn_timing["llm_start"] > 0 and turn_timing["first_token"] > 0:
                         logger.info(
-                            f"📊 TURN BREAKDOWN (fallback): speech_end->STT_final {(turn_timing['stt_final']-turn_timing['speech_end'])*1000:.0f}ms | "
+                            f"📊 TURN BREAKDOWN (to transcript item): speech_end->STT_final {(turn_timing['stt_final']-turn_timing['speech_end'])*1000:.0f}ms est | "
                             f"STT_final->turn {(turn_timing['turn_detected']-turn_timing['stt_final'])*1000:.0f}ms | "
                             f"turn->LLM {(turn_timing['llm_start']-turn_timing['turn_detected'])*1000:.0f}ms | "
                             f"LLM->first_token {(turn_timing['first_token']-turn_timing['llm_start'])*1000:.0f}ms | "
-                            f"first_token->audio {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms | "
-                            f"TOTAL {speech_to_audio:.0f}ms"
+                            f"first_token->item_added {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms | "
+                            f"TOTAL {speech_to_item:.0f}ms (audio start: see [AGENT_STATE] speaking)"
                         )
                     if turn_timing.get("tts_request", 0) == 0:
                         turn_timing["speech_end"] = 0.0
@@ -2505,7 +2517,7 @@ async def _entrypoint_body(ctx, setup_complete):
                         turn_timing["ttft_ms"] = 0.0
                         turn_timing["generation_time_ms"] = 0.0
             _real_audio_ms = turn_timing.get("last_speech_end_to_first_audio", 0)
-            _real_note = f"first audio at {_real_audio_ms:.0f}ms after speech_end (est)" if _real_audio_ms else "first audio not measured this turn"
+            _real_note = f"REAL first audio at {_real_audio_ms:.0f}ms after speech_end" if _real_audio_ms else "first audio not measured this turn (TTS unwrapped by design)"
             logger.info(f"🗣️ TTS (LLM complete): {cleaned} (transcript-only event; {_real_note})")
 
     session.on("conversation_item_added", on_item_added)

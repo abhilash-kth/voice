@@ -1281,6 +1281,15 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             "acknowledgment twice in a row."
         )
     lines.append(
+        "ACKNOWLEDGEMENT TURNS (critical): if the caller's whole message is only an "
+        "acknowledgement or filler (e.g. 'Ok', 'haan', 'ठीक है', 'nice', 'good', 'yes ji'), "
+        "it is NOT a question. Do NOT answer it with facts, do NOT repeat or re-list "
+        "anything already said, and do NOT introduce prices, addresses, names or numbers. "
+        "Reply with at most one short warm line (e.g. 'जी, बताइए।' / 'जी।') or, if the "
+        "caller still has an unanswered question from before, finish only that. "
+        "Never state a fact twice in the same call — the caller heard it already."
+    )
+    lines.append(
         "Behave like a warm human receptionist. Never repeat yourself, never push "
         "the same offer, never read out a list of services unprompted, and never "
         "give a long preamble. Answer exactly what was asked, then stop. "
@@ -1874,6 +1883,15 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
+                # Acknowledgement turns ("Ok," / "ठीक है.") are not questions:
+                # retrieving and injecting KB text for them was what made the
+                # agent re-answer paragraphs the caller never asked for (23:36
+                # log: three "Ok," turns -> three full office/founder replies,
+                # ~600 injected tokens + ~₹0.003 each). Skip retrieval here;
+                # the static KB/FAQ summary in the system prompt still applies.
+                if rag.is_acknowledgement(user_text):
+                    logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s'", user_text[:40])
+                    return
                 logger.info("🔎 [RAG_STARTED] query='%s'", user_text[:60])
                 # --- Fast path: the worker precomputes RAG from STT interim
                 # text (in parallel with endpointing), so by the time the turn
