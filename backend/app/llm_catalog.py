@@ -431,6 +431,30 @@ LLM_MODELS: List[Dict[str, Any]] = [
     # llama-3.1-8b-instant + llama-3.3-70b-versatile retired 2026-08-16
     # qwen/qwen3-32b + llama-4-scout retired 2026-07-17
     # -> replacements per Groq: openai/gpt-oss-20b, openai/gpt-oss-120b, qwen/qwen3.6-27b
+    # Qwen3.6 27B -> Qwen3.8 27B swap 2026-09-24 (user request; Groq lists 3.8 as the
+    # current Qwen: console.groq.com/docs/model/qwen/qwen3.8-27b). 3.6 stays callable
+    # for agents that saved it explicitly, but is hidden from pickers as deprecated.
+    {
+        "provider": "groq",
+        "model_id": "qwen/qwen3.8-27b",
+        "display_name": "Qwen3.8 27B",
+        "base_url": "https://api.groq.com/openai/v1",
+        "input_price_per_1m": 0.8,
+        "cached_input_price_per_1m": 0.0,
+        "output_price_per_1m": 4.0,
+        "context_window": 131072,
+        "max_output_tokens": 16384,
+        "reasoning_supported": True,
+        "reasoning_default": "none",
+        "streaming_supported": True,
+        "tool_calling_supported": True,
+        "structured_output_supported": True,
+        "expected_speed": "very_fast",
+        "status": "active", "free_tier": True,
+        "capabilities": ["chat", "reasoning", "tools", "vision"],
+        "notes": "Free tier (rate-limited). Qwen3.6's successor on Groq: 27B dense, thinking/instruct dual mode (reasoning_effort none=default-for-voice; low/medium/high supported), vision (2048 tokens per image), ~450+ tps. Pricing $0.80/$4.00 per 1M — no prompt-cache discount, and Groq still rejects prompt_cache_key, so caching stays OpenAI-only.",
+        "tier": "free",
+    },
     {
         "provider": "groq",
         "model_id": "qwen/qwen3.6-27b",
@@ -447,9 +471,9 @@ LLM_MODELS: List[Dict[str, Any]] = [
         "tool_calling_supported": True,
         "structured_output_supported": True,
         "expected_speed": "very_fast",
-        "status": "active", "free_tier": True,
+        "status": "deprecated", "free_tier": True,
         "capabilities": ["chat", "reasoning", "tools", "vision"],
-        "notes": "Free. Groq's recommended Llama/Qwen3 replacement (27B dense, thinking mode). Best multilingual quality on the free tier; strong Hindi.",
+        "notes": "Superseded by qwen/qwen3.8-27b (2026-09-24): hidden from pickers, still valid for agents that saved it explicitly. Free. Groq's former recommended Llama/Qwen3 replacement (27B dense, thinking mode); strong Hindi.",
         "tier": "free",
     },
     {
