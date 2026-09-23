@@ -443,7 +443,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             try:
                 # Use model_id as cache key for stable prefix caching
                 llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-                logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
+                logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (per-request [CACHE] hit/miss is read from provider usage CompletionUsage.prompt_cached_tokens — real numbers only)")
             except Exception:
                 pass
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
