@@ -574,6 +574,17 @@ except Exception as e:
 # Also patch aiohttp TCPConnector creation if needed - but http_context patch should be enough
 
 
+# Task 5 (2026-09-24): make the OpenAI SDK's own retry/error telemetry visible —
+# openai._base_client logs "Retrying request to /v1/chat/completions" (429/5xx
+# backoff) at INFO. TTFT spikes of ~2-3.5s match 1-2 backoff retries exactly;
+# without these lines we cannot distinguish provider retry from network.
+try:
+    import logging as _logging_oai
+    _logging_oai.getLogger("openai").setLevel(_logging_oai.INFO)
+    _logging_oai.getLogger("httpx").setLevel(_logging_oai.WARNING)
+except Exception:
+    pass
+
 # Latency fix globals: cache DB init and agent lookup per process
 _DB_INIT_DONE = False
 # Preemptive gate state of the current call (set by build_assistant_session;
@@ -823,6 +834,9 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
                             _logger.info(f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                            if ttft > 1800:
+                                # Task 5 forensics: what was around this request?
+                                _logger.warning(f"🐢 [TTFT_SPIKE_CONTEXT] TTFT={ttft:.0f}ms inflight_llm={self._timing.get('inflight_llm',0)} overlapping_starts={self._timing.get('overlapping_starts',0)} head_sha={self._timing.get('head_sha','?')} — cross-check openai._base_client retry lines (429/timeout backoff) and [LOOP_LAG] events")
                             if self._timing.get("llm_start", 0) > 0:
                                 _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
                             if self._timing.get("speech_end", 0) > 0:
@@ -832,9 +846,25 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                         if usage:
                             self._input_tokens = getattr(usage, 'prompt_tokens', 0) or getattr(usage, 'input_tokens', 0) or self._input_tokens
                             self._output_tokens = getattr(usage, 'completion_tokens', 0) or getattr(usage, 'output_tokens', 0) or self._output_tokens
-                            prompt_details = getattr(usage, 'prompt_tokens_details', None)
-                            if prompt_details:
-                                self._cached_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
+                            # ROOT CAUSE of "cached=0 on every request" (real call
+                            # 2026-09-24 01:55): livekit 1.8 maps OpenAI's
+                            # usage.prompt_tokens_details.cached_tokens into
+                            # CompletionUsage.prompt_cached_tokens at the inference
+                            # layer (livekit/agents/inference/llm.py:475-486) and
+                            # that details attribute is GONE from the object we
+                            # receive. Reading only prompt_tokens_details made
+                            # cached silently 0 even if the provider reported hits.
+                            # Read the mapped field first; keep the raw-shape and
+                            # dict fallbacks for other adapters.
+                            _cached_v = getattr(usage, 'prompt_cached_tokens', None)
+                            if _cached_v is None and isinstance(usage, dict):
+                                _pd = usage.get('prompt_tokens_details') or usage.get('input_tokens_details') or {}
+                                _cached_v = _pd.get('cached_tokens') if isinstance(_pd, dict) else getattr(_pd, 'cached_tokens', None)
+                            if _cached_v is None:
+                                prompt_details = getattr(usage, 'prompt_tokens_details', None)
+                                if prompt_details is not None:
+                                    _cached_v = getattr(prompt_details, 'cached_tokens', 0)
+                            self._cached_tokens = int(_cached_v or 0)
                     except Exception:
                         pass
                     yield chunk
@@ -845,6 +875,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb.format_exc()[:1000]}")
                 raise
             finally:
+                try:
+                    if self._timing.get("_inflight_counted"):
+                        self._timing["inflight_llm"] = max(0, int(self._timing.get("inflight_llm", 1)) - 1)
+                        self._timing["_inflight_counted"] = False
+                except Exception:
+                    pass
                 gen_complete = _time.time()
                 self._timing["generation_complete"] = gen_complete
                 self._timing["llm_complete"] = gen_complete
@@ -948,7 +984,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                                     self._timing["cache_misses"] = self._timing.get("cache_misses", 0) + 1
                             else:
                                 _ck_key, _ck_status = "n/a", "unsupported"
-                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} cached_input_tokens={_cached_now} cache_status={_ck_status} (status only reflects provider usage)")
+                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_chars={self._timing.get('head_chars_log','?')} head_sha={self._timing.get('head_sha','?')} (status only reflects provider usage)")
                         except Exception:
                             pass
                 except Exception as e:
@@ -1051,6 +1087,62 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             _gen = int(self._timing.get("gen", 0)) + 1
             self._timing["gen"] = _gen
             self._timing["assistant_output_received"] = False
+            # Task 2 (2026-09-24): log what actually builds the ~2900-token
+            # request and PROVE prefix stability instead of assuming it. The
+            # hash covers the stable head (leading system messages + tool
+            # defs); OpenAI caches on shared prefixes >=1024 tokens, so a
+            # stable hash with cached=0 points at the provider/account, while
+            # a changing hash is our bug and the diff names the section.
+            try:
+                _cc = kwargs.get("chat_ctx")
+                if _cc is not None:
+                    import hashlib as _hl
+                    _msgs = list(getattr(_cc, "messages", []) or [])
+                    def _mtext(m):
+                        c = getattr(m, "content", "")
+                        if isinstance(c, str):
+                            return c
+                        if isinstance(c, list):
+                            return " ".join(str(getattr(p, "text", p)) for p in c)
+                        return str(c or "")
+                    _head: list = []
+                    _hist_chars = 0
+                    _hist_msgs = 0
+                    _rag_chars = 0
+                    _user_last_chars = 0
+                    _seen_user = False
+                    for _i, _m in enumerate(_msgs):
+                        _r = getattr(_m, "role", "") or ""
+                        _t = _mtext(_m)
+                        if _r == "system" and not _seen_user and "[RAG]" not in _t[:80]:
+                            _head.append(_t)
+                        elif _r == "system":
+                            _rag_chars += len(_t)
+                        else:
+                            _seen_user = True
+                            if _i == len(_msgs) - 1 and _r == "user":
+                                _user_last_chars = len(_t)
+                            else:
+                                _hist_chars += len(_t)
+                                _hist_msgs += 1
+                    _tools = kwargs.get("tools") or []
+                    _tools_chars = sum(len(str(getattr(_t0, "name", _t0))) + len(str(getattr(_t0, "parameters", ""))) for _t0 in _tools)
+                    _head_chars = sum(len(_h) for _h in _head)
+                    _sha = _hl.sha256(("\x1f".join(_head) + "#" + repr(_tools_chars)).encode("utf-8", "ignore")).hexdigest()[:12]
+                    _prev_sha = self._timing.get("head_sha") or ""
+                    _stable = "yes" if (not _prev_sha or _prev_sha == _sha) else "NO(prev=%s)" % _prev_sha
+                    self._timing["head_sha"] = _sha
+                    self._timing["head_chars_log"] = _head_chars + _tools_chars
+                    _total_chars = _head_chars + _hist_chars + _rag_chars + _user_last_chars
+                    _logger.info(
+                        "🧮 [PROMPT] chars=%d (est≈%dt; billed %s) sections: stable_head=%dc lead? prior? instr | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc | tools_meta=%dc | head_sha=%s head_stable_vs_prev_turn=%s",
+                        _total_chars, int(_total_chars / 4.0) + 8, "see usage", _head_chars, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, _tools_chars, _sha, _stable,
+                    )
+                    # inflight gauge for spike forensics (Task 5)
+                    self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
+                    self._timing["_inflight_counted"] = True
+            except Exception as _pe:
+                _logger.debug(f"[PROMPT] section accounting skipped: {_pe!r}")
             # Reset per-request metrics but preserve provider/model and aggregated billing
             # Preserve aggregated and is_closing
             preserved_aggregated = {
@@ -1323,7 +1415,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # turns (pure ACKs) a speculative reply could be REUSED and bypass the
     # deterministic ack path. Keeping it off is the safe answer the spec asks
     # for; enabling needs a context-stable design, not a flag flip.
-    logger.info(f"🔇 [PREEMPTIVE] enabled={preemptive_enabled} reason='per-turn RAG injection makes speculative ctx stale (guaranteed discard+billed); reuse would bypass deterministic ACKs' started=0 cancelled=0 reused=0 completed=0")
+    logger.info(f"🔇 [PREEMPTIVE] enabled={preemptive_enabled} reason='per-turn RAG injection makes speculative ctx stale (guaranteed discard+billed); reuse would bypass deterministic ACKs' started=0 cancelled=0 reused=0 discarded=0 — every caller FINAL spoken while the agent was speaking/thinking is counted as would_cancel: under naive speculation each would have been a billed-then-discarded duplicate")
     global _PREEMPTIVE_ENABLED_FOR_LOG
     _PREEMPTIVE_ENABLED_FOR_LOG = bool(preemptive_enabled)
     
@@ -1770,6 +1862,32 @@ async def _entrypoint_body(ctx, setup_complete):
         "all_requests": [],  # list of {input, cached, output, success, ttft, gen_time, provider, model, is_closing}
         "is_closing": False,  # True when deterministic closing in progress
     }
+
+    # Task 5 (2026-09-24): event-loop blocking detector. A provider spike
+    # (TTFT 3344ms) is only "network" if the worker loop was NOT saturated at
+    # that moment. Heartbeat every 50ms; drift >180ms means the loop itself
+    # delayed stream callbacks (TTS bursts, barge-in cascade) and we log it so
+    # [TTFT_SPIKE_CONTEXT] can be cross-read against [LOOP_LAG] timestamps.
+    async def _loop_lag_watch(_tt=turn_timing):
+        import asyncio as _aio
+        _last = time.perf_counter()
+        _n = 0
+        try:
+            while True:
+                await _aio.sleep(0.05)
+                _now = time.perf_counter()
+                _drift = (_now - _last - 0.05) * 1000.0
+                _last = _now
+                if _drift > 180.0:
+                    _n += 1
+                    if _n <= 20 or _n % 20 == 0:
+                        logging.getLogger("voice-agent-saas-worker").warning(
+                            "🐌 [LOOP_LAG] event loop blocked ~%.0fms (lag#%d) — stream/TTFT timing during this window is worker-side, not provider",
+                            _drift, _n,
+                        )
+        except asyncio.CancelledError:
+            return
+    turn_timing["_loop_lag_task"] = asyncio.create_task(_loop_lag_watch())
     
 
     # ------------------------------------------------------------------
@@ -1938,6 +2056,14 @@ async def _entrypoint_body(ctx, setup_complete):
             if is_final and text.strip():
                 logger.info("📝 [USER_TRANSCRIPT_FINAL] '%s'", text.strip()[:80])
                 turn_timing["stt_final_ts"] = time.time()
+                # [PREEMPTIVE] would_cancel (Task 3, 2026-09-24): this FINAL
+                # arrived while the agent was mid-speech/thinking. Under naive
+                # speculative generation each one = a speculative request to
+                # cancel+discard (billed tokens, no reuse) — and in THIS call
+                # style these continuations are the NORM (fragment merges).
+                if turn_timing.get("agent_state") in ("speaking", "thinking"):
+                    turn_timing["spec_would_cancel"] = int(turn_timing.get("spec_would_cancel", 0)) + 1
+                    logger.info("🔇 [PREEMPTIVE] would_cancel=1 (FINAL during '%s' state — avoided by design)", turn_timing.get("agent_state"))
                 # One call does it all: cancels the armed window (single
                 # [WATCHDOG_CANCELLED]+[WATCHDOG_ARMED] log) and starts a fresh
                 # full window measured from this utterance.
@@ -2002,6 +2128,12 @@ async def _entrypoint_body(ctx, setup_complete):
     @ctx.room.on("disconnected")
     def _on_room_disconnected(*_):
         logger.info("Room disconnected event received")
+        _ll = turn_timing.pop("_loop_lag_task", None)
+        if _ll is not None:
+            try:
+                _ll.cancel()
+            except Exception:
+                pass
         try:
             _cancel_no_response(reason="call_end_room_disconnected")
             _cancel_stall_probe(reason="call_end_room_disconnected")
@@ -2679,6 +2811,7 @@ async def _entrypoint_body(ctx, setup_complete):
     session.on("conversation_item_added", on_item_added)
 
     def _on_state(ev):
+        turn_timing["agent_state"] = ev.new_state
         now = time.time()
         prev = state_tracker["state"]
         elapsed = now - state_tracker["since"]
@@ -3157,7 +3290,7 @@ async def _entrypoint_body(ctx, setup_complete):
                     else:
                         _cache_verdict = "unsupported (no OpenAI path in this call)"
                     logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} hits={_ch} misses={_cm} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
-                    logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 completed=0 overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
+                    logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 discarded=0 would_cancel={int(turn_timing.get('spec_would_cancel', 0) or 0)} overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
                     _ls = turn_timing.get("latency_samples", [])
                     if _ls:
                         def _avg(k, _src=_ls):

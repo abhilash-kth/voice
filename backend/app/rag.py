@@ -10,6 +10,7 @@ Docs can be swapped for embeddings later without touching the API.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, List
 
@@ -156,7 +157,30 @@ def retrieve(kb: KnowledgeBase, query: str, top_k: int = 5) -> List[KnowledgeIte
         scores = bm.score(q_tokens)
 
     ranked = sorted(zip(items, scores), key=lambda x: x[1], reverse=True)
-    return [it for it, _s in ranked[:top_k]]
+    # Relevance floor (2026-09-24 latency review): retrieve() used to return
+    # top_k hits even at BM25 score 0 — every off-topic turn ("Number लिखो
+    # मेरा 9538", "Ok bye.") was shipped a constant 1942-char / 3-hit block of
+    # irrelevant business text: ~500 wasted input tokens per turn AND junk
+    # grounding the model then tried to answer from. This is NOT a KB shrink:
+    # full corpus and retrieval are intact; we only drop what is demonstrably
+    # unrelated to THIS question. best<=0 -> no lexical overlap -> no
+    # injection (the static instructions slice still grounds the basics).
+    if not ranked:
+        return []
+    _best = float(ranked[0][1] or 0.0)
+    if _best <= 0.0:
+        return []
+    try:
+        _rel = float(os.getenv("VOICE_RAG_MIN_RELATIVE", "0.25"))
+    except Exception:
+        _rel = 0.25
+    _rel = min(max(_rel, 0.0), 1.0)
+    out = []
+    for _it, _sc in ranked[:top_k]:
+        if out and float(_sc) < _rel * _best:
+            break
+        out.append(_it)
+    return out
 
 
 def build_context_detailed(kb: KnowledgeBase, query: str, top_k: int = 3) -> dict:
