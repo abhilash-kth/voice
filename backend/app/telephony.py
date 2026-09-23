@@ -15,10 +15,11 @@ being installed in that interpreter.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 import logging
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from .config import (
     LIVEKIT_URL,
@@ -30,6 +31,24 @@ from .config import (
 logger = logging.getLogger("voice-agent-saas-telephony")
 
 AGENT_NAME = "voice-agent-saas"
+
+
+async def _lk(coro: Any, timeout: float, op: str) -> Any:
+    """Run a LiveKit API call with a hard timeout.
+
+    Without this, a slow/unreachable LiveKit server (e.g. the PC losing reach to
+    the cloud SFU) hangs the *caller* of the call forever: start_call never
+    returns, the worker's call-end cleanup never completes, and the worker
+    process stays busy — so the NEXT call is dispatched to nobody and the room
+    goes silent. TimeoutError is raised to the caller so it can surface a real
+    error instead of an endless spinner.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"{op} timed out after {timeout:.0f}s (LiveKit server unreachable or overloaded)"
+        )
 
 
 def make_room_name() -> str:
@@ -66,26 +85,36 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
     server_dispatched = False
     try:
         try:
-            await client.room.create_room(
-                api.CreateRoomRequest(
-                    name=room,
-                    empty_timeout=300,
-                    departure_timeout=30,
-                    agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
-                )
+            await _lk(
+                client.room.create_room(
+                    api.CreateRoomRequest(
+                        name=room,
+                        empty_timeout=300,
+                        departure_timeout=30,
+                        agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
+                    )
+                ),
+                timeout=8.0,
+                op="CreateRoom",
             )
             server_dispatched = True
             logger.info("[ROOM_CREATED] room=%s agent_id=%s mode=browser (server-dispatched)", room, agent_id)
+        except TimeoutError:
+            raise
         except Exception as e:
             logger.warning("[CREATE_ROOM_WARN] room=%s: %s", room, e)
             if hasattr(client, "agent_dispatch") and hasattr(api, "CreateAgentDispatchRequest"):
                 try:
-                    await client.agent_dispatch.create_dispatch(
-                        api.CreateAgentDispatchRequest(
-                            agent_name=AGENT_NAME,
-                            room=room,
-                            metadata=metadata,
-                        )
+                    await _lk(
+                        client.agent_dispatch.create_dispatch(
+                            api.CreateAgentDispatchRequest(
+                                agent_name=AGENT_NAME,
+                                room=room,
+                                metadata=metadata,
+                            )
+                        ),
+                        timeout=6.0,
+                        op="CreateAgentDispatch",
                     )
                     server_dispatched = True
                     logger.info("[AGENT_DISPATCH_SENT] room=%s agent=%s", room, AGENT_NAME)
@@ -148,24 +177,44 @@ async def create_sip_call(
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         # 1) Create the room and auto-dispatch the LiveKit worker into it.
-        await client.room.create_room(
-            api.CreateRoomRequest(
-                name=room,
-                empty_timeout=300,   # seconds before an empty room auto-closes
-                agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
-            )
+        await _lk(
+            client.room.create_room(
+                api.CreateRoomRequest(
+                    name=room,
+                    empty_timeout=300,   # seconds before an empty room auto-closes
+                    agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
+                )
+            ),
+            timeout=8.0,
+            op="CreateRoom",
         )
 
-        # 2) Dial the number through the SIP trunk.
-        resp = await client.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                room_name=room,
-                participant_identity="phone-" + uuid.uuid4().hex[:6],
-                sip_call_to=phone,          # e.g. +9180XXXXXXX
-                krisp_enabled=False,
-            ),
-            trunk_id=trunk,
-        )
+        # 2) Dial the number through the SIP trunk. If this fails the room would
+        # otherwise sit with an agent dispatch and no caller — clean it up.
+        try:
+            resp = await _lk(
+                client.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=room,
+                        participant_identity="phone-" + uuid.uuid4().hex[:6],
+                        sip_call_to=phone,          # e.g. +9180XXXXXXX
+                        krisp_enabled=False,
+                    ),
+                    trunk_id=trunk,
+                ),
+                timeout=15.0,
+                op="CreateSIPParticipant",
+            )
+        except Exception:
+            try:
+                await _lk(
+                    client.room.delete_room(api.room_service.DeleteRoomRequest(room=room)),
+                    timeout=5.0,
+                    op="DeleteRoom",
+                )
+            except Exception:
+                pass
+            raise
     finally:
         await client.aclose()
 
@@ -198,7 +247,11 @@ async def list_live_active_rooms() -> Optional[set]:
         return None
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
-        resp = await client.room.list_rooms(api.room_service.ListRoomsRequest())
+        resp = await _lk(
+            client.room.list_rooms(api.room_service.ListRoomsRequest()),
+            timeout=5.0,
+            op="ListRooms",
+        )
     except Exception:
         return None
     finally:
@@ -226,7 +279,11 @@ async def end_active_room(room_name: str) -> bool:
         return False
     client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
-        await client.room.delete_room(api.room_service.DeleteRoomRequest(room=room_name))
+        await _lk(
+            client.room.delete_room(api.room_service.DeleteRoomRequest(room=room_name)),
+            timeout=8.0,
+            op="DeleteRoom",
+        )
         return True
     except Exception as e:
         logger.warning(f"end_active_room: delete_room failed for {room_name}: {e}")

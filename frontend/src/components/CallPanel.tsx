@@ -44,12 +44,14 @@ function ActiveSession({
   roomName,
   onStateChange,
   onAnnouncementFinished,
+  waitSeconds,
 }: {
   agent?: Agent;
   callId: string;
   roomName: string;
   onStateChange: (state: CallState) => void;
   onAnnouncementFinished: () => void;
+  waitSeconds: number;
 }) {
   const room = useRoomContext();
   const { state: vaState, audioTrack } = useVoiceAssistant();
@@ -156,7 +158,7 @@ function ActiveSession({
         </p>
         <p className="text-gray-300 text-sm font-medium">
           {!agentJoined
-            ? "Waiting for agent to connect..."
+            ? `Waiting for agent to connect… ${waitSeconds}s`
             : vaState === "speaking"
               ? agent?.agent_mode === "announcement"
                 ? "Playing announcement script..."
@@ -220,6 +222,66 @@ export default function CallPanel({
   const isDisconnectingRef = useRef(false);
   const callEndReasonRef = useRef<string | null>(null);
   const activeSummaryPollRef = useRef<number>(0);
+  const [agentWaitSeconds, setAgentWaitSeconds] = useState(0);
+
+  // Watch the "agent joining" window. The backend/worker now marks a broken
+  // call with a real reason (call.status === "failed" + call.usage.error), so
+  // surface it the moment it appears instead of showing "Waiting for agent…"
+  // forever. A hard 30s timeout covers the other failure: no worker process
+  // picked up the dispatch at all (worker stopped / busy / crashed on setup).
+  useEffect(() => {
+    if (callState !== "waiting_for_agent" || !callId) return;
+    const startedAt = Date.now();
+    let cancelled = false;
+
+    const failWait = async (message: string) => {
+      if (cancelled) return;
+      console.error(`[CALL_ERROR] agent_join_failed: ${message}`);
+      setErr(message);
+      setCallState("error");
+      isDisconnectingRef.current = true; // suppress handleRoomDisconnected takeover
+      try {
+        await endCall(callId); // release the room so "Try again" starts clean
+      } catch {
+        /* backend error on cleanup is fine — the state reset below still works */
+      }
+      setSession(null);
+      window.setTimeout(() => {
+        isDisconnectingRef.current = false;
+      }, 800);
+    };
+
+    setAgentWaitSeconds(0);
+    const iv = window.setInterval(async () => {
+      if (cancelled) return;
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      setAgentWaitSeconds(elapsed);
+      if (elapsed >= 30) {
+        await failWait(
+          "The agent did not join within 30 seconds. The agent worker may be stopped or busy — " +
+            "check that it is running (`python -m app.agents.worker`), then try again.",
+        );
+        return;
+      }
+      try {
+        const c = await getCall(callId);
+        if (cancelled) return;
+        if (c.status === "failed") {
+          const why =
+            (typeof c.usage === "object" && c.usage !== null && (c.usage as any).error) ||
+            "the agent worker could not start this call";
+          await failWait(`The agent could not start: ${why}`);
+        }
+      } catch {
+        // backend briefly unreachable — keep waiting until the hard timeout
+      }
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(iv);
+    };
+  }, [callState, callId]);
 
   // Preselect an agent: preset > localStorage (last chosen) > first agent
   useEffect(() => {
@@ -299,6 +361,17 @@ export default function CallPanel({
         attempts++;
         const c = await getCall(cid);
         if (activeSummaryPollRef.current !== pollId) return;
+        if (c.status === "failed") {
+          // Surface the real reason (worker setup failure, LiveKit timeout…)
+          // instead of a fake "completed, billed ₹0.00" summary.
+          const why =
+            (typeof c.usage === "object" && c.usage !== null && (c.usage as any).error) ||
+            "the agent worker could not start the call";
+          setErr(`Call failed: ${why}`);
+          setCallState("error");
+          onStarted();
+          return;
+        }
         const costInr = (c.cost as any)?.client_price_inr;
         const duration = c.duration_seconds ?? 0;
         const isFinalized = c.status === "completed" || c.status === "failed";
@@ -617,6 +690,15 @@ export default function CallPanel({
             {err}
           </div>
         )}
+        {err && callState === "error" && !session && agentId && (
+          <button
+            type="button"
+            onClick={go}
+            className="w-full mt-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2.5 rounded-xl transition-all"
+          >
+            🔄 Try Again
+          </button>
+        )}
         {callEndedMsg && !callEndedMsg.startsWith("Finalizing") && !err && (
           <div className="text-green-300 text-sm bg-green-500/10 border border-green-500/30 rounded-lg p-3 mt-4">
             {callEndedMsg}
@@ -684,6 +766,7 @@ export default function CallPanel({
               roomName={session.room}
               onStateChange={(st) => setCallState(st)}
               onAnnouncementFinished={handleAnnouncementFinished}
+              waitSeconds={agentWaitSeconds}
             />
             <RoomAudioRenderer />
           </LiveKitRoom>

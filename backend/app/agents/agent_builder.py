@@ -719,10 +719,12 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     optional_params = {}
     # Support both endpointing_ms and legacy endpointing for backward compat
     # Deepgram's own end-of-speech detection must NOT beat the session's
-    # endpointing (min_delay 0.35s). 200ms fired before silero's min_silence,
-    # so LiveKit logged "stt end of speech received while vad is still in a
-    # speech segment, flushing vad" and cut users off mid-sentence.
-    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300"))
+    # endpointing. The session endpointing min is 0.25s and the silero VAD
+    # min_silence is 0.35s, so 200ms is the largest value that still fires
+    # before either layer — the final lands ~200ms after the user stops
+    # talking, and the session adds its adaptive 0.25-0.75s on top. (The old
+    # 300ms added a full extra 100ms of dead air to every turn.)
+    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "200"))
     # utterance_end is the fallback final when endpointing never fires (long
     # pause): 1000ms added a full second of dead air on slow speakers — but
     # Deepgram REJECTS utterance_end_ms below 1000 (WS handshake returns 400
@@ -1450,6 +1452,7 @@ def build_voice_agent(
     prior_memory: str = "",
     lead_data: Optional[dict] = None,
     turn_timing_ref: Optional[dict] = None,
+    rag_prefetch: Optional[dict] = None,
 ) -> "Any":
     """Return a LiveKit v1 ``Agent`` instance wired for this config.
 
@@ -1840,38 +1843,57 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
-                # Async RAG to avoid blocking event loop
-                try:
-                    rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, user_text, 3)
-                except Exception:
-                    # Fallback sync if to_thread fails
-                    rag_res = rag.build_context_detailed(cfg.knowledge, user_text, top_k=3)
-                _rag_elapsed = (_time.time() - _rag_t0) * 1000
-                hits = (rag_res.get("text") or "").strip()
-                kb_used = rag_res.get("kb_used", False)
-                kb_chars = rag_res.get("kb_chars", 0)
-                kb_hits = rag_res.get("kb_hits", 0)
-                faq_used = rag_res.get("faq_used", False)
-                faq_chars = rag_res.get("faq_chars", 0)
-                faq_hits = rag_res.get("faq_hits", 0)
-                total_chars = rag_res.get("total_chars", 0)
+                # --- Fast path: the worker precomputes RAG from STT interim
+                # text (in parallel with endpointing), so by the time the turn
+                # completes the retrieval result for this exact text is usually
+                # already cached. This hook is AWAITED by the session before the
+                # LLM starts, so a cache hit removes ~30-100ms from EVERY turn.
+                hits = ""
+                if rag_prefetch is not None:
+                    try:
+                        hits = (rag_prefetch.get(rag.normalize_query(user_text)) or "").strip()
+                    except Exception:
+                        hits = ""
+                if hits:
+                    logger.info(
+                        "⚡ RAG PREFETCH HIT '%s' (%d chars) — computed during the STT interim, "
+                        "critical-path cost %.0fms",
+                        user_text[:60], len(hits), (_time.time() - _rag_t0) * 1000,
+                    )
+                else:
+                    # Cache miss (final text diverged from every interim, or the
+                    # interim compute lost the race): compute now, same as before.
+                    try:
+                        rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, user_text, 3)
+                    except Exception:
+                        # Fallback sync if to_thread fails
+                        rag_res = rag.build_context_detailed(cfg.knowledge, user_text, top_k=3)
+                    _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                    hits = (rag_res.get("text") or "").strip()
+                    kb_used = rag_res.get("kb_used", False)
+                    kb_chars = rag_res.get("kb_chars", 0)
+                    kb_hits = rag_res.get("kb_hits", 0)
+                    faq_used = rag_res.get("faq_used", False)
+                    faq_chars = rag_res.get("faq_chars", 0)
+                    faq_hits = rag_res.get("faq_hits", 0)
+                    total_chars = rag_res.get("total_chars", 0)
 
-                # Authoritative user-facing retrieval log detailing KB and FAQ usage
-                logger.info(
-                    "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
-                    user_text[:60],
-                    _rag_elapsed,
-                    kb_used,
-                    kb_chars,
-                    kb_hits,
-                    faq_used,
-                    faq_chars,
-                    faq_hits,
-                    total_chars,
-                )
+                    # Authoritative user-facing retrieval log detailing KB and FAQ usage
+                    logger.info(
+                        "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
+                        user_text[:60],
+                        _rag_elapsed,
+                        kb_used,
+                        kb_chars,
+                        kb_hits,
+                        faq_used,
+                        faq_chars,
+                        faq_hits,
+                        total_chars,
+                    )
 
-                if _rag_elapsed > 200:
-                    logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
+                    if _rag_elapsed > 200:
+                        logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
 
                 if not hits or hits == self._last_rag:
                     logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
