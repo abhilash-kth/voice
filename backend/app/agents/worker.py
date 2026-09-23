@@ -814,13 +814,27 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             # counted as cache misses; cache_status becomes an explicit
             # "unknown" verdict driven by this flag.
             self._usage_seen = False
+            # Task 7 (2026-09-24): the FIRST decoded chunk is the critical
+            # path to TTS. First-token log LINES are queued here and emitted
+            # when the NEXT chunk arrives (long after the pipeline received
+            # chunk #1) or in finally — timing dict writes stay immediate so
+            # everything downstream (authoritative TTFT, COST, GENERATION
+            # COMPLETE) sees real values and real ordering.
+            self._pending_first_logs: list = []
 
         def __getattr__(self, name):
             return getattr(self._inner_stream, name)
 
         async def __aiter__(self):
+            def _flush_first_logs():
+                if self._pending_first_logs:
+                    for _lvl, _msg in self._pending_first_logs:
+                        (_logger.warning if _lvl else _logger.info)(_msg)
+                    self._pending_first_logs.clear()
+
             try:
                 async for chunk in self._inner_stream:
+                    _flush_first_logs()
                     now = _time.time()
                     if self._first_token:
                         self._first_token = False
@@ -840,7 +854,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                             self._timing["ttft_ms"] = ttft
                             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                            _logger.info(f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                            self._pending_first_logs.append((0, f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)"))
                             # Task 2 boundaries: join the two httpx hook
                             # timestamps for THIS attempt (rid) to the first
                             # decoded stream chunk, measured here — without
@@ -851,20 +865,23 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                                 _hrec = _pop_ht(str(model))
                                 if _hrec:
                                     _t0 = _hrec["send_ts"]; _t1 = _hrec["headers_ts"]
-                                    _logger.info(
-                                        "\u23f1\ufe0f [HTTP_CHUNK] rid=%s model=%s request_start->first_stream_chunk=%.0fms response_headers->first_stream_chunk=%.0fms (first chunk = first SSE delta decoded by the SDK — application-level boundary, NOT to be quoted as provider TTFB)",
-                                        _hrec.get("rid", "?"), model,
-                                        (first_token - _t0) * 1000.0, (first_token - _t1) * 1000.0,
-                                    )
+                                    # pop+format stay here (µs; keeps rid
+                                    # attribution race-free), only the log IO
+                                    # is deferred off the chunk-1 hop
+                                    self._pending_first_logs.append((0,
+                                        "⏱️ [HTTP_CHUNK] rid=%s model=%s request_start->first_stream_chunk=%.0fms response_headers->first_stream_chunk=%.0fms (first chunk = first SSE delta decoded by the SDK — application-level boundary, NOT to be quoted as provider TTFB)" % (
+                                            _hrec.get("rid", "?"), model,
+                                            (first_token - _t0) * 1000.0, (first_token - _t1) * 1000.0,
+                                        )))
                             except Exception:
                                 pass
                             if ttft > 1800:
                                 # Task 5 forensics: what was around this request?
-                                _logger.warning(f"🐢 [TTFT_SPIKE_CONTEXT] TTFT={ttft:.0f}ms inflight_llm={self._timing.get('inflight_llm',0)} overlapping_starts={self._timing.get('overlapping_starts',0)} head_sha={self._timing.get('head_sha','?')} — cross-check openai._base_client retry lines (429/timeout backoff) and [LOOP_LAG] events")
+                                self._pending_first_logs.append((1, f"🐢 [TTFT_SPIKE_CONTEXT] TTFT={ttft:.0f}ms inflight_llm={self._timing.get('inflight_llm',0)} overlapping_starts={self._timing.get('overlapping_starts',0)} head_sha={self._timing.get('head_sha','?')} — cross-check openai._base_client retry lines (429/timeout backoff) and [LOOP_LAG] events"))
                             if self._timing.get("llm_start", 0) > 0:
-                                _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
+                                self._pending_first_logs.append((0, f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)"))
                             if self._timing.get("speech_end", 0) > 0:
-                                _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
+                                self._pending_first_logs.append((0, f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms"))
                     try:
                         usage = getattr(chunk, 'usage', None)
                         if usage:
@@ -900,6 +917,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb.format_exc()[:1000]}")
                 raise
             finally:
+                _flush_first_logs()
                 try:
                     if self._timing.get("_inflight_counted"):
                         self._timing["inflight_llm"] = max(0, int(self._timing.get("inflight_llm", 1)) - 1)
