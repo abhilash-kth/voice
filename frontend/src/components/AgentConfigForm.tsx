@@ -991,7 +991,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                         value={m.model_id}
                         title={`${priceLabel(m)} | cached $${m.cached_input_price_per_1m}/1M | ${(m.context_window/1000).toLocaleString()}K context | max out ${m.max_output_tokens.toLocaleString()} | speed: ${m.expected_speed} | ${m.reasoning_supported ? 'reasoning: '+m.reasoning_default : 'no reasoning'} | ${m.capabilities.join(', ')}`}
                       >
-                        {m.voice_recommended ? "\u2605 " : ""}{m.display_name} \u2014 {priceLabel(m)}, {m.expected_speed}
+                        {m.voice_recommended ? "\u2605 " : ""}{m.display_name} — {priceLabel(m)}, {m.expected_speed}
                         {m.free_tier ? " [free tier]" : ""}
                         {m.status === "deprecated" ? " (deprecated \u2014 switch recommended)" : ""}
                       </option>
