@@ -183,7 +183,16 @@ class ProviderSelection(BaseModel):
     
     @model_validator(mode='after')
     def validate_llm(self):
-        """Validate LLM provider/model if v2 fields present."""
+        """Validate LLM provider/model if v2 fields present and ensure default core providers."""
+        if self.llm is None and self.llm_v2 is None:
+            self.llm = ProviderPair(id="openai_gpt_4_1_mini", config={})
+        if self.stt is None:
+            self.stt = ProviderPair(id="deepgram_nova2", config={})
+        if self.tts is None:
+            self.tts = ProviderPair(id="google_wavenet_hi", config={})
+        if self.telephony is None:
+            self.telephony = ProviderPair(id="browser", config={})
+
         if self.llm_v2:
             # Use v2 validation
             try:

@@ -72,7 +72,19 @@ def _user_dict(u: Any) -> dict:
 # Agents
 # ---------------------------------------------------------------------------
 def _agent_dict(a: Any) -> dict:
-    return {
+    prov = _load_dict(a.providers)
+    if not isinstance(prov, dict):
+        prov = {}
+    if "stt" not in prov or not prov.get("stt"):
+        prov["stt"] = {"id": "deepgram_nova2", "config": {}}
+    if "tts" not in prov or not prov.get("tts"):
+        prov["tts"] = {"id": "google_wavenet_hi", "config": {}}
+    if "llm" not in prov or not prov.get("llm"):
+        prov["llm"] = {"id": "openai_gpt_4_1_mini", "config": {}}
+    if "telephony" not in prov or not prov.get("telephony"):
+        prov["telephony"] = {"id": "browser", "config": {}}
+
+    res = {
         "id": a.id,
         "user_id": a.userId,
         "name": a.name,
@@ -92,10 +104,18 @@ def _agent_dict(a: Any) -> dict:
         "fallback_response": getattr(a, "fallbackResponse", "") or "Sorry, there is a temporary technical problem. Please try again shortly.",
         "no_response_timeout_seconds": getattr(a, "noResponseTimeoutSeconds", 60) or 60,
         "no_response_message": getattr(a, "noResponseMessage", "") or "I did not hear a response, so I will end the call now. Thank you for calling.",
-        "providers": _load_dict(a.providers),
+        "providers": prov,
         "knowledge": _load_dict(a.knowledge),
         "created_at": a.createdAt,
     }
+    # Fast path cache to DATA_DIR so worker can load in 0ms without DB delay
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{a.id}.json"
+        cache_file.write_text(json.dumps(res), encoding="utf-8")
+    except Exception:
+        pass
+    return res
 
 
 async def list_agents(user_id: str) -> list[dict]:

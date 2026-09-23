@@ -203,7 +203,16 @@ export default function CallPanel({
   onPresetConsumed,
 }: Props) {
   const [mode, setMode] = useState<"browser" | "sip">("browser");
-  const [agentId, setAgentId] = useState("");
+  const [agentId, setAgentId] = useState<string>(() => {
+    if (presetAgentId && agents.some((a) => a.id === presetAgentId)) return presetAgentId;
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem(LAST_AGENT_KEY);
+        if (saved && agents.some((a) => a.id === saved)) return saved;
+      } catch {}
+    }
+    return agents[0]?.id || "";
+  });
   const [phone, setPhone] = useState("");
   const [trunkId, setTrunkId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -225,37 +234,40 @@ export default function CallPanel({
   useEffect(() => {
     if (!agents.length) return;
 
+    let targetId = "";
     if (presetAgentId && agents.some((a) => a.id === presetAgentId)) {
-      setAgentId(presetAgentId);
+      targetId = presetAgentId;
+      onPresetConsumed?.();
+    } else if (agentId && agents.some((a) => a.id === agentId)) {
+      targetId = agentId;
+    } else {
+      let savedAgentId: string | null = null;
       if (typeof window !== "undefined") {
         try {
-          localStorage.setItem(LAST_AGENT_KEY, presetAgentId);
+          savedAgentId = localStorage.getItem(LAST_AGENT_KEY);
         } catch {}
       }
-      onPresetConsumed?.();
-      return;
+      if (savedAgentId && agents.some((a) => a.id === savedAgentId)) {
+        targetId = savedAgentId;
+      } else {
+        targetId = agents[0].id;
+      }
     }
 
-    if (agentId && agents.some((a) => a.id === agentId)) {
-      return;
-    }
-
-    let savedAgentId: string | null = null;
-    if (typeof window !== "undefined") {
-      try {
-        savedAgentId = localStorage.getItem(LAST_AGENT_KEY);
-      } catch {}
-    }
-
-    if (savedAgentId && agents.some((a) => a.id === savedAgentId)) {
-      setAgentId(savedAgentId);
-    } else {
-      const fallbackId = agents[0].id;
-      setAgentId(fallbackId);
+    if (targetId) {
+      if (targetId !== agentId) {
+        setAgentId(targetId);
+      }
       if (typeof window !== "undefined") {
         try {
-          localStorage.setItem(LAST_AGENT_KEY, fallbackId);
+          localStorage.setItem(LAST_AGENT_KEY, targetId);
         } catch {}
+      }
+      const found = agents.find((a) => a.id === targetId);
+      if (found) {
+        console.log(
+          `[AGENT_SELECTED] agent_id=${found.id} name=${found.name} mode=${found.agent_mode || "assistant"}`
+        );
       }
     }
   }, [agents, presetAgentId, agentId, onPresetConsumed]);
@@ -264,8 +276,9 @@ export default function CallPanel({
     setAgentId(newId);
     setCallEndedMsg("");
     setErr("");
+    isDisconnectingRef.current = false;
     activeSummaryPollRef.current += 1;
-    if (typeof window !== "undefined") {
+    if (newId && typeof window !== "undefined") {
       try {
         localStorage.setItem(LAST_AGENT_KEY, newId);
       } catch {}
@@ -282,7 +295,7 @@ export default function CallPanel({
 
   const fetchCallSummary = async (cid: string) => {
     if (!cid) {
-      setCallEndedMsg("Call ended. Select an agent to start a new call.");
+      setCallEndedMsg("Call ended. Ready to start a new call.");
       return;
     }
     const pollId = ++activeSummaryPollRef.current;
@@ -339,7 +352,7 @@ export default function CallPanel({
       onStarted();
     } catch {
       if (activeSummaryPollRef.current === pollId) {
-        setCallEndedMsg("Call ended. Select an agent to start a new call.");
+        setCallEndedMsg("Call ended. Ready to start a new call.");
       }
     }
   };
@@ -420,7 +433,7 @@ export default function CallPanel({
     activeSummaryPollRef.current += 1;
     setErr("");
     setCallEndedMsg("");
-    if (isDisconnectingRef.current) return;
+    isDisconnectingRef.current = false;
     if (
       callState === "connecting" ||
       callState === "waiting_for_agent" ||
@@ -429,14 +442,19 @@ export default function CallPanel({
     ) {
       return setErr("A call is already active. End the current call first.");
     }
-    if (!agentId) return setErr("Select an agent first.");
-    const selectedAgent = agents.find((a) => a.id === agentId);
+    let targetAgentId = agentId;
+    if (!targetAgentId && agents.length > 0) {
+      targetAgentId = presetAgentId || agents[0].id;
+      setAgentId(targetAgentId);
+    }
+    if (!targetAgentId) return setErr("Select an agent first.");
+    const selectedAgent = agents.find((a) => a.id === targetAgentId);
     if (!selectedAgent) return setErr("Selected agent not found.");
     if (mode === "sip" && !phone) return setErr("Enter a phone number for SIP calling.");
 
-    console.log(`[CALL_START] agent_id=${agentId} mode=${mode}`);
+    console.log(`[CALL_START] agent_id=${targetAgentId} mode=${mode}`);
     console.log(
-      `[AGENT_SELECTED] agent_id=${agentId} name=${selectedAgent.name} mode=${selectedAgent.agent_mode || "assistant"}`
+      `[AGENT_SELECTED] agent_id=${targetAgentId} name=${selectedAgent.name} mode=${selectedAgent.agent_mode || "assistant"}`
     );
 
     setBusy(true);
@@ -470,7 +488,7 @@ export default function CallPanel({
       }
 
       const res = await startCall({
-        agent_id: agentId,
+        agent_id: targetAgentId,
         mode,
         phone: mode === "sip" ? phone : undefined,
         sip_trunk_id: trunkId || undefined,
@@ -530,6 +548,13 @@ export default function CallPanel({
           value={agentId}
           disabled={isCallActive}
           onChange={(e) => handleAgentSelect(e.target.value)}
+          onClick={() => {
+            if (agentId) {
+              setCallEndedMsg("");
+              setErr("");
+              isDisconnectingRef.current = false;
+            }
+          }}
           className="input mt-1 mb-2"
         >
           <option value="">Select an agent…</option>

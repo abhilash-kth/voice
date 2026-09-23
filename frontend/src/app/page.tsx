@@ -371,13 +371,13 @@ export default function Dashboard() {
                         {a.agent_mode === "announcement" ? "announcement" : "assistant"}
                       </span>
                       <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
-                        LLM: {a.providers.llm.id.slice(0, 18)}
+                        LLM: {(a.providers?.llm?.id || a.providers?.llm_v2?.model_id || "default").slice(0, 18)}
                       </span>
                       <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
-                        STT: {a.providers.stt.id.slice(0, 14)}
+                        STT: {(a.providers?.stt?.id || "default").slice(0, 14)}
                       </span>
                       <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
-                        TTS: {a.providers.tts.id.slice(0, 14)}
+                        TTS: {(a.providers?.tts?.id || "default").slice(0, 14)}
                       </span>
                     </div>
                     <div className="flex flex-wrap gap-1.5 text-[11px] mb-4">

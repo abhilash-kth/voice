@@ -101,7 +101,12 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
         .with_grants(
             api.VideoGrants(room=room, room_join=True, can_publish=True, can_subscribe=True)
         )
-        .with_room_config(
+    )
+
+    # Only attach RoomConfiguration agent dispatch if server dispatch didn't succeed,
+    # preventing duplicate worker jobs dispatched to the same room.
+    if not server_dispatched:
+        token_builder = token_builder.with_room_config(
             api.RoomConfiguration(
                 agents=[
                     api.RoomAgentDispatch(
@@ -111,7 +116,6 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
                 ]
             )
         )
-    )
 
     token = token_builder.to_jwt()
     logger.info("[TOKEN_CREATED] room=%s identity=%s", room, identity)

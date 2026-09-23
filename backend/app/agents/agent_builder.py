@@ -674,10 +674,21 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
         from livekit.plugins.google import STT
         lang = overrides.get("language", "hi-IN")
         languages = [lang] if isinstance(lang, str) and "," not in lang else [x.strip() for x in lang.split(",")]
+        creds_file = overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None
+        if creds_file and not os.path.exists(creds_file):
+            creds_file = None
         return STT(
             languages=languages,
             model=overrides.get("model", "latest"),
-            credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
+            credentials_file=creds_file,
+        )
+
+    if sel.id.startswith("openai"):
+        from livekit.plugins.openai import STT
+        return STT(
+            model=overrides.get("model", "whisper-1"),
+            language=overrides.get("language", getattr(cfg, "language", "hi") or "hi"),
+            api_key=overrides.get("api_key") or OPENAI_API_KEY,
         )
 
     from livekit.plugins.deepgram import STT
@@ -828,10 +839,28 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
         voice = _resolve_tts_voice(language, overrides.get("voice"), gender)
         logger.info(f"🎙️ Google TTS: voice={voice} language={language} gender={gender}")
+        creds_file = overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None
+        if creds_file and not os.path.exists(creds_file):
+            creds_file = None
         return TTS(
             voice_name=voice,
             language=language,
-            credentials_file=overrides.get("credentials_file") or GOOGLE_APPLICATION_CREDENTIALS or None,
+            credentials_file=creds_file,
+        )
+
+    if sel.id.startswith("openai"):
+        from livekit.plugins.openai import TTS
+        return TTS(
+            model=overrides.get("model", "tts-1"),
+            voice=overrides.get("voice", "alloy" if (getattr(cfg, "gender", "female") or "female").lower() == "male" else "shimmer"),
+            api_key=overrides.get("api_key") or OPENAI_API_KEY,
+        )
+
+    if sel.id.startswith("deepgram"):
+        from livekit.plugins.deepgram import TTS
+        return TTS(
+            model=overrides.get("model", "aura-asteria-en"),
+            api_key=overrides.get("api_key") or DEEPGRAM_API_KEY,
         )
 
     if sel.id.startswith("sarvam"):
@@ -957,8 +986,26 @@ def build_tts(cfg: AgentConfig) -> Any:
     primary_pair = getattr(cfg.providers, "tts", None) if hasattr(cfg, "providers") else None
     if not primary_pair:
         from ..models import ProviderPair
-        primary_pair = ProviderPair(id="google_wavenet_hi", config={})
-    primary = _build_tts_from_pair(primary_pair, cfg)
+        if SARVAM_API_KEY:
+            primary_pair = ProviderPair(id="sarvam_bulbul_v3", config={})
+        elif OPENAI_API_KEY:
+            primary_pair = ProviderPair(id="openai", config={})
+        else:
+            primary_pair = ProviderPair(id="google_wavenet_hi", config={})
+    try:
+        primary = _build_tts_from_pair(primary_pair, cfg)
+    except Exception as e:
+        logger.warning(f"⚠️ Primary TTS {primary_pair.id} build failed: {e}. Trying fallback...")
+        if SARVAM_API_KEY and not primary_pair.id.startswith("sarvam"):
+            from ..models import ProviderPair
+            primary_pair = ProviderPair(id="sarvam_bulbul_v3", config={})
+            primary = _build_tts_from_pair(primary_pair, cfg)
+        elif OPENAI_API_KEY and not primary_pair.id.startswith("openai"):
+            from ..models import ProviderPair
+            primary_pair = ProviderPair(id="openai", config={})
+            primary = _build_tts_from_pair(primary_pair, cfg)
+        else:
+            raise
 
     fallback_pair = getattr(cfg.providers, "tts_fallback", None)
     if not fallback_pair:

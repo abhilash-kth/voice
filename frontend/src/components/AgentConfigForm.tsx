@@ -253,9 +253,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [picked, setPicked] = useState<Record<string, string>>(
     editing?.providers
       ? {
-          llm: editing.providers.llm.id,
-          stt: editing.providers.stt.id,
-          tts: editing.providers.tts.id,
+          llm: editing.providers.llm?.id || "groq_gpt_oss_20b",
+          stt: editing.providers.stt?.id || "deepgram_nova2",
+          tts: editing.providers.tts?.id || "google_wavenet_hi",
           telephony: editing.providers.telephony?.id || "browser",
         }
       : {
@@ -574,8 +574,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
 
     // STT, TTS, telephony (same for V2)
     for (const kind of ["stt", "tts", "telephony"] as const) {
-      const pid = picked[kind];
-      if (!pid) continue;
+      const pid = picked[kind] || (kind === "stt" ? "deepgram_nova2" : kind === "tts" ? "google_wavenet_hi" : "browser");
       cfg[kind] = buildProviderEntry(pid);
     }
     if (fallbackEnabled) {

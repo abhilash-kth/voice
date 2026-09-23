@@ -2516,8 +2516,8 @@ async def entrypoint(ctx):
                 llm_cached_input_tokens=llm_cached,
                 llm_ttft_ms=ttft,
                 llm_generation_time_ms=gen_time,
-                stt_provider_id=cfg.providers.stt.id,
-                tts_provider_id=cfg.providers.tts.id,
+                stt_provider_id=cfg.providers.stt.id if (cfg.providers and cfg.providers.stt) else "deepgram_nova2",
+                tts_provider_id=cfg.providers.tts.id if (cfg.providers and cfg.providers.tts) else "google_wavenet_hi",
                 client_rate_per_min=cfg.client_rate_per_min,
             )
             if memory_enabled:
