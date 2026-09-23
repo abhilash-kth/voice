@@ -29,6 +29,14 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 # ---------------------------------------------------------------------------
+# Disable LiveKit agents loop block monitor by default (LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS=0).
+# On Windows and environments with synchronous console logging, the 10ms loop monitor
+# watchdog thread triggers false-positive warnings that stall the event loop for 1.3-7.2s,
+# causing WebRTC transport and STT WebSocket connection timeouts.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS", "0")
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent          # backend/

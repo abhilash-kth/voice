@@ -27,6 +27,15 @@ import aiohttp
 from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
+# Disable LiveKit agents loop block monitor by default (LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS=0).
+# On Windows and environments with synchronous console logging, the 10ms loop monitor
+# watchdog thread triggers false-positive warnings that stall the event loop for 1.3-7.2s,
+# causing WebRTC transport and STT WebSocket connection timeouts.
+# MUST run before livekit is imported so child worker processes inherit it.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS", "0")
+
+# ---------------------------------------------------------------------------
 # Thread limits. Cap the BLAS/math libs to 1 thread (avoids per-thread pool
 # thrashing), but leave ONNX runtime UNTHROTTLED so the local silero VAD can use
 # all cores — throttling it to 1 thread is what made "inference is slower than
@@ -1304,6 +1313,15 @@ async def entrypoint(ctx):
 
     call_start = time.time()
 
+    # Connect to the LiveKit room immediately per LiveKit Agents architecture.
+    # Satisfies the 10-second connection deadline and initializes WebRTC transport
+    # concurrently while agent config and models are prepared.
+    try:
+        await ctx.connect()
+        logger.info("⚡ LiveKit room connected immediately: %s", getattr(ctx.room, "name", ""))
+    except Exception as exc:
+        logger.warning("ctx.connect() warning: %r (session.start will attempt connect)", exc)
+
     # --- Latency fix: DB init was 2.33s per job + 1.13s lookup + 8.62s None->listening
     # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
     # Total 13.5s before user hears greeting. Fix: cache DB init per process, parallel provider build.
@@ -1426,6 +1444,10 @@ async def entrypoint(ctx):
                     })
                 except Exception:
                     pass
+            try:
+                ctx.shutdown()
+            except Exception:
+                pass
             return
         logger.info("[AGENT_SELECTED] room=%s Using default demo agent config", getattr(ctx.room, "name", ""))
         from app.sample import default_config
@@ -2910,6 +2932,7 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
+    os.environ["LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS"] = "0"
     # Silence loop_monitor telemetry in runner processes to avoid slow synchronous console writes
     try:
         logging.getLogger("livekit.agents.telemetry").setLevel(logging.ERROR)
@@ -2966,6 +2989,22 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: async_toolset imported (avoids 101ms import block)")
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
+
+    # Prewarm Pydantic ChatMessage and ChatContext validation schemas off the agent loop.
+    # In Pydantic v2, ChatMessage.__init__ triggers model_rebuild() upon first invocation.
+    # On Windows, this took 7259ms inside entrypoint. Prewarming here compiles it off-loop.
+    try:
+        from app.agents.agent_builder import warm_agent_builder_schemas
+        warm_agent_builder_schemas()
+    except Exception as e:
+        logger.debug(f"ChatMessage prewarm failed: {e}")
+
+    try:
+        from livekit.agents.voice import Agent as _VoiceAgent, room_io as _room_io
+        _ = _room_io.RoomOptions(close_on_disconnect=False, delete_room_on_close=False)
+        logger.info("🔥 Prewarm: Voice Agent & RoomOptions imported")
+    except Exception as e:
+        logger.debug(f"Voice Agent prewarm failed: {e}")
 
     # Warm the Google TTS *credentials* before the first customer response so the
     # ~163-198ms JSON/RSA parse never lands on the agent event loop.
@@ -3038,6 +3077,7 @@ def _worker_load(worker) -> float:
 
 
 if __name__ == "__main__":
+    os.environ["LIVEKIT_AGENTS_LOOP_BLOCK_WARN_MS"] = "0"
     from livekit.agents import WorkerOptions, cli
 
     # Silence runaway loop_monitor telemetry warnings that trigger synchronous console writes
