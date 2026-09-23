@@ -984,7 +984,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                                     self._timing["cache_misses"] = self._timing.get("cache_misses", 0) + 1
                             else:
                                 _ck_key, _ck_status = "n/a", "unsupported"
-                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_chars={self._timing.get('head_chars_log','?')} head_sha={self._timing.get('head_sha','?')} (status only reflects provider usage)")
+                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_tokens_est={self._timing.get('head_est_tokens','?')} stable_head_chars={self._timing.get('head_chars_log','?')} head_sha={self._timing.get('head_sha','?')} head_same_as_previous={self._timing.get('head_stable_prev','?')} (status only reflects provider usage; hash is content-free)")
                         except Exception:
                             pass
                 except Exception as e:
@@ -1095,9 +1095,17 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             # a changing hash is our bug and the diff names the section.
             try:
                 _cc = kwargs.get("chat_ctx")
+                if _cc is None and args:
+                    _cc = args[0]
                 if _cc is not None:
                     import hashlib as _hl
-                    _msgs = list(getattr(_cc, "messages", []) or [])
+                    _mf = getattr(_cc, "messages", None)
+                    # livekit-agents 1.8.2: ChatContext.messages is a METHOD
+                    # (returns list[ChatMessage]) — the previous direct getattr
+                    # produced a bound method, list() raised TypeError, and the
+                    # whole block died in a debug-level except: every production
+                    # request logged stable_head_chars=?/head_sha=?/inflight 0.
+                    _msgs = list(_mf() if callable(_mf) else (_mf or []))
                     def _mtext(m):
                         c = getattr(m, "content", "")
                         if isinstance(c, str):
@@ -1110,10 +1118,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     _hist_msgs = 0
                     _rag_chars = 0
                     _user_last_chars = 0
+                    _dyn_before_head = 0
                     _seen_user = False
+                    _first_sys = None
                     for _i, _m in enumerate(_msgs):
                         _r = getattr(_m, "role", "") or ""
                         _t = _mtext(_m)
+                        if _r == "system" and _first_sys is None and not _seen_user and "[RAG]" not in _t[:80]:
+                            _first_sys = _i
                         if _r == "system" and not _seen_user and "[RAG]" not in _t[:80]:
                             _head.append(_t)
                         elif _r == "system":
@@ -1125,23 +1137,37 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                             else:
                                 _hist_chars += len(_t)
                                 _hist_msgs += 1
-                    _tools = kwargs.get("tools") or []
+                    _tools = kwargs.get("tools")
+                    if _tools is None and len(args) > 1:
+                        _tools = args[1]
+                    _tools = _tools or []
+                    _dyn_before_head = int(_first_sys or 0)
                     _tools_chars = sum(len(str(getattr(_t0, "name", _t0))) + len(str(getattr(_t0, "parameters", ""))) for _t0 in _tools)
                     _head_chars = sum(len(_h) for _h in _head)
-                    _sha = _hl.sha256(("\x1f".join(_head) + "#" + repr(_tools_chars)).encode("utf-8", "ignore")).hexdigest()[:12]
+                    _sha = _hl.sha256(("\x1f".join(_head) + "#tools=" + repr(_tools_chars)).encode("utf-8", "ignore")).hexdigest()[:12]
                     _prev_sha = self._timing.get("head_sha") or ""
-                    _stable = "yes" if (not _prev_sha or _prev_sha == _sha) else "NO(prev=%s)" % _prev_sha
+                    _stable = "yes" if (not _prev_sha or _prev_sha == _sha) else "NO"
                     self._timing["head_sha"] = _sha
-                    self._timing["head_chars_log"] = _head_chars + _tools_chars
+                    self._timing["head_sha_prev"] = _prev_sha
+                    self._timing["head_stable_prev"] = _stable
+                    self._timing["head_chars_log"] = _head_chars
+                    _head_est_t = int(_head_chars / 4.0)
+                    self._timing["head_est_tokens"] = _head_est_t
                     _total_chars = _head_chars + _hist_chars + _rag_chars + _user_last_chars
                     _logger.info(
-                        "🧮 [PROMPT] chars=%d (est≈%dt; billed %s) sections: stable_head=%dc lead? prior? instr | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc | tools_meta=%dc | head_sha=%s head_stable_vs_prev_turn=%s",
-                        _total_chars, int(_total_chars / 4.0) + 8, "see usage", _head_chars, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, _tools_chars, _sha, _stable,
+                        "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc | tools_meta=%dc | head_sha=%s",
+                        _total_chars, int(_total_chars / 4.0), _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, _tools_chars, _sha,
                     )
                     # inflight gauge for spike forensics (Task 5)
                     self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
                     self._timing["_inflight_counted"] = True
             except Exception as _pe:
+                # never silent again: one visible line per call is cheap and this
+                # exact silence is what hid the head_sha instrumentation failure in
+                # the 02:12 call.
+                if not self._timing.get("prompt_acct_warned"):
+                    self._timing["prompt_acct_warned"] = True
+                    _logger.warning("[PROMPT] section accounting failed (once): %r", _pe)
                 _logger.debug(f"[PROMPT] section accounting skipped: {_pe!r}")
             # Reset per-request metrics but preserve provider/model and aggregated billing
             # Preserve aggregated and is_closing
@@ -2019,7 +2045,16 @@ async def _entrypoint_body(ctx, setup_complete):
                                             # listening. That is the proof the greeting AUDIO
                                             # stopped (not just a log). tell the builder on_enter.
                                             turn_timing["greeting_interrupted"] = True
+                                            turn_timing["greeting_bargein_ts"] = time.time()
                                             logger.info("🔇 [GREETING_CANCELLED] generation=%d — greeting audio actually stopped (playout flushed + partial committed)", _g)
+                                            # "when I interrupt the greeting it should ALSO
+                                            # listen": from this instant the floor belongs to
+                                            # the caller. The 6s apology is suppressed while
+                                            # this window is fresh (see _silence_fallback) and
+                                            # the 30s no-response watchdog still guards real
+                                            # silence — the agent waits like a human being
+                                            # interrupted, it does not talk back over them.
+                                            logger.info("👂 [GREETING_LISTENING] caller owns the floor — agent listens until their utterance endpoint-finishes; no apology, no resume")
                                 except Exception:
                                     pass
 
@@ -2310,6 +2345,28 @@ async def _entrypoint_body(ctx, setup_complete):
                 if _m >= _rs:
                     logger.info("🛟 silence watchdog suppressed: reply already streaming/speaking per REAL stream markers (item_added lag)")
                     return
+        except Exception:
+            pass
+        # Barge-in-aware suppression (2026-09-24, "it should also listen"):
+        # this exact apology was spoken OVER the caller right after a
+        # greeting-cancel + interrupted-generation cascade (01:55:41.875 —
+        # caller heard 'Sorry, temporary technical problem' while still
+        # talking, and then asked the agent what the problem was). If a
+        # barge-in/greeting-interrupt just happened, or the caller's speech
+        # onset is <1.2s old (they may still be mid-sentence), SILENCE is the
+        # correct behavior — their next FINAL re-arms everything normally.
+        # Only this apology is suppressed; the 30s no-response watchdog and
+        # every other path are untouched.
+        try:
+            _nowfb = time.time()
+            _gb_age = _nowfb - float(turn_timing.get("greeting_bargein_ts", 0) or 0)
+            _bb_age = _nowfb - float(turn_timing.get("last_bargein_ts", 0) or 0)
+            if _gb_age < LLM_FALLBACK_DELAY + 1.0 or _bb_age < 1.2:
+                logger.info(
+                    "🛟 fallback suppressed: recent interrupt (greeting-barge %.1fs ago, any-barge %.1fs ago) — listening, not speaking over the caller",
+                    _gb_age if _gb_age < 1e9 else -1, _bb_age if _bb_age < 1e9 else -1,
+                )
+                return
         except Exception:
             pass
         logger.warning(
