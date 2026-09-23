@@ -390,42 +390,77 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # Only OpenAI-compatible providers ride on an AsyncOpenAI client: Gemini's
     # plugin builds its own SDK client and would reject these kwargs.
     _native_google = provider_type == "google"
-    # Task 1/5 (2026-09-24 02:12 evidence): max_retries=0 at SDK level AND
-    # llm_conn_options max_retry=0 in the worker mean every request is ONE
-    # HTTP attempt — so the 3549ms TTFT spike cannot be a client-side retry
-    # and could not be a backoff. To prove where that time actually sits we
-    # attach httpx event hooks: send->headers (provider queue+prefill for a
-    # streaming request; first bytes arrive with the first SSE chunk) and
-    # per-attempt counting (a livekit-level retry re-enters here and shows up
-    # as attempt#>1). Same api_key/base_url/model/max_retries as before — this
-    # does not alter behavior, only timestamps; limits/timeout mirror the
-    # plugin's own defaults exactly (livekit conn_options still override the
-    # per-request timeout via with_options).
-    _http_inst = {"n": 0, "send": 0.0}
+    # Task 1/2 (2026-09-24 02:31 post-mortem): the previous hook version used
+    # SYNC callbacks on an AsyncClient — httpx awaits every event hook, so
+    # `await None` raised TypeError inside EVERY request (the regression that
+    # failed all 12 requests of the 02:31 call). The 02:31 run is INVALID for
+    # provider-latency conclusions by this file's fault; nothing below changes
+    # request behavior: api_key/base_url/model/max_retries are exactly as
+    # before, limits/timeout mirror the openai plugin's own defaults
+    # (livekit conn_options still override per-request timeout), and every
+    # hook body is wrapped so instrumentation can never fail a call. Hooks
+    # only READ: the stream is not consumed (the response hook fires on
+    # headers arrival, before any body iteration — that is the
+    # HTTP_RESPONSE_HEADERS boundary; FIRST_STREAM_CHUNK is measured by the
+    # worker's stream wrapper via the shared http_timing store).
+    # Mechanism labels (Task 4 — these are NOT all "SDK retries"):
+    #   A OpenAI SDK retry   → impossible here: max_retries=0; if ever
+    #                           enabled, the x-stainless-retry-count header
+    #                           this line echoes becomes >0 per send.
+    #   B LiveKit FallbackAdapter switching → a NEW chat() on a DIFFERENT
+    #                           instance: visible as the next [PROMPT]/
+    #                           REQUEST START line carrying a different model
+    #                           + llm_instance tag (and library's own
+    #                           "switching to next LLM"/"recovery failed").
+    #   C application duplicate/invalidated generation → the worker's
+    #                           "LLM REQUEST START while previous still
+    #                           active" line, not this one.
+    # client_attempt# counts sends sharing ONE httpx client (per LLM
+    # instance): with B/C above it is a correlation counter, not a retry
+    # claim. Rid joins this line to [HTTP_RESPONSE_HEADERS] and
+    # [HTTP_CHUNK] even when attempts interleave.
+    import uuid as _uuid_mod
     import httpx as _httpx
+    from . import http_timing as _http_timing
+    _http_inst = {"n": 0}
 
-    def _on_http_send(_request):
-        _http_inst["n"] += 1
-        _http_inst["send"] = time.perf_counter()
-        if _http_inst["n"] > 1:
+    async def _on_http_send(_request):
+        try:
+            _http_inst["n"] += 1
+            _rid = _uuid_mod.uuid4().hex[:8]
+            # extensions is httpx-internal metadata, never sent on the wire
+            _request.extensions["voice_rid"] = _rid
+            _http_timing.note_send(model_id, _rid)
             logger.info(
-                "\U0001f310 [HTTP_REQ] model=%s attempt#%d %s %s — multiple attempts on one client mean a livekit-level retry; with max_retries=0 the provider saw ONE request each time",
-                model_id, _http_inst["n"], _request.method, _request.url.path,
+                "\U0001f310 [HTTP_REQUEST_START] rid=%s model=%s client_attempt#%d sdk_retry_count=%s path=%s — one send of one chat() attempt (see B/C distinction in builder comment; SDK retries are disabled by max_retries=0)",
+                _rid, model_id, _http_inst["n"],
+                _request.headers.get("x-stainless-retry-count", "absent"),
+                _request.url.path,
             )
+        except Exception:
+            pass
 
     async def _on_http_headers(_response):
-        _el = (time.perf_counter() - _http_inst["send"]) * 1000.0
-        logger.info(
-            "\U0001f310 [HTTP_TTFB] model=%s send->headers=%.0fms status=%d — for streaming, headers arrive with the first chunk; if this ~ TTFT the delay is provider queue/prefill, not our stack",
-            model_id, _el, _response.status_code,
-        )
+        try:
+            _rid = _response.request.extensions.get("voice_rid", "?")
+            _el = _http_timing.note_headers(_rid, _response.status_code)
+            logger.info(
+                "\U0001f310 [HTTP_RESPONSE_HEADERS] rid=%s model=%s status=%d request_start->response_headers=%s — headers boundary only; first streamed body bytes come later (see [HTTP_CHUNK])",
+                _rid, model_id, _response.status_code,
+                ("%.0fms" % _el) if _el >= 0 else "?",
+            )
+        except Exception:
+            pass
 
-    def _on_http_error(_request):
-        _el = (time.perf_counter() - _http_inst["send"]) * 1000.0
-        logger.warning(
-            "\U0001f310 [HTTP_ERROR] model=%s transport failure %.0fms after send (connect/pool/read) — not provider latency",
-            model_id, _el,
-        )
+    async def _on_http_error(_request):
+        try:
+            _rid = _request.extensions.get("voice_rid", "?")
+            logger.warning(
+                "\U0001f310 [HTTP_ERROR] rid=%s model=%s — transport-level failure (connect/pool/read). The 02:31 TypeError regression came from sync hooks being awaited by httpx; hooks are async since that fix, so a line here now means a real network problem.",
+                _rid, model_id,
+            )
+        except Exception:
+            pass
 
     client = None if _native_google else AsyncOpenAI(
         api_key=api_key, base_url=base_url, max_retries=0,
