@@ -576,6 +576,9 @@ except Exception as e:
 
 # Latency fix globals: cache DB init and agent lookup per process
 _DB_INIT_DONE = False
+# Preemptive gate state of the current call (set by build_assistant_session;
+# read by finalize_billing's [PREEMPTIVE] summary — worker process == one call).
+_PREEMPTIVE_ENABLED_FOR_LOG = False
 _AGENT_CACHE: dict = {}  # key -> {"rec": ..., "ts": float}
 _AGENT_CACHE_TTL = 30.0
 _VAD_CACHE = None
@@ -928,6 +931,26 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                             total_agg_cost = total_cost
                         _logger.info(f"LLM COST [LLM_RESPONSE_COMPLETED] provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${total_cost:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success} aggregated_successful={self._timing.get('successful_requests',0)} total_agg_cost=${total_agg_cost:.6f} is_closing={is_deterministic_closing}")
                         _logger.info(f"📊 BILLING SUMMARY successful={self._timing.get('successful_requests',0)} failed={self._timing.get('failed_requests',0)} total_input={self._timing.get('aggregated_input',0)} total_cached={self._timing.get('aggregated_cached',0)} total_output={self._timing.get('aggregated_output',0)} total_cost=${total_agg_cost:.6f}")
+                        # Task 1 (2026-09-24): explicit cache status per
+                        # request, derived ONLY from provider usage. hit is
+                        # claimed when cached_input_tokens>0 — mere presence
+                        # of the key is never claimed; non-OpenAI paths say
+                        # unsupported instead of pretending.
+                        try:
+                            _cached_now = int(self._cached_tokens or 0)
+                            _is_openai = "openai" in str(prov).lower()
+                            if _is_openai:
+                                _ck_key = f"voice-{model}-v1"
+                                _ck_status = "hit" if _cached_now > 0 else "miss"
+                                if _cached_now > 0:
+                                    self._timing["cache_hits"] = self._timing.get("cache_hits", 0) + 1
+                                else:
+                                    self._timing["cache_misses"] = self._timing.get("cache_misses", 0) + 1
+                            else:
+                                _ck_key, _ck_status = "n/a", "unsupported"
+                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} cached_input_tokens={_cached_now} cache_status={_ck_status} (status only reflects provider usage)")
+                        except Exception:
+                            pass
                 except Exception as e:
                     _logger.debug(f"Could not calculate LLM cost: {e}")
 
@@ -1013,6 +1036,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 prev_start = self._timing.get("request_start", 0)
                 elapsed = _time.time() - prev_start if prev_start else 0
                 _logger.warning(f"⚠️ LLM REQUEST START while previous still active (elapsed {elapsed:.2f}s) - previous will be cancelled and return 0/0, this is duplicate/invalidated request. Ensuring exactly one valid per turn by marking previous as invalidated, not failed.")
+                self._timing["overlapping_starts"] = self._timing.get("overlapping_starts", 0) + 1
                 # Mark previous as invalidated, not failed, to prevent duplicate counting
                 # Don't increment failed_requests for superseded preemptive/invalidated
                 # The new request will be the valid one for this turn
@@ -1290,6 +1314,18 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     
     # Verify runtime Session config will have preemptive disabled
     logger.info(f"🔧 FINAL Session config verification: preemptive={preemptive_enabled} (env {env_preemptive}, rag_enabled {rag_enabled}, has_kb {has_kb}) - must be False when RAG enabled to prevent duplicate")
+    # Task 2 (2026-09-24): the gate is architectural, not timid. 1.8.x builds
+    # speculative generations from the bare agent.chat_ctx WITHOUT running
+    # on_user_turn_completed (agent_activity.on_preemptive_generation), then
+    # reuses one only if the ctx is still equivalent at commit. Per-turn RAG
+    # injection mutates the committed ctx, so speculation on knowledge turns is
+    # generated UNGROUNDED (~3K tokens billed) and discarded; on non-injected
+    # turns (pure ACKs) a speculative reply could be REUSED and bypass the
+    # deterministic ack path. Keeping it off is the safe answer the spec asks
+    # for; enabling needs a context-stable design, not a flag flip.
+    logger.info(f"🔇 [PREEMPTIVE] enabled={preemptive_enabled} reason='per-turn RAG injection makes speculative ctx stale (guaranteed discard+billed); reuse would bypass deterministic ACKs' started=0 cancelled=0 reused=0 completed=0")
+    global _PREEMPTIVE_ENABLED_FOR_LOG
+    _PREEMPTIVE_ENABLED_FOR_LOG = bool(preemptive_enabled)
     
     logger.info(
         f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), "
@@ -1901,6 +1937,7 @@ async def _entrypoint_body(ctx, setup_complete):
             # anyway (STT endpointing).
             if is_final and text.strip():
                 logger.info("📝 [USER_TRANSCRIPT_FINAL] '%s'", text.strip()[:80])
+                turn_timing["stt_final_ts"] = time.time()
                 # One call does it all: cancels the armed window (single
                 # [WATCHDOG_CANCELLED]+[WATCHDOG_ARMED] log) and starts a fresh
                 # full window measured from this utterance.
@@ -2636,7 +2673,7 @@ async def _entrypoint_body(ctx, setup_complete):
                         turn_timing["ttft_ms"] = 0.0
                         turn_timing["generation_time_ms"] = 0.0
             _real_audio_ms = turn_timing.get("last_speech_end_to_first_audio", 0)
-            _real_note = f"REAL first audio at {_real_audio_ms:.0f}ms after speech_end" if _real_audio_ms else "first audio not measured this turn (TTS unwrapped by design)"
+            _real_note = f"REAL first audio at {_real_audio_ms:.0f}ms after speech_end (tts_node probe)" if _real_audio_ms else "no audio frame reached the tts_node this turn (silent turn or interrupted before speech)"
             logger.info(f"🗣️ TTS (LLM complete): {cleaned} (transcript-only event; {_real_note})")
 
     session.on("conversation_item_added", on_item_added)
@@ -2806,6 +2843,7 @@ async def _entrypoint_body(ctx, setup_complete):
                     turn_timing["assistant_output_received"] = False
 
         elif ev.new_state == "listening" and prev == "speaking":
+            turn_timing["playout_end_ts"] = time.time()
             # Agent finished speaking, now listening: estimate speech_end for next turn
             # Reset timing for next turn, but keep last turn's metrics for final calc
             # Actually speech_end will be set when user starts speaking? We need VAD hook.
@@ -3106,6 +3144,28 @@ async def _entrypoint_body(ctx, setup_complete):
                         avg_ttft = sum(r['ttft'] for r in successful_reqs) / len(successful_reqs)
                         avg_gen = sum(r['gen_time'] for r in successful_reqs) / len(successful_reqs)
                         logger.info(f"📊 FINAL BILLING averages across {len(successful_reqs)} successful: avg TTFT {avg_ttft:.0f}ms avg gen_time {avg_gen:.0f}ms last TTFT {ttft:.0f}ms last gen {gen_time:.0f}ms")
+                # Task 1/2/3 call-level metric summaries (real numbers only).
+                try:
+                    _ch = int(turn_timing.get("cache_hits", 0) or 0)
+                    _cm = int(turn_timing.get("cache_misses", 0) or 0)
+                    _cached_total = sum(int(r.get("cached", 0) or 0) for r in all_reqs if r.get("success"))
+                    _openai_any = any("openai" in str(r.get("provider", "")).lower() for r in all_reqs)
+                    if _ch > 0:
+                        _cache_verdict = "working"
+                    elif _openai_any:
+                        _cache_verdict = "not_engaging (key armed+verified; provider reports 0 cached — stable prefix likely below the 1024-token minimum or no cache routing; see per-request [CACHE] lines)"
+                    else:
+                        _cache_verdict = "unsupported (no OpenAI path in this call)"
+                    logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} hits={_ch} misses={_cm} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
+                    logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 completed=0 overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
+                    _ls = turn_timing.get("latency_samples", [])
+                    if _ls:
+                        def _avg(k, _src=_ls):
+                            _v = [x[k] for x in _src if isinstance(x, dict) and x.get(k) is not None and x[k] >= 0]
+                            return (sum(_v) / len(_v)) if _v else float("nan")
+                        logger.info(f"🔊 [LATENCY] summary over {len(_ls)} spoken turns: avg speech_to_first_audio_ms={_avg('speech_end_to_first_audio_ms'):.0f} avg ttft_to_first_audio_ms={_avg('tts_synth_ms'):.0f} avg turn_commit_ms={_avg('turn_commit_ms'):.0f} (first audio measured on the REAL TTS frame stream via Agent.tts_node)")
+                except Exception as _le:
+                    logger.debug(f"call metric summaries skipped: {_le!r}")
                 
                 if ttft == 0 and gen_time == 0:
                     logger.warning(f"⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")

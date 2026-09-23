@@ -515,6 +515,23 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     try:
         llm_instance = _instantiate_llm(provider_type, llm_kwargs)
         logger.info(f"✅ LLM instance built successfully: provider={provider} model={model_id} provider_type={provider_type}")
+        # Task 1 (2026-09-24): don't CLAIM caching — verify the key survived
+        # constructor -> plugin options. livekit-plugins-openai >=1.8 maps
+        # OpenAILLMOptions.prompt_cache_key into chat() create kwargs
+        # (llm.py: `_opts.prompt_cache_key` -> top-level param); if the
+        # installed plugin is older, the option is silently dead and cached
+        # tokens stay 0 forever -> say so loudly instead of pretending.
+        try:
+            _ck = getattr(getattr(llm_instance, "_opts", None), "prompt_cache_key", None)
+            if provider_type == "openai":
+                if _ck:
+                    logger.info("🗄️ [CACHE] provider=openai model=%s cache_key=%s status=armed (key verified in plugin options; hit/miss is only reported from real usage.prompt_tokens_details.cached_tokens)", model_id, _ck)
+                else:
+                    logger.warning("🗄️ [CACHE] provider=openai model=%s status=unsupported — prompt_cache_key did NOT reach the plugin's create kwargs (plugin too old or kwarg dropped); cached_input_tokens will stay 0; upgrade livekit-plugins-openai>=1.8 to enable", model_id)
+            else:
+                logger.info("🗄️ [CACHE] provider=%s model=%s cache_status=unsupported (prompt_cache_key is OpenAI-only; compatible endpoints reject it)", provider, model_id)
+        except Exception as _cke:
+            logger.debug(f"cache-key verification skipped: {_cke!r}")
         return llm_instance
     except Exception as e:
         logger.error(
@@ -1290,21 +1307,10 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             "acknowledgment twice in a row."
         )
     lines.append(
-        "ACKNOWLEDGEMENT TURNS (critical): if the caller's whole message is only an "
-        "acknowledgement or filler (e.g. 'Ok', 'haan', 'ठीक है', 'nice', 'good', 'yes ji'), "
-        "it is NOT a question. Do NOT answer it with facts, do NOT repeat or re-list "
-        "anything already said, and do NOT introduce prices, addresses, names or numbers. "
-        "Reply with at most one short warm line (e.g. 'जी, बताइए।' / 'जी।') or, if the "
-        "caller still has an unanswered question from before, finish only that. "
-        "Never state a fact twice in the same call — the caller heard it already."
-    )
-    lines.append(
-        "INCOMPLETE TURNS (critical): callers who think out loud send half-questions "
-        "(e.g. 'अच्छा यह बताओ' with no object, 'मुझे यह…', trailing 'कि', 'और', or a "
-        "hold-on like 'एक minute'). These are NOT questions yet — do NOT answer them "
-        "with facts, and do NOT guess what was meant. Reply with a single short line "
-        "like 'जी, पूछिए।' / 'जी, बताइए।' and wait. Never repeat a fact you already "
-        "gave in this call, even as part of another answer."
+        "ACK/INCOMPLETE TURNS: pure acknowledgements and trailing half-questions ('कि', "
+        "'और', 'एक minute') are handled deterministically BEFORE you are called; if one "
+        "still reaches you, reply with at most one short warm line ('जी।' / 'जी, बताइए।') "
+        "— never facts, never a repeated statement, never guess what was meant."
     )
     lines.append(
         "Behave like a warm human receptionist. Never repeat yourself, never push "
@@ -1741,6 +1747,77 @@ def build_voice_agent(
                     return _skip()
             return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
+        async def tts_node(self, text, model_settings):
+            """Measure the FIRST assistant audio frame per speech (Task 3).
+
+            Deliberately NOT a TTS-object wrapper — an earlier experiment that
+            wrapped the TTS instance broke the greeting (see worker's
+            "TTS left unwrapped" note). Instead we override the agent's
+            tts_node hook, call the library default (which owns
+            synthesize/segmenting/aligned transcripts and works with ANY
+            provider behind it, including the FallbackAdapter), and wrap only
+            the frame generator. Zero added latency: it is a pass-through
+            async for. Stamps exactly the keys the existing turn-summary code
+            already understands (tts_request / first_tts_audio /
+            first_audio / last_speech_end_to_first_audio) so the 🗣️ TTS line
+            upgrades from "audio not measured" to REAL audio automatically.
+            """
+            res = Agent.default.tts_node(self, text, model_settings)
+            if asyncio.iscoroutine(res):
+                res = await res
+            tt = self._turn_timing_ref
+            if res is None or tt is None:
+                return res
+            tt["tts_request"] = time.time()
+            _logger = logging.getLogger("voice-agent-saas-agent-builder")
+
+            async def _probe():
+                _first = True
+                async for frame in res:
+                    if _first:
+                        _first = False
+                        if float(tt.get("first_tts_audio", 0) or 0) == 0.0:
+                            _now = time.time()
+                            tt["first_tts_audio"] = _now
+                            tt["first_audio"] = _now
+                            _se = float(tt.get("speech_end", 0) or 0)
+                            _sf = float(tt.get("stt_final_ts", 0) or 0)
+                            _tc = float(tt.get("turn_commit_ts", 0) or 0)
+                            _ft = float(tt.get("first_token", 0) or 0)
+                            _ttft = float(tt.get("ttft_ms", 0) or 0)
+                            def _ms(a, b):
+                                return f"{(b - a) * 1000:.0f}ms" if a and b and b >= a else "na"
+                            _synth_ms = int((_now - _ft) * 1000) if _ft else -1
+                            _s2fa = (tt["first_tts_audio"] - _se) * 1000 if _se else 0.0
+                            if _s2fa > 0:
+                                tt["last_speech_end_to_first_audio"] = _s2fa
+                            _logger.info(
+                                "🔊 [FIRST_ASSISTANT_AUDIO] t=%.3f (generation=%s)",
+                                _now, tt.get("gen", 0),
+                            )
+                            _logger.info(
+                                "⏱️ [LATENCY] stt_final_ms=%s turn_commit_ms=%s llm_ttft_ms=%s tts_first_audio_ms=%s speech_to_first_audio_ms=%s",
+                                _ms(_se, _sf) if _sf else "na",
+                                _ms(_sf if _sf else _se, _tc),
+                                f"{_ttft:.0f}ms" if _ttft else "na",
+                                f"{_synth_ms}ms" if _synth_ms >= 0 else "na",
+                                f"{_s2fa:.0f}ms" if _s2fa > 0 else "na",
+                            )
+                            try:
+                                _samples = tt.setdefault("latency_samples", [])
+                                if len(_samples) < 40:
+                                    _samples.append({
+                                        "speech_end_to_first_audio_ms": round(_s2fa) if _s2fa > 0 else None,
+                                        "ttft_ms": round(_ttft) if _ttft else None,
+                                        "tts_synth_ms": _synth_ms if _synth_ms >= 0 else None,
+                                        "turn_commit_ms": round((_tc - _sf) * 1000) if _tc and _sf else None,
+                                    })
+                            except Exception:
+                                pass
+                    yield frame
+
+            return _probe()
+
         async def on_enter(self) -> None:
             # Assistant mode: greet as soon as the caller can hear, then listen.
             self._opening_started = True
@@ -1801,6 +1878,8 @@ def build_voice_agent(
             try:
                 _turn_marker_text = _chat_msg_text(new_message).strip()
                 logger.info("🗣️ [USER_TURN_COMPLETED] user turn committed: '%s'", _turn_marker_text[:80])
+                if self._turn_timing_ref is not None:
+                    self._turn_timing_ref["turn_commit_ts"] = time.time()
             except Exception:
                 pass
             try:
