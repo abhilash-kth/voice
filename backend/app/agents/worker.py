@@ -22,7 +22,9 @@ import sys
 import asyncio
 import logging
 import time
+import uuid
 import json
+import traceback
 import aiohttp
 from typing import Any, Iterator, Optional
 
@@ -87,7 +89,8 @@ try:  # noqa: E402
 except ImportError:  # package is optional (pip install livekit-plugins-sarvam)
     _sarvam_plugin = None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from app.config import setup_logging
+setup_logging()
 logger = logging.getLogger("voice-agent-saas-worker")
 
 # FIX: 314ms synchronous SSL initialization block on LiveKit agent event loop
@@ -498,6 +501,40 @@ async def warm_tts_off_loop(tts_inst: Any, timeout: float = 3.0) -> bool:
     return warmed
 
 
+# ---------------------------------------------------------------------------
+# Call-failure surfacing
+# ---------------------------------------------------------------------------
+async def _mark_call_failed(call_id: str, user_id: str, error: str) -> None:
+    """Best-effort: record WHY a call failed so the UI can surface it.
+
+    Called from the worker's failure path. The DB may not be initialized yet
+    (the failure may have happened before DB init), so init on the agent loop
+    with a short timeout and give up quietly if unavailable — the room is still
+    cut and the job still shuts down by the caller. The reason lands in the
+    call row's `usage` JSON (`{"error": ...}`), which the UI reads while the
+    caller is still in the "waiting for agent" state.
+    """
+    if not call_id:
+        return
+    global _DB_INIT_DONE
+    try:
+        if not _DB_INIT_DONE:
+            try:
+                await asyncio.wait_for(db_init(), timeout=6)
+                _DB_INIT_DONE = True
+            except Exception as e:
+                logger.warning(f"Could not init DB to mark call {call_id} failed: {e!r}")
+                return
+        await repo.update_call(call_id, {
+            "status": "failed",
+            "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+            "usage": {"error": (error or "unknown worker error")[:2000]},
+        })
+        logger.info(f"⛔ Call {call_id} marked failed with reason: {error[:300]}")
+    except Exception as e:
+        logger.warning(f"Could not mark call {call_id} failed in DB: {e!r}")
+
+
 try:
     import google.auth.crypt._cryptography_rsa
     import google.auth._service_account_info
@@ -770,7 +807,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                         self._timing["ttft_ms"] = ttft
                         prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                         model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                        _logger.info(f"LLM TTFT provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
+                        _logger.info(f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
                         if self._timing.get("llm_start", 0) > 0:
                             _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
                         if self._timing.get("speech_end", 0) > 0:
@@ -811,7 +848,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 # Only consider successful if output>0 or assistant_output_received, and not closing
                 is_success = (self._output_tokens > 0 or self._timing.get("assistant_output_received", False)) and not is_deterministic_closing
                 if is_success:
-                    # Update last_successful_metrics for billing preservation
+                    # Preserve last successful turn metrics for final billing
                     try:
                         self._timing["last_ttft"] = self._timing.get("ttft_ms", 0)
                         self._timing["last_gen_time"] = gen_time
@@ -875,7 +912,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                                         total_agg_cost += c['total_llm_cost']
                         except Exception:
                             total_agg_cost = total_cost
-                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${total_cost:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success} aggregated_successful={self._timing.get('successful_requests',0)} total_agg_cost=${total_agg_cost:.6f} is_closing={is_deterministic_closing}")
+                        _logger.info(f"LLM COST [LLM_RESPONSE_COMPLETED] provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${total_cost:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success} aggregated_successful={self._timing.get('successful_requests',0)} total_agg_cost=${total_agg_cost:.6f} is_closing={is_deterministic_closing}")
                         _logger.info(f"📊 BILLING SUMMARY successful={self._timing.get('successful_requests',0)} failed={self._timing.get('failed_requests',0)} total_input={self._timing.get('aggregated_input',0)} total_cached={self._timing.get('aggregated_cached',0)} total_output={self._timing.get('aggregated_output',0)} total_cost=${total_agg_cost:.6f}")
                 except Exception as e:
                     _logger.debug(f"Could not calculate LLM cost: {e}")
@@ -893,14 +930,34 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
         async def __aenter__(self):
             # Resolve inner if it's a coroutine (some LLM impls have async chat)
             inner = self._inner_orig
-            if _asyncio.iscoroutine(inner):
-                inner = await inner
-            self._inner_cm = inner
-            # Enter inner CM
-            if hasattr(inner, '__aenter__'):
-                stream = await inner.__aenter__()
-            else:
-                stream = inner
+            try:
+                if _asyncio.iscoroutine(inner):
+                    inner = await inner
+                self._inner_cm = inner
+                # Enter inner CM
+                if hasattr(inner, '__aenter__'):
+                    stream = await inner.__aenter__()
+                else:
+                    stream = inner
+            except BaseException as e:
+                # P6 root-cause hardening: a request that dies BEFORE streaming
+                # (provider/client raised, e.g. the observed
+                # "APIStatusError.__init__() missing 2 required positional
+                # arguments" crash) used to leave llm_active=True forever —
+                # TimingStreamWrapper's finally never ran. The stale flag
+                # suppressed empty-turn diagnostics (state held "thinking") and
+                # made wedges invisible. Clear per-request state, log loudly,
+                # re-raise unchanged so LiveKit's own error path proceeds.
+                self._timing["llm_active"] = False
+                _fail_now = _time.time()
+                self._timing["generation_complete"] = _fail_now
+                self._timing["llm_complete"] = _fail_now
+                _logger.error(
+                    "❌ LLM REQUEST FAILED BEFORE STREAM [LLM_RESPONSE_COMPLETED] "
+                    f"provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} "
+                    f"error={type(e).__name__}: {e} — llm_active cleared, turn not dropped"
+                )
+                raise
             self._inner_stream = stream
             return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start)
 
@@ -980,7 +1037,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', '') or 'unknown'
             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', '') or getattr(self._inner, 'model', 'unknown') or 'unknown'
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
-            _logger.info(f"LLM REQUEST START provider={prov} model={model} base_url={base_url} request_start={request_start}")
+            _logger.info(f"LLM REQUEST START [LLM_RESPONSE_STARTED] provider={prov} model={model} base_url={base_url} request_start={request_start}")
             try:
                 inner_result = self._inner.chat(*args, **kwargs)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
@@ -1127,13 +1184,27 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # after 0.25s + 1 word) made the agent jump in on every breath and read as
     # robotic; worse, every false barge-in pushes a speech handle into LiveKit's
     # interrupt path — where the repeated 5s timeout errors came from.
-    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.35"))
+    # min_delay: how long the session waits after the last STT final before it
+    # assumes the user is done. The STT final itself already implies ~200ms of
+    # detected silence (Deepgram endpointing_ms=200), so 0.25s here keeps the
+    # total speech_end->LLM start near 450-550ms without cutting off natural
+    # Hindi mid-sentence pauses (0.1s would). Bump via VOICE_ENDPOINTING_MIN if
+    # callers get cut off; drop toward 0.15 only if the agent feels slow.
+    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.25"))
     max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
-    # min_words is the knob that actually gates interruptions in LiveKit; a
-    # 0.5s / 2-word floor filters coughs, "hmm", and echo without making the
-    # agent feel un-interruptible.
-    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.5"))
+    # Interruption = the human barge-in contract:
+    #  * min_words=2 is the semantic gate — a lone "haan/hmm/ok" backchannel or a
+    #    cough must NOT cut the agent off mid-sentence (humans don't stop for
+    #    those either), while a real 2+ word barge-in stops it immediately.
+    #  * min_duration=0.35 (was 0.5) — once the gate passes, cut fast; a human
+    #    stops talking within ~200-400ms of being spoken over.
+    #  * resume_false_interruption keeps LiveKit's automatic recovery: if a
+    #    "barge-in" turns out to be noise (no words, silence), the agent resumes
+    #    its sentence instead of dying — false_interruption_timeout controls how
+    #    quickly it recovers (default SDK 2.0s felt like a freeze; 1.5s here).
+    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.35"))
     min_interruption_words = int(os.getenv("VOICE_MIN_INTERRUPTION_WORDS", "2"))
+    false_interruption_timeout = float(os.getenv("VOICE_FALSE_INTERRUPTION_TIMEOUT", "1.5"))
     allow_interruptions = os.getenv("VOICE_ALLOW_INTERRUPTIONS", "1") == "1"
     turn_detection_mode = os.getenv("VOICE_TURN_DETECTION", "stt").strip().lower()
     if turn_detection_mode not in ("vad", "stt", "realtime_llm", "manual"):
@@ -1198,7 +1269,8 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         f"preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, "
         f"endpointing={min_delay}/{max_delay}, "
         f"interruption={'on' if allow_interruptions else 'off'} "
-        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words})"
+        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words}, "
+        f"false_resume={false_interruption_timeout}s)"
     )
 
     return AgentSession(
@@ -1215,6 +1287,8 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
                 "mode": "vad",
                 "min_duration": min_interruption_duration,
                 "min_words": min_interruption_words,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": false_interruption_timeout,
             },
             "preemptive_generation": {
                 "enabled": preemptive_enabled,
@@ -1236,6 +1310,14 @@ def build_announcement_session(cfg: AgentConfig):
         tts=build_tts(cfg),
         conn_options=_build_conn_options(),
         turn_handling={
+            # Announcement has no STT/VAD at all, so the library's default
+            # "vad"-style turn detector can only fail: every call logs
+            # "TurnDetector requires a VAD model" and the session runs on a
+            # half-configured detector. "manual" is the honest setting — the
+            # script is a single non-interactive playback; end-of-utterance
+            # detection is irrelevant here (assistant calls keep their own
+            # turn_detection=stt path untouched).
+            "turn_detection": "manual",
             "endpointing": {"min_delay": 0.2, "max_delay": 0.5},
             "interruption": {"enabled": False},          # the script must not be cut off
             "preemptive_generation": {"enabled": False},
@@ -1292,6 +1374,99 @@ async def start_egress(room: str) -> Optional[str]:
 # Entrypoint
 # ---------------------------------------------------------------------------
 async def entrypoint(ctx):
+    """LiveKit job entrypoint — the worker's failure contract.
+
+    Any exception during setup (agent load, provider build, session start) used
+    to kill the job silently: the room stayed open with no agent, the UI waited
+    on "Waiting for agent to connect..." forever, and the call row stayed
+    "planned". Now every setup failure:
+
+      1. logs CRITICAL with the full traceback,
+      2. marks the call "failed" in the DB with the reason (the UI polls this
+         and shows the caller the real error instead of an endless spinner),
+      3. deletes the room (the caller's browser disconnects instead of hanging
+         in a silent room),
+      4. shuts the job down (frees the worker process for the next dispatch).
+
+    A 90-second setup watchdog additionally force-fails jobs whose setup hangs
+    (stuck provider build / DB init / dead loop) so one sick job can't clog
+    dispatch — the classic "second call goes silent" symptom.
+    """
+    # FIRST observable link of the dispatch chain on the worker side. If the
+    # API logs CALL_START -> ROOM_CREATED -> AGENT_DISPATCH_SENT but this line
+    # never appears, LiveKit never offered the job to this worker (dispatch
+    # dropped / worker not registered at dispatch time) — never a code issue.
+    try:
+        _md = getattr(getattr(ctx, "job", None), "metadata", "") or ""
+        logger.info(
+            "[JOB_RECEIVED] room=%s job_id=%s worker_agent=%s metadata=%s",
+            getattr(getattr(ctx, "room", None), "name", ""),
+            getattr(getattr(ctx, "job", None), "id", ""),
+            WORKER_AGENT_NAME,
+            _md[:200],
+        )
+        # P9 lifecycle marker: the job is now owned by THIS process (pid ties
+        # every later log line to a concrete runner process — two "initializing
+        # job runner" lines are two idle processes, not two worker instances).
+        logger.info(
+            "[JOB_ACCEPTED] job_id=%s room=%s pid=%s agent_name=%s",
+            getattr(getattr(ctx, "job", None), "id", ""),
+            getattr(getattr(ctx, "room", None), "name", ""),
+            os.getpid(),
+            WORKER_AGENT_NAME,
+        )
+    except Exception:
+        pass
+    setup_complete = {"done": False}
+
+    async def _setup_watchdog():
+        try:
+            await asyncio.sleep(90.0)
+        except asyncio.CancelledError:
+            return
+        if not setup_complete["done"]:
+            logger.critical(
+                "⛔ Setup exceeded 90s — force-shutting job to free the worker "
+                "process (stuck provider build / DB init / event loop)"
+            )
+            try:
+                ctx.shutdown()
+            except Exception:
+                pass
+
+    watchdog_task = asyncio.create_task(_setup_watchdog())
+    try:
+        await _entrypoint_body(ctx, setup_complete)
+    except Exception as e:
+        logger.critical(
+            "WORKER_JOB_SETUP_FAILED room=%s: %s: %s\n%s",
+            getattr(ctx.room, "name", ""), type(e).__name__, e, traceback.format_exc(),
+        )
+        try:
+            meta = json.loads(ctx.job.metadata or "{}")
+        except Exception:
+            meta = {}
+        await _mark_call_failed(
+            meta.get("call_id", ""), meta.get("user_id", ""), f"{type(e).__name__}: {e}"
+        )
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
+        try:
+            ctx.shutdown()
+        except Exception:
+            pass
+        raise
+    finally:
+        if not watchdog_task.done():
+            watchdog_task.cancel()
+
+
+async def _entrypoint_body(ctx, setup_complete):
     from livekit.agents import AgentSession
     from app.agents.agent_builder import (
         build_vad,
@@ -1303,6 +1478,15 @@ async def entrypoint(ctx):
     )
 
     call_start = time.time()
+
+    # Connect to the LiveKit room immediately per LiveKit Agents architecture.
+    # Satisfies the 10-second connection deadline and initializes WebRTC transport
+    # concurrently while agent config and models are prepared.
+    try:
+        await ctx.connect()
+        logger.info("⚡ LiveKit room connected immediately: %s", getattr(ctx.room, "name", ""))
+    except Exception as exc:
+        logger.warning("ctx.connect() warning: %r (session.start will attempt connect)", exc)
 
     # --- Latency fix: DB init was 2.33s per job + 1.13s lookup + 8.62s None->listening
     # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
@@ -1323,62 +1507,6 @@ async def entrypoint(ctx):
     except Exception as _e:
         logger.debug(f"SSL ensure failed: {_e!r}")
 
-    db_t0 = time.time()
-    db_just_initialized = False
-    if not _DB_INIT_DONE:
-        try:
-            # DB init MUST run on the agent's own event loop.
-            #
-            # An earlier version ran it as
-            #   asyncio.to_thread(lambda: asyncio.new_event_loop().run_until_complete(db_init()))
-            # which connected the *process-wide* Prisma singleton (engine +
-            # httpx connection pool) to a throwaway loop in a worker thread. The
-            # next real query — repo.get_agent() on the agent loop — then hung
-            # until the 3s lookup timeout, showing up as
-            #   "agent lookup attempt 1/2 failed (3.01s): "  (empty message = TimeoutError)
-            # and adding ~4.5s before the greeting.
-            #
-            # The 1359ms SSL block this hack was working around is already fixed
-            # globally by the cached httpx/SSL-context patch at import time, so
-            # connecting on-loop is cheap now. One synchronous piece remains in
-            # connect(): prisma_client first verifies the engine binary with
-            # `prisma-engine --version` via subprocess (~200ms on Windows).
-            # Run that check off the audio loop once, before connecting.
-            try:
-                def _ensure_prisma_engine_binary() -> bool:
-                    import importlib
-                    for mod_base in ("prisma_client", "prisma"):
-                        try:
-                            paths = importlib.import_module(f"{mod_base}.binaries.paths")
-                            utils = importlib.import_module(f"{mod_base}.engine.utils")
-                            utils.ensure(paths.BINARY_PATHS.query_engine)
-                            return True
-                        except Exception:
-                            continue
-                    return False
-                if await asyncio.to_thread(_ensure_prisma_engine_binary):
-                    logger.info("🔥 Prewarm: Prisma engine binary verified off-loop (avoids ~200ms subprocess spawn on agent loop during DB connect)")
-            except Exception:
-                pass  # db_init() will do the check itself; never block the call
-            await asyncio.wait_for(db_init(), timeout=8)
-            _DB_INIT_DONE = True
-            db_just_initialized = True
-            logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
-        except Exception as exc:
-            logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
-    else:
-        # A reused job process gets a new event loop. db.init() reconnects when
-        # the previous client is bound to a dead loop; skipping it hangs the
-        # next call and the worker looks like it stopped.
-        try:
-            await asyncio.wait_for(db_init(), timeout=5)
-            logger.info("⏱️ DB init rechecked on this event loop")
-        except Exception as exc:
-            _DB_INIT_DONE = False
-            logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
-
-    # Agent lookup cache (in-memory, 30s TTL) to avoid 1.13s DB hit per call
-
     try:
         meta = json.loads(ctx.job.metadata or "{}")
     except Exception:
@@ -1388,66 +1516,124 @@ async def entrypoint(ctx):
     phone = meta.get("phone")
     call_id = meta.get("call_id", "")
     user_id = meta.get("user_id", "")
-    # Per-lead data for dynamic scripts (bulk-call campaigns). Every lead's columns
-    # can be referenced in the greeting/announcement text as {column_name}.
     lead_data = meta.get("lead_data") or {}
 
+    logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
+    logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
+
     rec = None
-    # Always load the agent the user just selected. A 30s cache made
-    # "hang up, pick another agent, call again" run the previous config.
-    if agent_id and user_id:
-        lookup_t0 = time.time()
-        # Right after a fresh connect the first query still pays the cold TLS
-        # handshake to Postgres/Neon (~1.5-4s). Cancelling it at 3s and retrying
-        # just wastes 3s and can leave the engine's connection pool in a bad
-        # state, so give a cold first attempt more room.
-        timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
-        for attempt in range(2):  # Reduced from 3 to 2 attempts for faster fail
+    if agent_id:
+        try:
+            from app.config import DATA_DIR
+            cache_file = DATA_DIR / f"agent_{agent_id}.json"
+            if cache_file.exists():
+                rec = json.loads(cache_file.read_text(encoding="utf-8"))
+                logger.info("⚡ Fast-path: Agent '%s' loaded from local cache in 0ms (no DB delay)", rec.get("name", agent_id))
+        except Exception as exc:
+            logger.warning("Could not read agent cache file: %r", exc)
+
+    if rec is not None:
+        # Warm DB connection in background so billing/cleanup at end of call is instant
+        if not _DB_INIT_DONE:
+            async def _bg_db_init():
+                global _DB_INIT_DONE
+                try:
+                    await asyncio.wait_for(db_init(), timeout=10)
+                    _DB_INIT_DONE = True
+                    logger.info("⏱️ Background DB init completed ready for billing")
+                except Exception as exc:
+                    logger.warning("Background DB init failed: %r", exc)
+            asyncio.create_task(_bg_db_init())
+    else:
+        db_t0 = time.time()
+        db_just_initialized = False
+        if not _DB_INIT_DONE:
             try:
-                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
-                logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
-                break
+                try:
+                    def _ensure_prisma_engine_binary() -> bool:
+                        import importlib
+                        for mod_base in ("prisma_client", "prisma"):
+                            try:
+                                paths = importlib.import_module(f"{mod_base}.binaries.paths")
+                                utils = importlib.import_module(f"{mod_base}.engine.utils")
+                                utils.ensure(paths.BINARY_PATHS.query_engine)
+                                return True
+                            except Exception:
+                                continue
+                        return False
+                    if await asyncio.to_thread(_ensure_prisma_engine_binary):
+                        logger.info("🔥 Prewarm: Prisma engine binary verified off-loop")
+                except Exception:
+                    pass
+                await asyncio.wait_for(db_init(), timeout=8)
+                _DB_INIT_DONE = True
+                db_just_initialized = True
+                logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
             except Exception as exc:
-                # %r, not %s: a bare TimeoutError stringifies to "" and the old
-                # log line read "failed (3.01s): " with no reason at all.
-                logger.warning(
-                    "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
-                    attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
-                )
-                if attempt < 1:
-                    await asyncio.sleep(0.15)
+                logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
+        else:
+            try:
+                await asyncio.wait_for(db_init(), timeout=5)
+                logger.info("⏱️ DB init rechecked on this event loop")
+            except Exception as exc:
+                _DB_INIT_DONE = False
+                logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
+
+        if agent_id and user_id:
+            lookup_t0 = time.time()
+            timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
+            for attempt in range(2):
+                try:
+                    rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
+                    logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
+                        attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
+                    )
+                    if attempt < 1:
+                        await asyncio.sleep(0.15)
 
     if rec is None:
-        # fall back to the default demo agent so the worker never crashes
-        logger.error(
-            "❌ Could not load agent_id=%s — the worker is still running, but this "
-            "call will use the demo agent. End it and start again with the agent you selected.",
-            agent_id,
-        )
+        if agent_id and agent_id != "demo":
+            logger.error(
+                "[CALL_ERROR] room=%s Agent '%s' not found for user %s. Refusing silent fallback.",
+                getattr(ctx.room, "name", ""), agent_id, user_id,
+            )
+            if call_id and user_id:
+                try:
+                    await repo.update_call(call_id, {
+                        "status": "failed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+                except Exception:
+                    pass
+            try:
+                ctx.shutdown()
+            except Exception:
+                pass
+            return
+        logger.info("[AGENT_SELECTED] room=%s Using default demo agent config", getattr(ctx.room, "name", ""))
         from app.sample import default_config
         cfg = default_config()
-        agent_id = agent_id or "demo"
+        agent_id = "demo"
     else:
         cfg = AgentConfig(**rec)
 
     logger.info(f"📞 agent={cfg.name} mode={mode} phone={phone} call={call_id}")
 
-    # Ensure the call record exists / is in-progress.
-    call_record = None
-    if call_id and user_id:
-        call_record = await repo.get_call(call_id, user_id)
-    if call_record is None:
-        call_record = await repo.create_call({
-            "user_id": user_id or "demo",
-            "agent_id": agent_id or "demo",
-            "mode": mode,
-            "phone": phone or None,
-            "room": ctx.room.name,
-            "status": "in-progress",
-            "started_at": time.strftime("%Y-%m-%d %H:%M"),
-        })
-    else:
-        await repo.update_call(call_record["id"], {"status": "in-progress", "room": ctx.room.name})
+    # Ensure the call record status is tracked in-progress asynchronously without blocking audio
+    call_record = {"id": call_id or f"call_{uuid.uuid4().hex[:8]}", "user_id": user_id}
+    async def _mark_call_in_progress():
+        try:
+            if not _DB_INIT_DONE:
+                await asyncio.wait_for(db_init(), timeout=10)
+            if call_id and user_id:
+                await repo.update_call(call_id, {"status": "in-progress", "room": getattr(ctx.room, "name", "")})
+        except Exception as e:
+            logger.warning("Could not mark call in-progress: %s", e)
+    asyncio.create_task(_mark_call_in_progress())
 
     usage = {"tts_chars": 0, "llm_input_tokens": 0, "llm_output_tokens": 0,
              "user_speech_seconds": 0.0, "transcripts": []}
@@ -1469,7 +1655,7 @@ async def entrypoint(ctx):
     else:
         customer_key = ctx.room.name
     memory_enabled = bool(getattr(cfg, "memory_enabled", True))
-    prior_memory = memory.load(customer_key) if memory_enabled else ""
+    prior_memory = (await asyncio.to_thread(memory.load, customer_key)) if memory_enabled else ""
 
     if (cfg.greeting or "").strip():
         greeting = cfg.greeting
@@ -1518,27 +1704,123 @@ async def entrypoint(ctx):
         "is_closing": False,  # True when deterministic closing in progress
     }
     
-    # Preserve last successful metrics for final billing (fix 0ms telemetry)
-    last_successful_metrics = {
-        "ttft_ms": 0.0,
-        "generation_time_ms": 0.0,
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-        "provider": "",
-        "model": "",
-    }
 
     # ------------------------------------------------------------------
     # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
     # ------------------------------------------------------------------
     agent_mode = getattr(cfg, "agent_mode", "assistant") or "assistant"
+    logger.info("[AGENT_WAITING] room=%s agent_id=%s name=%s agent_mode=%s", getattr(ctx.room, "name", ""), agent_id, cfg.name, agent_mode)
     if agent_mode == "announcement":
         session = build_announcement_session(cfg)
     else:
-        # Async build to avoid blocking job executor (was 3.46s sync -> unresponsive)
-        # Pass turn_timing_ref to enable TTS timing wrapper (measures real TTS audio)
         session = await build_assistant_session(cfg, turn_timing_ref=turn_timing)
+
+    # ------------------------------------------------------------------
+    # RAG precomputation (latency): the session AWAITs on_user_turn_completed
+    # before the LLM starts, and per-turn RAG (BM25 over the knowledge base)
+    # used to run inside that hook — 27-105ms+ added to every single turn.
+    # Instead, run retrieval on each STT interim (while the user is still
+    # finishing the sentence, i.e. during the endpointing silence) and cache
+    # the result by normalized text. The final text almost always matches the
+    # last interim, so the awaited hook becomes a dict lookup (~0ms).
+    # ------------------------------------------------------------------
+    rag_prefetch: dict = {}
+    rag_prefetch_inflight: set = set()
+    # [USER_SPEECH_STARTED] edge detector state (mutable cell; updated from
+    # the transcription handler, which is sync and loop-local).
+    _last_tx_ts = [0.0]
+
+    def _precompute_rag(text: str) -> None:
+        try:
+            from app import rag as _rag_mod
+            key = _rag_mod.normalize_query(text)
+        except Exception:
+            return
+        if len(key) < 4 or key in rag_prefetch or key in rag_prefetch_inflight:
+            return
+        rag_prefetch_inflight.add(key)
+
+        async def _work():
+            try:
+                from app import rag as _rag_mod
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(_rag_mod.build_context_detailed, cfg.knowledge, text, 3),
+                    timeout=4,
+                )
+                hits = (res.get("text") or "").strip()
+                if hits:
+                    if len(rag_prefetch) > 8:   # bound the cache to one utterance worth
+                        rag_prefetch.pop(next(iter(rag_prefetch)))
+                    # Store the FULL detailed structure (text + kb/faq flags),
+                    # not just the text — the turn hook then reports prefetch
+                    # HITs with the exact same result structure as a MISS.
+                    rag_prefetch[key] = res
+            except Exception as e:
+                logger.debug(f"RAG precompute skipped: {e!r}")
+            finally:
+                rag_prefetch_inflight.discard(key)
+
+        try:
+            asyncio.ensure_future(_work())
+        except Exception:
+            rag_prefetch_inflight.discard(key)
+
+    def _on_transcription(ev) -> None:
+        try:
+            # v1 UserInputTranscribedEvent carries `.transcript` (+ `.is_final`);
+            # legacy "transcription" events used `.text`.
+            text = getattr(ev, "transcript", None) or getattr(ev, "text", None) or ""
+            is_final = bool(getattr(ev, "is_final", False))
+            if text.strip():
+                _precompute_rag(text)
+                # P4 marker — utterance-start edge: first transcript after a
+                # >0.7s gap is treated as [USER_SPEECH_STARTED] (interims fire
+                # every ~200ms, so logging each one would spam the call log).
+                _now = time.time()
+                if _now - _last_tx_ts[0] > 0.7:
+                    _last_tx_ts[0] = _now
+                    logger.info("🎙️ [USER_SPEECH_STARTED] first transcript: '%s'", text.strip()[:60])
+            else:
+                _last_tx_ts[0] = time.time()
+            # P5 ROOT-CAUSE FIX (watchdog sync, 2026-09-23 call at 21:45):
+            # the no-response watchdog was cancelled ONLY via
+            # conversation_item_added / agent_state_changed. When the reply
+            # pipeline stalled (no LLM ever started), neither event fired, so
+            # the 30s timer armed at greeting-end FIRED while the user was
+            # actively speaking and the call was auto-cut. STT finals are
+            # authoritative proof of user activity that flows on its own event
+            # (this handler is what drives RAG prefetch, so it demonstrably
+            # works even when the reply pipeline wedges): reset the clock on
+            # every final with text. Interims don't reset — they fire too
+            # often; a user mid-utterance emits finals every few seconds
+            # anyway (STT endpointing).
+            if is_final and text.strip():
+                logger.info("📝 [USER_TRANSCRIPT_FINAL] '%s'", text.strip()[:80])
+                # One call does it all: cancels the armed window (single
+                # [WATCHDOG_CANCELLED]+[WATCHDOG_ARMED] log) and starts a fresh
+                # full window measured from this utterance.
+                _schedule_no_response(reason="user_transcript_final")
+                # P4 diagnostic: start the reply-stall probe for this turn.
+                _arm_stall_probe(text.strip())
+        except Exception:
+            pass
+
+    if agent_mode != "announcement":
+        # livekit-agents v1 emits "user_input_transcribed" for every STT interim
+        # and final; the older "transcription" event never fires on v1 (a dead
+        # listener = prefetch silently never runs, so attach BOTH defensively —
+        # duplicate fires are cheap, the key+inflight dedup handles them).
+        attached_events = []
+        for _ev_name in ("user_input_transcribed",):
+            try:
+                session.on(_ev_name, _on_transcription)
+                attached_events.append(_ev_name)
+            except Exception:
+                continue
+        if attached_events:
+            logger.info(f"🔧 RAG precompute armed on STT events: {attached_events}")
+        else:
+            logger.debug("transcription hook unavailable (RAG precompute off)")
 
     # ------------------------------------------------------------------
     # Silence watchdog + No-response watchdog.
@@ -1551,6 +1833,7 @@ async def entrypoint(ctx):
     #    (configurable per agent, e.g. 30 sec), speak the agent's
     #    no_response_message and hang up. Requested by user.
     # ------------------------------------------------------------------
+    call_finished = asyncio.Event()
     call_closed = {"done": False}
     closing_requested = {"done": False}
     closing_in_progress = {"done": False}
@@ -1563,12 +1846,50 @@ async def entrypoint(ctx):
         "pending": None,
         "fallback_say": None,
     }
-    # No-response tracking: last time user spoke or agent spoke
+    # No-response tracking: last time user spoke or agent spoke.
+    # `gen` is a monotonically increasing arming generation: every (re)arm or
+    # cancel bumps it and each scheduled handler captures its generation, so a
+    # stale handler left over from an earlier window can NEVER fire after a
+    # cancel/reset (P5: no false no-response while the caller is talking).
     no_response_state = {
         "last_activity": time.time(),
         "task": None,
         "triggered": False,
+        "gen": 0,
     }
+
+    @ctx.room.on("disconnected")
+    def _on_room_disconnected(*_):
+        logger.info("Room disconnected event received")
+        try:
+            _cancel_no_response(reason="call_end_room_disconnected")
+            _cancel_stall_probe(reason="call_end_room_disconnected")
+        except Exception:
+            pass
+        call_finished.set()
+
+    @session.on("close")
+    def _on_session_close(*_):
+        logger.info("Session close event received")
+        try:
+            _cancel_no_response(reason="call_end_session_close")
+            _cancel_stall_probe(reason="call_end_session_close")
+        except Exception:
+            pass
+        call_finished.set()
+
+    async def _on_job_shutdown(*_):
+        call_finished.set()
+        # P2: this job thread's event loop is about to close — release its
+        # Prisma client (per-loop registry) so engine processes do not pile
+        # up in the worker. Best-effort, never blocks shutdown.
+        try:
+            from app.db import release_current_loop
+            await asyncio.wait_for(release_current_loop(), timeout=6)
+        except Exception:
+            pass
+
+    ctx.add_shutdown_callback(_on_job_shutdown)
 
     async def _do_deterministic_closing():
         # Prevent duplicate closings, but allow if already closing to ensure completion
@@ -1627,18 +1948,28 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning(f"Deterministic closing outer failed: {e}")
             await asyncio.sleep(1.0)
-        # Now auto-cut the call
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         logger.info("✂️ Auto-cutting call after deterministic closing TTS")
         try:
             session.shutdown(drain=False)
         except Exception:
             pass
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
         try:
             ctx.shutdown()
         except Exception:
             pass
+        call_finished.set()
 
     def _schedule_deterministic_closing():
+        if agent_mode == "announcement":
+            return
         if closing_in_progress["done"]:
             return
         if closing_task_ref["task"] is not None and not closing_task_ref["task"].done():
@@ -1724,19 +2055,25 @@ async def entrypoint(ctx):
             logger.warning(f"🛟 could not arm silence watchdog: {e}")
 
     # ---------- No-response handling — robust scheduled timer ----------
-    def _cancel_no_response():
+    def _cancel_no_response(reason: str = "cancel"):
         t = no_response_state.get("task")
+        no_response_state["gen"] = no_response_state.get("gen", 0) + 1  # stale-task guard
         if t is not None and not t.done():
             t.cancel()
+            logger.info(f"⏱️ [WATCHDOG_CANCELLED] gen={no_response_state['gen']} reason={reason}")
         no_response_state["task"] = None
 
-    async def _no_response_timeout_handler():
+    async def _no_response_timeout_handler(gen: int):
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
         no_response_msg = (getattr(cfg, "no_response_message", "") or
                            "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
         try:
             await asyncio.sleep(idle_timeout)
         except asyncio.CancelledError:
+            return
+        # Stale-window guard: if this handler was re-armed/cancelled while it
+        # slept, its generation no longer matches — never act on old windows.
+        if gen != no_response_state.get("gen"):
             return
         if call_closed["done"] or closing_in_progress["done"] or closing_requested["done"] or no_response_state.get("triggered"):
             return
@@ -1746,9 +2083,13 @@ async def entrypoint(ctx):
             _schedule_no_response()
             return
         elapsed = time.time() - no_response_state.get("last_activity", 0)
-        # If user spoke during sleep, task would have been cancelled; double-check
+        # Defensive double-check against the per-final activity clock: if the
+        # user spoke during the sleep window, skip AND re-arm a full window
+        # (the old code returned without re-arming, silently disabling the
+        # watchdog for the remainder of the call).
         if elapsed < idle_timeout - 0.5:
-            logger.info(f"⏱️ No-response timer fired but user spoke {elapsed:.1f}s ago (timeout {idle_timeout}s) — skipping")
+            logger.info(f"⏱️ No-response timer fired but user spoke {elapsed:.1f}s ago (timeout {idle_timeout}s) — skipping and re-arming")
+            _schedule_no_response()
             return
         # Only trigger when waiting for user
         cur_state = state_tracker.get("state")
@@ -1757,6 +2098,7 @@ async def entrypoint(ctx):
             _schedule_no_response()
             return
         no_response_state["triggered"] = True
+        logger.info(f"⏱️ [WATCHDOG_FIRED] gen={gen} — no user response for {elapsed:.0f}s (timeout {idle_timeout}s)")
         # Mark call as closing to prevent re-arming watchdog on listening transition
         call_closed["done"] = True
         closing_in_progress["done"] = True
@@ -1791,17 +2133,26 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning(f"No-response outer failed: {e}")
             await asyncio.sleep(1.0)
+        logger.info("[CALL_END_REQUESTED] source=timeout reason=no_response")
         logger.info("✂️ Auto-cutting call after no-response TTS")
         try:
             session.shutdown(drain=False)
         except Exception:
             pass
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
         try:
             ctx.shutdown()
         except Exception:
             pass
+        call_finished.set()
 
-    def _schedule_no_response():
+    def _schedule_no_response(reason: str = "re-arm"):
         # Announcement mode reads a script and hangs up. A silence timer would
         # interrupt that script or start a second goodbye.
         if agent_mode == "announcement":
@@ -1809,50 +2160,29 @@ async def entrypoint(ctx):
         if no_response_state.get("triggered") or call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
             logger.info("⏱️ Not arming no-response — call already closing/triggered")
             return
-        _cancel_no_response()
+        _cancel_no_response(reason=reason)
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
         no_response_msg = (getattr(cfg, "no_response_message", "") or
                            "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
         no_response_state["last_activity"] = time.time()
+        no_response_state["gen"] = no_response_state.get("gen", 0) + 1
+        gen = no_response_state["gen"]
         try:
-            no_response_state["task"] = asyncio.ensure_future(_no_response_timeout_handler())
-            logger.info(f"⏱️ No-response watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}' (scheduled)")
+            no_response_state["task"] = asyncio.ensure_future(_no_response_timeout_handler(gen))
+            logger.info(f"⏱️ [WATCHDOG_ARMED] gen={gen} timeout={idle_timeout}s -> '{no_response_msg[:60]}'")
         except Exception as e:
             logger.warning(f"Could not arm no-response watchdog: {e}")
-
-    # Fallback loop monitor (kept for safety, primary is scheduled timer)
-    async def _no_response_monitor():
-        if agent_mode == "announcement":
-            return
-        idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-        no_response_msg = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
-        logger.info(f"⏱️ No-response loop watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}'")
-        await asyncio.sleep(2)
-        while not call_closed["done"] and not closing_in_progress["done"] and not no_response_state.get("triggered"):
-            try:
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                return
-            if closing_requested["done"] or closing_in_progress["done"] or call_closed["done"]:
-                continue
-            elapsed = time.time() - no_response_state.get("last_activity", 0)
-            cur_state = state_tracker.get("state")
-            if cur_state not in ("listening", None):
-                if cur_state in ("speaking", "thinking"):
-                    no_response_state["last_activity"] = time.time()
-                continue
-            if elapsed >= idle_timeout and not no_response_state.get("triggered"):
-                if no_response_state.get("task") is None or no_response_state["task"].done():
-                    logger.info(f"⏱️ Loop detected no response {elapsed:.0f}s — triggering")
-                    await _no_response_timeout_handler()
-                return
 
     def on_item_added(ev):
         # Allow system closing/no-response messages even after call_closed is set
         # to ensure transcript logging works; otherwise early return hides TTS log
         try:
             _item_role = getattr(getattr(ev, "item", None), "role", None)
+            # P4 chain marker: proves on_user_turn_completed's chat-context
+            # insert ran (reply pipeline alive past scheduling).
+            _it = getattr(ev, "item", None)
+            _tx = _msg_text(_it) if _it is not None else ""
+            logger.info("💬 [CONVERSATION_ITEM] role=%s len=%d text='%s'", _item_role, len(_tx or ""), (_tx or "")[:60])
         except Exception:
             _item_role = None
         if call_closed["done"] and _item_role != "assistant" and not no_response_state.get("triggered"):
@@ -1898,13 +2228,16 @@ async def entrypoint(ctx):
             turn_timing["llm_complete"] = 0.0
             turn_timing["generation_complete"] = 0.0
             turn_timing["first_audio"] = 0.0
+            turn_timing["last_speech_end_to_first_audio"] = 0.0
             turn_timing["ttft_ms"] = 0.0
             turn_timing["generation_time_ms"] = 0.0
             turn_timing["input_tokens"] = 0
             turn_timing["cached_input_tokens"] = 0
             turn_timing["output_tokens"] = 0
             # Fresh speech_end and stt_final for this turn
-            turn_timing["speech_end"] = now - 0.25  # approximate speech end 250ms before final
+            # Deepgram does not expose the true VAD end time on the final event;
+            # all speech_end->X numbers below are estimates from this point.
+            turn_timing["speech_end"] = now - 0.25  # ESTIMATE: speech ended ~250ms before final
             turn_timing["stt_final"] = now
             # Calculate speech_end->STT_final
             if turn_timing["speech_end"] > 0:
@@ -1913,11 +2246,12 @@ async def entrypoint(ctx):
                 # Flag if exceeds 400ms target
                 if speech_to_stt > 600:
                     logger.warning(f"🐢 Slow STT final: speech_end->STT_final {speech_to_stt:.0f}ms exceeds 400ms target (possible Deepgram delay)")
-            # Reset speech_end for next turn after logging
-            # Keep it for total calculation until first_audio
-            # User spoke — cancel any pending no-response timer (user is active)
-            _cancel_no_response()
-            no_response_state["last_activity"] = now
+            # User turn committed — start a fresh silence window NOW rather than
+            # only cancelling: if the agent then replies, the state transitions
+            # cancel/re-arm this timer anyway; if the reply wedges, the call
+            # still ends after the timeout instead of sitting in dead air
+            # forever (an old cancel-only path left exactly that hole).
+            _schedule_no_response(reason="user_turn_committed")
             words = max(len(text.split()), 1)
             usage["llm_input_tokens"] += int(words * 1.3)
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
@@ -2019,7 +2353,7 @@ async def entrypoint(ctx):
         elif role == "assistant":
             # Mark assistant output received for empty-turn race fix
             turn_timing["assistant_output_received"] = True
-            # Update last_successful_metrics for billing preservation
+            # Preserve last successful turn metrics for final billing
             try:
                 if turn_timing.get("ttft_ms",0) > 0:
                     turn_timing["last_ttft"] = turn_timing.get("ttft_ms",0)
@@ -2166,7 +2500,9 @@ async def entrypoint(ctx):
                         turn_timing["first_audio"] = 0.0
                         turn_timing["ttft_ms"] = 0.0
                         turn_timing["generation_time_ms"] = 0.0
-            logger.info(f"🗣️ TTS (LLM complete): {cleaned} (REAL audio was at {turn_timing.get('last_speech_end_to_first_audio',0):.0f}ms, this is transcript only)")
+            _real_audio_ms = turn_timing.get("last_speech_end_to_first_audio", 0)
+            _real_note = f"first audio at {_real_audio_ms:.0f}ms after speech_end (est)" if _real_audio_ms else "first audio not measured this turn"
+            logger.info(f"🗣️ TTS (LLM complete): {cleaned} (transcript-only event; {_real_note})")
 
     session.on("conversation_item_added", on_item_added)
 
@@ -2176,7 +2512,11 @@ async def entrypoint(ctx):
         elapsed = now - state_tracker["since"]
         if prev == "thinking" and elapsed > 2.5:
             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
-        logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        logger.info(f"🔄 [AGENT_STATE] {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        # Reply-stall probe: any forward progress into thinking/speaking means
+        # the reply pipeline is alive — stand the diagnostic timer down.
+        if ev.new_state in ("thinking", "speaking"):
+            _cancel_stall_probe(reason=f"agent_state_{ev.new_state}")
 
         # --- Production timing instrumentation ---
         if prev == "listening" and ev.new_state == "thinking":
@@ -2365,6 +2705,137 @@ async def entrypoint(ctx):
 
     session.on("agent_state_changed", _on_state)
 
+    # ------------------------------------------------------------------
+    # P4/P6 diagnostics: reply-stall probe + [SPEECH_CREATED] marker.
+    # After a user transcript FINAL the healthy chain is:
+    #   [USER_TRANSCRIPT_FINAL] -> [USER_TURN_COMPLETED] (agent hook)
+    #   -> [SPEECH_CREATED] -> [AGENT_STATE] listening -> thinking
+    #   -> LLM REQUEST START -> first_token -> TTS -> speaking
+    # If nothing reaches thinking/speaking within ~6s of the final, the reply
+    # pipeline is stalled inside LiveKit's scheduling/authorization layer
+    # (observed 2026-09-23 21:45: greeting fine, turn committed, RAG
+    # injected, then no thinking, no LLM request, billing 0/0 for 18+s).
+    # The probe ONLY logs a red-alert; it never retries and never calls
+    # generate_reply — a forced retry would mask the root cause.
+    # ------------------------------------------------------------------
+    stall_probe = {"task": None, "gen": 0, "armed_for": "", "armed_ts": 0.0, "handle": None}
+
+    def _reply_stall_snapshot() -> str:
+        """Deep state dump of LiveKit's scheduling internals at wedge time.
+
+        Distinguishes the three possible stuck points inside
+        ``_pipeline_reply_task`` (all produce IDENTICAL silence in logs):
+          A. handle never scheduled  -> scheduler didn't pop it (queue/starvation)
+          B. scheduled+authorized but user-silence gate open/closed mismatch
+          C. handle already interrupted (silent drop path)
+        Read-only getattr everywhere; never raises — diagnostics must not
+        change call behavior.
+        """
+        try:
+            act = getattr(session, "_activity", None)
+            if act is None:
+                return "snapshot: activity=None"
+            def _ev(e):
+                try:
+                    return e.is_set()
+                except Exception:
+                    return "?"
+            def _fd(f):
+                try:
+                    return f.done()
+                except Exception:
+                    return "?"
+            q = list(getattr(act, "_speech_q", None) or [])
+            cs = getattr(act, "_current_speech", None)
+            parts = [
+                f"scheduling_paused={getattr(act, '_scheduling_paused', '?')}",
+                f"new_turns_blocked={getattr(act, '_new_turns_blocked', '?')}",
+                f"scheduler_task_done={_fd(getattr(act, '_scheduling_atask', None))}",
+                f"queue_len={len(q)}",
+                f"user_silence_event_set={_ev(getattr(act, '_user_silence_event', None))}",
+                f"authorization_allowed={_ev(getattr(act, '_authorization_allowed', None))}",
+                f"user_state={getattr(getattr(act, '_session', None), 'user_state', None)}",
+            ]
+            h = stall_probe.get("handle")
+            for label, s in (("pending_reply", h), ("current_speech", cs)):
+                if s is None:
+                    parts.append(f"{label}=None")
+                    continue
+                parts.append(
+                    f"{label}[id={getattr(s, 'id', '?')} scheduled={getattr(s, 'scheduled', '?')}"
+                    f" interrupted={getattr(s, 'interrupted', '?')} done={s.done() if callable(getattr(s, 'done', None)) else '?'}"
+                    f" scheduled_fut_done={_fd(getattr(s, '_scheduled_fut', None))}"
+                    f" authorized={_ev(getattr(s, '_authorize_event', None))}"
+                    f" generations_open={sum(0 if _fd(g) else 1 for g in (getattr(s, '_generations', None) or []))}]"
+                )
+            if q:
+                parts.append("queued=" + ",".join(
+                    f"(h={getattr(x[2], 'id', '?')},sched={getattr(x[2], 'scheduled', '?')},int={getattr(x[2], 'interrupted', '?')})"
+                    for x in q[:5]
+                ))
+            age = time.time() - stall_probe.get("armed_ts", time.time())
+            parts.append(f"seconds_since_final={age:.1f}")
+            return "snapshot: " + " ".join(parts)
+        except Exception as e:
+            return f"snapshot: unavailable ({e!r})"
+
+    def _cancel_stall_probe(reason: str = "progress"):
+        t = stall_probe.get("task")
+        stall_probe["gen"] = stall_probe.get("gen", 0) + 1
+        if t is not None and not t.done():
+            t.cancel()
+            logger.debug(f"[REPLY_PROBE_CANCELLED] gen={stall_probe['gen']} reason={reason}")
+        stall_probe["task"] = None
+
+    async def _stall_probe_handler(gen: int):
+        try:
+            await asyncio.sleep(6.0)
+        except asyncio.CancelledError:
+            return
+        if gen != stall_probe.get("gen"):
+            return
+        if call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
+            return
+        cur = state_tracker.get("state")
+        if cur in ("thinking", "speaking"):
+            return
+        since = time.time() - stall_probe.get("armed_ts", time.time())
+        logger.error(
+            f"🚨 [REPLY_STALLED] no agent thinking/speaking {since:.1f}s after user final "
+            f"'{stall_probe.get('armed_for', '')[:60]}' (agent state={cur}). {_reply_stall_snapshot()}"
+        )
+
+    def _arm_stall_probe(text: str) -> None:
+        if agent_mode == "announcement":
+            return
+        _cancel_stall_probe(reason="re-arm")
+        stall_probe["gen"] = stall_probe.get("gen", 0) + 1
+        gen = stall_probe["gen"]
+        stall_probe["armed_for"] = text
+        stall_probe["armed_ts"] = time.time()
+        try:
+            stall_probe["task"] = asyncio.ensure_future(_stall_probe_handler(gen))
+        except Exception:
+            stall_probe["task"] = None
+
+    def _on_speech_created(ev) -> None:
+        try:
+            handle = getattr(ev, "speech_handle", None)
+            if getattr(ev, "source", "") == "generate_reply":
+                # remember the latest pending reply handle so the stall probe
+                # can dump its exact wait-state (scheduled/authorized/gate)
+                stall_probe["handle"] = handle
+            logger.info(
+                "🔊 [SPEECH_CREATED] id=%s source=%s user_initiated=%s",
+                getattr(handle, "id", "?") if handle is not None else "?",
+                getattr(ev, "source", "?"),
+                getattr(ev, "user_initiated", "?"),
+            )
+        except Exception:
+            pass
+
+    session.on("speech_created", _on_speech_created)
+
     # Start recording if the agent has it on — but DO NOT block the call from
     # connecting. A missing/unavailable Egress service used to add ~21s before
     # session.start(), delaying every call. Now it runs in the background and the
@@ -2389,11 +2860,12 @@ async def entrypoint(ctx):
         if not (script or "").strip():
             script = greeting or f"Hello, this is {cfg.name}."
         agent = build_announce_agent(cfg, announce_text=script)
-        logger.info("📢 mode=announcement — will read the script when the caller can hear, then hang up")
+        logger.info("[ANNOUNCEMENT_STARTED] room=%s agent_id=%s script=%s", getattr(ctx.room, "name", ""), agent_id, script[:60])
     else:
-        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing)
-        logger.info("💬 mode=assistant — will greet when the caller can hear, then listen")
+        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing, rag_prefetch=rag_prefetch)
+        logger.info("[ASSISTANT_STARTED] room=%s agent_id=%s greeting=%s", getattr(ctx.room, "name", ""), agent_id, greeting[:60])
     agent_holder["agent"] = agent
+    logger.info("[AGENT_STARTED] room=%s agent_id=%s agent_mode=%s", getattr(ctx.room, "name", ""), agent_id, agent_mode)
 
     # Server-side noise cancellation. Two tiers:
     #   * NOISE_CANCELLATION=krisp -> server-side Krisp (BVC) filter. Only works on
@@ -2404,42 +2876,15 @@ async def entrypoint(ctx):
     #     and Deepgram STT uses its built-in VAD (`vad_events=True`), which rejects
     #     non-speech/noise frames before they reach the LLM.
     room_options = None
-    nc_mode = os.getenv("NOISE_CANCELLATION", "").strip().lower()
-    if nc_mode == "krisp":
-        try:
-            from livekit import rtc
-            from livekit.agents.voice import room_io
-            room_options = room_io.RoomOptions(
-                close_on_disconnect=False,
-                input_options=room_io.RoomInputOptions(
-                    noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
-                )
-            )
-            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=False).")
-        except Exception as e:
-            logger.warning(
-                "Krisp noise cancellation unavailable (%s). To enable it on LiveKit "
-                "Cloud: pip install livekit-krisp-noise-cancellation and set "
-                "NOISE_CANCELLATION=krisp. For a self-hosted demo, leave it unset — "
-                "browser calls get WebRTC noise suppression and Deepgram VAD filters "
-                "non-speech.", e,
-            )
-            # Fallback: still ensure close_on_disconnect=False even if Krisp fails
-            try:
-                from livekit.agents.voice import room_io as _rio
-                room_options = _rio.RoomOptions(close_on_disconnect=False)
-                logger.info("🎤 RoomOptions(close_on_disconnect=False) armed as fallback after Krisp failure.")
-            except Exception:
-                pass
-    else:
-        try:
-            from livekit.agents.voice import room_io as _rio
-            room_options = _rio.RoomOptions(close_on_disconnect=False)
-            logger.info("🎤 RoomOptions(close_on_disconnect=False) armed (TTS goodbye protected).")
-        except Exception as e:
-            logger.warning(f"Could not set RoomOptions close_on_disconnect=False: {e}")
-        if nc_mode:
-            logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
+    try:
+        from livekit.agents.voice import room_io as _rio
+        room_options = _rio.RoomOptions(
+            close_on_disconnect=False,
+            delete_room_on_close=False,
+        )
+        logger.info("🎤 RoomOptions(close_on_disconnect=False, delete_room_on_close=False) armed.")
+    except Exception as e:
+        logger.warning(f"Could not set RoomOptions: {e}")
 
     # ------------------------------------------------------------------
     # Finalization (idempotent) + call-end watchdog.
@@ -2573,6 +3018,26 @@ async def entrypoint(ctx):
                     logger.warning(f"Billing POST exception, will fallback to direct DB: {e!r}", exc_info=True)
                     billing_posted = False
 
+            # Preserve a failure reason recorded earlier on this call (the
+            # setup-failure path writes usage.error into the DB before the
+            # shutdown callbacks run — a blind overwrite would wipe it and the
+            # UI would lose the "why").
+            try:
+                from app.db import get_prisma
+                prior_row = await get_prisma().call.find_unique(where={"id": call_record["id"]})
+                if prior_row is not None:
+                    prior_dict = repo._call_dict(prior_row)
+                    prior_error = (prior_dict.get("usage") or {}).get("error")
+                    if prior_error:
+                        usage["error"] = prior_error
+                        # A setup failure is a failed, unbilled call. (If a real
+                        # conversation had run long before a late failure, keep
+                        # the status the duration check produced.)
+                        if not real_call:
+                            status = "failed"
+            except Exception:
+                pass
+
             # Fallback local update (ensures call is marked completed even if backend unreachable)
             try:
                 await repo.update_call(call_record["id"], {
@@ -2587,27 +3052,21 @@ async def entrypoint(ctx):
             except Exception as e:
                 logger.warning(f"Local call update failed: {e}")
 
-            # Safety net: ALWAYS check wallet deduction — if backend failed or returned non-200,
-            # deduct directly via DB (idempotent, checks existing spend transaction)
-            if real_call:
+            # Fallback direct wallet deduct only if backend /api/billing/log failed
+            if real_call and not billing_posted:
                 try:
                     has_spend = False
                     try:
                         has_spend = await repo.has_spend_for_call(call_record.get("user_id", user_id), call_record["id"])
                     except Exception as he:
                         logger.warning(f"has_spend check failed: {he}")
-                        has_spend = False
                     if not has_spend:
                         charge = float(costs.get("client_price_inr", 0) or 0)
                         if charge > 0:
                             wallet = await repo.deduct(call_record.get("user_id", user_id), charge, note=f"Call {call_record['id']}")
-                            logger.info(f"💸 Wallet auto-deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)} (billing_posted={billing_posted})")
-                        else:
-                            logger.info(f"Call {call_record['id']} has zero charge, no deduction needed")
-                    else:
-                        logger.info(f"💰 Wallet already deducted for call {call_record['id']} (billing_posted={billing_posted}) — skipping direct deduct")
+                            logger.info(f"💸 Wallet fallback deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)}")
                 except Exception as de:
-                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}", exc_info=True)
+                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}")
 
         except Exception as e:
             logger.exception(f"finalize_billing error: {e}")
@@ -2662,14 +3121,14 @@ async def entrypoint(ctx):
             except Exception:
                 return []
 
-        async def _release(reason: str):
+        async def _release(reason: str, source: str = "timeout"):
             if released["done"]:
                 return
             released["done"] = True
             call_closed["done"] = True
             logger.info(
-                "👋 Caller left (%s) — ending this job. The worker stays up for the next agent.",
-                reason,
+                "[CALL_END_REQUESTED] source=%s reason=%s room=%s agent_id=%s",
+                source, reason, getattr(ctx.room, "name", ""), agent_id,
             )
             _cancel_pending()
             _cancel_no_response()
@@ -2677,32 +3136,33 @@ async def entrypoint(ctx):
             if fallback_task is not None and not fallback_task.done():
                 fallback_task.cancel()
             reply_tracker["fallback_say"] = None
-            # Do not speak into a transport the browser has already closed.
-            # That await is what kept the job (and the worker slot) stuck.
             try:
                 session.shutdown(drain=False)
             except Exception as e:
                 logger.warning("session.shutdown on caller leave failed: %r", e)
 
-            async def _force_exit():
-                await asyncio.sleep(4)
-                logger.warning("job still running 4s after caller left — forcing shutdown")
+            room_name = getattr(ctx.room, "name", None)
+            if room_name:
                 try:
-                    ctx.shutdown()
-                except Exception as e:
-                    logger.warning("ctx.shutdown failed: %r", e)
+                    from app.telephony import end_active_room
+                    await end_active_room(room_name)
+                except Exception:
+                    pass
 
             try:
-                asyncio.create_task(_force_exit())
-            except Exception:
-                pass
+                ctx.shutdown()
+            except Exception as e:
+                logger.warning("ctx.shutdown failed: %r", e)
+
+            logger.info("[CALL_ENDED] room=%s agent_id=%s reason=%s", getattr(ctx.room, "name", ""), agent_id, reason)
+            call_finished.set()
 
         def _on_connected(participant):
             if not _is_human(participant):
                 return
             saw_human["yes"] = True
             gone_since["t"] = 0.0
-            logger.info("👤 caller joined: %s", getattr(participant, "identity", "?"))
+            logger.info("[AGENT_JOINED] room=%s Caller joined: %s", getattr(room, "name", ""), getattr(participant, "identity", "?"))
 
         def _on_disconnected(participant):
             if not _is_human(participant):
@@ -2710,16 +3170,24 @@ async def entrypoint(ctx):
             if _humans():
                 return
             gone_since["t"] = time.time()
-            logger.info("👤 caller left: %s", getattr(participant, "identity", "?"))
+            logger.info("👤 Caller disconnected: %s (grace period active)", getattr(participant, "identity", "?"))
 
         room.on("participant_connected", _on_connected)
         room.on("participant_disconnected", _on_disconnected)
-        if _humans():
+        initial_humans = _humans()
+        if initial_humans:
             saw_human["yes"] = True
-            logger.info("👤 caller already in the room (%s)", len(_humans()))
+            logger.info("[AGENT_JOINED] room=%s Caller already in room (%d): %s", getattr(room, "name", ""), len(initial_humans), [p.identity for p in initial_humans])
+
         try:
             while not released["done"]:
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.5)
+                # Announcement agent manages its own completion — don't interfere while it's playing
+                if agent_mode == "announcement":
+                    ag = agent_holder.get("agent")
+                    if ag is not None and getattr(ag, "_opening_started", False) and not getattr(ag, "_opening_done", False):
+                        continue
+
                 humans = _humans()
                 if humans:
                     saw_human["yes"] = True
@@ -2730,11 +3198,9 @@ async def entrypoint(ctx):
                 if gone_since["t"] == 0.0:
                     gone_since["t"] = time.time()
                     continue
-                # Long enough for a browser remount to rejoin the same room,
-                # short enough that "end call, pick another agent, start" gets
-                # a free worker process.
-                if time.time() - gone_since["t"] >= 1.5:
-                    await _release("no caller in the room")
+                # Generous 12-second grace period (NOT 1.5s!) before deciding caller is truly gone
+                if time.time() - gone_since["t"] >= 12.0:
+                    await _release("user_ended", source="timeout")
                     return
         except asyncio.CancelledError:
             return
@@ -2784,23 +3250,43 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning("backup opening line failed: %s: %r", type(e).__name__, e)
 
+    # Deduplication check: if another agent has already connected to this room, exit immediately
+    try:
+        remote_agents = [
+            p for p in ctx.room.remote_participants.values()
+            if getattr(p, "kind", None) == 4
+            or getattr(p, "is_agent", False)
+            or (getattr(p, "identity", "") or "").startswith("agent-")
+        ]
+        if remote_agents:
+            logger.warning(
+                "⚠️ Duplicate agent already present in room %s (%s). Exiting this runner to prevent duplicate audio.",
+                getattr(ctx.room, "name", ""),
+                [getattr(p, "identity", "") for p in remote_agents],
+            )
+            call_closed["done"] = True
+            ctx.shutdown()
+            return
+    except Exception as e:
+        logger.debug("duplicate agent check: %r", e)
+
     opening_backup = asyncio.create_task(_backup_opening_line())
     watchdog = asyncio.create_task(watch_call_end())
-    # Primary: scheduled timer (resets on activity), fallback: loop monitor
-    loop_monitor_task = asyncio.create_task(_no_response_monitor())
 
     start_kwargs: dict = {"agent": agent, "room": ctx.room}
     if room_options is not None:
         start_kwargs["room_options"] = room_options
+    setup_complete["done"] = True   # setup finished — release the setup watchdog
     try:
         await session.start(**start_kwargs)
+        # Keep entrypoint alive until the call completes so background watchdogs run
+        await call_finished.wait()
     except Exception as e:
         logger.exception("session.start failed — job will exit so the worker can take the next call: %r", e)
         raise
     finally:
         opening_backup.cancel()
         watchdog.cancel()
-        loop_monitor_task.cancel()
         _cancel_no_response()
         if egress_task is not None:
             egress_task.cancel()
@@ -2911,6 +3397,16 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
+    setup_logging()
+    # Job processes must keep ONLY livekit's IPC LogQueueHandler: our own
+    # QueueListener prints directly to the console too, so without this purge
+    # every job log line appears twice, all of it synchronously on the loop.
+    try:
+        from app.config import purge_sync_root_handlers
+        purge_sync_root_handlers(job_proc=True)
+    except Exception:
+        pass
+
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
     # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU
@@ -2960,6 +3456,22 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: async_toolset imported (avoids 101ms import block)")
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
+
+    # Prewarm Pydantic ChatMessage and ChatContext validation schemas off the agent loop.
+    # In Pydantic v2, ChatMessage.__init__ triggers model_rebuild() upon first invocation.
+    # On Windows, this took 7259ms inside entrypoint. Prewarming here compiles it off-loop.
+    try:
+        from app.agents.agent_builder import warm_agent_builder_schemas
+        warm_agent_builder_schemas()
+    except Exception as e:
+        logger.debug(f"ChatMessage prewarm failed: {e}")
+
+    try:
+        from livekit.agents.voice import Agent as _VoiceAgent, room_io as _room_io
+        _ = _room_io.RoomOptions(close_on_disconnect=False, delete_room_on_close=False)
+        logger.info("🔥 Prewarm: Voice Agent & RoomOptions imported")
+    except Exception as e:
+        logger.debug(f"Voice Agent prewarm failed: {e}")
 
     # Warm the Google TTS *credentials* before the first customer response so the
     # ~163-198ms JSON/RSA parse never lands on the agent event loop.
@@ -3015,7 +3527,39 @@ def prewarm(proc):
     # 1359ms SSL block that pushed it off-loop is fixed by the cached SSL context patch).
 
 
+def _worker_load(worker) -> float:
+    """Calculate load based on actual active jobs rather than Windows event-loop jitter.
+
+    Default CPU-sampling load_fnc in livekit-agents spikes to 1.0 on Windows due to
+    asyncio IOCP polling (GetQueuedCompletionStatus) and synchronous console I/O,
+    falsely marking the worker as 'at full capacity, marking as unavailable' and
+    dropping incoming calls.
+    """
+    # Supervisor-side housekeeping, piggybacked on a tick that runs on the main
+    # loop: livekit's CLI adds a synchronous JSON console handler to root AFTER
+    # our async setup — every record would otherwise print twice and stall the
+    # loop 150-350ms per burst on Windows console writes.
+    try:
+        from app.config import purge_sync_root_handlers
+        purge_sync_root_handlers()
+    except Exception:
+        pass
+    try:
+        active = len(getattr(worker, "active_jobs", []) or [])
+        max_jobs = int(os.getenv("MAX_CONCURRENT_CALLS", "10"))
+        return min(float(active) / float(max_jobs), 1.0)
+    except Exception:
+        return 0.0
+
+
 if __name__ == "__main__":
+    setup_logging()
+    try:
+        from app.agents.agent_builder import warm_agent_builder_schemas
+        warm_agent_builder_schemas()
+    except Exception:
+        pass
+
     from livekit.agents import WorkerOptions, cli
 
     # livekit-agents v1 ships a Typer CLI that requires a subcommand
@@ -3037,5 +3581,7 @@ if __name__ == "__main__":
             # Windows doesn't support the default "forkserver" context; "spawn"
             # is portable and works on Windows/macOS/Linux alike.
             multiprocessing_context="spawn",
+            load_fnc=_worker_load,
+            load_threshold=float(os.getenv("WORKER_LOAD_THRESHOLD", "0.95")),
         )
     )

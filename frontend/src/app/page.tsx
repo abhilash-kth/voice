@@ -32,6 +32,10 @@ export default function Dashboard() {
   const [presetCallAgentId, setPresetCallAgentId] = useState("");
   const [notice, setNotice] = useState("");
   const [backendError, setBackendError] = useState("");
+  // P10: flips true on the first successful agents fetch and stays true.
+  // CallPanel disables Start until then — first-call success must not
+  // depend on a page refresh.
+  const [agentsReady, setAgentsReady] = useState(false);
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -53,6 +57,7 @@ export default function Dashboard() {
       setCatalog(c);
       setAgents(a.agents);
       setBackendError("");
+      setAgentsReady(true);
     } catch (e) {
       setBackendError(
         "Could not reach the backend at localhost:8000. Start it with: uvicorn app.main:app --port 8000",
@@ -293,6 +298,7 @@ export default function Dashboard() {
             onStarted={afterCall}
             presetAgentId={presetCallAgentId}
             onPresetConsumed={() => setPresetCallAgentId("")}
+            agentsReady={agentsReady}
           />
         )}
 

@@ -106,6 +106,7 @@ export interface Agent {
   created_at: string;
   agent_mode?: string;
   announce_text?: string;
+  end_after_announcement?: boolean;
   fallback_response?: string;
   providers: {
     llm: { id: string; config: Record<string, unknown> };
@@ -208,6 +209,7 @@ export const startCall = (body: {
   }>("/api/calls", { method: "POST", body: JSON.stringify(body) });
 export const listCalls = () => req<{ calls: CallRecord[] }>("/api/calls");
 export const getCall = (id: string) => req<CallRecord>(`/api/calls/${id}`);
+export const endCall = (id: string) => req<{ ok: boolean; call_id: string }>(`/api/calls/${id}/end`, { method: "POST" });
 export const deleteCall = (id: string) => req<void>(`/api/calls/${id}`, { method: "DELETE" });
 
 // ------ campaigns (bulk calling) ------------------------------------------

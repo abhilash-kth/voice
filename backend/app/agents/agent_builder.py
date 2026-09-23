@@ -14,6 +14,8 @@ the API).
 """
 from __future__ import annotations
 
+import time
+
 import asyncio
 import logging
 import os
@@ -29,7 +31,6 @@ from ..config import (
     OPENROUTER_API_KEY,
     GEMINI_API_KEY,
     SARVAM_API_KEY,
-    LLM_MODEL,
 )
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
@@ -448,6 +449,18 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
         llm_kwargs["reasoning_effort"] = reasoning
 
+    # Prefix-cache pinning for OpenAI's AUTOMATIC 1024+ token prompt cache:
+    # without a stable prompt_cache_key, requests get load-balanced across
+    # backend machines and the big static prefix (system + owner prompt + tool
+    # defs, ~1.5-2K tokens) never hits — production logs showed cached=0 on
+    # every turn and TTFT 1.2-2.3s on gpt-4.1-mini. A stable key pins requests
+    # to the same machine, so turns 2+ reuse the cached prefix (~30-60% lower
+    # TTFT). OPENAI-ONLY: Groq/OpenRouter-compatible endpoints reject the field
+    # with a 400 on every request, so apply it only when provider_type=openai.
+    if provider_type == "openai" and "prompt_cache_key" not in llm_kwargs:
+        llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
+        logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 (prefix cache pinning — watch cached>0 from turn 2 on)")
+
     # Try responses API for gpt-5 reasoning models with tools (proper support)
     # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
     # responses API uses reasoning object, not reasoning_effort string, and supports tools
@@ -526,7 +539,7 @@ def build_llm(cfg: AgentConfig) -> Any:
         primary_pair = cfg.providers.get_primary_llm()
         fallback_pair = cfg.providers.get_fallback_llm()
     except AttributeError:
-        primary_pair = cfg.providers.llm
+        primary_pair = getattr(cfg.providers, "llm", None)
         fallback_pair = getattr(cfg.providers, "llm_fallback", None)
         if not fallback_pair:
             try:
@@ -535,6 +548,10 @@ def build_llm(cfg: AgentConfig) -> Any:
                     fallback_pair = fp.llm
             except Exception:
                 pass
+
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="openai_gpt4o_mini", config={})
 
     # Log LLM PROVIDER CONFIG for primary
     try:
@@ -688,26 +705,39 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
     # - no_delay True: send final immediately, don't buffer
     # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
+    from ..catalog import CATALOG
+    cat_stt = CATALOG.get("stt", {}).get(sel.id, {})
+    default_model = cat_stt.get("model") or ("nova-3" if "nova3" in sel.id or "nova-3" in sel.id else "nova-2")
+    model_name = str(overrides.get("model") or default_model).strip()
     stt_kwargs = dict(
-        model=overrides.get("model", "nova-2"),
+        model=model_name,
         language=overrides.get("language", "hi"),
-        keywords=keywords,
         interim_results=bool(overrides.get("interim_results", True)),
         vad_events=bool(overrides.get("vad_events", True)),
         no_delay=bool(overrides.get("no_delay", True)),
         filler_words=bool(overrides.get("filler_words", True)),
         api_key=overrides.get("api_key") or DEEPGRAM_API_KEY or None,
     )
+    # Deepgram API compatibility:
+    # - Nova-3 models require Keyterm Prompting (list of strings via 'keyterm' parameter)
+    # - Nova-2, Nova-1, Enhanced, Base models use Keywords (list of (keyword, boost) tuples via 'keywords')
+    if model_name.lower().startswith("nova-3"):
+        keyterms = [k[0] if isinstance(k, (tuple, list)) else str(k) for k in keywords]
+        stt_kwargs["keyterm"] = keyterms
+    elif "nova-2" in model_name.lower():
+        stt_kwargs["keywords"] = keywords
     # Try to add production latency params with correct names, fallback gracefully if not supported
     # Correct param is endpointing_ms (not endpointing) per installed plugin 1.8.2
     # Preserve utterance_end_ms, smart_format, punctuate - don't drop all on single failure
     optional_params = {}
     # Support both endpointing_ms and legacy endpointing for backward compat
     # Deepgram's own end-of-speech detection must NOT beat the session's
-    # endpointing (min_delay 0.35s). 200ms fired before silero's min_silence,
-    # so LiveKit logged "stt end of speech received while vad is still in a
-    # speech segment, flushing vad" and cut users off mid-sentence.
-    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300"))
+    # endpointing. The session endpointing min is 0.25s and the silero VAD
+    # min_silence is 0.35s, so 200ms is the largest value that still fires
+    # before either layer — the final lands ~200ms after the user stops
+    # talking, and the session adds its adaptive 0.25-0.75s on top. (The old
+    # 300ms added a full extra 100ms of dead air to every turn.)
+    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "200"))
     # utterance_end is the fallback final when endpointing never fires (long
     # pause): 1000ms added a full second of dead air on slow speakers — but
     # Deepgram REJECTS utterance_end_ms below 1000 (WS handshake returns 400
@@ -768,7 +798,10 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_stt(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.stt
+    primary_pair = getattr(cfg.providers, "stt", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="deepgram_nova2", config={})
     primary = _build_stt_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "stt_fallback", None)
@@ -936,7 +969,10 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_tts(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.tts
+    primary_pair = getattr(cfg.providers, "tts", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="google_wavenet_hi", config={})
     primary = _build_tts_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "tts_fallback", None)
@@ -1212,6 +1248,16 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
     kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
+    logger.info(
+        "📚 [KNOWLEDGE_BASE_INIT] Agent '%s' knowledge loaded: manual_text=%d chars, documents=%d, faq=%d items | Static budgets: KB=%d chars, FAQ=%d chars, Owner=%d chars",
+        cfg.name,
+        len(getattr(cfg.knowledge, "text", "") or ""),
+        len(getattr(cfg.knowledge, "documents", []) or []),
+        len(getattr(cfg.knowledge, "faq", []) or []),
+        kb_budget,
+        faq_budget,
+        owner_budget,
+    )
 
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
@@ -1220,6 +1266,20 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
         f"Preferred language: {lang}; use it when the caller's language is unclear.",
     ]
+    # Human rhythm + real latency win: a 1-3 word acknowledgment spoken as its
+    # OWN first sentence reaches the TTS the moment the LLM emits its first
+    # tokens, so the caller hears a response within ~1s instead of waiting for a
+    # full synthesized sentence. This is also how human receptionists answer.
+    # Env kill switch: VOICE_ACK_OPENERS=0.
+    if os.getenv("VOICE_ACK_OPENERS", "1") == "1":
+        lines.append(
+            "CONVERSATION RHYTHM (critical): begin EVERY answer with a very short natural "
+            "acknowledgment as its OWN complete sentence, in the caller's language — for "
+            "example 'जी.' / 'हाँ जी.' / 'अच्छा.' in Hindi, 'Sure.' / 'Right.' / 'Of course.' "
+            "in English — then give the full answer starting from the next sentence. Keep the "
+            "acknowledgment to 1-3 words, vary it naturally, and never use the same "
+            "acknowledgment twice in a row."
+        )
     lines.append(
         "Behave like a warm human receptionist. Never repeat yourself, never push "
         "the same offer, never read out a list of services unprompted, and never "
@@ -1271,8 +1331,8 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         if truncated_any:
             logger.warning(
                 "⚠️ Knowledge base truncated to fit the LLM context budget "
-                f"({sum(len(f) for f in facts)} -> {used} chars; Groq's free tier is "
-                "8k TPM, and an oversized prompt is what causes 429s → silent dropped "
+                f"({sum(len(f) for f in facts)} -> {used} chars; an oversized prompt "
+                "is what causes rate-limit 429s → silent dropped "
                 f"turns). Raise VOICE_KB_BUDGET_CHARS only if you've upgraded the "
                 f"Groq tier or switched to a higher-limit provider (budget {kb_budget})."
             )
@@ -1353,7 +1413,7 @@ async def wait_until_caller_can_hear(session, timeout: float = 12.0) -> None:
         except Exception as e:
             logger.warning(f"wait_for_ready failed; speaking anyway: {e}")
     # RoomIO "ready" is earlier than the browser attaching <audio>.
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(0.2)
 
 
 async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> None:
@@ -1391,6 +1451,27 @@ async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> No
         raise last_error
 
 
+def warm_agent_builder_schemas() -> None:
+    """Pre-warm Pydantic ChatMessage and ChatContext validation schemas off the event loop.
+
+    Pydantic v2 triggers a lazy model_rebuild() upon first ChatMessage instantiation.
+    On Windows systems, model_rebuild() inspects caller namespaces and imports annotations,
+    blocking the asyncio event loop for up to 7+ seconds if done inside an active call turn.
+    Calling this in prewarm() compiles the validators ahead of time.
+    """
+    try:
+        from livekit.agents.llm import chat_context
+        chat_context.ChatMessage.model_rebuild()
+        from livekit.agents import llm
+        warm_ctx = llm.ChatContext()
+        warm_ctx.add_message(role="system", content="warmup")
+        warm_ctx.add_message(role="user", content="warmup")
+        warm_ctx.add_message(role="assistant", content="warmup")
+        logger.info("🔥 Prewarm: llm.ChatContext / ChatMessage models compiled (0ms model_rebuild during call)")
+    except Exception as exc:
+        logger.debug("ChatContext schema prewarm note: %r", exc)
+
+
 def build_voice_agent(
     cfg: AgentConfig,
     *,
@@ -1398,6 +1479,7 @@ def build_voice_agent(
     prior_memory: str = "",
     lead_data: Optional[dict] = None,
     turn_timing_ref: Optional[dict] = None,
+    rag_prefetch: Optional[dict] = None,
 ) -> "Any":
     """Return a LiveKit v1 ``Agent`` instance wired for this config.
 
@@ -1470,6 +1552,7 @@ def build_voice_agent(
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         # Avoid duplicate TTS: worker.py already spoke deterministic closing.
         # Only speak here as fallback if worker hasn't (check last closing timestamp).
         import time as _time
@@ -1499,6 +1582,14 @@ def build_voice_agent(
             await asyncio.sleep(0.4)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
+        agent_inst = agent_ref.get("instance")
+        if agent_inst is not None:
+            sess = getattr(agent_inst, "session", None)
+            if sess is not None:
+                try:
+                    sess.shutdown(drain=False)
+                except Exception:
+                    pass
         room = getattr(ctx.room, "name", None)
         if room:
             try:
@@ -1507,6 +1598,7 @@ def build_voice_agent(
             except Exception as e:
                 logger.warning(f"end_call: could not delete room {room}: {e}")
         ctx.shutdown()
+        logger.info("[CALL_ENDED] reason=completed")
         return "Call ended."
 
     # `name="end_call"` keeps the LLM-visible tool name in sync with the prompt
@@ -1563,7 +1655,6 @@ def build_voice_agent(
             self.greeting = greeting
             self._opening_started = False
             self._opening_done = False
-            self._last_rag = ""  # per-turn RAG injection (see on_user_turn_completed)
             self._turn_timing_ref = turn_timing_ref  # For preventing duplicate REQUEST START while previous active
             # Store instance so _end_call tool can speak deterministic closing via session.
             agent_ref["instance"] = self
@@ -1585,12 +1676,13 @@ def build_voice_agent(
             self._opening_started = True
             try:
                 if not (self.greeting or "").strip():
-                    logger.warning("Assistant has no greeting — skipping opening line")
+                    logger.info("[ASSISTANT_STARTED] Assistant has no greeting — listening immediately")
                     return
-                logger.info("🗣️ Assistant connected — speaking greeting once the caller can hear")
+                logger.info("[ASSISTANT_STARTED] Assistant connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
+                logger.info("[ASSISTANT_STARTED] Speaking greeting: %s", self.greeting[:60])
                 await speak_opening_line(self.session, self.greeting, timeout=45)
-                logger.info("✅ Greeting finished — now listening")
+                logger.info("[ASSISTANT_STARTED] Greeting finished — now listening for caller speech")
             except Exception as e:
                 logger.warning(f"Greeting failed: {type(e).__name__}: {e!r}")
             finally:
@@ -1621,6 +1713,11 @@ def build_voice_agent(
             # Turn serialization is LiveKit's job, not ours: a superseded request is
             # simply cancelled and reported as 0/0 tokens, which billing ignores.
             # So: log only, never wait.
+            try:
+                _turn_marker_text = _chat_msg_text(new_message).strip()
+                logger.info("🗣️ [USER_TURN_COMPLETED] user turn committed: '%s'", _turn_marker_text[:80])
+            except Exception:
+                pass
             try:
                 if self._turn_timing_ref and self._turn_timing_ref.get("llm_active", False):
                     prev_start = self._turn_timing_ref.get("request_start", 0)
@@ -1777,32 +1874,117 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
-                # Async RAG to avoid blocking event loop
-                try:
-                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
-                    hits = (hits or "").strip()
-                except Exception:
-                    # Fallback sync if to_thread fails
-                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
-                _rag_elapsed = (_time.time() - _rag_t0) * 1000
-                if _rag_elapsed > 200:
-                    logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
+                logger.info("🔎 [RAG_STARTED] query='%s'", user_text[:60])
+                # --- Fast path: the worker precomputes RAG from STT interim
+                # text (in parallel with endpointing), so by the time the turn
+                # completes the retrieval result for this exact text is usually
+                # already cached. This hook is AWAITED by the session before the
+                # LLM starts, so a cache hit removes ~30-100ms from EVERY turn.
+                hits = ""
+                # P3 ROOT-CAUSE FIX: initialize EVERY retrieval-result field
+                # before either branch. Previously kb_used/faq_used & friends
+                # were assigned ONLY on the cache-MISS path; the shared log
+                # line after injection then raised UnboundLocalError on each
+                # prefetch-HIT turn (surfacing as the misleading
+                # "per-turn RAG injection skipped" warning — the context was in
+                # fact injected). Both branches now produce the same structure.
+                kb_used = False
+                kb_chars = 0
+                kb_hits = 0
+                faq_used = False
+                faq_chars = 0
+                faq_hits = 0
+                total_chars = 0
+                _prefetch_entry = None
+                if rag_prefetch is not None:
+                    try:
+                        _prefetch_entry = rag_prefetch.get(rag.normalize_query(user_text))
+                    except Exception:
+                        _prefetch_entry = None
+                # The worker caches the full detailed result; tolerate the old
+                # bare-string shape too so a worker/builder version skew cannot
+                # turn a hit into a crash.
+                if isinstance(_prefetch_entry, dict):
+                    hits = (_prefetch_entry.get("text") or "").strip()
+                elif isinstance(_prefetch_entry, str):
+                    hits = _prefetch_entry.strip()
                 else:
-                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms (hits {len(hits)} chars)")
-                if not hits or hits == self._last_rag:
-                    logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
-                    return  # nothing new
+                    hits = ""
+                if hits:
+                    if isinstance(_prefetch_entry, dict):
+                        kb_used = bool(_prefetch_entry.get("kb_used", False))
+                        kb_chars = int(_prefetch_entry.get("kb_chars", 0) or 0)
+                        kb_hits = int(_prefetch_entry.get("kb_hits", 0) or 0)
+                        faq_used = bool(_prefetch_entry.get("faq_used", False))
+                        faq_chars = int(_prefetch_entry.get("faq_chars", 0) or 0)
+                        faq_hits = int(_prefetch_entry.get("faq_hits", 0) or 0)
+                        total_chars = int(_prefetch_entry.get("total_chars", len(hits)) or len(hits))
+                    else:  # bare text (older worker): source flags unknown
+                        kb_used = True
+                        kb_chars = total_chars = len(hits)
+                    _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                    logger.info(
+                        "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars | prefetch=true",
+                        user_text[:60], _rag_elapsed, kb_used, kb_chars, kb_hits,
+                        faq_used, faq_chars, faq_hits, total_chars,
+                    )
+                    logger.info(
+                        "⚡ RAG PREFETCH HIT '%s' (%d chars) — computed during the STT interim, "
+                        "critical-path cost %.0fms",
+                        user_text[:60], len(hits), _rag_elapsed,
+                    )
+                else:
+                    # Cache miss (final text diverged from every interim, or the
+                    # interim compute lost the race): compute now, same as before.
+                    try:
+                        rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, user_text, 3)
+                    except Exception:
+                        # Fallback sync if to_thread fails
+                        rag_res = rag.build_context_detailed(cfg.knowledge, user_text, top_k=3)
+                    _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                    hits = (rag_res.get("text") or "").strip()
+                    kb_used = rag_res.get("kb_used", False)
+                    kb_chars = rag_res.get("kb_chars", 0)
+                    kb_hits = rag_res.get("kb_hits", 0)
+                    faq_used = rag_res.get("faq_used", False)
+                    faq_chars = rag_res.get("faq_chars", 0)
+                    faq_hits = rag_res.get("faq_hits", 0)
+                    total_chars = rag_res.get("total_chars", 0)
+
+                    # Authoritative user-facing retrieval log detailing KB and FAQ usage
+                    logger.info(
+                        "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
+                        user_text[:60],
+                        _rag_elapsed,
+                        kb_used,
+                        kb_chars,
+                        kb_hits,
+                        faq_used,
+                        faq_chars,
+                        faq_hits,
+                        total_chars,
+                    )
+
+                    if _rag_elapsed > 200:
+                        logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
+
+                # NOTE: deliberately NO "same as last turn" dedupe here. This hook
+                # edits the per-turn copy of the chat context (temp_mutable_chat_ctx);
+                # the library discards it after generation, so the previous turn's
+                # injected facts are NOT in this turn's prompt. Skipping injection on
+                # "no new hits" (the old behavior) silently left repeat-question turns
+                # ungrounded (23:19 log: identical kb result -> "RAG no new hits" ->
+                # model answered from generic priors). Same text = same injection cost
+                # (~600 tokens); correctness wins.
+                if not hits:
+                    logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                    return  # nothing to inject
                 target = _find_chat_ctx(turn_ctx)
                 if target is None:
                     logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
+                
                 # FIX ROOT CAUSE: When KB/FAQ RAG enabled, preemptive must be disabled BEFORE turn begins
-                # Verify runtime Session config, not just config variable
-                # Exactly one LLM REQUEST START per turn, no preemptive that can be invalidated by RAG mutation
-                # Previous bug: logged conflict but still allowed duplicate 0/0 failure
-                # New: Check if RAG enabled, if so preemptive should already be disabled at session level (worker.py fix)
-                # If preemptive_on env True but RAG enabled, session config has preemptive=False, so no invalidation should happen
-                # Log verification, not conflict
                 rag_enabled = True
                 try:
                     import os as _os_rag_check
@@ -1813,21 +1995,10 @@ def build_voice_agent(
                     rag_enabled = True
                 
                 if preemptive_on and rag_enabled:
-                    # This should NOT happen after worker.py fix - preemptive should be disabled when RAG enabled
-                    # If it does happen, it means session config still has preemptive enabled, which is bug
-                    # Log as warning that duplicate may occur, but we have disabled at session level so should be safe
-                    # Actually, after fix, preemptive_on env True but session preemptive=False, so no invalidation
-                    # So we log that RAG grounding needed but preemptive already disabled at session level, no invalidation
                     logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {user_text[:60]})")
                 elif preemptive_on:
                     logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
-                # Drop previous RAG message to avoid growth
-                try:
-                    items = getattr(target, "items", None)
-                    if isinstance(items, list):
-                        target.items = [m for m in items if _RAG_PREFIX not in _chat_msg_text(m)]
-                except Exception:
-                    pass
+                
                 target.add_message(
                     role="system",
                     content=(
@@ -1835,10 +2006,12 @@ def build_voice_agent(
                         f"question:\n{hits}"
                     ),
                 )
-                self._last_rag = hits
-                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]}")
+                logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
             except Exception as e:
-                logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
+                # RAG only *enriches* the turn context: a retrieval failure must
+                # never gate or delay the LLM reply (brief P4). Log loudly with
+                # the real exception, then fall through so LiveKit generates.
+                logger.warning(f"⚠️ per-turn RAG handling raised {type(e).__name__}: {e!r} — LLM reply still proceeds ungrounded for this turn")
                 logger.info(f"⏱️ TIMING on_user_turn_completed (RAG error, fallback): {(_time.time()-_rag_t0)*1000:.0f}ms")
 
     return _VoiceAgent()
@@ -1861,11 +2034,8 @@ def build_announce_agent(
     from livekit.agents import Agent
     from livekit.agents import llm
 
-    text = (announce_text or cfg.greeting or "").strip()
-    if not text:
-        raise ValueError(
-            "Announcement agent has no script. Set announce_text (or greeting) on the agent."
-        )
+    text = (announce_text or getattr(cfg, "announce_text", "") or cfg.greeting or f"Hello, this is {cfg.name} with an announcement.").strip()
+    end_after_announcement = bool(getattr(cfg, "end_after_announcement", False))
 
     class _AnnounceAgent(Agent):
         def __init__(self):
@@ -1884,36 +2054,49 @@ def build_announce_agent(
             )
 
         async def on_enter(self) -> None:
-            # Announcement mode: read the fixed script, then hang up. No STT, no LLM.
-            # The room is deleted only after playout has flushed — deleting it
-            # immediately is what made these calls sound silent.
             self._opening_started = True
             try:
-                logger.info("📢 Announcement connected — reading the script once the caller can hear")
+                logger.info("[ANNOUNCEMENT_STARTED] Announcement connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
+                logger.info("[ANNOUNCEMENT_STARTED] Reading announcement script: %s", text[:60])
                 await speak_opening_line(self.session, text, timeout=120)
-                logger.info("✅ Announcement script finished")
-                await asyncio.sleep(1.2)
+                logger.info("[ANNOUNCEMENT_FINISHED] Announcement script playback completed")
             except Exception as e:
                 logger.warning(f"Announcement playback failed: {type(e).__name__}: {e!r}")
             finally:
                 self._opening_done = True
-            try:
-                from livekit.agents import get_job_context
-                ctx = get_job_context(required=False)
-                if ctx is not None:
-                    room = getattr(ctx.room, "name", None)
-                    if room:
-                        try:
-                            from ..telephony import end_active_room
-                            await end_active_room(room)
-                        except Exception as e:
-                            logger.warning(f"announcement: could not delete room {room}: {e}")
-                    ctx.shutdown()
-                else:
-                    self.session.shutdown(drain=True)
-                logger.info("📢 Announcement finished — closing call.")
-            except Exception as e:
-                logger.warning(f"could not close announcement session: {e}")
+
+            if end_after_announcement:
+                logger.info("[CALL_END_REQUESTED] source=announcement reason=announcement_completed")
+                try:
+                    await asyncio.sleep(2.5)  # flush audio playout buffer to caller
+                    from livekit.agents import get_job_context
+                    ctx = get_job_context(required=False)
+                    try:
+                        self.session.shutdown(drain=True)
+                    except Exception:
+                        pass
+                    if ctx is not None:
+                        room = getattr(ctx.room, "name", None)
+                        if room:
+                            try:
+                                from ..telephony import end_active_room
+                                await end_active_room(room)
+                            except Exception as e:
+                                logger.warning(f"announcement: could not delete room {room}: {e}")
+                        ctx.shutdown()
+                    logger.info("[CALL_ENDED] reason=announcement_completed")
+                except Exception as e:
+                    logger.warning(f"could not close announcement session: {e}")
+            else:
+                logger.info("📢 Announcement finished — keeping call connected (end_after_announcement=False)")
 
     return _AnnounceAgent()
+
+
+# Pre-compile schemas when agent_builder is imported
+try:
+    warm_agent_builder_schemas()
+except Exception:
+    pass
+
