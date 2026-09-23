@@ -692,16 +692,19 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
     # - no_delay True: send final immediately, don't buffer
     # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
+    model_name = str(overrides.get("model", "nova-2")).strip()
     stt_kwargs = dict(
-        model=overrides.get("model", "nova-2"),
+        model=model_name,
         language=overrides.get("language", "hi"),
-        keywords=keywords,
         interim_results=bool(overrides.get("interim_results", True)),
         vad_events=bool(overrides.get("vad_events", True)),
         no_delay=bool(overrides.get("no_delay", True)),
         filler_words=bool(overrides.get("filler_words", True)),
         api_key=overrides.get("api_key") or DEEPGRAM_API_KEY or None,
     )
+    # Deepgram only supports keywords on nova-2; nova-3 uses keyterm prompting
+    if "nova-2" in model_name.lower():
+        stt_kwargs["keywords"] = keywords
     # Try to add production latency params with correct names, fallback gracefully if not supported
     # Correct param is endpointing_ms (not endpointing) per installed plugin 1.8.2
     # Preserve utterance_end_ms, smart_format, punctuate - don't drop all on single failure
@@ -1409,6 +1412,26 @@ async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> No
                 await asyncio.sleep(0.4)
     if last_error is not None:
         raise last_error
+
+
+def warm_agent_builder_schemas() -> None:
+    """Pre-warm Pydantic ChatMessage and ChatContext validation schemas off the event loop.
+
+    Pydantic v2 triggers a lazy model_rebuild() upon first ChatMessage instantiation.
+    On Windows systems, model_rebuild() inspects caller namespaces and imports annotations,
+    blocking the asyncio event loop for up to 7+ seconds if done inside an active call turn.
+    Calling this in prewarm() compiles the validators ahead of time.
+    """
+    try:
+        from livekit.agents import llm
+        warm_ctx = llm.ChatContext()
+        warm_ctx.add_message(role="system", content="warmup")
+        warm_ctx.add_message(role="user", content="warmup")
+        warm_ctx.add_message(role="assistant", content="warmup")
+        _ = llm.ChatMessage(role="system", content="warmup")
+        logger.info("🔥 Prewarm: llm.ChatContext / ChatMessage models compiled (0ms model_rebuild during call)")
+    except Exception as exc:
+        logger.debug("ChatContext schema prewarm note: %r", exc)
 
 
 def build_voice_agent(
