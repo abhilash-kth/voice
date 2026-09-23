@@ -1697,6 +1697,40 @@ def build_voice_agent(
                 # here or the two can disagree.
             )
 
+        def llm_node(self, chat_ctx, tools, model_settings):
+            """Deterministic ack + incomplete-turn silence (see app/turn_rules.py).
+
+            Library contract (voice/generation.py `_llm_inference_task`): a
+            coroutine resolving to ``str`` IS the complete reply (fed straight to
+            TTS); one resolving to ``None`` yields no output at all. That is how
+            an acknowledgement gets answered with ZERO LLM calls (no REQUEST
+            START, no tokens, no billing entry to exclude) and how an incomplete
+            fragment stays silent until the caller finishes the thought. Every
+            other turn falls through to the default LLM path untouched.
+            """
+            tt = self._turn_timing_ref
+            if tt is not None:
+                ack = tt.get("ack_reply")
+                if ack is not None:
+                    tt.pop("ack_reply", None)
+                    logger.info(
+                        "✅ [ACK_FAST_PATH] text='%s' response='%s' (no LLM request)",
+                        str(ack.get("text", ""))[:60], str(ack.get("reply", ""))[:40],
+                    )
+
+                    async def _ack_reply():
+                        return str(ack.get("reply") or "जी।")
+
+                    return _ack_reply()
+                if tt.get("gov_turn_state") == "suppress":
+                    logger.info("⏸️ [LLM_REQUEST_SKIPPED] reason=incomplete_turn — awaiting caller continuation")
+
+                    async def _skip():
+                        return None
+
+                    return _skip()
+            return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+
         async def on_enter(self) -> None:
             # Assistant mode: greet as soon as the caller can hear, then listen.
             self._opening_started = True
@@ -1724,7 +1758,9 @@ def build_voice_agent(
             - Explicit goodbye detection is fast (string ops, ~1ms)
             - Conversation trim is fast (list slice)
             - RAG is now async via to_thread to avoid blocking event loop (was sync, could be 100-300ms)
-            - When VOICE_PREEMPTIVE=1, RAG is skipped (static facts only) to preserve preemptive generation
+            - Turn governor (below): ack turns answer deterministically via the
+              agent's llm_node override (zero LLM), incomplete fragments are held
+              silently and merged into the next completed turn's RAG query
             - Added timing logs for STT_final->LLM_start to detect 3-7s outliers
             - FIX: Prevent duplicate/invalidated LLM requests - wait for previous LLM to complete before new REQUEST START
             - Exactly one REQUEST START per completed user turn, no 0/0 race
@@ -1826,28 +1862,56 @@ def build_voice_agent(
                     )
             except Exception:
                 explicit_goodbye = False
-            # Acknowledgement turns ("Ok," / "ठीक है." / "haan ji") are neither
-            # questions nor closings: skip the trim AND per-turn RAG so the model
-            # answers from the prompt's ACKNOWLEDGEMENT TURNS rule instead of
-            # re-deriving KB facts (23:36 log: three "Ok," turns -> three full
-            # office/founder replies, ~600 injected tokens + ~₹0.003 each).
-            # Second purpose (2026-09-23): leaving chat_ctx untouched is what
-            # lets the worker's scoped preemptive gate REUSE a speculative
-            # generation for these turns (library re-checks is_equivalent at
-            # commit; any mutation here would cancel it).
+            # --- Turn governor (2026-09-24 spec) — runs BEFORE any LLM
+            # scheduling and decides three outcomes:
+            #   ack        -> llm_node answers with a canned line; NO LLM request,
+            #                 NO tokens, NO billing (00:31 log: 'Ok.' still cost a
+            #                 2865-token request whose 3-char answer was then
+            #                 mis-flagged into an apology).
+            #   incomplete -> llm_node produces NOTHING; the fragment is kept in
+            #                 pending_fragments and merged into the next complete
+            #                 turn (00:31 log: one thought split into 4 finals
+            #                 produced 3 invalidated 0/0 requests + 1 answered).
+            #   complete   -> normal trim+RAG+LLM path; if fragments are pending,
+            #                 RAG runs on the MERGED query.
+            # Closing intent always wins (explicit_goodbye computed above), so
+            # "thanks"/"बस इतना ही..." keep the existing deterministic closing.
             try:
-                _ack_check_text = user_text
+                _gtext = user_text
             except NameError:
-                _ack_check_text = ""
-            if _ack_check_text:
-                try:
-                    from .. import rag as _rag_ack
-                    _is_ack_turn = _rag_ack.is_acknowledgement(_ack_check_text)
-                except Exception:
-                    _is_ack_turn = False
-                if _is_ack_turn:
-                    logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s' (ctx untouched)", _ack_check_text[:40])
-                    return
+                _gtext = ""
+            _tt = self._turn_timing_ref
+            if _tt is not None:
+                # per-turn flags: drop anything left from a cancelled turn so a
+                # stale 'ack'/'suppress' can never hijack the next real question
+                _tt.pop("gov_turn_state", None)
+                _tt.pop("ack_reply", None)
+                _tt.pop("combined_query", None)
+                if _gtext and not explicit_goodbye:
+                    try:
+                        from .. import rag as _rag_rules
+                        _is_ack = _rag_rules.is_acknowledgement(_gtext)
+                        _is_inc = (not _is_ack) and _rag_rules.is_incomplete_turn(_gtext)
+                    except Exception:
+                        _is_ack = _is_inc = False
+                    if _is_ack:
+                        _tt["gov_turn_state"] = "ack"
+                        _tt["ack_reply"] = {"text": _gtext, "reply": _rag_rules.ack_reply(_gtext)}
+                        logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s' → deterministic reply, no LLM", _gtext[:40])
+                        return
+                    if _is_inc:
+                        _pend = list(_tt.get("pending_fragments") or [])
+                        _pend = (_pend + [_gtext])[-4:]
+                        _tt["pending_fragments"] = _pend
+                        _tt["gov_turn_state"] = "suppress"
+                        logger.info("⏸️ [INCOMPLETE_TURN] text='%s' waiting_for_continuation=true fragments=%d", _gtext[:60], len(_pend))
+                        return
+                    _pend = list(_tt.get("pending_fragments") or [])
+                    if _pend:
+                        _combined = " ".join(_pend + [_gtext])
+                        _tt["gov_turn_state"] = "complete"
+                        _tt["combined_query"] = _combined
+                        logger.info("🧩 [COMPLETE_TURN] merged %d fragment(s): '%s'", len(_pend) + 1, _combined[:90])
             # Keep the rolling conversation bounded. Groq accounts the entire
             # prompt against TPM; an unbounded voice call eventually turns every
             # request into a 429 even with the 20b model. Preserve system facts
@@ -1922,6 +1986,12 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
+                # If this turn completed a split thought, retrieve for the MERGED
+                # question (fragments + this final) instead of the bare tail —
+                # [COMPLETE_TURN] logged above shows the merge.
+                _cq = (self._turn_timing_ref or {}).get("combined_query")
+                if _cq:
+                    user_text = str(_cq)
                 logger.info("🔎 [RAG_STARTED] query='%s'", user_text[:60])
                 # --- Fast path: the worker precomputes RAG from STT interim
                 # text (in parallel with endpointing), so by the time the turn

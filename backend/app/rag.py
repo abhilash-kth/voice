@@ -78,42 +78,10 @@ def _tokens(text: str) -> List[str]:
     return [t.lower() for t in _WORD_RE.findall(text)]
 
 
-# Words that are pure acknowledgement/filler — a turn made ONLY of these is
-# not a question, so per-turn retrieval (and its prompt cost) can be skipped.
-# Deliberately excludes anything with information content: "bye"/"alvida"
-# (handled by the closing guard), "chalo"/"number"/"price" etc. Keep in sync
-# with the ACKNOWLEDGEMENT TURNS rule in build_instructions().
-_ACK_WORDS = {
-    # latin
-    "ok", "okay", "okey", "kk", "k", "thx", "thanks", "thank", "nice",
-    "good", "great", "yes", "yeah", "yep", "yup", "sure", "fine", "right",
-    "cool", "wow", "hmm", "hm", "ha", "haa", "haan", "han", "ji", "sir",
-    "madam", "mam", "maam", "theek", "thik", "accha", "achha", "achcha",
-    "sahi", "theek", "hai",
-    # devanagari
-    "ठीक", "है", "जी", "हां", "हाँ", "अच्छा", "अच्छी", "जीब", "सही", "शाबाश",
-    "हाँ", "ठिक", "थीक",
-}
-
-
-def is_acknowledgement(text: str) -> bool:
-    """True when the whole turn is only acknowledgement/filler words.
-
-    Guards: any '?' (even "haan to?" is a question), or any word carrying
-    content, disqualifies. Max 3 words so multi-sentence turns are never
-    mistaken for acks. Used to skip per-turn RAG retrieval/injection (the
-    static KB summary still applies) and to keep the prompt rule honest.
-    """
-    try:
-        t = (text or "").strip().lower()
-        if not t or "?" in t or "？" in t or "¿" in t:
-            return False
-        words = [w for w in re.split(r"[^\wऀ-ॿ']+", t, flags=re.UNICODE) if w]
-        if not words or len(words) > 3:
-            return False
-        return all(w in _ACK_WORDS for w in words)
-    except Exception:
-        return False
+# Acknowledgement / incomplete-turn classification lives in turn_rules.py
+# (shared with worker + builder hook without importing retrieval deps).
+# Re-exported here for existing call sites.
+from .turn_rules import ack_reply, is_acknowledgement, is_incomplete_turn  # noqa: F401
 
 
 def normalize_query(text: str) -> str:
