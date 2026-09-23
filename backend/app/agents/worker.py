@@ -30,6 +30,19 @@ import aiohttp
 # the event loop): hashlib used to be lazily imported on the first LLM request
 # of every call, right inside [PROMPT]. Import once at startup instead.
 import hashlib as _hl
+
+# Same lesson, applied to the modules whose first real import landed during an
+# active call (see the prewarm() blocks): the first STT interim used to import
+# app.rag ON THE LOOP (rag → models/pydantic chain → rank_bm25), which is the
+# tokenize/parse stall the monitor blamed on "tokenize.py"/numpy frames while
+# the import lock starved everything else. Import at process start; the
+# function-local "from app import rag" lines then cost ~200ns dict lookups.
+# Guarded so a bare `python worker.py` without the app package on sys.path
+# still starts.
+try:
+    from app import rag as _rag_preload  # noqa: F401
+except Exception:
+    pass
 from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
@@ -3947,6 +3960,35 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: async_toolset imported (avoids 101ms import block)")
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
+
+    # Prewarm (03:07–03:09 log): the remaining application-owned loop blocks
+    # were module loads and first-execution costs, NOT audio math — the first
+    # STT interim imported app.rag (+ pydantic validators for KnowledgeItem),
+    # the first LLM completion imported app.llm_catalog inside the billing
+    # block, hangup imports app.telephony/db. Job processes spawn fresh
+    # (multiprocessing_context="spawn"), so warm per-job HERE; everything
+    # below is import/constructor calls only — no state the live pipeline
+    # reads, so a failure here changes nothing but the first-turn timing.
+    try:
+        from app import rag as _rag_pw
+        _kb0 = _rag_pw.KnowledgeBase(text="prewarm warmup sample corpus tokens")
+        # exercises build_index, _index_for, BM25 fast+fallback paths,
+        # normalize_query, and the first KnowledgeItem validation (pydantic
+        # model_rebuild imports inspect→tokenize — must never happen
+        # mid-utterance either).
+        _rag_pw.build_index(_kb0)
+        _rag_pw.build_context_detailed(_kb0, "warmup query", top_k=1)
+        _rag_pw.normalize_query(" Ok  warmup ")
+        logger.info("🔥 Prewarm: RAG stack hot (rag import chain, index build, validators — 0ms module load on first interim)")
+    except Exception as e:
+        logger.debug(f"RAG prewarm failed: {e}")
+    try:
+        import app.llm_catalog  # noqa: F401  (billing cost calc: first LLM completion)
+        import app.telephony  # noqa: F401   (end_active_room: hangup path)
+        import app.db  # noqa: F401          (release_current_loop/get_prisma)
+        logger.info("🔥 Prewarm: llm_catalog/telephony/db imported (billing + hangup paths load-free)")
+    except Exception as e:
+        logger.debug(f"billing/telephony prewarm failed: {e}")
 
     # Prewarm Pydantic ChatMessage and ChatContext validation schemas off the agent loop.
     # In Pydantic v2, ChatMessage.__init__ triggers model_rebuild() upon first invocation.
