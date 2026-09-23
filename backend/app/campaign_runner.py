@@ -71,6 +71,24 @@ async def reconcile_and_dispatch(cmp: dict) -> None:
     c = await _refetch(cid, user_id)
     if not c:
         return
+
+    # If the agent's config broke since the campaign started (key rotated,
+    # model retired), every dial would crash the worker and fail the call.
+    # Pause loudly instead of burning wallet credits lead by lead.
+    try:
+        from . import preflight as _pf
+        agent_rec = await repo.get_agent(cmp["agent_id"], user_id)
+        if agent_rec:
+            err = await _pf.preflight_agent_config(agent_rec)
+            if err:
+                campaign_store.set_status(user_id, cid, "paused")
+                logger.error(
+                    f"campaign {cid}: PAUSED — agent config no longer builds: {err}"
+                )
+                return
+    except Exception as e:
+        logger.warning(f"campaign {cid}: preflight check failed: {e}")
+
     queued = [l for l in c["leads"] if l["status"] == "queued"]
     calling_now = len([l for l in c["leads"] if l["status"] == "calling"])
     free = max(0, c["concurrency"] - calling_now)

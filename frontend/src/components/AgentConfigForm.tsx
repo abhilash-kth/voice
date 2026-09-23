@@ -109,6 +109,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   );
   const [mode, setMode] = useState(editing?.agent_mode || "assistant");
   const [announceText, setAnnounceText] = useState(editing?.announce_text || "");
+  const [endAfterAnnouncement, setEndAfterAnnouncement] = useState(
+    editing?.end_after_announcement ?? false
+  );
   const [personality, setPersonality] = useState(editing?.voice_personality || "friendly");
   const [language, setLanguage] = useState(editing?.language || "hi");
   // Spoken-voice gender: picks the Google Chirp 3 speaker / Sarvam Bulbul speaker.
@@ -508,7 +511,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         max_tokens: maxTokens,
         ...tuning,
       };
-      if (fallbackEnabled) {
+      if (fallbackEnabled && mode !== "announcement") {
         const fallbackMeta = getModelMeta(fallbackLlmProvider, fallbackLlmModel);
         // Do not treat Groq 120B as OpenAI - keep separate
         if (!(primaryLlmProvider === fallbackLlmProvider && primaryLlmModel === fallbackLlmModel)) {
@@ -549,6 +552,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       if (fallbackEnabled) {
         for (const kind of fallbackKinds) {
           if (kind === "llm") continue; // handled separately
+          if (mode === "announcement" && kind !== "tts") continue; // fixed-script mode: only the voice falls back
           const fpid = fallbackPicked[kind];
           if (!fpid) continue;
           const primaryId = picked[kind];
@@ -562,7 +566,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         }
         // LLM fallback legacy
         const fpid = fallbackPicked.llm;
-        if (fpid && fpid !== picked.llm) {
+        if (mode !== "announcement" && fpid && fpid !== picked.llm) {
           cfg.llm_fallback = buildProviderEntry(fpid);
         }
       }
@@ -576,7 +580,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       cfg[kind] = buildProviderEntry(pid);
     }
     if (fallbackEnabled) {
-      for (const kind of ["stt", "tts"] as const) {
+      // Announcement mode has no STT/LLM at runtime — only the voice (TTS) can fall back.
+      const fbKinds = mode === "announcement" ? (["tts"] as const) : (["stt", "tts"] as const);
+      for (const kind of fbKinds) {
         const fpid = fallbackPicked[kind];
         if (!fpid) continue;
         const primaryId = picked[kind];
@@ -597,8 +603,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const submit = async () => {
     setErr("");
     if (!name) return setErr("Please give the agent a name.");
-    if (mode === "announcement" && !announceText.trim() && !greeting.trim()) {
-      return setErr("For Announcement mode, fill in a Fixed script (or a Greeting to use as its fallback).");
+    if (mode === "announcement" && !announceText.trim()) {
+      return setErr("For Announcement mode, fill in the Fixed script — it is the only thing the agent will speak.");
     }
     // Validate V2 LLM provider/model
     if (isV2) {
@@ -627,6 +633,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         voice_personality: personality,
         agent_mode: mode,
         announce_text: mode === "announcement" ? announceText : "",
+        end_after_announcement: mode === "announcement" ? endAfterAnnouncement : false,
         fallback_response: fallbackResponse.trim(),
         no_response_timeout_seconds: Math.max(15, Number(noResponseTimeout) || 30),
         no_response_message: noResponseMessage.trim(),
@@ -694,19 +701,18 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             className="input mt-1"
           />
         </div>
-        <div>
-          <label className="text-xs text-gray-400 font-medium">Greeting</label>
-          <textarea
-            value={greeting}
-            onChange={(e) => setGreeting(e.target.value)}
-            rows={2}
-            placeholder="Namaste! Main Kavya hoon..."
-            className="input mt-1"
-          />
-          {mode === "announcement" && (
-            <p className="text-[11px] text-gray-500 mt-1">Optional in Announcement mode — used only if the Fixed script below is left empty.</p>
-          )}
-        </div>
+        {mode !== "announcement" && (
+          <div>
+            <label className="text-xs text-gray-400 font-medium">Greeting</label>
+            <textarea
+              value={greeting}
+              onChange={(e) => setGreeting(e.target.value)}
+              rows={2}
+              placeholder="Namaste! Main Kavya hoon..."
+              className="input mt-1"
+            />
+          </div>
+        )}
 
         <div>
           <label className="text-xs text-gray-400 font-medium">Fallback response</label>
@@ -719,28 +725,30 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           />
           <p className="text-[11px] text-gray-500 mt-1">Spoken when there is a temporary network, provider, or server problem.</p>
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="text-xs text-gray-400 font-medium">No-response timeout (seconds)</label>
-            <input
-              type="number"
-              min={15}
-              value={noResponseTimeout}
-              onChange={(e) => setNoResponseTimeout(Number(e.target.value))}
-              className="input mt-1"
-            />
-            <p className="text-[11px] text-gray-500 mt-1">Recommended: 30 seconds.</p>
+        {mode !== "announcement" && (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-gray-400 font-medium">No-response timeout (seconds)</label>
+              <input
+                type="number"
+                min={15}
+                value={noResponseTimeout}
+                onChange={(e) => setNoResponseTimeout(Number(e.target.value))}
+                className="input mt-1"
+              />
+              <p className="text-[11px] text-gray-500 mt-1">Recommended: 30 seconds.</p>
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 font-medium">No-response closing message</label>
+              <textarea
+                value={noResponseMessage}
+                onChange={(e) => setNoResponseMessage(e.target.value)}
+                rows={2}
+                className="input mt-1"
+              />
+            </div>
           </div>
-          <div>
-            <label className="text-xs text-gray-400 font-medium">No-response closing message</label>
-            <textarea
-              value={noResponseMessage}
-              onChange={(e) => setNoResponseMessage(e.target.value)}
-              rows={2}
-              className="input mt-1"
-            />
-          </div>
-        </div>
+        )}
 
         <div>
           <label className="text-xs text-gray-400 font-medium">Agent mode</label>
@@ -768,14 +776,22 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         </div>
 
         {mode === "announcement" && (
-          <div>
-            <label className="text-xs text-gray-400 font-medium">Fixed script (announcement)</label>
-            <textarea
-              value={announceText}
-              onChange={(e) => setAnnounceText(e.target.value)}
-              rows={3}
-              placeholder="Namaste! Ye ek reminder hai..."
-              className="w-full bg-gray-800 border border-blue-600/40 rounded-lg px-3 py-2 text-sm mt-1"
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-gray-400 font-medium">Fixed script (announcement)</label>
+              <textarea
+                value={announceText}
+                onChange={(e) => setAnnounceText(e.target.value)}
+                rows={3}
+                placeholder="Namaste! Ye ek reminder hai..."
+                className="w-full bg-gray-800 border border-blue-600/40 rounded-lg px-3 py-2 text-sm mt-1"
+              />
+            </div>
+            <Toggle
+              on={endAfterAnnouncement}
+              set={setEndAfterAnnouncement}
+              label="End call after announcement"
+              hint="Automatically hang up when script finishes (default: keep call open)"
             />
           </div>
         )}
@@ -795,38 +811,42 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               ))}
             </select>
           </div>
-          <div>
-            <label className="text-xs text-gray-400 font-medium">Language</label>
-            <select
-              value={language}
-              onChange={(e) => setLanguage(e.target.value)}
-              className="input mt-1"
-            >
-              {LANGUAGES.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.label}
-                </option>
-              ))}
-            </select>
-            <p className="mt-1 text-[10px] text-gray-500">
-              Drives STT language and the TTS locale the agent speaks in.
-            </p>
-          </div>
-          <div>
-            <label className="text-xs text-gray-400 font-medium">Voice gender</label>
-            <select
-              value={gender}
-              onChange={(e) => setGender(e.target.value)}
-              className="input mt-1"
-            >
-              <option value="female">Female</option>
-              <option value="male">Male</option>
-              <option value="neutral">Neutral</option>
-            </select>
-            <p className="mt-1 text-[10px] text-gray-500">
-              {GENDER_VOICE_HINT[gender] || GENDER_VOICE_HINT.female}
-            </p>
-          </div>
+          {mode !== "announcement" && (
+            <>
+              <div>
+                <label className="text-xs text-gray-400 font-medium">Language</label>
+                <select
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value)}
+                  className="input mt-1"
+                >
+                  {LANGUAGES.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[10px] text-gray-500">
+                  Drives STT language and the TTS locale the agent speaks in.
+                </p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400 font-medium">Voice gender</label>
+                <select
+                  value={gender}
+                  onChange={(e) => setGender(e.target.value)}
+                  className="input mt-1"
+                >
+                  <option value="female">Female</option>
+                  <option value="male">Male</option>
+                  <option value="neutral">Neutral</option>
+                </select>
+                <p className="mt-1 text-[10px] text-gray-500">
+                  {GENDER_VOICE_HINT[gender] || GENDER_VOICE_HINT.female}
+                </p>
+              </div>
+            </>
+          )}
         </div>
 
         {mode === "assistant" && (
@@ -1054,11 +1074,13 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             </button>
           </div>
           <p className="text-[11px] text-gray-500 mb-3">
-            Fallback supports multiple models with provider+model separate. Example: primary OpenAI gpt-4.1-mini, fallback Groq openai/gpt-oss-120b. Do not treat Groq 120B as OpenAI.
+            {mode === "announcement"
+              ? "Announcement mode plays a fixed script — only a backup voice (TTS) applies. If the primary TTS fails, the fallback TTS speaks the script."
+              : "Fallback supports multiple models with provider+model separate. Example: primary OpenAI gpt-4.1-mini, fallback Groq openai/gpt-oss-120b. Do not treat Groq 120B as OpenAI."}
           </p>
           {fallbackEnabled && (
             <div className="space-y-3">
-              {isV2 && (
+              {mode === "assistant" && isV2 && (
                 <div className="bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-semibold text-gray-300">LLM fallback - Provider → Model</span>
@@ -1100,7 +1122,10 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   {renderModelInfo(fallbackLlmProvider, fallbackLlmModel)}
                 </div>
               )}
-              {fallbackKinds.filter(k => k !== "llm" || !isV2).map((kind) => (
+              {(mode === "announcement"
+                ? fallbackKinds.filter((k) => k === "tts")
+                : fallbackKinds.filter(k => k !== "llm" || !isV2)
+              ).map((kind) => (
                 <div key={kind} className="bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-semibold text-gray-300">{KIND_LABEL[kind]} fallback</span>
