@@ -298,3 +298,54 @@ async def end_active_room(room_name: str) -> bool:
 def _req_creds() -> None:
     if not (LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise RuntimeError("LIVEKIT_API_KEY / LIVEKIT_API_SECRET not configured")
+
+
+async def room_agent_joined(room_name: str) -> Optional[bool]:
+    """True when a LiveKit **agent** participant is actually inside the room.
+
+    Room creation + agent dispatch succeeding only means the server ACCEPTED the
+    dispatch — a worker still has to pick the job up and join. This probe is how
+    the API learns that the dispatch realistically failed (worker stopped, busy,
+    or a stale second worker window eating jobs), instead of letting the caller
+    sit in a silent room. Returns None when LiveKit is unreachable, so callers
+    can treat "unknown" differently from a definitive miss.
+    """
+    if not room_name:
+        return None
+    try:
+        from livekit import api
+        _req_creds()
+    except Exception:
+        return None
+    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        resp = await _lk(
+            client.room.list_participants(api.ListParticipantsRequest(room=room_name)),
+            timeout=6.0,
+            op="ListParticipants",
+        )
+        Kind = getattr(api.ParticipantInfo, "Kind", None)
+        agent_enum = getattr(Kind, "AGENT", None) if Kind else None
+        for p in getattr(resp, "participants", []) or []:
+            kind = getattr(p, "kind", None)
+            if agent_enum is not None and kind == agent_enum:
+                return True
+            try:  # protobuf open enums are ints in some SDK releases (AGENT=4)
+                if int(kind) == 4:
+                    return True
+            except Exception:
+                pass
+            if "agent" in str(kind).lower():
+                return True
+            # defensive fallback for SDKs that do not expose ParticipantInfo.Kind
+            ident = (getattr(p, "identity", "") or "").lower()
+            if ident.startswith("agent"):
+                return True
+        return False
+    except Exception:
+        return None
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
