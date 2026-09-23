@@ -892,6 +892,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 else:
                     self._timing["failed_requests"] += 1
                     _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
+                    _logger.info("🔇 [LLM_CANCELLED] reason=user_continued — superseded request never billed; the new completed turn owns the one live request")
                 
                 _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
@@ -1252,11 +1253,13 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # Exactly one LLM REQUEST START per completed user turn, no preemptive that can be invalidated by RAG mutation
     # Previous bug: only disabled when has_kb, but RAG is always enabled, so preemptive still caused duplicate 0/0 failures
     # New: disable preemptive whenever RAG enabled (which is default), regardless of has_kb, to prevent any invalidation
-    # NOTE 2026-09-23 (verified against livekit-agents 1.8.2): a discarded preemptive
+    # NOTE 2026-09-24 (verified against livekit-agents 1.8.2): a discarded preemptive
     # attempt is NOT free — perform_llm_inference starts before the scheduling gate, so
-    # every invalidation = one billed prompt. That is why the global flag stays False
-    # and only the ack-scoped gate in _build_and_run_job/_on_transcription ever enables
-    # it (ack turns mutate nothing, so their attempt is REUSED, never discarded).
+    # every invalidation = one billed prompt. The global flag therefore stays False.
+    # Acknowledgements get NO speculative generation at all: the turn governor in
+    # agent_builder answers them deterministically inside Agent.llm_node (zero API).
+    # (The 2026-09-23 VOICE_PREEMPTIVE_ACK toggle experiment was replaced by that
+    # deterministic path per the 2026-09-24 spec — simpler, cheaper, no cancellation.)
     if rag_enabled and env_preemptive:
         preemptive_enabled = False
         logger.info(f"🔧 RAG+preemptive ROOT FIX: RAG enabled={rag_enabled} has_kb={has_kb}, disabling preemptive to prevent duplicate/invalidated LLM requests (was {env_preemptive} from env). Ensures exactly one REQUEST START per turn, no preemptive invalidation by RAG mutation.")
@@ -1748,7 +1751,9 @@ async def _entrypoint_body(ctx, setup_complete):
         if len(key) < 4 or key in rag_prefetch or key in rag_prefetch_inflight:
             return
         if _rag_mod.is_acknowledgement(text):
-            return  # "Ok," etc — the turn hook skips injection too; don't spend CPU
+            return  # "Ok," etc — answered deterministically by llm_node; no retrieval
+        if _rag_mod.is_incomplete_turn(text):
+            return  # fragment will be merged into the completed turn; don't spend CPU
         rag_prefetch_inflight.add(key)
 
         async def _work():
@@ -1782,31 +1787,11 @@ async def _entrypoint_body(ctx, setup_complete):
             # legacy "transcription" events used `.text`.
             text = getattr(ev, "transcript", None) or getattr(ev, "text", None) or ""
             is_final = bool(getattr(ev, "is_final", False))
-            # --- Scoped speculative generation (VOICE_PREEMPTIVE_ACK=1, the
-            # user-approved 2026-09-23 experiment). Session default is OFF, so
-            # a missed/late toggle costs nothing. We flip it True only while
-            # the raw PREFLIGHT text of this turn is a pure acknowledgement:
-            # those turns skip trim+RAG in the builder hook, leaving chat_ctx
-            # untouched, so the library reuses the speculative result at commit
-            # (is_equivalent + punctuation-insensitive transcript match both
-            # pass — verified against livekit-agents 1.8.2 sources) and the
-            # "जी, बताइए।" reply is already generated/being spoken when the
-            # turn commits, hiding ~1-2s TTFT. Every real-content transcript
-            # flips it back to False BEFORE the library reads it for the next
-            # event (audio_recognition calls the session event first, then
-            # on_preemptive_generation, in the same stack), so RAG turns never
-            # send a speculative request. A question that merely STARTS with
-            # "ok" may briefly have one; the commit-time transcript mismatch
-            # discards it (worst case: one partial prompt, then normal path).
+            # [AGENT_INTERRUPTED_BY_USER] marker (spec §10): the library does the
+            # actual interruption; this just records WHY the agent stopped.
             try:
-                if _pg_opts is not None:
-                    _allow_pre = (
-                        (not is_final) and bool(text.strip())
-                        and len(text.split()) <= 3 and _is_acknowledgement(text)
-                    )
-                    if bool(_pg_opts.get("enabled")) != _allow_pre:
-                        _pg_opts["enabled"] = _allow_pre
-                        logger.info("🔧 [PREEMPTIVE_GATE] enabled=%s on preflight '%s'", _allow_pre, text.strip()[:40])
+                if text.strip() and not is_final and state_tracker.get("state") == "speaking":
+                    logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech — agent output being interrupted")
             except Exception:
                 pass
             if text.strip():
@@ -1843,28 +1828,11 @@ async def _entrypoint_body(ctx, setup_complete):
         except Exception:
             pass
 
-    _pg_opts = None            # replaced below for conversational sessions
-    _is_acknowledgement = None  # (handler above guards on None)
-
     if agent_mode != "announcement":
         # livekit-agents v1 emits "user_input_transcribed" for every STT interim
         # and final; the legacy "transcription" event never fires on 1.x, so we
         # attach the single live event name.
         attached_events = []
-        # Scoped preemptive gate state (see _on_transcription): the resolved
-        # SessionOptions dict is read live by the library per event, so we may
-        # toggle "enabled" here without touching any other turn-handling config.
-        _pg_opts = None
-        _is_acknowledgement = None
-        if os.getenv("VOICE_PREEMPTIVE_ACK", "1") == "1":
-            try:
-                from app.rag import is_acknowledgement as _is_acknowledgement
-                _pg_opts = session.options.preemptive_generation
-                logger.info("🔧 [PREEMPTIVE_GATE] scoped ack-only speculative replies armed (session default stays off)")
-            except Exception as _pge:
-                _pg_opts = None
-                _is_acknowledgement = None
-                logger.debug(f"preemptive gate unavailable: {_pge!r}")
         for _ev_name in ("user_input_transcribed",):
             try:
                 session.on(_ev_name, _on_transcription)
@@ -2447,6 +2415,17 @@ async def _entrypoint_body(ctx, setup_complete):
             # Reset no-response timer when agent speaks - timeout starts after agent finishes
             no_response_state["last_activity"] = now
             cleaned = clean_reply_text(text)
+            if (
+                cleaned == FALLBACK_REPLY
+                and text.strip()
+                and turn_timing.get("gov_turn_state") == "ack"
+            ):
+                # Deterministic ack replies ("जी।") are INTENTIONALLY 3-4 chars;
+                # the "< 4 chars => fallback" rule in clean_reply_text must not
+                # rewrite them into the apology (00:31:31 log did exactly that:
+                # llm_node answered 'Ok.' with 'जी।' and the caller heard
+                # "Sorry, mujhe yeh samajh nahi aaya" instead).
+                cleaned = text.strip()
             # Never let the LLM close a call on its own. Models sometimes emit
             # a farewell after ambiguous STT fragments such as "company go".
             # Only transcript-level explicit intent may produce a closing TTS.
@@ -2628,6 +2607,16 @@ async def _entrypoint_body(ctx, setup_complete):
             # FIX: is_closing=True must prevent Empty LLM turn detected from firing, closing 0/0 excluded from failed_requests
             if turn_timing.get("is_closing", False):
                 logger.info(f"👋 Deterministic closing in progress (is_closing=True), thinking->listening {elapsed:.2f}s is intentional closing, not empty failure - suppressing warning")
+                state_tracker["state"] = ev.new_state
+                state_tracker["since"] = now
+                return
+            if turn_timing.get("gov_turn_state") == "suppress":
+                # Incomplete fragment: llm_node deliberately produced nothing so
+                # the caller can continue their sentence. Silence here is the
+                # feature — do not run the empty-turn warning/fallback ladder.
+                # The 15s silence fallback + 30s watchdog still recover the call
+                # if the caller stops mid-thought.
+                logger.info("⏸️ thinking->listening on an INCOMPLETE_TURN — staying silent, awaiting continuation")
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
