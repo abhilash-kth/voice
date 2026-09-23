@@ -701,7 +701,9 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # Production Deepgram tuning for 300-400ms speech_end->STT_final:
     # - endpointing_ms 200ms: Deepgram waits 200ms silence before final (was default 25ms)
     # - utterance_end_ms 1000ms: wait 1s for utterance end, allows natural pause in Hindi without premature final
-    # - interim_results True: needed for preemptive generation (LLM warm while user speaking)
+    # - interim_results True: feeds RAG prefetch + lets the library accumulate
+    #   continuations into one final (preemptive generation stays OFF — see the
+    #   verified note in worker.build_conversational_session)
     # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
     # - no_delay True: send final immediately, don't buffer
     # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
@@ -737,6 +739,13 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # before either layer — the final lands ~200ms after the user stops
     # talking, and the session adds its adaptive 0.25-0.75s on top. (The old
     # 300ms added a full extra 100ms of dead air to every turn.)
+    # DECIDED 2026-09-23 against raising this to ~400ms despite split-turn logs
+    # (23:19 + 23:36 calls): the observed splits had 1-2s pauses between
+    # fragments (user composing thoughts), which endpointing cannot merge at
+    # any value under a second — and >250ms here would let the session VAD
+    # (min_silence 0.35s) beat Deepgram's final, committing turns with partial
+    # text (more "flushing vad"). Fixed at the answer layer instead: the
+    # INCOMPLETE TURNS prompt rule + acknowledgement gate above.
     _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "200"))
     # utterance_end is the fallback final when endpointing never fires (long
     # pause): 1000ms added a full second of dead air on slow speakers — but
@@ -1290,6 +1299,14 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         "Never state a fact twice in the same call — the caller heard it already."
     )
     lines.append(
+        "INCOMPLETE TURNS (critical): callers who think out loud send half-questions "
+        "(e.g. 'अच्छा यह बताओ' with no object, 'मुझे यह…', trailing 'कि', 'और', or a "
+        "hold-on like 'एक minute'). These are NOT questions yet — do NOT answer them "
+        "with facts, and do NOT guess what was meant. Reply with a single short line "
+        "like 'जी, पूछिए।' / 'जी, बताइए।' and wait. Never repeat a fact you already "
+        "gave in this call, even as part of another answer."
+    )
+    lines.append(
         "Behave like a warm human receptionist. Never repeat yourself, never push "
         "the same offer, never read out a list of services unprompted, and never "
         "give a long preamble. Answer exactly what was asked, then stop. "
@@ -1809,6 +1826,28 @@ def build_voice_agent(
                     )
             except Exception:
                 explicit_goodbye = False
+            # Acknowledgement turns ("Ok," / "ठीक है." / "haan ji") are neither
+            # questions nor closings: skip the trim AND per-turn RAG so the model
+            # answers from the prompt's ACKNOWLEDGEMENT TURNS rule instead of
+            # re-deriving KB facts (23:36 log: three "Ok," turns -> three full
+            # office/founder replies, ~600 injected tokens + ~₹0.003 each).
+            # Second purpose (2026-09-23): leaving chat_ctx untouched is what
+            # lets the worker's scoped preemptive gate REUSE a speculative
+            # generation for these turns (library re-checks is_equivalent at
+            # commit; any mutation here would cancel it).
+            try:
+                _ack_check_text = user_text
+            except NameError:
+                _ack_check_text = ""
+            if _ack_check_text:
+                try:
+                    from .. import rag as _rag_ack
+                    _is_ack_turn = _rag_ack.is_acknowledgement(_ack_check_text)
+                except Exception:
+                    _is_ack_turn = False
+                if _is_ack_turn:
+                    logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s' (ctx untouched)", _ack_check_text[:40])
+                    return
             # Keep the rolling conversation bounded. Groq accounts the entire
             # prompt against TPM; an unbounded voice call eventually turns every
             # request into a 429 even with the 20b model. Preserve system facts
@@ -1883,15 +1922,6 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
-                # Acknowledgement turns ("Ok," / "ठीक है.") are not questions:
-                # retrieving and injecting KB text for them was what made the
-                # agent re-answer paragraphs the caller never asked for (23:36
-                # log: three "Ok," turns -> three full office/founder replies,
-                # ~600 injected tokens + ~₹0.003 each). Skip retrieval here;
-                # the static KB/FAQ summary in the system prompt still applies.
-                if rag.is_acknowledgement(user_text):
-                    logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s'", user_text[:40])
-                    return
                 logger.info("🔎 [RAG_STARTED] query='%s'", user_text[:60])
                 # --- Fast path: the worker precomputes RAG from STT interim
                 # text (in parallel with endpointing), so by the time the turn

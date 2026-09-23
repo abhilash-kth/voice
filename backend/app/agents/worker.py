@@ -1252,6 +1252,11 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # Exactly one LLM REQUEST START per completed user turn, no preemptive that can be invalidated by RAG mutation
     # Previous bug: only disabled when has_kb, but RAG is always enabled, so preemptive still caused duplicate 0/0 failures
     # New: disable preemptive whenever RAG enabled (which is default), regardless of has_kb, to prevent any invalidation
+    # NOTE 2026-09-23 (verified against livekit-agents 1.8.2): a discarded preemptive
+    # attempt is NOT free — perform_llm_inference starts before the scheduling gate, so
+    # every invalidation = one billed prompt. That is why the global flag stays False
+    # and only the ack-scoped gate in _build_and_run_job/_on_transcription ever enables
+    # it (ack turns mutate nothing, so their attempt is REUSED, never discarded).
     if rag_enabled and env_preemptive:
         preemptive_enabled = False
         logger.info(f"🔧 RAG+preemptive ROOT FIX: RAG enabled={rag_enabled} has_kb={has_kb}, disabling preemptive to prevent duplicate/invalidated LLM requests (was {env_preemptive} from env). Ensures exactly one REQUEST START per turn, no preemptive invalidation by RAG mutation.")
@@ -1777,6 +1782,33 @@ async def _entrypoint_body(ctx, setup_complete):
             # legacy "transcription" events used `.text`.
             text = getattr(ev, "transcript", None) or getattr(ev, "text", None) or ""
             is_final = bool(getattr(ev, "is_final", False))
+            # --- Scoped speculative generation (VOICE_PREEMPTIVE_ACK=1, the
+            # user-approved 2026-09-23 experiment). Session default is OFF, so
+            # a missed/late toggle costs nothing. We flip it True only while
+            # the raw PREFLIGHT text of this turn is a pure acknowledgement:
+            # those turns skip trim+RAG in the builder hook, leaving chat_ctx
+            # untouched, so the library reuses the speculative result at commit
+            # (is_equivalent + punctuation-insensitive transcript match both
+            # pass — verified against livekit-agents 1.8.2 sources) and the
+            # "जी, बताइए।" reply is already generated/being spoken when the
+            # turn commits, hiding ~1-2s TTFT. Every real-content transcript
+            # flips it back to False BEFORE the library reads it for the next
+            # event (audio_recognition calls the session event first, then
+            # on_preemptive_generation, in the same stack), so RAG turns never
+            # send a speculative request. A question that merely STARTS with
+            # "ok" may briefly have one; the commit-time transcript mismatch
+            # discards it (worst case: one partial prompt, then normal path).
+            try:
+                if _pg_opts is not None:
+                    _allow_pre = (
+                        (not is_final) and bool(text.strip())
+                        and len(text.split()) <= 3 and _is_acknowledgement(text)
+                    )
+                    if bool(_pg_opts.get("enabled")) != _allow_pre:
+                        _pg_opts["enabled"] = _allow_pre
+                        logger.info("🔧 [PREEMPTIVE_GATE] enabled=%s on preflight '%s'", _allow_pre, text.strip()[:40])
+            except Exception:
+                pass
             if text.strip():
                 _precompute_rag(text)
                 # P4 marker — utterance-start edge: first transcript after a
@@ -1811,12 +1843,28 @@ async def _entrypoint_body(ctx, setup_complete):
         except Exception:
             pass
 
+    _pg_opts = None            # replaced below for conversational sessions
+    _is_acknowledgement = None  # (handler above guards on None)
+
     if agent_mode != "announcement":
         # livekit-agents v1 emits "user_input_transcribed" for every STT interim
-        # and final; the older "transcription" event never fires on v1 (a dead
-        # listener = prefetch silently never runs, so attach BOTH defensively —
-        # duplicate fires are cheap, the key+inflight dedup handles them).
+        # and final; the legacy "transcription" event never fires on 1.x, so we
+        # attach the single live event name.
         attached_events = []
+        # Scoped preemptive gate state (see _on_transcription): the resolved
+        # SessionOptions dict is read live by the library per event, so we may
+        # toggle "enabled" here without touching any other turn-handling config.
+        _pg_opts = None
+        _is_acknowledgement = None
+        if os.getenv("VOICE_PREEMPTIVE_ACK", "1") == "1":
+            try:
+                from app.rag import is_acknowledgement as _is_acknowledgement
+                _pg_opts = session.options.preemptive_generation
+                logger.info("🔧 [PREEMPTIVE_GATE] scoped ack-only speculative replies armed (session default stays off)")
+            except Exception as _pge:
+                _pg_opts = None
+                _is_acknowledgement = None
+                logger.debug(f"preemptive gate unavailable: {_pge!r}")
         for _ev_name in ("user_input_transcribed",):
             try:
                 session.on(_ev_name, _on_transcription)
