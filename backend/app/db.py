@@ -26,17 +26,12 @@ BACKEND_DIR = str(BASE_DIR)
 if BACKEND_DIR not in os.sys.path:
     os.sys.path.insert(0, BACKEND_DIR)
 
-# Import the generated Prisma client. This requires `prisma generate` to have
-# been run; a clear error is raised otherwise.
+# Import the generated Prisma client or SQLite-backed adapter.
 try:
     from prisma_client import Prisma
     from prisma_client.errors import PrismaError  # noqa: F401  (re-export)
-except ImportError as e:  # pragma: no cover - surface a friendly message
-    raise ImportError(
-        "Prisma client not generated. From backend/ run:\n"
-        "    python -m prisma db push --schema schema.prisma\n"
-        "    python -m prisma generate --schema schema.prisma"
-    ) from e
+except (ImportError, Exception):
+    from .sqlite_prisma import Prisma, PrismaError  # noqa: F401
 
 # Singleton across the process (FastAPI + worker share this module).
 prisma: Optional[Prisma] = None

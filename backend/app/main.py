@@ -97,6 +97,17 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.exception("Unhandled server error: %s", exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -292,6 +303,12 @@ async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_c
     rec = await repo.update_agent(agent_id, user.id, patch)
     if not rec:
         raise HTTPException(404, "Agent not found")
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception:
+        pass
     return rec
 
 
@@ -397,17 +414,42 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     if not rec["enabled"]:
         raise HTTPException(400, "This agent is disabled")
 
+    logger.info("[CALL_START] agent_id=%s mode=%s user_id=%s", agent_id, mode, user.id)
+    logger.info("[AGENT_SELECTED] agent_id=%s name=%s mode=%s", agent_id, rec.get("name"), rec.get("agent_mode", "assistant"))
+
     # Concurrency = calls that are ACTUALLY live right now (LiveKit rooms with real
     # participants), NOT rows stuck in "in-progress". Falls back to the DB count if
     # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
+    if mode == "browser":
+        try:
+            existing_calls = await repo.list_calls(user.id, limit=20)
+            for prev in existing_calls:
+                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
+                    prev_room = prev.get("room")
+                    logger.info("[CALL_END_REQUESTED] source=cleanup reason=prior_browser_call call_id=%s room=%s", prev.get("id"), prev_room)
+                    if prev_room:
+                        try:
+                            await telephony.end_active_room(prev_room)
+                        except Exception:
+                            pass
+                    await repo.update_call(prev["id"], {
+                        "status": "completed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+        except Exception as e:
+            logger.warning("Error auto-cleaning prior browser calls: %s", e)
+
     live_rooms = await telephony.list_live_active_rooms()
     active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
     if active >= rec["max_concurrency"]:
-        raise HTTPException(
-            409,
-            f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
-            "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
-        )
+        if mode == "browser":
+            logger.info("Browser mode: overriding concurrency limit for agent %s on manual user start", agent_id)
+        else:
+            raise HTTPException(
+                409,
+                f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
+                "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
+            )
 
     wallet = await repo.get_wallet(user.id)
     if wallet["balance"] <= 0:
@@ -415,6 +457,14 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
     if mode == "sip" and not phone:
         raise HTTPException(400, "SIP mode requires a phone number")
+
+    # Cache the active agent config locally so worker can load in 0ms without DB delay
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception as e:
+        logger.warning("Could not cache agent config to data dir: %s", e)
 
     call = await repo.create_call({
         "user_id": user.id,
@@ -428,7 +478,7 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         if mode == "sip":
             result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
         else:
-            result = telephony.create_browser_room(agent_id, phone, call["id"], user.id)
+            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
     except ModuleNotFoundError:
         raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
     except ValueError as e:
@@ -454,6 +504,27 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
     return rec
 
 
+@app.post("/api/calls/{call_id}/end")
+async def end_call(call_id: str, user=Depends(auth.get_current_user)):
+    logger.info("[CALL_END_REQUESTED] source=frontend call_id=%s user_id=%s", call_id, user.id)
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    room = rec.get("room")
+    if room:
+        try:
+            await telephony.end_active_room(room)
+        except Exception as e:
+            logger.warning(f"Could not close room before ending call {call_id}: {e}")
+    if rec.get("status") in ("planned", "in-progress"):
+        await repo.update_call(call_id, {
+            "status": "completed",
+            "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+        })
+    logger.info("[CALL_ENDED] call_id=%s reason=user_ended", call_id)
+    return {"ok": True, "call_id": call_id}
+
+
 @app.delete("/api/calls/{call_id}", status_code=204)
 async def delete_call(call_id: str, user=Depends(auth.get_current_user)):
     rec = await repo.get_call(call_id, user.id)
@@ -461,6 +532,7 @@ async def delete_call(call_id: str, user=Depends(auth.get_current_user)):
         raise HTTPException(404, "Call not found")
     # If the selected row is still live, close its room before deleting the row.
     if rec.get("status") in ("planned", "in-progress") and rec.get("room"):
+        logger.info("[CALL_END_REQUESTED] source=cleanup reason=delete_call call_id=%s room=%s", call_id, rec.get("room"))
         try:
             await telephony.end_active_room(rec["room"])
         except Exception as e:

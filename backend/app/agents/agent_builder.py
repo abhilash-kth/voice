@@ -526,7 +526,7 @@ def build_llm(cfg: AgentConfig) -> Any:
         primary_pair = cfg.providers.get_primary_llm()
         fallback_pair = cfg.providers.get_fallback_llm()
     except AttributeError:
-        primary_pair = cfg.providers.llm
+        primary_pair = getattr(cfg.providers, "llm", None)
         fallback_pair = getattr(cfg.providers, "llm_fallback", None)
         if not fallback_pair:
             try:
@@ -535,6 +535,10 @@ def build_llm(cfg: AgentConfig) -> Any:
                     fallback_pair = fp.llm
             except Exception:
                 pass
+
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="openai_gpt4o_mini", config={})
 
     # Log LLM PROVIDER CONFIG for primary
     try:
@@ -688,16 +692,27 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
     # - no_delay True: send final immediately, don't buffer
     # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
+    from ..catalog import CATALOG
+    cat_stt = CATALOG.get("stt", {}).get(sel.id, {})
+    default_model = cat_stt.get("model") or ("nova-3" if "nova3" in sel.id or "nova-3" in sel.id else "nova-2")
+    model_name = str(overrides.get("model") or default_model).strip()
     stt_kwargs = dict(
-        model=overrides.get("model", "nova-2"),
+        model=model_name,
         language=overrides.get("language", "hi"),
-        keywords=keywords,
         interim_results=bool(overrides.get("interim_results", True)),
         vad_events=bool(overrides.get("vad_events", True)),
         no_delay=bool(overrides.get("no_delay", True)),
         filler_words=bool(overrides.get("filler_words", True)),
         api_key=overrides.get("api_key") or DEEPGRAM_API_KEY or None,
     )
+    # Deepgram API compatibility:
+    # - Nova-3 models require Keyterm Prompting (list of strings via 'keyterm' parameter)
+    # - Nova-2, Nova-1, Enhanced, Base models use Keywords (list of (keyword, boost) tuples via 'keywords')
+    if model_name.lower().startswith("nova-3"):
+        keyterms = [k[0] if isinstance(k, (tuple, list)) else str(k) for k in keywords]
+        stt_kwargs["keyterm"] = keyterms
+    elif "nova-2" in model_name.lower():
+        stt_kwargs["keywords"] = keywords
     # Try to add production latency params with correct names, fallback gracefully if not supported
     # Correct param is endpointing_ms (not endpointing) per installed plugin 1.8.2
     # Preserve utterance_end_ms, smart_format, punctuate - don't drop all on single failure
@@ -768,7 +783,10 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_stt(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.stt
+    primary_pair = getattr(cfg.providers, "stt", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="deepgram_nova2", config={})
     primary = _build_stt_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "stt_fallback", None)
@@ -936,7 +954,10 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_tts(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.tts
+    primary_pair = getattr(cfg.providers, "tts", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="google_wavenet_hi", config={})
     primary = _build_tts_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "tts_fallback", None)
@@ -1212,6 +1233,16 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
     kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
+    logger.info(
+        "📚 [KNOWLEDGE_BASE_INIT] Agent '%s' knowledge loaded: manual_text=%d chars, documents=%d, faq=%d items | Static budgets: KB=%d chars, FAQ=%d chars, Owner=%d chars",
+        cfg.name,
+        len(getattr(cfg.knowledge, "text", "") or ""),
+        len(getattr(cfg.knowledge, "documents", []) or []),
+        len(getattr(cfg.knowledge, "faq", []) or []),
+        kb_budget,
+        faq_budget,
+        owner_budget,
+    )
 
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
@@ -1353,7 +1384,7 @@ async def wait_until_caller_can_hear(session, timeout: float = 12.0) -> None:
         except Exception as e:
             logger.warning(f"wait_for_ready failed; speaking anyway: {e}")
     # RoomIO "ready" is earlier than the browser attaching <audio>.
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(0.2)
 
 
 async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> None:
@@ -1389,6 +1420,27 @@ async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> No
                 await asyncio.sleep(0.4)
     if last_error is not None:
         raise last_error
+
+
+def warm_agent_builder_schemas() -> None:
+    """Pre-warm Pydantic ChatMessage and ChatContext validation schemas off the event loop.
+
+    Pydantic v2 triggers a lazy model_rebuild() upon first ChatMessage instantiation.
+    On Windows systems, model_rebuild() inspects caller namespaces and imports annotations,
+    blocking the asyncio event loop for up to 7+ seconds if done inside an active call turn.
+    Calling this in prewarm() compiles the validators ahead of time.
+    """
+    try:
+        from livekit.agents.llm import chat_context
+        chat_context.ChatMessage.model_rebuild()
+        from livekit.agents import llm
+        warm_ctx = llm.ChatContext()
+        warm_ctx.add_message(role="system", content="warmup")
+        warm_ctx.add_message(role="user", content="warmup")
+        warm_ctx.add_message(role="assistant", content="warmup")
+        logger.info("🔥 Prewarm: llm.ChatContext / ChatMessage models compiled (0ms model_rebuild during call)")
+    except Exception as exc:
+        logger.debug("ChatContext schema prewarm note: %r", exc)
 
 
 def build_voice_agent(
@@ -1470,6 +1522,7 @@ def build_voice_agent(
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         # Avoid duplicate TTS: worker.py already spoke deterministic closing.
         # Only speak here as fallback if worker hasn't (check last closing timestamp).
         import time as _time
@@ -1499,6 +1552,14 @@ def build_voice_agent(
             await asyncio.sleep(0.4)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
+        agent_inst = agent_ref.get("instance")
+        if agent_inst is not None:
+            sess = getattr(agent_inst, "session", None)
+            if sess is not None:
+                try:
+                    sess.shutdown(drain=False)
+                except Exception:
+                    pass
         room = getattr(ctx.room, "name", None)
         if room:
             try:
@@ -1507,6 +1568,7 @@ def build_voice_agent(
             except Exception as e:
                 logger.warning(f"end_call: could not delete room {room}: {e}")
         ctx.shutdown()
+        logger.info("[CALL_ENDED] reason=completed")
         return "Call ended."
 
     # `name="end_call"` keeps the LLM-visible tool name in sync with the prompt
@@ -1585,12 +1647,13 @@ def build_voice_agent(
             self._opening_started = True
             try:
                 if not (self.greeting or "").strip():
-                    logger.warning("Assistant has no greeting — skipping opening line")
+                    logger.info("[ASSISTANT_STARTED] Assistant has no greeting — listening immediately")
                     return
-                logger.info("🗣️ Assistant connected — speaking greeting once the caller can hear")
+                logger.info("[ASSISTANT_STARTED] Assistant connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
+                logger.info("[ASSISTANT_STARTED] Speaking greeting: %s", self.greeting[:60])
                 await speak_opening_line(self.session, self.greeting, timeout=45)
-                logger.info("✅ Greeting finished — now listening")
+                logger.info("[ASSISTANT_STARTED] Greeting finished — now listening for caller speech")
             except Exception as e:
                 logger.warning(f"Greeting failed: {type(e).__name__}: {e!r}")
             finally:
@@ -1779,16 +1842,37 @@ def build_voice_agent(
                 from .. import rag  # local import: keep this module light
                 # Async RAG to avoid blocking event loop
                 try:
-                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
-                    hits = (hits or "").strip()
+                    rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, user_text, 3)
                 except Exception:
                     # Fallback sync if to_thread fails
-                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
+                    rag_res = rag.build_context_detailed(cfg.knowledge, user_text, top_k=3)
                 _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                hits = (rag_res.get("text") or "").strip()
+                kb_used = rag_res.get("kb_used", False)
+                kb_chars = rag_res.get("kb_chars", 0)
+                kb_hits = rag_res.get("kb_hits", 0)
+                faq_used = rag_res.get("faq_used", False)
+                faq_chars = rag_res.get("faq_chars", 0)
+                faq_hits = rag_res.get("faq_hits", 0)
+                total_chars = rag_res.get("total_chars", 0)
+
+                # Authoritative user-facing retrieval log detailing KB and FAQ usage
+                logger.info(
+                    "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
+                    user_text[:60],
+                    _rag_elapsed,
+                    kb_used,
+                    kb_chars,
+                    kb_hits,
+                    faq_used,
+                    faq_chars,
+                    faq_hits,
+                    total_chars,
+                )
+
                 if _rag_elapsed > 200:
                     logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
-                else:
-                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms (hits {len(hits)} chars)")
+
                 if not hits or hits == self._last_rag:
                     logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return  # nothing new
@@ -1796,13 +1880,8 @@ def build_voice_agent(
                 if target is None:
                     logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
+                
                 # FIX ROOT CAUSE: When KB/FAQ RAG enabled, preemptive must be disabled BEFORE turn begins
-                # Verify runtime Session config, not just config variable
-                # Exactly one LLM REQUEST START per turn, no preemptive that can be invalidated by RAG mutation
-                # Previous bug: logged conflict but still allowed duplicate 0/0 failure
-                # New: Check if RAG enabled, if so preemptive should already be disabled at session level (worker.py fix)
-                # If preemptive_on env True but RAG enabled, session config has preemptive=False, so no invalidation should happen
-                # Log verification, not conflict
                 rag_enabled = True
                 try:
                     import os as _os_rag_check
@@ -1813,14 +1892,10 @@ def build_voice_agent(
                     rag_enabled = True
                 
                 if preemptive_on and rag_enabled:
-                    # This should NOT happen after worker.py fix - preemptive should be disabled when RAG enabled
-                    # If it does happen, it means session config still has preemptive enabled, which is bug
-                    # Log as warning that duplicate may occur, but we have disabled at session level so should be safe
-                    # Actually, after fix, preemptive_on env True but session preemptive=False, so no invalidation
-                    # So we log that RAG grounding needed but preemptive already disabled at session level, no invalidation
                     logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {user_text[:60]})")
                 elif preemptive_on:
                     logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
+                
                 # Drop previous RAG message to avoid growth
                 try:
                     items = getattr(target, "items", None)
@@ -1836,7 +1911,7 @@ def build_voice_agent(
                     ),
                 )
                 self._last_rag = hits
-                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]}")
+                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
             except Exception as e:
                 logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
                 logger.info(f"⏱️ TIMING on_user_turn_completed (RAG error, fallback): {(_time.time()-_rag_t0)*1000:.0f}ms")
@@ -1861,11 +1936,8 @@ def build_announce_agent(
     from livekit.agents import Agent
     from livekit.agents import llm
 
-    text = (announce_text or cfg.greeting or "").strip()
-    if not text:
-        raise ValueError(
-            "Announcement agent has no script. Set announce_text (or greeting) on the agent."
-        )
+    text = (announce_text or getattr(cfg, "announce_text", "") or cfg.greeting or f"Hello, this is {cfg.name} with an announcement.").strip()
+    end_after_announcement = bool(getattr(cfg, "end_after_announcement", False))
 
     class _AnnounceAgent(Agent):
         def __init__(self):
@@ -1884,36 +1956,49 @@ def build_announce_agent(
             )
 
         async def on_enter(self) -> None:
-            # Announcement mode: read the fixed script, then hang up. No STT, no LLM.
-            # The room is deleted only after playout has flushed — deleting it
-            # immediately is what made these calls sound silent.
             self._opening_started = True
             try:
-                logger.info("📢 Announcement connected — reading the script once the caller can hear")
+                logger.info("[ANNOUNCEMENT_STARTED] Announcement connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
+                logger.info("[ANNOUNCEMENT_STARTED] Reading announcement script: %s", text[:60])
                 await speak_opening_line(self.session, text, timeout=120)
-                logger.info("✅ Announcement script finished")
-                await asyncio.sleep(1.2)
+                logger.info("[ANNOUNCEMENT_FINISHED] Announcement script playback completed")
             except Exception as e:
                 logger.warning(f"Announcement playback failed: {type(e).__name__}: {e!r}")
             finally:
                 self._opening_done = True
-            try:
-                from livekit.agents import get_job_context
-                ctx = get_job_context(required=False)
-                if ctx is not None:
-                    room = getattr(ctx.room, "name", None)
-                    if room:
-                        try:
-                            from ..telephony import end_active_room
-                            await end_active_room(room)
-                        except Exception as e:
-                            logger.warning(f"announcement: could not delete room {room}: {e}")
-                    ctx.shutdown()
-                else:
-                    self.session.shutdown(drain=True)
-                logger.info("📢 Announcement finished — closing call.")
-            except Exception as e:
-                logger.warning(f"could not close announcement session: {e}")
+
+            if end_after_announcement:
+                logger.info("[CALL_END_REQUESTED] source=announcement reason=announcement_completed")
+                try:
+                    await asyncio.sleep(2.5)  # flush audio playout buffer to caller
+                    from livekit.agents import get_job_context
+                    ctx = get_job_context(required=False)
+                    try:
+                        self.session.shutdown(drain=True)
+                    except Exception:
+                        pass
+                    if ctx is not None:
+                        room = getattr(ctx.room, "name", None)
+                        if room:
+                            try:
+                                from ..telephony import end_active_room
+                                await end_active_room(room)
+                            except Exception as e:
+                                logger.warning(f"announcement: could not delete room {room}: {e}")
+                        ctx.shutdown()
+                    logger.info("[CALL_ENDED] reason=announcement_completed")
+                except Exception as e:
+                    logger.warning(f"could not close announcement session: {e}")
+            else:
+                logger.info("📢 Announcement finished — keeping call connected (end_after_announcement=False)")
 
     return _AnnounceAgent()
+
+
+# Pre-compile schemas when agent_builder is imported
+try:
+    warm_agent_builder_schemas()
+except Exception:
+    pass
+

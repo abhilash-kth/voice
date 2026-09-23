@@ -51,12 +51,20 @@ def build_index(kb: KnowledgeBase) -> List[KnowledgeItem]:
     items: List[KnowledgeItem] = []
     if kb.text and kb.text.strip():
         for i, chunk in enumerate(_chunk_text(kb.text)):
-            items.append(KnowledgeItem(chunk_id=f"manual:{i}", text=chunk, source="manual"))
+            items.append(KnowledgeItem(chunk_id=f"manual:{i}", text=chunk, source="knowledge_base"))
     for doc in kb.documents:  # [{name, content}, ...]
         name = doc.get("name", "document")
         content = doc.get("content", "") or doc.get("text", "")
         for i, chunk in enumerate(_chunk_text(content)):
-            items.append(KnowledgeItem(chunk_id=f"{name}:{i}", text=chunk, source=name))
+            items.append(KnowledgeItem(chunk_id=f"{name}:{i}", text=chunk, source=f"doc:{name}"))
+    for i, item in enumerate(getattr(kb, "faq", []) or []):
+        if not isinstance(item, dict):
+            continue
+        q = (item.get("q") or item.get("question") or "").strip()
+        a = (item.get("a") or item.get("answer") or "").strip()
+        if q or a:
+            faq_text = f"Q: {q}\nA: {a}" if q and a else (q or a)
+            items.append(KnowledgeItem(chunk_id=f"faq:{i}", text=faq_text, source="faq"))
     return items
 
 
@@ -133,9 +141,48 @@ def retrieve(kb: KnowledgeBase, query: str, top_k: int = 5) -> List[KnowledgeIte
     return [it for it, _s in ranked[:top_k]]
 
 
-def build_context(kb: KnowledgeBase, query: str, top_k: int = 3) -> str:
+def build_context_detailed(kb: KnowledgeBase, query: str, top_k: int = 3) -> dict:
+    """Retrieve top facts and return detailed metadata on KB vs FAQ usage."""
     hits = retrieve(kb, query, top_k=top_k)
     if not hits:
-        return ""
+        return {
+            "text": "",
+            "kb_used": False,
+            "kb_chars": 0,
+            "kb_hits": 0,
+            "faq_used": False,
+            "faq_chars": 0,
+            "faq_hits": 0,
+            "total_chars": 0,
+            "sources": [],
+        }
+
+    kb_parts: List[str] = []
+    faq_parts: List[str] = []
+    sources: List[str] = []
+
+    for it in hits:
+        sources.append(it.source)
+        if it.source == "faq":
+            faq_parts.append(it.text)
+        else:
+            kb_parts.append(it.text)
+
     parts = [f"- {it.text}" for it in hits]
-    return "\n".join(parts)
+    full_text = "\n".join(parts)
+
+    return {
+        "text": full_text,
+        "kb_used": len(kb_parts) > 0,
+        "kb_chars": sum(len(p) for p in kb_parts),
+        "kb_hits": len(kb_parts),
+        "faq_used": len(faq_parts) > 0,
+        "faq_chars": sum(len(p) for p in faq_parts),
+        "faq_hits": len(faq_parts),
+        "total_chars": len(full_text),
+        "sources": sources,
+    }
+
+
+def build_context(kb: KnowledgeBase, query: str, top_k: int = 3) -> str:
+    return build_context_detailed(kb, query, top_k=top_k)["text"]
