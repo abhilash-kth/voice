@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 from .config import BASE_DIR
 
@@ -38,90 +38,128 @@ except ImportError as e:  # pragma: no cover - surface a friendly message
         "    python -m prisma generate --schema schema.prisma"
     ) from e
 
-# Singleton across the process (FastAPI + worker share this module).
+# Back-compat module attribute: the most recently created client. Kept only so
+# legacy status pokes do not break; ALL real access must go through
+# ``get_prisma()`` which returns the client owned by the *current* event loop.
 prisma: Optional[Prisma] = None
 
-# Event-loop affinity.
+# Event-loop affinity — per-loop client registry.
 #
-# Prisma's engine + httpx connection pool (and asyncio.Lock itself) are bound to
-# the loop that created them. Connecting from a throwaway loop — e.g. the old
-# `asyncio.to_thread(lambda: asyncio.new_event_loop().run_until_complete(init())`
-# in the LiveKit worker — leaves a client that *reports* itself connected while
-# every real query on the agent loop hangs until it times out (or raises
-# "Event loop is closed"). So we remember which loop we connected on and refuse
-# to reuse the client from a different one.
-_connected_loop: Optional[asyncio.AbstractEventLoop] = None
-_connect_lock: Optional[asyncio.Lock] = None
-_connect_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+# A Prisma client (engine subprocess + httpx pool) is hard-bound to the asyncio
+# loop it connected on: using it from any other loop hangs queries or raises
+# "Event loop is closed". LiveKit's job runner executes each job on its own
+# loop (jobs run in per-job threads), so one process legitimately hosts
+# several loops over its lifetime.
+#
+# The old singleton reconnected the one shared client whenever a foreign loop
+# called init() ("Prisma client is connected to a different event loop —
+# reconnecting"): every job paid the ~2.5s engine startup AGAIN mid-call, and
+# any queries still in flight on the previous loop were broken underneath.
+#
+# Instead, each loop gets its OWN client, connected lazily on first init() on
+# that loop, with its own connect lock (asyncio.Lock is loop-bound, so locks
+# live per loop too — reusing one across loops raises "got Future attached to
+# a different loop"). Loops that go away release their client via
+# ``release_current_loop()`` (the worker calls it on job shutdown); bounded
+# registry, no leaks, zero cross-loop churn.
+_prisma_by_loop: Dict[asyncio.AbstractEventLoop, Prisma] = {}
+_locks_by_loop: Dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+# Fallback for sync / no-running-loop contexts (import-time pokes only; real
+# queries always run inside a loop).
+_fallback_prisma: Optional[Prisma] = None
 
 
 def get_prisma() -> Prisma:
-    """Return the shared Prisma client, creating it lazily."""
-    global prisma
-    if prisma is None:
-        prisma = Prisma()
-    return prisma
+    """Return the Prisma client owned by the *current* event loop.
+
+    Creates it lazily (unconnected; ``init()`` connects). Called from sync
+    module-level code without a running loop returns a shared fallback client.
+    """
+    global prisma, _fallback_prisma
+    try:
+        loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        if _fallback_prisma is None:
+            _fallback_prisma = Prisma()
+            prisma = _fallback_prisma
+        return _fallback_prisma
+    client = _prisma_by_loop.get(loop)
+    if client is None:
+        client = Prisma()
+        _prisma_by_loop[loop] = client
+        prisma = client
+    return client
 
 
 def is_connected() -> bool:
-    """True only when the client is connected *to the current event loop*."""
-    global prisma
+    """True only when the client *of the current event loop* is connected."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return bool(prisma and prisma.is_connected())
-    return bool(prisma and prisma.is_connected() and _connected_loop is loop)
+        return any(c.is_connected() for c in _prisma_by_loop.values()) or bool(
+            _fallback_prisma and _fallback_prisma.is_connected()
+        )
+    client = _prisma_by_loop.get(loop)
+    return bool(client and client.is_connected())
 
 
-def _get_connect_lock() -> asyncio.Lock:
-    """asyncio.Lock binds to the loop that first awaits it (LoopBoundMixin).
-
-    Build it per running loop instead of at import time so a process that sees
-    more than one loop (LiveKit job runner, tests) never hits
-    "got Future attached to a different loop".
-    """
-    global _connect_lock, _connect_lock_loop
-    loop = asyncio.get_running_loop()
-    if _connect_lock is None or _connect_lock_loop is not loop:
-        _connect_lock = asyncio.Lock()
-        _connect_lock_loop = loop
-    return _connect_lock
+def _get_loop_lock(loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+    lock = _locks_by_loop.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks_by_loop[loop] = lock
+    return lock
 
 
 async def init() -> None:
-    """Connect on the *calling* event loop (FastAPI startup / worker entrypoint)."""
-    global prisma, _connected_loop
-    client = get_prisma()
+    """Connect this loop's client. Idempotent; safe to call from every loop."""
     loop = asyncio.get_running_loop()
-    if client.is_connected() and _connected_loop is loop:
+    client = get_prisma()
+    if client.is_connected():
         return
-    # Multiple LiveKit jobs can start together. Serialize initialization so
-    # concurrent Prisma engine startup does not leave one request hanging.
-    async with _get_connect_lock():
-        if client.is_connected() and _connected_loop is loop:
-            return
+    # Multiple entrypoints on the same loop can race here; serialize per loop.
+    async with _get_loop_lock(loop):
         if client.is_connected():
-            # Connected from another loop: unusable here. Drop it and start a
-            # fresh client rather than hang every query on this loop.
-            logger.warning(
-                "Prisma client is connected to a different event loop — reconnecting on the "
-                "current loop (a foreign-loop client makes queries hang or raise "
-                "'Event loop is closed')"
-            )
-            try:
-                await asyncio.wait_for(client.disconnect(), timeout=3)
-            except Exception as e:
-                logger.debug(f"Disconnecting the foreign-loop Prisma client failed: {e!r}")
-                prisma = Prisma()  # abandon it; a fresh client gets a fresh engine/pool
-                client = prisma
-            _connected_loop = None
+            return
         await client.connect()
-        _connected_loop = loop
+
+
+async def release_current_loop() -> None:
+    """Disconnect and drop the client owned by the *current* loop.
+
+    Call this when a short-lived loop is about to close (LiveKit job thread,
+    throwaway runner loops) so engine processes do not pile up in long-lived
+    worker processes. Best-effort; never raises.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    client = _prisma_by_loop.pop(loop, None)
+    _locks_by_loop.pop(loop, None)
+    if client is not None and client.is_connected():
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=5)
+        except Exception as e:
+            logger.debug(f"Releasing this loop's Prisma client failed: {e!r}")
 
 
 async def shutdown() -> None:
-    """Disconnect (called on FastAPI shutdown / worker exit)."""
-    global prisma, _connected_loop
-    if prisma and prisma.is_connected():
-        await prisma.disconnect()
-        _connected_loop = None
+    """Disconnect ALL loop-bound clients (FastAPI shutdown / worker exit)."""
+    global prisma
+    for loop, client in list(_prisma_by_loop.items()):
+        if client.is_connected():
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+            except Exception as e:
+                logger.debug(f"Disconnecting a loop-bound Prisma client failed: {e!r}")
+    _prisma_by_loop.clear()
+    _locks_by_loop.clear()
+    if _fallback_prisma is not None and _fallback_prisma.is_connected():
+        try:
+            await asyncio.wait_for(_fallback_prisma.disconnect(), timeout=5)
+        except Exception:
+            pass
+    prisma = None

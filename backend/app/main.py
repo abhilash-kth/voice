@@ -13,6 +13,7 @@ The LiveKit worker (app.agents.worker) reports cost/usage/transcripts here.
 from __future__ import annotations
 
 import os
+import time
 import asyncio
 import logging
 from typing import Optional
@@ -45,6 +46,19 @@ from .config import WALLET_TOPUP_AMOUNT, LIVEKIT_URL, BILLING_INTERNAL_TOKEN, SE
 @asynccontextmanager
 async def lifespan(app):
     await init()
+
+    # Import the voice runtime (livekit agents + plugins) on the main thread in
+    # the background so the first start_call's preflight is instant and so the
+    # plugin-registration-on-main-thread rule is satisfied before any worker
+    # thread touches the plugin modules.
+    async def _warm_runtime():
+        try:
+            from . import preflight as _preflight
+            await _preflight.warm_voice_runtime()
+        except Exception as e:
+            logger.warning(f"voice runtime warm failed: {e!r}")
+
+    warm_task = asyncio.create_task(_warm_runtime())
 
     # Safety net: any "in-progress" call that never got finalized (worker crashed,
     # room never closed, caller vanished) is auto-marked "failed". We use LiveKit's
@@ -84,6 +98,7 @@ async def lifespan(app):
     finally:
         cleanup_task.cancel()
         campaign_task.cancel()
+        warm_task.cancel()
         await shutdown()
 
 
@@ -95,6 +110,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.exception("Unhandled server error: %s", exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +318,12 @@ async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_c
     rec = await repo.update_agent(agent_id, user.id, patch)
     if not rec:
         raise HTTPException(404, "Agent not found")
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception:
+        pass
     return rec
 
 
@@ -384,6 +416,86 @@ def _parse_file(name: str, raw: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Start a call (browser or SIP)
 # ---------------------------------------------------------------------------
+_AGENT_JOIN_VERIFY_SECONDS = float(os.getenv("DISPATCH_VERIFY_SECONDS", "18"))
+
+
+async def _agent_join_watchdog(call_id: str, room: str, user_id: str,
+                               agent_id: str, mode: str, phone: str) -> None:
+    """Heal, then fail loudly, when the LiveKit dispatch never produces an agent.
+
+    Room creation + agent dispatch succeeding only means the server ACCEPTED the
+    dispatch — a worker still has to be OFFERED the job and join. Self-hosted
+    LiveKit drops a dispatch when no worker is registered for the agent name at
+    that moment (worker still booting, re-registering after a network blip, or
+    stuck draining a previous call), and older servers do not retry it. So:
+
+      1. ~8s with no agent in the room  → create the dispatch explicitly ONCE
+         ([DISPATCH_RETRY]) — by then a freshly (re)started worker is registered,
+         so this alone heals the classic "first click after worker restart".
+      2. Still no agent after DISPATCH_VERIFY_SECONDS → mark the call `failed`
+         with the real reason in `usage.error`. The UI polls the call row every
+         ~2s while waiting, so the caller sees it far earlier than the old
+         silent 30s timeout.
+
+    One-shot by design: repeated re-dispatch against a genuinely dead worker
+    changes nothing, so this is remediation, not a retry loop.
+    """
+    try:
+        await asyncio.sleep(3.0)  # dispatch head start; the agent normally joins in 2-8s
+        deadline = time.monotonic() + max(8.0, _AGENT_JOIN_VERIFY_SECONDS)
+        retry_at = time.monotonic() + 5.0  # ~8s after the call was placed
+        retried = False
+        while time.monotonic() < deadline:
+            try:
+                row = await repo.get_call(call_id, user_id)
+            except Exception:
+                return
+            if not row or row.get("status") not in ("planned", "in-progress"):
+                return  # already completed/failed — user ended it or the worker did
+            joined = await telephony.room_agent_joined(room)
+            if joined is True:
+                logger.info("[AGENT_JOIN_VERIFIED] room=%s call=%s", room, call_id)
+                return
+            if not retried and time.monotonic() >= retry_at:
+                retried = True
+                meta = telephony._metadata(agent_id, mode, phone or "", call_id, user_id)
+                dispatch_id = await telephony.create_agent_dispatch(room, meta)
+                logger.warning(
+                    "[DISPATCH_RETRY] room=%s call=%s: no agent after ~8s, one-shot "
+                    "explicit dispatch %s (worker now registered?)",
+                    room, call_id, dispatch_id or "FAILED",
+                )
+                if dispatch_id:
+                    deadline += 8.0  # graceful slack for the re-dispatch to land
+            await asyncio.sleep(2.0)
+
+        # Final re-check before failing (the agent may have joined during the
+        # last sleep and flipped the row already).
+        try:
+            row = await repo.get_call(call_id, user_id)
+        except Exception:
+            return
+        if not row or row.get("status") not in ("planned", "in-progress"):
+            return
+        reason = (
+            f"the agent did not join the room within {int(max(8.0, _AGENT_JOIN_VERIFY_SECONDS))} seconds — "
+            "the agent worker is not picking up the dispatch. Make sure exactly ONE agent worker is running "
+            "(python -m app.agents.worker), that no old worker window is still open, and that the worker is "
+            "connected to the LiveKit server; then try again."
+        )
+        logger.error("[AGENT_JOIN_TIMEOUT] room=%s call=%s: %s", room, call_id, reason)
+        try:
+            await repo.update_call(call_id, {
+                "status": "failed",
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                "usage": {"error": reason},
+            })
+        except Exception as e:
+            logger.warning("could not mark call %s failed after agent-join timeout: %r", call_id, e)
+    except Exception as e:
+        logger.debug("agent-join watchdog stopped early for call %s: %r", call_id, e)
+
+
 @app.post("/api/calls")
 async def start_call(body: dict, user=Depends(auth.get_current_user)):
     agent_id = body.get("agent_id")
@@ -397,17 +509,60 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     if not rec["enabled"]:
         raise HTTPException(400, "This agent is disabled")
 
+    # PREFLIGHT: run the worker's exact config→runtime path BEFORE creating the
+    # room. A saved agent whose config no longer builds (model removed from the
+    # catalog, missing API key, unknown provider) used to crash the worker job
+    # after the room existed — the caller sat in a silent room forever with no
+    # error anywhere. Now the call fails here, immediately, with the real
+    # reason the UI can show.
+    from . import preflight as _preflight
+    cfg_err = await _preflight.preflight_agent_config(rec)
+    if cfg_err:
+        logger.error(
+            "[CALL_BLOCKED] agent_id=%s name=%s: config would crash the worker: %s",
+            agent_id, rec.get("name"), cfg_err,
+        )
+        raise HTTPException(
+            400,
+            f"Agent '{rec.get('name', agent_id)}' is not ready to take calls: {cfg_err}. "
+            "Open the agent, re-save its LLM/STT/TTS selection (and check the API keys in backend/.env), then retry.",
+        )
+
+    logger.info("[CALL_START] agent_id=%s mode=%s user_id=%s", agent_id, mode, user.id)
+    logger.info("[AGENT_SELECTED] agent_id=%s name=%s mode=%s", agent_id, rec.get("name"), rec.get("agent_mode", "assistant"))
+
     # Concurrency = calls that are ACTUALLY live right now (LiveKit rooms with real
     # participants), NOT rows stuck in "in-progress". Falls back to the DB count if
     # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
+    if mode == "browser":
+        try:
+            existing_calls = await repo.list_calls(user.id, limit=20)
+            for prev in existing_calls:
+                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
+                    prev_room = prev.get("room")
+                    if prev_room:
+                        try:
+                            await telephony.end_active_room(prev_room)
+                        except Exception:
+                            pass
+                    await repo.update_call(prev["id"], {
+                        "status": "completed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+        except Exception as e:
+            logger.warning("Error auto-cleaning prior browser calls: %s", e)
+
     live_rooms = await telephony.list_live_active_rooms()
     active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
     if active >= rec["max_concurrency"]:
-        raise HTTPException(
-            409,
-            f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
-            "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
-        )
+        if mode == "browser":
+            logger.info("Browser mode: overriding concurrency limit for agent %s on manual user start", agent_id)
+        else:
+            raise HTTPException(
+                409,
+                f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
+                "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
+            )
 
     wallet = await repo.get_wallet(user.id)
     if wallet["balance"] <= 0:
@@ -415,6 +570,14 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
     if mode == "sip" and not phone:
         raise HTTPException(400, "SIP mode requires a phone number")
+
+    # Cache the active agent config locally so worker can load in 0ms without DB delay
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception as e:
+        logger.warning("Could not cache agent config to data dir: %s", e)
 
     call = await repo.create_call({
         "user_id": user.id,
@@ -428,16 +591,39 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         if mode == "sip":
             result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
         else:
-            result = telephony.create_browser_room(agent_id, phone, call["id"], user.id)
+            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
     except ModuleNotFoundError:
         raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except TimeoutError as e:
+        # LiveKit itself did not answer. Mark the call failed so the UI and the
+        # Calls tab show the truth instead of a stale "planned" row.
+        try:
+            await repo.update_call(call["id"], {
+                "status": "failed",
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+            })
+        except Exception:
+            pass
+        raise HTTPException(503, f"LiveKit server did not respond: {e}. Check that the LiveKit server is running and reachable, then retry.")
     except Exception as e:
         raise HTTPException(400, f"Call setup failed: {e}")
 
     await repo.update_call(call["id"], {"room": result["room"]})
     result["call_id"] = call["id"]
+
+    # The room + dispatch are now accepted by LiveKit, but "accepted" is not
+    # "a worker actually joined". Watch it in the background so a dead/absent
+    # worker turns into a precise call failure (visible in the UI within ~2s
+    # via the waiting poll) instead of 30s of silence in an empty room.
+    try:
+        asyncio.create_task(
+            _agent_join_watchdog(call["id"], result["room"], user.id, agent_id, mode, phone)
+        )
+    except Exception as e:
+        logger.debug("agent-join watchdog not scheduled: %r", e)
+
     return result
 
 
@@ -452,6 +638,27 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
     if not rec:
         raise HTTPException(404, "Call not found")
     return rec
+
+
+@app.post("/api/calls/{call_id}/end")
+async def end_call(call_id: str, user=Depends(auth.get_current_user)):
+    logger.info("[CALL_END_REQUESTED] source=user call_id=%s user_id=%s", call_id, user.id)
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    room = rec.get("room")
+    if room:
+        try:
+            await telephony.end_active_room(room)
+        except Exception as e:
+            logger.warning(f"Could not close room before ending call {call_id}: {e}")
+    if rec.get("status") in ("planned", "in-progress"):
+        await repo.update_call(call_id, {
+            "status": "completed",
+            "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+        })
+    logger.info("[CALL_ENDED] call_id=%s reason=user_ended", call_id)
+    return {"ok": True, "call_id": call_id}
 
 
 @app.delete("/api/calls/{call_id}", status_code=204)
@@ -535,6 +742,17 @@ async def start_campaign(campaign_id: str, user=Depends(auth.get_current_user)):
     wallet = await repo.get_wallet(user.id)
     if (wallet.get("balance") or 0) <= 0:
         raise HTTPException(402, "Wallet balance is ₹0. Recharge to run a campaign.")
+    # Preflight the agent: a config that crashes the worker would fail EVERY
+    # dial in this campaign and still bill the failed minutes.
+    from . import preflight as _pf
+    agent_rec = await repo.get_agent(c["agent_id"], user.id)
+    if agent_rec:
+        err = await _pf.preflight_agent_config(agent_rec)
+        if err:
+            raise HTTPException(
+                400,
+                f"Campaign agent '{agent_rec.get('name')}' is not ready: {err}. Fix the agent config and retry.",
+            )
     c = campaign_store.set_status(user.id, campaign_id, "running")
     return c
 
