@@ -419,20 +419,32 @@ def _parse_file(name: str, raw: bytes) -> str:
 _AGENT_JOIN_VERIFY_SECONDS = float(os.getenv("DISPATCH_VERIFY_SECONDS", "18"))
 
 
-async def _agent_join_watchdog(call_id: str, room: str, user_id: str) -> None:
-    """Fail the call loudly when the LiveKit dispatch never produces an agent.
+async def _agent_join_watchdog(call_id: str, room: str, user_id: str,
+                               agent_id: str, mode: str, phone: str) -> None:
+    """Heal, then fail loudly, when the LiveKit dispatch never produces an agent.
 
     Room creation + agent dispatch succeeding only means the server ACCEPTED the
-    dispatch — a worker still has to pick the job up and join. When that never
-    happens (worker stopped, stuck draining a previous call, or a stale second
-    worker window eating jobs with old code), the caller used to sit in a silent
-    room until the frontend's own 30s timeout. The UI polls the call row every
-    ~2s while waiting, so marking the row failed with the REAL reason here
-    surfaces it much earlier and much more precisely.
+    dispatch — a worker still has to be OFFERED the job and join. Self-hosted
+    LiveKit drops a dispatch when no worker is registered for the agent name at
+    that moment (worker still booting, re-registering after a network blip, or
+    stuck draining a previous call), and older servers do not retry it. So:
+
+      1. ~8s with no agent in the room  → create the dispatch explicitly ONCE
+         ([DISPATCH_RETRY]) — by then a freshly (re)started worker is registered,
+         so this alone heals the classic "first click after worker restart".
+      2. Still no agent after DISPATCH_VERIFY_SECONDS → mark the call `failed`
+         with the real reason in `usage.error`. The UI polls the call row every
+         ~2s while waiting, so the caller sees it far earlier than the old
+         silent 30s timeout.
+
+    One-shot by design: repeated re-dispatch against a genuinely dead worker
+    changes nothing, so this is remediation, not a retry loop.
     """
     try:
         await asyncio.sleep(3.0)  # dispatch head start; the agent normally joins in 2-8s
         deadline = time.monotonic() + max(8.0, _AGENT_JOIN_VERIFY_SECONDS)
+        retry_at = time.monotonic() + 5.0  # ~8s after the call was placed
+        retried = False
         while time.monotonic() < deadline:
             try:
                 row = await repo.get_call(call_id, user_id)
@@ -444,6 +456,17 @@ async def _agent_join_watchdog(call_id: str, room: str, user_id: str) -> None:
             if joined is True:
                 logger.info("[AGENT_JOIN_VERIFIED] room=%s call=%s", room, call_id)
                 return
+            if not retried and time.monotonic() >= retry_at:
+                retried = True
+                meta = telephony._metadata(agent_id, mode, phone or "", call_id, user_id)
+                dispatch_id = await telephony.create_agent_dispatch(room, meta)
+                logger.warning(
+                    "[DISPATCH_RETRY] room=%s call=%s: no agent after ~8s, one-shot "
+                    "explicit dispatch %s (worker now registered?)",
+                    room, call_id, dispatch_id or "FAILED",
+                )
+                if dispatch_id:
+                    deadline += 8.0  # graceful slack for the re-dispatch to land
             await asyncio.sleep(2.0)
 
         # Final re-check before failing (the agent may have joined during the
@@ -595,7 +618,9 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
     # worker turns into a precise call failure (visible in the UI within ~2s
     # via the waiting poll) instead of 30s of silence in an empty room.
     try:
-        asyncio.create_task(_agent_join_watchdog(call["id"], result["room"], user.id))
+        asyncio.create_task(
+            _agent_join_watchdog(call["id"], result["room"], user.id, agent_id, mode, phone)
+        )
     except Exception as e:
         logger.debug("agent-join watchdog not scheduled: %r", e)
 

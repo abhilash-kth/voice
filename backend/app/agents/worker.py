@@ -1363,6 +1363,21 @@ async def entrypoint(ctx):
     (stuck provider build / DB init / dead loop) so one sick job can't clog
     dispatch — the classic "second call goes silent" symptom.
     """
+    # FIRST observable link of the dispatch chain on the worker side. If the
+    # API logs CALL_START -> ROOM_CREATED -> AGENT_DISPATCH_SENT but this line
+    # never appears, LiveKit never offered the job to this worker (dispatch
+    # dropped / worker not registered at dispatch time) — never a code issue.
+    try:
+        _md = getattr(getattr(ctx, "job", None), "metadata", "") or ""
+        logger.info(
+            "[JOB_RECEIVED] room=%s job_id=%s worker_agent=%s metadata=%s",
+            getattr(getattr(ctx, "room", None), "name", ""),
+            getattr(getattr(ctx, "job", None), "id", ""),
+            WORKER_AGENT_NAME,
+            _md[:200],
+        )
+    except Exception:
+        pass
     setup_complete = {"done": False}
 
     async def _setup_watchdog():
