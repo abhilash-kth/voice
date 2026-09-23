@@ -51,7 +51,7 @@ def _metadata(agent_id: str, mode: str, phone: str = "", call_id: str = "",
 # ---------------------------------------------------------------------------
 async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "", user_id: str = "",
                               lead_data: Optional[dict] = None) -> dict:
-    """Creates a room on the LiveKit server with agent dispatch + returns a browser participant token."""
+    """Creates a room + returns a browser participant token configured for automatic agent dispatch on join."""
     from livekit import api
 
     _req_creds()
@@ -59,64 +59,25 @@ async def create_browser_room(agent_id: str, phone: str = "", call_id: str = "",
     identity = "caller-" + uuid.uuid4().hex[:6]
     metadata = _metadata(agent_id, "browser", phone, call_id, user_id, lead_data)
 
-    client = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-    room_created = False
-    try:
-        try:
-            await client.room.create_room(
-                api.CreateRoomRequest(
-                    name=room,
-                    empty_timeout=300,
-                    departure_timeout=30,
-                    agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME, metadata=metadata)],
-                )
-            )
-            room_created = True
-        except Exception as e:
-            logger.warning("[CREATE_ROOM_WARN] room=%s: %s", room, e)
-
-        # Only dispatch via AgentDispatchService if create_room did not already succeed
-        if not room_created and hasattr(client, "agent_dispatch") and hasattr(api, "CreateAgentDispatchRequest"):
-            try:
-                await client.agent_dispatch.create_dispatch(
-                    api.CreateAgentDispatchRequest(
-                        agent_name=AGENT_NAME,
-                        room=room,
-                        metadata=metadata,
-                    )
-                )
-                logger.info("[AGENT_DISPATCH_SENT] room=%s agent=%s", room, AGENT_NAME)
-                room_created = True
-            except Exception as e:
-                logger.debug("agent_dispatch call: %s", e)
-    finally:
-        await client.aclose()
-
-    token_builder = (
+    token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(identity)
         .with_ttl(timedelta(minutes=30))
         .with_grants(
             api.VideoGrants(room=room, room_join=True, room_create=True, can_publish=True, can_subscribe=True)
         )
-    )
-    # Only if server-side room/agent dispatch failed, attach RoomConfiguration on the token
-    if not room_created:
-        try:
-            token_builder = token_builder.with_room_config(
-                api.RoomConfiguration(
-                    agents=[
-                        api.RoomAgentDispatch(
-                            agent_name=AGENT_NAME,
-                            metadata=metadata,
-                        )
-                    ]
-                )
+        .with_room_config(
+            api.RoomConfiguration(
+                agents=[
+                    api.RoomAgentDispatch(
+                        agent_name=AGENT_NAME,
+                        metadata=metadata,
+                    )
+                ]
             )
-        except Exception as e:
-            logger.warning("[TOKEN_ROOM_CONFIG_WARN] room=%s: %s", room, e)
-
-    token = token_builder.to_jwt()
+        )
+        .to_jwt()
+    )
 
     logger.info("[ROOM_CREATED] room=%s agent_id=%s mode=browser", room, agent_id)
     logger.info("[TOKEN_CREATED] room=%s identity=%s", room, identity)

@@ -1212,6 +1212,16 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
     kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
+    logger.info(
+        "📚 [KNOWLEDGE_BASE_INIT] Agent '%s' knowledge loaded: manual_text=%d chars, documents=%d, faq=%d items | Static budgets: KB=%d chars, FAQ=%d chars, Owner=%d chars",
+        cfg.name,
+        len(getattr(cfg.knowledge, "text", "") or ""),
+        len(getattr(cfg.knowledge, "documents", []) or []),
+        len(getattr(cfg.knowledge, "faq", []) or []),
+        kb_budget,
+        faq_budget,
+        owner_budget,
+    )
 
     lines = [
         f"You are {cfg.name}, a {persona} voice receptionist.",
@@ -1790,16 +1800,37 @@ def build_voice_agent(
                 from .. import rag  # local import: keep this module light
                 # Async RAG to avoid blocking event loop
                 try:
-                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
-                    hits = (hits or "").strip()
+                    rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, user_text, 3)
                 except Exception:
                     # Fallback sync if to_thread fails
-                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
+                    rag_res = rag.build_context_detailed(cfg.knowledge, user_text, top_k=3)
                 _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                hits = (rag_res.get("text") or "").strip()
+                kb_used = rag_res.get("kb_used", False)
+                kb_chars = rag_res.get("kb_chars", 0)
+                kb_hits = rag_res.get("kb_hits", 0)
+                faq_used = rag_res.get("faq_used", False)
+                faq_chars = rag_res.get("faq_chars", 0)
+                faq_hits = rag_res.get("faq_hits", 0)
+                total_chars = rag_res.get("total_chars", 0)
+
+                # Authoritative user-facing retrieval log detailing KB and FAQ usage
+                logger.info(
+                    "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
+                    user_text[:60],
+                    _rag_elapsed,
+                    kb_used,
+                    kb_chars,
+                    kb_hits,
+                    faq_used,
+                    faq_chars,
+                    faq_hits,
+                    total_chars,
+                )
+
                 if _rag_elapsed > 200:
                     logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
-                else:
-                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms (hits {len(hits)} chars)")
+
                 if not hits or hits == self._last_rag:
                     logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return  # nothing new
@@ -1807,13 +1838,8 @@ def build_voice_agent(
                 if target is None:
                     logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
+                
                 # FIX ROOT CAUSE: When KB/FAQ RAG enabled, preemptive must be disabled BEFORE turn begins
-                # Verify runtime Session config, not just config variable
-                # Exactly one LLM REQUEST START per turn, no preemptive that can be invalidated by RAG mutation
-                # Previous bug: logged conflict but still allowed duplicate 0/0 failure
-                # New: Check if RAG enabled, if so preemptive should already be disabled at session level (worker.py fix)
-                # If preemptive_on env True but RAG enabled, session config has preemptive=False, so no invalidation should happen
-                # Log verification, not conflict
                 rag_enabled = True
                 try:
                     import os as _os_rag_check
@@ -1824,14 +1850,10 @@ def build_voice_agent(
                     rag_enabled = True
                 
                 if preemptive_on and rag_enabled:
-                    # This should NOT happen after worker.py fix - preemptive should be disabled when RAG enabled
-                    # If it does happen, it means session config still has preemptive enabled, which is bug
-                    # Log as warning that duplicate may occur, but we have disabled at session level so should be safe
-                    # Actually, after fix, preemptive_on env True but session preemptive=False, so no invalidation
-                    # So we log that RAG grounding needed but preemptive already disabled at session level, no invalidation
                     logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {user_text[:60]})")
                 elif preemptive_on:
                     logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
+                
                 # Drop previous RAG message to avoid growth
                 try:
                     items = getattr(target, "items", None)
@@ -1847,7 +1869,7 @@ def build_voice_agent(
                     ),
                 )
                 self._last_rag = hits
-                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]}")
+                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
             except Exception as e:
                 logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
                 logger.info(f"⏱️ TIMING on_user_turn_completed (RAG error, fallback): {(_time.time()-_rag_t0)*1000:.0f}ms")
