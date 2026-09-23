@@ -26,6 +26,10 @@ import uuid
 import json
 import traceback
 import aiohttp
+# Hoisted (03:08:14 log: a first-time module import tokenized for 273ms INSIDE
+# the event loop): hashlib used to be lazily imported on the first LLM request
+# of every call, right inside [PROMPT]. Import once at startup instead.
+import hashlib as _hl
 from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
@@ -913,8 +917,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             except Exception as e:
                 # FIX: Log actual exception for 0/0 failures to diagnose root cause
                 # Previous 0/0 failures (Request 1 and 5) had no error logged, making root cause invisible
-                import traceback as _tb
-                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb.format_exc()[:1000]}")
+                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={traceback.format_exc()[:1000]}")
                 raise
             finally:
                 _flush_first_logs()
@@ -988,6 +991,24 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
                     _bi_recent = (_time.time() - float(self._timing.get("last_bargein_ts", 0.0))) < 1.0
                     _logger.info("🔇 [LLM_CANCELLED] reason=%s generation=%s — superseded request never billed; the new completed turn owns the one live request", "user_barge_in" if _bi_recent else "user_continued", self._timing.get("gen", 0))
+                    # 03:07 K-exam fix: killed BEFORE any token = the caller was
+                    # still speaking (VAD split mid-utterance); the question
+                    # that was cut off must stay mergeable with its
+                    # continuation. Tagged with this request's generation so the
+                    # builder only adopts it while that generation is still
+                    # current (a late teardown can never contaminate two turns
+                    # later). Barge-in DURING an answer is excluded:
+                    # first_token is nonzero once any output was streamed.
+                    if not self._timing.get("first_token", 0):
+                        try:
+                            _uxt = str(self._timing.get("req_user_text") or "").strip()
+                            if _uxt:
+                                self._timing["overwritten_turn"] = {
+                                    "text": _uxt, "ts": _time.time(),
+                                    "gen": int(self._timing.get("gen", 0) or 0),
+                                }
+                        except Exception:
+                            pass
                 
                 _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
@@ -1152,7 +1173,6 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 if _cc is None and args:
                     _cc = args[0]
                 if _cc is not None:
-                    import hashlib as _hl
                     _mf = getattr(_cc, "messages", None)
                     # livekit-agents 1.8.2: ChatContext.messages is a METHOD
                     # (returns list[ChatMessage]) — the previous direct getattr
@@ -1172,6 +1192,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _hist_msgs = 0
                     _rag_chars = 0
                     _user_last_chars = 0
+                    _user_last_text = ""
                     _dyn_before_head = 0
                     _seen_user = False
                     _first_sys = None
@@ -1186,8 +1207,15 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                             _rag_chars += len(_t)
                         else:
                             _seen_user = True
-                            if _i == len(_msgs) - 1 and _r == "user":
-                                _user_last_chars = len(_t)
+                            if _r == "user":
+                                # last USER message wherever it sits — when RAG
+                                # context was injected this turn the final entry
+                                # is the [RAG] system message (final_user=0c in
+                                # production logs), so a positional check would
+                                # miss the text the continuation-merge needs.
+                                _user_last_text = _t
+                                if _i == len(_msgs) - 1:
+                                    _user_last_chars = len(_t)
                             else:
                                 _hist_chars += len(_t)
                                 _hist_msgs += 1
@@ -1196,6 +1224,10 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         _tools = args[1]
                     _tools = _tools or []
                     _dyn_before_head = int(_first_sys or 0)
+                    # 03:07 K-exam fix: remember this request's question so the
+                    # builder can merge it into the caller's immediate
+                    # continuation if the request is superseded pre-output.
+                    self._timing["req_user_text"] = _user_last_text[:600]
                     _tools_chars = sum(len(str(getattr(_t0, "name", _t0))) + len(str(getattr(_t0, "parameters", ""))) for _t0 in _tools)
                     _head_chars = sum(len(_h) for _h in _head)
                     _sha = _hl.sha256(("\x1f".join(_head) + "#tools=" + repr(_tools_chars)).encode("utf-8", "ignore")).hexdigest()[:12]
@@ -1264,7 +1296,6 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 model = self._prov_info.get('model_id', '') or 'unknown'
                 base_url = self._prov_info.get('base_url', '') or 'unknown'
                 _logger.error(f"LLM API ERROR provider={prov} model={model} base_url={base_url} Error={e} Type={type(e).__name__} After {(error_time-request_start)*1000:.0f}ms")
-                import traceback
                 _logger.error(f"Full traceback: {traceback.format_exc()}")
                 raise
 
