@@ -1442,7 +1442,9 @@ async def wait_until_caller_can_hear(session, timeout: float = 12.0) -> None:
     await asyncio.sleep(0.2)
 
 
-async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> None:
+async def speak_opening_line(
+    session, text: str, *, timeout: float = 45.0, allow_interruptions: bool = False
+) -> None:
     """Play one opening line and wait until playout finishes.
 
     Interruptions stay off for this line only. The browser mic opens at the
@@ -1456,7 +1458,15 @@ async def speak_opening_line(session, text: str, *, timeout: float = 45.0) -> No
     last_error: Exception | None = None
     for attempt in (1, 2):
         try:
-            handle = session.say(text, allow_interruptions=False)
+            # allow_interruptions: the greeting used to be hard-protected
+            # (False), which made EVERY interruption path skip it — library
+            # barge-in checks _current_speech.allow_interruptions and
+            # SpeechHandle.interrupt() raises while the handle is protected
+            # (voice/speech_handle.py:221, agent_activity.py user-speech
+            # gates). Result: talking over "Namaste…" changed nothing audible.
+            # Assistant mode now passes True; announcement one-way playback
+            # keeps False.
+            handle = session.say(text, allow_interruptions=allow_interruptions)
             if handle is None:
                 return
             waiter = getattr(handle, "wait_for_playout", None)
@@ -1741,12 +1751,25 @@ def build_voice_agent(
                 logger.info("[ASSISTANT_STARTED] Assistant connected — waiting for caller audio path")
                 await wait_until_caller_can_hear(self.session)
                 logger.info("[ASSISTANT_STARTED] Speaking greeting: %s", self.greeting[:60])
-                await speak_opening_line(self.session, self.greeting, timeout=45)
-                logger.info("[ASSISTANT_STARTED] Greeting finished — now listening for caller speech")
+                _gtt = self._turn_timing_ref
+                if _gtt is not None:
+                    _gtt["greeting_active"] = True
+                logger.info("👋 [GREETING_STARTED] '%s' — interruptible: caller speech cancels playback", self.greeting[:60])
+                try:
+                    await speak_opening_line(self.session, self.greeting, timeout=45, allow_interruptions=True)
+                finally:
+                    if _gtt is not None:
+                        _gtt["greeting_active"] = False
+                if _gtt is not None and _gtt.pop("greeting_interrupted", None):
+                    logger.info("🔇 Greeting ended via caller barge-in — only the played portion counts; caller's turn proceeds")
+                else:
+                    logger.info("[ASSISTANT_STARTED] Greeting finished — now listening for caller speech")
             except Exception as e:
                 logger.warning(f"Greeting failed: {type(e).__name__}: {e!r}")
             finally:
                 self._opening_done = True
+                if self._turn_timing_ref is not None:
+                    self._turn_timing_ref["greeting_active"] = False
 
         async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
             """Hook that runs after the user finishes speaking — CRITICAL LATENCY PATH.

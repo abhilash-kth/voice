@@ -1835,8 +1835,11 @@ async def _entrypoint_body(ctx, setup_complete):
                     else:
                         _gen0 = int(turn_timing.get("gen", 0))
                         _llm_was = bool(turn_timing.get("llm_active", False))
+                        _in_greet = bool(turn_timing.get("greeting_active", False))
                         _last_bargein_ts[0] = _now_b
                         turn_timing["last_bargein_ts"] = _now_b
+                        if _in_greet:
+                            logger.info("🗣️ [USER_SPEECH_DURING_GREETING] caller spoke over the greeting: '%s' — cancelling, not waiting for min_words/turn-commit", text.strip()[:40])
                         logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech — interrupting immediately (no wait for the min_words gate / turn commit)")
                         logger.info("⚡ [INTERRUPTION_START] generation=%d transcript='%s'", _gen0, text.strip()[:40])
                         if _llm_was:
@@ -1848,11 +1851,21 @@ async def _entrypoint_body(ctx, setup_complete):
                         logger.info("🚫 [GENERATION_INVALIDATED] generation=%d — current is now %d; late callbacks from %d cannot publish", _gen0, _gen0 + 1, _gen0)
                         try:
                             _fut = session.interrupt()
+                            if _in_greet:
+                                logger.info("⛔ [GREETING_INTERRUPTED] generation=%d — greeting speech + TTS + playback cancelled", _gen0)
 
-                            def _barge_done(_f, _g=_gen0):
+                            def _barge_done(_f, _g=_gen0, _ig=_in_greet):
                                 try:
                                     if not _f.cancelled() and _f.exception() is None:
                                         logger.info("✅ [INTERRUPTION_COMPLETE] generation=%d — agent returned to listening", _g)
+                                        if _ig:
+                                            # session.interrupt()'s future completes only AFTER the
+                                            # library finished teardown: playback flushed, the
+                                            # played-partial committed to chat_ctx, state ->
+                                            # listening. That is the proof the greeting AUDIO
+                                            # stopped (not just a log). tell the builder on_enter.
+                                            turn_timing["greeting_interrupted"] = True
+                                            logger.info("🔇 [GREETING_CANCELLED] generation=%d — greeting audio actually stopped (playout flushed + partial committed)", _g)
                                 except Exception:
                                     pass
 
@@ -3370,7 +3383,11 @@ async def _entrypoint_body(ctx, setup_complete):
             return
         logger.warning("🛟 Opening line had not started — speaking it now (%s)", agent_mode)
         try:
-            handle = session.say(line, allow_interruptions=False)
+            # Assistant-mode greetings must be interruptible (the primary path
+            # in agent_builder.speak_opening_line passes True now too); this
+            # fallback line was the same hard-protected pattern. Announcements
+            # stay one-way.
+            handle = session.say(line, allow_interruptions=(agent_mode != "announcement"))
             waiter = getattr(handle, "wait_for_playout", None)
             if callable(waiter):
                 await asyncio.wait_for(waiter(), timeout=45)
