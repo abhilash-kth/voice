@@ -2910,6 +2910,13 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
+    # Silence loop_monitor telemetry in runner processes to avoid slow synchronous console writes
+    try:
+        logging.getLogger("livekit.agents.telemetry").setLevel(logging.ERROR)
+        logging.getLogger("livekit.agents.telemetry.loop_monitor").setLevel(logging.ERROR)
+    except Exception:
+        pass
+
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
     # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU
@@ -3014,8 +3021,28 @@ def prewarm(proc):
     # 1359ms SSL block that pushed it off-loop is fixed by the cached SSL context patch).
 
 
+def _worker_load(worker) -> float:
+    """Calculate load based on actual active jobs rather than Windows event-loop jitter.
+
+    Default CPU-sampling load_fnc in livekit-agents spikes to 1.0 on Windows due to
+    asyncio IOCP polling (GetQueuedCompletionStatus) and synchronous console I/O,
+    falsely marking the worker as 'at full capacity, marking as unavailable' and
+    dropping incoming calls.
+    """
+    try:
+        active = len(getattr(worker, "active_jobs", []) or [])
+        max_jobs = int(os.getenv("MAX_CONCURRENT_CALLS", "10"))
+        return min(float(active) / float(max_jobs), 1.0)
+    except Exception:
+        return 0.0
+
+
 if __name__ == "__main__":
     from livekit.agents import WorkerOptions, cli
+
+    # Silence runaway loop_monitor telemetry warnings that trigger synchronous console writes
+    logging.getLogger("livekit.agents.telemetry").setLevel(logging.ERROR)
+    logging.getLogger("livekit.agents.telemetry.loop_monitor").setLevel(logging.ERROR)
 
     # livekit-agents v1 ships a Typer CLI that requires a subcommand
     # (start / dev / console). Default to `start` so that
@@ -3036,5 +3063,7 @@ if __name__ == "__main__":
             # Windows doesn't support the default "forkserver" context; "spawn"
             # is portable and works on Windows/macOS/Linux alike.
             multiprocessing_context="spawn",
+            load_fnc=_worker_load,
+            load_threshold=float(os.getenv("WORKER_LOAD_THRESHOLD", "0.95")),
         )
     )
