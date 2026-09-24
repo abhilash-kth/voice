@@ -1467,7 +1467,8 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             "Open every answer with a very short acknowledgment as its own complete sentence, in the caller's language ('जी.' / 'हाँ जी.' / 'Sure.'), 1-3 words, varied naturally, never the same one twice in a row; then give the full answer."
         )
     lines.append(
-        "ACK/INCOMPLETE TURNS: pure acknowledgements and half-spoken fragments ('कि', 'और', 'एक minute') are answered deterministically before you are called; if one still reaches you, reply with at most one short warm line ('जी, बताइए।') — never facts, never guesses about what was meant."
+        "ACK/INCOMPLETE TURNS: pure acknowledgements and half-spoken fragments ('कि', 'और', 'एक minute') are answered deterministically before you are called; if one still reaches you, reply with at most one short warm line ('जी, बताइए।') — never facts, never guesses about what was meant. "
+        "That line is ONLY for turn-less fragments: NEVER use it to dodge a question, even a garbled or unclear one — for any question, answer from the provided business facts, or say plainly you don't have that detail and offer a follow-up. And never repeat an answer you already gave in this call."
     )
     lines.append(
         "NEVER offer further help at the end of an answer: no 'Aur kuch poochna hai?', 'क्या मैं आपकी और मदद कर सकती हूँ?' or any variant — one answer, then stop and wait. Ask a follow-up only while actively collecting required enquiry details (name, phone, budget)."
@@ -2372,10 +2373,41 @@ def build_voice_agent(
                 # ungrounded (23:19 log: identical kb result -> "RAG no new hits" ->
                 # model answered from generic priors). Same text = same injection cost
                 # (~600 tokens); correctness wins.
+                _rag_kind = "retrieved"
                 if not hits:
-                    logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", user_text[:70])
-                    logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
-                    return  # nothing to inject
+                    # ---- 0-hit turn: ONE cheap containment fallback over the
+                    # cached corpus (rag.fallback_context — BM25/ranking
+                    # untouched, runs in a thread so the loop stays free).
+                    # STT-mangled keywords ("Kriscent" heard as "sent") share
+                    # no exact token with any chunk, so main retrieval is
+                    # legitimately empty; containment still finds the chunk
+                    # containing the fragment, capped at ~560 chars. If the
+                    # fallback also finds nothing, the request proceeds
+                    # ungrounded — the prompt tells the model to say so
+                    # honestly instead of guessing.
+                    _fb_text = ""
+                    _fb_hits = 0
+                    try:
+                        _fb_text, _fb_hits = await asyncio.to_thread(
+                            rag.fallback_context, cfg.knowledge, user_text
+                        )
+                    except Exception as _fb_exc:
+                        logger.debug("RAG fallback failed: %r", _fb_exc)
+                    if _fb_text:
+                        hits = _fb_text
+                        _rag_kind = "near-match"
+                        logger.info(
+                            "🕳️ [RAG_MISS] query='%s' fallback_attempted=yes fallback_hits=%d fallback_context_chars=%d",
+                            user_text[:70], _fb_hits, len(_fb_text),
+                        )
+                    else:
+                        logger.info(
+                            "🕳️ [RAG_MISS] query='%s' fallback_attempted=yes fallback_hits=0 fallback_context_chars=0",
+                            user_text[:70],
+                        )
+                        logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", user_text[:70])
+                        logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                        return  # nothing to inject, main retrieval AND fallback came up empty
                 target = _find_chat_ctx(turn_ctx)
                 if target is None:
                     logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
@@ -2396,15 +2428,22 @@ def build_voice_agent(
                 elif preemptive_on:
                     logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
                 
+                if _rag_kind == "near-match":
+                    _header = (
+                        f"{_RAG_PREFIX} NEAR-MATCH business context (the exact question "
+                        "keywords were not found in the knowledge base; use ONLY statements "
+                        "this excerpt makes verbatim, do not stretch it to fit the question):"
+                    )
+                else:
+                    _header = (
+                        f"{_RAG_PREFIX} Relevant business facts for THIS specific question:"
+                    )
                 target.add_message(
                     role="system",
-                    content=(
-                        f"{_RAG_PREFIX} Relevant business facts for THIS specific "
-                        f"question:\n{hits}"
-                    ),
+                    content=f"{_header}\n{hits}",
                 )
                 logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
-                logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d)", user_text[:70], len(hits))
+                logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d, kind=%s)", user_text[:70], len(hits), _rag_kind)
             except Exception as e:
                 # RAG only *enriches* the turn context: a retrieval failure must
                 # never gate or delay the LLM reply (brief P4). Log loudly with
