@@ -1649,9 +1649,12 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                             self._timing["prov_prefix_hash_prev"] = _prev_pref
                         _pck = getattr(getattr(self._inner, "_opts", None), "prompt_cache_key", None) or getattr(self._inner, "prompt_cache_key", None) or "?"
                         # Never log full content, only hashes/lengths/roles
+                        # Cache diagnostics: show stable_head size to prove >1024 eligibility
+                        _stable_chars_log = self._timing.get("head_chars_log", "?")
+                        _stable_tokens_log = self._timing.get("head_est_tokens", "?")
                         _logger.info(
-                            "\U0001f50d [PROVIDER_BOUND] provider=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s prefix_same_as_previous=%s app_head_sha=%s app_head_same=%s",
-                            _dbg_prov, _dbg_model, _pck, len(_prov_msgs), _prov_role_seq, _prov_len_seq, _prov_first_hash, _prov_prefix_hash, _prov_prefix_same, _sha, _stable,
+                            "\U0001f50d [PROVIDER_BOUND] provider=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s prefix_same_as_previous=%s app_head_sha=%s app_head_same=%s stable_head_chars=%s stable_head_tokens_est=%s",
+                            _dbg_prov, _dbg_model, _pck, len(_prov_msgs), _prov_role_seq, _prov_len_seq, _prov_first_hash, _prov_prefix_hash, _prov_prefix_same, _sha, _stable, _stable_chars_log, _stable_tokens_log,
                         )
                     except Exception as _pb_e:
                         _logger.debug(f"[PROVIDER_BOUND] fingerprint failed: {_pb_e!r}")

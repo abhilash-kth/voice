@@ -722,6 +722,33 @@ def build_llm(cfg: AgentConfig) -> Any:
     primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
     _pm_attach(primary, primary_pair)
 
+    # Cache fix v3: make prompt_cache_key per-agent so that per-agent owner/KB/FAQ
+    # content is genuinely identical for same key. Global key voice-gpt-4.1-mini-v1
+    # caused cross-agent thrashing and violated "identical for same cache key"
+    # principle when stable included per-agent content. Per-agent key restores
+    # reliable within-agent caching while still using native_explicit mode.
+    try:
+        _agent_short = (getattr(cfg, "id", "") or getattr(cfg, "name", "") or "")[:12]
+        _agent_short = "".join(c for c in _agent_short if c.isalnum())[:8] or "agent"
+        # Resolve model_id for key
+        try:
+            _, _model_id_for_key, _ = primary_pair.resolve_llm_provider_model()
+        except Exception:
+            _model_id_for_key = (primary_pair.config or {}).get("model", "gpt-4.1-mini")
+        _per_agent_key = f"voice-{_model_id_for_key}-{_agent_short}-v1"
+        # Only for OpenAI (native_explicit)
+        try:
+            from ..llm_catalog import get_prompt_cache_capability as _gcc_key
+            _cap_for_key = _gcc_key("openai", _model_id_for_key)
+            if _cap_for_key.get("mode") == "native_explicit":
+                if hasattr(primary, "_opts") and hasattr(primary._opts, "prompt_cache_key"):
+                    primary._opts.prompt_cache_key = _per_agent_key
+                    logger.info(f"🔧 Per-agent prompt_cache_key={_per_agent_key} (agent {_agent_short}) for reliable caching — identical for same agent across turns")
+        except Exception as _ke:
+            logger.debug(f"Per-agent cache key setup skipped: {_ke!r}")
+    except Exception as _e:
+        logger.debug(f"Per-agent cache key outer skipped: {_e!r}")
+
     # Build fallback chain - supports multiple models, provider/model separate
     fallbacks = []
     if fallback_pair:
@@ -773,6 +800,25 @@ def build_llm(cfg: AgentConfig) -> Any:
         try:
             inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
             _pm_attach(inst, fb_pair)
+            # Per-agent cache key for fallback too (same agent short as primary)
+            try:
+                _agent_short_fb = (getattr(cfg, "id", "") or getattr(cfg, "name", "") or "")[:12]
+                _agent_short_fb = "".join(c for c in _agent_short_fb if c.isalnum())[:8] or "agent"
+                try:
+                    _, _model_id_fb, _ = fb_pair.resolve_llm_provider_model()
+                except Exception:
+                    _model_id_fb = (fb_pair.config or {}).get("model", "gpt-4.1-mini")
+                _per_agent_key_fb = f"voice-{_model_id_fb}-{_agent_short_fb}-v1"
+                try:
+                    from ..llm_catalog import get_prompt_cache_capability as _gcc_fb
+                    _cap_fb = _gcc_fb("openai", _model_id_fb)
+                    if _cap_fb.get("mode") == "native_explicit":
+                        if hasattr(inst, "_opts") and hasattr(inst._opts, "prompt_cache_key"):
+                            inst._opts.prompt_cache_key = _per_agent_key_fb
+                except Exception:
+                    pass
+            except Exception:
+                pass
             fallback_instances.append(inst)
             fallback_ids.append(fb_pair.id)
         except Exception as e:
@@ -1280,9 +1326,13 @@ _OWNER_PROMPT_BUDGET_CHARS_DEFAULT = 4000
 # KB 800 (was 1200), FAQ 400 (was 800), owner 2000 (was 2500), prior_memory 800 (was unlimited 40 turns ~4000 tokens)
 # Total static ~3200 chars ~800 tokens + RAG 500 + history 8*150=1200 = ~2500 tokens (was 3500-3700)
 # Prior_memory 40 turns -> 800 chars preserves recent cross-call context without bloating
-_KB_BUDGET_CHARS_VOICE_RAG = 800
-_FAQ_BUDGET_CHARS_VOICE_RAG = 400
-_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 2000
+# v3 (2026-09-24 cache fix): 1126-token stable was borderline <1024 real tokens → cached=0 miss.
+# Restore larger genuinely stable prefix: KB 2500 FAQ 1200 owner 3000 matches historical
+# cache-hit size (~2350 tokens est) and is still bounded to avoid Groq 429s.
+# This is natural business content, not artificial padding.
+_KB_BUDGET_CHARS_VOICE_RAG = 2500
+_FAQ_BUDGET_CHARS_VOICE_RAG = 1200
+_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 3000
 _PRIOR_MEMORY_BUDGET_CHARS_VOICE_RAG = 800
 
 # Legacy module-level constants kept for backward compat / logging, but
@@ -1586,7 +1636,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         kb_budget,
         faq_budget,
         owner_budget,
-        "KB/FAQ skipped — RAG per-turn injects only relevant chunks" if rag_on else "KB/FAQ included — RAG disabled for this call",
+        "KB/FAQ included in stable prefix for caching + RAG per-turn injects relevant chunks" if rag_on else "KB/FAQ included — RAG disabled for this call",
     )
 
     lines = [
@@ -1624,11 +1674,13 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         lines.append("Instructions from the business owner:")
         lines.append(extra)
 
-    # Static KB/FAQ slices are redundant while per-turn RAG injects the
-    # relevant chunks — they return only in RAG-off mode (single source of
-    # grounding there). Emptying the lists reuses the untouched budget/
-    # truncation logic below.
-    facts = _flatten_knowledge(cfg.knowledge) if not rag_on else []
+    # Cache fix v3: static KB/FAQ are genuinely stable for same agent and
+    # increase the cacheable prefix to reliably >1024 real tokens. When RAG is
+    # on, per-turn RAG still injects the *relevant* chunks (27-105ms), but the
+    # static slices provide a large identical prefix for prompt caching.
+    # This restores historical cache-hit size (~2350 tokens) without artificial
+    # padding — natural business content only. RAG behavior unchanged.
+    facts = _flatten_knowledge(cfg.knowledge)
     if facts:
         kept: list[str] = []
         used = 0
@@ -1663,7 +1715,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         lines.append("Relevant business facts to use when answering:")
         lines.append(query_context)
 
-    faq = (getattr(cfg.knowledge, "faq", None) or []) if not rag_on else []
+    faq = getattr(cfg.knowledge, "faq", None) or []
     if faq:
         faq_lines: list[str] = []
         used = 0
@@ -1707,14 +1759,14 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
     # EVERY request, measured at build time (the per-request [PROMPT] line in
     # the worker shows the same numbers next to dynamic/RAG tokens).
     logger.info(
-        "📐 [STABLE_PROMPT] chars=%d est_tokens=%d (4.0 chars/token) | sections: core+%sowner=%d kb_static=%s faq_static=%s | policy=behavior-only%s",
+        "📐 [STABLE_PROMPT] chars=%d est_tokens=%d (4.0 chars/token) | sections: core+%sowner=%d kb_static=%s faq_static=%s | policy=%s",
         _stable_chars,
         int(_stable_chars / 4.0),
         "ack-rhythm " if os.getenv("VOICE_ACK_OPENERS", "1") == "1" else "",
         len(extra),
-        "on" if not rag_on and facts else "off (RAG)",
-        "on" if not rag_on and faq else "off (RAG)",
-        "" if rag_on else " — RAG DISABLED: static slices re-included",
+        "on" if facts else "off",
+        "on" if faq else "off",
+        "cache-optimized: KB/FAQ in stable for >1024 tokens + RAG per-turn" if rag_on else "RAG disabled: static slices re-included",
     )
     return "\n".join(lines)
 
