@@ -1534,9 +1534,17 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     for _i, _m in enumerate(_msgs):
                         _r = getattr(_m, "role", "") or ""
                         _t = _mtext(_m)
-                        if _r == "system" and _first_sys is None and not _seen_user and "[RAG]" not in _t[:80]:
+                        _mid = getattr(_m, "id", "") or ""
+                        # Cache fix: ONLY the behavioral instructions (id=lk.agent_task.instructions)
+                        # are the stable cacheable prefix. All other system messages (prior_memory,
+                        # lead_data, RAG) are dynamic and must be counted as dynamic, not stable,
+                        # even if they appear before first user in older contexts. This makes the
+                        # logged stable_head reflect the TRUE provider-bound cacheable prefix.
+                        _is_stable = (_mid == "lk.agent_task.instructions") or (_r == "system" and _first_sys is None and not _seen_user and "[RAG]" not in _t[:80] and "Prior conversation" not in _t[:80] and "contact list" not in _t[:80].lower())
+                        # For first_sys detection, only stable instructions count as head start
+                        if _r == "system" and _first_sys is None and _is_stable:
                             _first_sys = _i
-                        if _r == "system" and not _seen_user and "[RAG]" not in _t[:80]:
+                        if _r == "system" and _is_stable and not _seen_user:
                             _head.append(_t)
                         elif _r == "system":
                             _rag_chars += len(_t)
@@ -1614,6 +1622,39 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         "yes" if self._timing.get("ack_reply") else "no",
                         "yes" if self._timing.get("gov_turn_state") == "suppress" else "no",
                     )
+                    # --- Provider-bound fingerprint for cache diagnosis (safe, no PII) ---
+                    try:
+                        _prov_msgs = []
+                        _prov_role_seq = "?"
+                        _prov_len_seq = "?"
+                        _prov_first_hash = "?"
+                        _prov_prefix_hash = "?"
+                        _prov_prefix_same = "?"
+                        if hasattr(_cc, "to_provider_format"):
+                            try:
+                                _pb, _ = _cc.to_provider_format("openai")
+                                _prov_msgs = _pb or []
+                            except Exception:
+                                _prov_msgs = []
+                        if _prov_msgs:
+                            _prov_role_seq = ",".join([str(m.get("role", "?")) for m in _prov_msgs])
+                            _prov_len_seq = ",".join([str(len(str(m.get("content", "")))) for m in _prov_msgs])
+                            _first_c = str(_prov_msgs[0].get("content", "")) if _prov_msgs else ""
+                            _prov_first_hash = _hl.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12] if _first_c else "?"
+                            _pref_c = "".join([str(m.get("content", "")) for m in _prov_msgs[:2]])
+                            _prov_prefix_hash = _hl.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12] if _pref_c else "?"
+                            _prev_pref = self._timing.get("prov_prefix_hash", "")
+                            _prov_prefix_same = "yes" if (not _prev_pref or _prev_pref == _prov_prefix_hash) else "NO"
+                            self._timing["prov_prefix_hash"] = _prov_prefix_hash
+                            self._timing["prov_prefix_hash_prev"] = _prev_pref
+                        _pck = getattr(getattr(self._inner, "_opts", None), "prompt_cache_key", None) or getattr(self._inner, "prompt_cache_key", None) or "?"
+                        # Never log full content, only hashes/lengths/roles
+                        _logger.info(
+                            "\U0001f50d [PROVIDER_BOUND] provider=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s prefix_same_as_previous=%s app_head_sha=%s app_head_same=%s",
+                            _dbg_prov, _dbg_model, _pck, len(_prov_msgs), _prov_role_seq, _prov_len_seq, _prov_first_hash, _prov_prefix_hash, _prov_prefix_same, _sha, _stable,
+                        )
+                    except Exception as _pb_e:
+                        _logger.debug(f"[PROVIDER_BOUND] fingerprint failed: {_pb_e!r}")
                     # inflight gauge for spike forensics (Task 5)
                     self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
                     # Per-request ownership (12:28): this used to be the shared
