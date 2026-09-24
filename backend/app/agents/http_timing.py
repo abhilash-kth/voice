@@ -8,7 +8,7 @@ different layers —
   FIRST_STREAM_CHUNK      first decoded SSE delta   (worker LLM stream wrapper)
 
 — and the hooks can't reach the stream wrapper, so both sides rendezvous here.
-Pure bookkeeping: dict writes + time.time(); no lock needed (single event
+Pure bookkeeping: dict writes + monotonic_ns(); no lock needed (single event
 loop, no awaits inside). Nothing in this module can fail a request — every
 caller wraps its use in try/except, and reads that find no record simply skip
 the [HTTP_CHUNK] line rather than inventing numbers.
@@ -32,11 +32,11 @@ _model_last: dict = {}
 def note_send(model: str, rid: str) -> None:
     """Called from the httpx request hook when the SDK hands the request to
     the transport. Bounded growth: a call has ~15 requests; prune stale."""
-    now = time.time()
-    _records[rid] = {"rid": rid, "model": model, "send_ts": now, "headers_ts": 0.0, "status": 0, "trace": None}
+    now = time.monotonic_ns()
+    _records[rid] = {"rid": rid, "model": model, "send_mono_ns": now, "headers_mono_ns": 0, "status": 0, "trace": None}
     _model_last[model] = rid
     if len(_records) > 256:
-        for k in [k for k, v in _records.items() if now - v["send_ts"] > 120.0][:128]:
+        for k in [k for k, v in _records.items() if now - v["send_mono_ns"] > 120_000_000_000][:128]:
             _records.pop(k, None)
 
 
@@ -67,13 +67,13 @@ def note_headers(rid: str, status: int) -> float:
     rec = _records.get(rid)
     if rec is None:
         return -1.0
-    now = time.time()
-    rec["headers_ts"] = now
+    now = time.monotonic_ns()
+    rec["headers_mono_ns"] = now
     try:
         rec["status"] = int(status)
     except Exception:
         pass
-    return (now - rec["send_ts"]) * 1000.0
+    return (now - rec["send_mono_ns"]) / 1_000_000.0
 
 
 def pop_for_model(model: str, max_age: float = 15.0):
@@ -85,8 +85,8 @@ def pop_for_model(model: str, max_age: float = 15.0):
     if rid is None:
         return None
     rec = _records.pop(rid, None)
-    if not rec or rec["headers_ts"] <= 0.0:
+    if not rec or rec["headers_mono_ns"] <= 0:
         return None
-    if time.time() - rec["send_ts"] > max_age:
+    if time.monotonic_ns() - rec["send_mono_ns"] > int(max_age * 1_000_000_000):
         return None
     return rec

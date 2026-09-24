@@ -448,8 +448,8 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             # loop (107ms block warning) — that adds directly to
             # request_start->response_headers and delays audio/turn handling.
             logger.info(
-                "\U0001f310 [HTTP_REQUEST_START] rid=%s model=%s client_attempt#%d sdk_retry_count=%s path=%s — one send of one chat() attempt (see B/C distinction in builder comment; SDK retries are disabled by max_retries=0)",
-                _rid, model_id, _http_inst["n"],
+                "\U0001f310 [HTTP_REQUEST_START] monotonic_ns=%d rid=%s model=%s client_attempt#%d sdk_retry_count=%s path=%s — one send of one chat() attempt (see B/C distinction in builder comment; SDK retries are disabled by max_retries=0)",
+                time.monotonic_ns(), _rid, model_id, _http_inst["n"],
                 _request.headers.get("x-stainless-retry-count", "absent"),
                 _request.url.path,
             )
@@ -517,8 +517,8 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             _el = _http_timing.note_headers(_rid, _response.status_code)
             _transport = _http_timing.trace_summary(_rid)
             logger.info(
-                "\U0001f310 [HTTP_RESPONSE_HEADERS] rid=%s model=%s status=%d request_start->response_headers=%s transport=%s — headers boundary only; first streamed body bytes come later (see [HTTP_CHUNK])",
-                _rid, model_id, _response.status_code,
+                "\U0001f310 [HTTP_RESPONSE_HEADERS] monotonic_ns=%d rid=%s model=%s status=%d request_start->response_headers=%s transport=%s — headers boundary only; first streamed body bytes come later (see [HTTP_CHUNK])",
+                time.monotonic_ns(), _rid, model_id, _response.status_code,
                 ("%.0fms" % _el) if _el >= 0 else "?",
                 _transport or "no_trace_events",
             )
@@ -2036,6 +2036,7 @@ def build_voice_agent(
     # Cross-call memory becomes part of the initial conversation history, so it
     # influences every turn without being re-inserted.
     chat_ctx = llm.ChatContext()
+    _in_call_memory_lines: list[str] = []
     if lead_data:
         # For bulk-call campaigns, give the agent the lead's details (from the
         # uploaded file) so it can address them by name / reference their data.
@@ -2251,6 +2252,27 @@ def build_voice_agent(
                     self._turn_timing_ref["greeting_active"] = False
 
         async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+            _tt = self._turn_timing_ref
+            _entered_ns = time.monotonic_ns()
+            if _tt is not None:
+                _tt["callback_enter_mono_ns"] = _entered_ns
+                logger.info(
+                    "[TURN_TRACE] stage=callback_enter monotonic_ns=%d call_id=%s turn_id=%s generation_id=%s",
+                    _entered_ns, _tt.get("call_id", "N/A"), _tt.get("turn_id", "N/A"), _tt.get("gen", "N/A"),
+                )
+            try:
+                await self._on_user_turn_completed_impl(turn_ctx, new_message)
+            finally:
+                _completed_ns = time.monotonic_ns()
+                if _tt is not None:
+                    _tt["callback_complete_mono_ns"] = _completed_ns
+                    logger.info(
+                        "[TURN_TRACE] stage=callback_complete monotonic_ns=%d call_id=%s turn_id=%s generation_id=%s callback_duration_ms=%.3f",
+                        _completed_ns, _tt.get("call_id", "N/A"), _tt.get("turn_id", "N/A"), _tt.get("gen", "N/A"),
+                        max(0, _completed_ns - _entered_ns) / 1_000_000,
+                    )
+
+        async def _on_user_turn_completed_impl(self, turn_ctx, new_message) -> None:
             """Hook that runs after the user finishes speaking — CRITICAL LATENCY PATH.
 
             LiveKit's ``AgentSession`` ``await``s this hook, so any blocking here
@@ -2279,9 +2301,22 @@ def build_voice_agent(
             # So: log only, never wait.
             try:
                 _turn_marker_text = _chat_msg_text(new_message).strip()
-                logger.info("🗣️ [USER_TURN_COMPLETED] user turn committed: '%s'", _turn_marker_text[:80])
+                logger.info("🗣️ [USER_TURN_COMPLETED] callback entered for user turn: '%s'", _turn_marker_text[:80])
                 if self._turn_timing_ref is not None:
-                    self._turn_timing_ref["turn_commit_ts"] = time.time()
+                    _commit_ts = time.time()
+                    self._turn_timing_ref["turn_callback_enter_ts"] = _commit_ts
+                    _commit_mono = time.monotonic_ns()
+                    self._turn_timing_ref["callback_enter_mono_ns"] = _commit_mono
+                    self._turn_timing_ref["pipeline_stage"] = "user_turn_completed"
+                    _final_mono = int(self._turn_timing_ref.get("stt_final_mono_ns", 0) or 0)
+                    _final_ts = float(self._turn_timing_ref.get("stt_final_ts", 0.0) or 0.0)
+                    _final_age = _commit_ts - _final_ts
+                    _commit_ms = (
+                        f"{(_commit_mono - _final_mono) / 1_000_000:.0f}ms"
+                        if _final_mono > 0 and _commit_mono >= _final_mono
+                        else "N/A"
+                    )
+                    logger.info("⏱️ [TURN_TIMING] stt_final_to_callback_enter_ms=%s", _commit_ms)
             except Exception:
                 pass
             try:
@@ -2504,14 +2539,54 @@ def build_voice_agent(
                             kept_dialogue = dialogue_items[-_history_limit:]
                         else:
                             kept_dialogue = dialogue_items
+                        trimmed_count = len(dialogue_items) - len(kept_dialogue)
+                        if trimmed_count > 0:
+                            # Keep a bounded, verbatim window of this call's older
+                            # dialogue in the existing system-memory path. This
+                            # prevents context trimming from erasing caller facts
+                            # without RAG or entity-specific extraction.
+                            for _old_item in dialogue_items[:-_history_limit]:
+                                _old_role = getattr(_old_item, "role", "")
+                                _old_text = _chat_msg_text(_old_item).strip()
+                                if _old_role in ("user", "assistant") and _old_text:
+                                    _speaker = "Customer" if _old_role == "user" else "Agent"
+                                    _in_call_memory_lines.append(f"{_speaker}: {_old_text}")
+                            try:
+                                _memory_budget = int(os.getenv("VOICE_PRIOR_MEMORY_BUDGET_CHARS", "800"))
+                            except (TypeError, ValueError):
+                                _memory_budget = 800
+                            _memory_budget = max(1, _memory_budget)
+                            _memory_text = "\n".join(_in_call_memory_lines)[-_memory_budget:]
+                            _line_boundary = _memory_text.find("\n")
+                            if _line_boundary != -1 and _line_boundary < _memory_budget * 0.3:
+                                _memory_text = _memory_text[_line_boundary + 1:]
+                            _in_call_memory_lines[:] = [_memory_text] if _memory_text else []
+                            _memory_id = "voice.in_call_memory"
+                            _memory_message = next(
+                                (m for m in _other_sys if getattr(m, "id", "") == _memory_id),
+                                None,
+                            )
+                            _memory_content = (
+                                "Earlier turns from this call (verbatim context):\n" + _memory_text
+                            )
+                            if _memory_message is None:
+                                _memory_message = target_ctx.add_message(
+                                    role="system", content=_memory_content, id=_memory_id,
+                                )
+                                _other_sys.append(_memory_message)
+                            else:
+                                _memory_message.content = [_memory_content]
+                            logger.info(
+                                "🧠 [IN_CALL_MEMORY] archived_dialogue_items=%d retained_chars=%d",
+                                trimmed_count, len(_memory_text),
+                            )
                         # Order: stable behavioral → history (dynamic) → other dynamic system (prior_memory, lead_data)
                         # RAG for THIS turn is injected later with created_at just before final user, so it lands after history as well.
                         # For cache: stable at beginning, identical across turns/customers; dynamic after.
                         if len(items) > _trim_threshold or _other_sys:
                             target_ctx.items = _stable_sys + kept_dialogue + _other_sys
                         # else: no reordering needed (only stable present)
-                        logger.info("🧹 Trimmed conversation context to %s messages (voice latency: %s dialogue max, preserves name via prior_memory)", len(target_ctx.items), _history_limit)
-                        trimmed_count = len(dialogue_items) - len(kept_dialogue)
+                        logger.info("🧹 Trimmed conversation context to %s messages (dialogue max=%s, older turns retained in bounded in-call memory)", len(target_ctx.items), _history_limit)
                         if trimmed_count > 0:
                             logger.info(f"📝 Trimmed {trimmed_count} old dialogue items, kept last {_history_limit} for memory retention (reduces input tokens)")
                 except Exception as exc:
