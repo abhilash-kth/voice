@@ -431,33 +431,71 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             # extensions is httpx-internal metadata, never sent on the wire
             _request.extensions["voice_rid"] = _rid
             _http_timing.note_send(model_id, _rid)
-            # --- Provider-bound fingerprint for cache diagnosis (safe, no PII) ---
-            try:
-                import json as _js
-                import hashlib as _hl2
-                _body = _request.content
-                if _body:
-                    _j = _js.loads(_body.decode("utf-8", "ignore") if isinstance(_body, (bytes, bytearray)) else str(_body))
-                    _pck = _j.get("prompt_cache_key", "?")
-                    _msgs = _j.get("messages", [])
-                    _role_seq = ",".join([str(m.get("role", "?")) for m in _msgs])
-                    _len_seq = ",".join([str(len(str(m.get("content", "")))) for m in _msgs])
-                    _first_c = str(_msgs[0].get("content", "")) if _msgs else ""
-                    _first_hash = _hl2.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12] if _first_c else "?"
-                    _pref_c = "".join([str(m.get("content", "")) for m in _msgs[:2]])
-                    _pref_hash = _hl2.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12] if _pref_c else "?"
-                    logger.info(
-                        "\U0001f50d [HTTP_BODY_FINGERPRINT] rid=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s",
-                        _rid, model_id, _pck, len(_msgs), _role_seq, _len_seq, _first_hash, _pref_hash,
-                    )
-            except Exception as _e:
-                logger.debug(f"[HTTP_BODY_FINGERPRINT] failed: {_e!r}")
+            # Critical-path: log REQUEST_START immediately without blocking work.
+            # The old code did JSON decode + hashing synchronously on the event
+            # loop (107ms block warning) — that adds directly to
+            # request_start->response_headers and delays audio/turn handling.
             logger.info(
                 "\U0001f310 [HTTP_REQUEST_START] rid=%s model=%s client_attempt#%d sdk_retry_count=%s path=%s — one send of one chat() attempt (see B/C distinction in builder comment; SDK retries are disabled by max_retries=0)",
                 _rid, model_id, _http_inst["n"],
                 _request.headers.get("x-stainless-retry-count", "absent"),
                 _request.url.path,
             )
+            # --- Provider-bound fingerprint off critical path ---
+            # Offload JSON parsing + hashing to a background task / thread so it
+            # never blocks the agent event loop. Cache is FIXED and working
+            # (1792 hit), so diagnostic can be async. No PII, only hashes/lens.
+            try:
+                _body_snapshot = _request.content  # bytes, safe to capture
+                if _body_snapshot:
+                    import asyncio as _aio2
+
+                    def _parse_fp():
+                        try:
+                            import json as _js
+                            import hashlib as _hl2
+
+                            _j = _js.loads(
+                                _body_snapshot.decode("utf-8", "ignore")
+                                if isinstance(_body_snapshot, (bytes, bytearray))
+                                else str(_body_snapshot)
+                            )
+                            _pck = _j.get("prompt_cache_key", "?")
+                            _msgs = _j.get("messages", []) or []
+                            _role_seq = ",".join([str(m.get("role", "?")) for m in _msgs])
+                            _len_seq = ",".join([str(len(str(m.get("content", "")))) for m in _msgs])
+                            _first_c = str(_msgs[0].get("content", "")) if _msgs else ""
+                            _first_hash = (
+                                _hl2.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12]
+                                if _first_c
+                                else "?"
+                            )
+                            _pref_c = "".join([str(m.get("content", "")) for m in _msgs[:2]])
+                            _pref_hash = (
+                                _hl2.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12]
+                                if _pref_c
+                                else "?"
+                            )
+                            return (_pck, len(_msgs), _role_seq, _len_seq, _first_hash, _pref_hash)
+                        except Exception:
+                            return None
+
+                    async def _log_fp():
+                        try:
+                            _res = await _aio2.to_thread(_parse_fp)
+                            if _res is None:
+                                return
+                            _pck, _cnt, _role_seq, _len_seq, _first_hash, _pref_hash = _res
+                            logger.info(
+                                "\U0001f50d [HTTP_BODY_FINGERPRINT] rid=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s",
+                                _rid, model_id, _pck, _cnt, _role_seq, _len_seq, _first_hash, _pref_hash,
+                            )
+                        except Exception as _e:
+                            logger.debug(f"[HTTP_BODY_FINGERPRINT] failed: {_e!r}")
+
+                    _aio2.create_task(_log_fp())
+            except Exception as _e:
+                logger.debug(f"[HTTP_BODY_FINGERPRINT] schedule failed: {_e!r}")
         except Exception:
             pass
 

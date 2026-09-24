@@ -1623,25 +1623,24 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         "yes" if self._timing.get("gov_turn_state") == "suppress" else "no",
                     )
                     # --- Provider-bound fingerprint for cache diagnosis (safe, no PII) ---
+                    # Latency fix: avoid duplicate ChatContext -> provider format
+                    # serialization on the event loop (to_provider_format does a
+                    # full copy/transform of ~10k chars). Use the already-parsed
+                    # _msgs list directly — same data, zero extra serialization.
+                    # No cache logic changed, only diagnostic path.
                     try:
-                        _prov_msgs = []
+                        _prov_msgs = _msgs  # use existing parsed messages, not to_provider_format
                         _prov_role_seq = "?"
                         _prov_len_seq = "?"
                         _prov_first_hash = "?"
                         _prov_prefix_hash = "?"
                         _prov_prefix_same = "?"
-                        if hasattr(_cc, "to_provider_format"):
-                            try:
-                                _pb, _ = _cc.to_provider_format("openai")
-                                _prov_msgs = _pb or []
-                            except Exception:
-                                _prov_msgs = []
                         if _prov_msgs:
-                            _prov_role_seq = ",".join([str(m.get("role", "?")) for m in _prov_msgs])
-                            _prov_len_seq = ",".join([str(len(str(m.get("content", "")))) for m in _prov_msgs])
-                            _first_c = str(_prov_msgs[0].get("content", "")) if _prov_msgs else ""
+                            _prov_role_seq = ",".join([str(getattr(m, "role", "?")) for m in _prov_msgs])
+                            _prov_len_seq = ",".join([str(len(_mtext(m))) for m in _prov_msgs])
+                            _first_c = _mtext(_prov_msgs[0]) if _prov_msgs else ""
                             _prov_first_hash = _hl.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12] if _first_c else "?"
-                            _pref_c = "".join([str(m.get("content", "")) for m in _prov_msgs[:2]])
+                            _pref_c = "".join([_mtext(m) for m in _prov_msgs[:2]])
                             _prov_prefix_hash = _hl.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12] if _pref_c else "?"
                             _prev_pref = self._timing.get("prov_prefix_hash", "")
                             _prov_prefix_same = "yes" if (not _prev_pref or _prev_pref == _prov_prefix_hash) else "NO"
