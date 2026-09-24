@@ -2422,13 +2422,82 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
+                from ..turn_rules import is_contextual_followup, build_contextual_retrieval_query
                 # If this turn completed a split thought, retrieve for the MERGED
                 # question (fragments + this final) instead of the bare tail —
                 # [COMPLETE_TURN] logged above shows the merge.
                 _cq = (self._turn_timing_ref or {}).get("combined_query")
                 if _cq:
                     user_text = str(_cq)
-                logger.info("🔎 [RAG_STARTED] query='%s'", user_text[:60])
+
+                # --- Conversational context for RAG (fix for pronoun follow-ups) ---
+                # Preserve actual user message for LLM (new_message unchanged).
+                # Only the INTERNAL retrieval query gets enriched with recent context.
+                original_user_query = user_text
+                retrieval_query = original_user_query
+                recent_user_ctx = ""
+                recent_assistant_ctx = ""
+                context_used = False
+                try:
+                    _ctx_for_recent = _find_chat_ctx(turn_ctx)
+                    if _ctx_for_recent is not None:
+                        _items = getattr(_ctx_for_recent, "items", []) or []
+                        # Find last user before current (not ack/incomplete, not same text)
+                        for m in reversed(_items):
+                            if getattr(m, "role", "") == "user":
+                                _txt = _chat_msg_text(m).strip()
+                                if not _txt or _txt == original_user_query or len(_txt) < 4:
+                                    continue
+                                try:
+                                    from ..turn_rules import is_acknowledgement as _is_ack_r, is_incomplete_turn as _is_inc_r
+                                    if _is_ack_r(_txt) or _is_inc_r(_txt):
+                                        continue
+                                except Exception:
+                                    pass
+                                recent_user_ctx = _txt
+                                break
+                        if not recent_user_ctx:
+                            for m in reversed(_items):
+                                if getattr(m, "role", "") == "assistant":
+                                    _txt = _chat_msg_text(m).strip()
+                                    if _txt and len(_txt) > 10:
+                                        recent_assistant_ctx = _txt[:200]
+                                        break
+                except Exception:
+                    recent_user_ctx = ""
+                    recent_assistant_ctx = ""
+
+                try:
+                    if is_contextual_followup(original_user_query):
+                        _ctx_candidate = recent_user_ctx or recent_assistant_ctx
+                        if _ctx_candidate:
+                            _built = build_contextual_retrieval_query(
+                                original_user_query, recent_user_ctx, recent_assistant_ctx
+                            )
+                            if _built and _built != original_user_query:
+                                retrieval_query = _built
+                                context_used = True
+                except Exception:
+                    retrieval_query = original_user_query
+                    context_used = False
+
+                try:
+                    logger.info(
+                        "🔎 [RAG_CONTEXT_QUERY] user_query='%s' retrieval_query='%s' context_used=%s recent_len=%d",
+                        original_user_query[:80],
+                        retrieval_query[:120],
+                        "yes" if context_used else "no",
+                        len(recent_user_ctx or recent_assistant_ctx),
+                    )
+                except Exception:
+                    pass
+
+                logger.info(
+                    "🔎 [RAG_STARTED] query='%s' retrieval_query='%s' context_used=%s",
+                    original_user_query[:60],
+                    retrieval_query[:60],
+                    "yes" if context_used else "no",
+                )
                 # --- Fast path: the worker precomputes RAG from STT interim
                 # text (in parallel with endpointing), so by the time the turn
                 # completes the retrieval result for this exact text is usually
@@ -2453,7 +2522,11 @@ def build_voice_agent(
                 _prefetch_entry = None
                 if rag_prefetch is not None:
                     try:
-                        _prefetch_entry = rag_prefetch.get(rag.normalize_query(user_text))
+                        # Prefetch cache is keyed by original normalized query (worker stores contextual result under original key)
+                        _prefetch_entry = rag_prefetch.get(rag.normalize_query(original_user_query))
+                        # Fallback: try retrieval_query key as well (in case worker stored under contextual key)
+                        if _prefetch_entry is None and retrieval_query != original_user_query:
+                            _prefetch_entry = rag_prefetch.get(rag.normalize_query(retrieval_query))
                     except Exception:
                         _prefetch_entry = None
                 # The worker caches the full detailed result; tolerate the old
@@ -2481,22 +2554,23 @@ def build_voice_agent(
                     _rag_elapsed = (_time.time() - _rag_t0) * 1000
                     logger.info(
                         "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars | prefetch=true",
-                        user_text[:60], _rag_elapsed, kb_used, kb_chars, kb_hits,
+                        retrieval_query[:60], _rag_elapsed, kb_used, kb_chars, kb_hits,
                         faq_used, faq_chars, faq_hits, total_chars,
                     )
                     logger.info(
                         "⚡ RAG PREFETCH HIT '%s' (%d chars) — computed during the STT interim, "
                         "critical-path cost %.0fms",
-                        user_text[:60], len(hits), _rag_elapsed,
+                        retrieval_query[:60], len(hits), _rag_elapsed,
                     )
                 else:
                     # Cache miss (final text diverged from every interim, or the
-                    # interim compute lost the race): compute now, same as before.
+                    # interim compute lost the race): compute now using contextual retrieval_query.
+                    # Actual LLM user message (new_message) remains unchanged.
                     try:
-                        rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, user_text, 3)
+                        rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, retrieval_query, 3)
                     except Exception:
                         # Fallback sync if to_thread fails
-                        rag_res = rag.build_context_detailed(cfg.knowledge, user_text, top_k=3)
+                        rag_res = rag.build_context_detailed(cfg.knowledge, retrieval_query, top_k=3)
                     _rag_elapsed = (_time.time() - _rag_t0) * 1000
                     hits = (rag_res.get("text") or "").strip()
                     kb_used = rag_res.get("kb_used", False)
@@ -2510,7 +2584,7 @@ def build_voice_agent(
                     # Authoritative user-facing retrieval log detailing KB and FAQ usage
                     logger.info(
                         "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
-                        user_text[:60],
+                        retrieval_query[:60],
                         _rag_elapsed,
                         kb_used,
                         kb_chars,
@@ -2526,7 +2600,7 @@ def build_voice_agent(
 
                 logger.info(
                     "🔎 [RAG_QUERY] query='%s' source=%s result_count=%d relevant_context_found=%s",
-                    user_text[:70], _rag_src, int(kb_hits) + int(faq_hits), "yes" if hits else "no",
+                    retrieval_query[:70], _rag_src, int(kb_hits) + int(faq_hits), "yes" if hits else "no",
                 )
                 # NOTE: deliberately NO "same as last turn" dedupe here. This hook
                 # edits the per-turn copy of the chat context (temp_mutable_chat_ctx);
@@ -2556,7 +2630,7 @@ def build_voice_agent(
                     _fb_hits = 0
                     try:
                         _fb_text, _fb_hits = await asyncio.to_thread(
-                            rag.fallback_context, cfg.knowledge, user_text
+                            rag.fallback_context, cfg.knowledge, retrieval_query
                         )
                     except Exception as _fb_exc:
                         logger.debug("RAG fallback failed: %r", _fb_exc)
@@ -2565,14 +2639,14 @@ def build_voice_agent(
                         _rag_kind = "near-match"
                         logger.info(
                             "🕳️ [RAG_MISS] query='%s' fallback_attempted=yes fallback_hits=%d fallback_context_chars=%d",
-                            user_text[:70], _fb_hits, len(_fb_text),
+                            retrieval_query[:70], _fb_hits, len(_fb_text),
                         )
                     else:
                         logger.info(
                             "🕳️ [RAG_MISS] query='%s' fallback_attempted=yes fallback_hits=0 fallback_context_chars=0",
-                            user_text[:70],
+                            retrieval_query[:70],
                         )
-                        logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", user_text[:70])
+                        logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", retrieval_query[:70])
                         logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
                         return  # nothing to inject, main retrieval AND fallback came up empty
                 if target is None:
@@ -2590,9 +2664,9 @@ def build_voice_agent(
                     rag_enabled = True
                 
                 if preemptive_on and rag_enabled:
-                    logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {user_text[:60]})")
+                    logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {retrieval_query[:60]})")
                 elif preemptive_on:
-                    logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
+                    logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {retrieval_query[:60]})")
                 
                 if _rag_kind == "near-match":
                     _header = (
@@ -2625,8 +2699,8 @@ def build_voice_agent(
                     content=f"{_header}\n{hits}",
                     created_at=_inj_at,
                 )
-                logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
-                logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d, kind=%s)", user_text[:70], len(hits), _rag_kind)
+                logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {retrieval_query[:80]} (kb_used={kb_used}, faq_used={faq_used}) original='{original_user_query[:60]}'")
+                logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d, kind=%s)", retrieval_query[:70], len(hits), _rag_kind)
             except Exception as e:
                 # RAG only *enriches* the turn context: a retrieval failure must
                 # never gate or delay the LLM reply (brief P4). Log loudly with

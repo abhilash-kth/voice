@@ -110,6 +110,131 @@ _TERMINAL_VERBS = {
     "किया", "करूं", "करूँ", "हो", "हूँ", "हूं",
 }
 
+# ---------------------------------------------------------------------------
+# Conversational FAQ retrieval: contextual follow-up detection (2026-09-24)
+# ---------------------------------------------------------------------------
+# Real-call evidence: "Kriscent क्या काम करता है?" then "और यह किस location
+# पर है?" -> RAG query only "और यह किस location पर है?" kept=0/87, FAQ miss,
+# but "और Kriscent का head office कहां पर है?" hits. Root cause: anaphoric
+# pronouns (यह / इसका / वहाँ etc) lose their antecedent before retrieval.
+# This module is pure-text, no I/O, shared by worker prefetch and builder hook,
+# so both paths use identical logic and preserve latency optimization.
+# No hardcoded company/entity names, no keyword-specific handling.
+# ---------------------------------------------------------------------------
+
+# Hindi demonstratives / possessives / locatives that signal anaphora.
+_ANAPHORIC_HI = frozenset({
+    "यह", "ये", "वह", "वो",
+    "इस", "उस", "इसका", "इसकी", "इसके", "उसका", "उसकी", "उसके",
+    "इनका", "उनका", "इनकी", "उनकी", "इनके", "उनके",
+    "इसे", "उसे", "इन्हें", "उन्हें", "इसको", "उसको",
+    "यहाँ", "वहाँ", "यहां", "वहां", "यहा", "वहा", "इधर", "उधर",
+    "यही", "वही", "इसी", "उसी",
+})
+
+# English pronouns that in short queries usually need antecedent.
+_ANAPHORIC_EN = frozenset({
+    "it", "its", "this", "that", "these", "those", "here", "there",
+    "they", "them", "their", "he", "she", "his", "her",
+})
+
+_GENERIC_SHORT_FOLLOWUP_MARKERS = frozenset({
+    "और", "aur", "or", "and",
+})
+
+
+def is_contextual_followup(text: str) -> bool:
+    """True when `text` looks like a contextual follow-up needing prior context.
+
+    Conservative: triggers ONLY on anaphoric pronouns (यह / इसका / वहाँ etc)
+    or very short follow-ups that are unlikely to be standalone explicit
+    questions. No company/entity hardcoding, no keyword-specific handling.
+
+    Explicit queries like "Where is Kriscent located?" contain no anaphoric
+    pronoun and are longer, so they return False and keep normal path.
+    """
+    try:
+        t = (text or "").strip()
+        if not t:
+            return False
+        # Ack / incomplete are handled elsewhere, never contextual.
+        if is_acknowledgement(t) or is_incomplete_turn(t):
+            return False
+        words = _norm_words(t)
+        if not words:
+            return False
+        low_words = [w.lower() for w in words]
+        # Hindi anaphoric pronouns: strong signal.
+        for w in words:
+            if w in _ANAPHORIC_HI:
+                return True
+        for w in low_words:
+            if w in _ANAPHORIC_HI:
+                return True
+        # English anaphoric in short queries (<=7 words) — "where is it?" etc.
+        if len(words) <= 7:
+            for w in low_words:
+                if w in _ANAPHORIC_EN:
+                    return True
+        # Very short queries (<=3 words) that are not acknowledgements are
+        # likely follow-ups like "location?" "head office?" after prior entity.
+        if len(words) <= 3:
+            return True
+        # Starts with "और" + short (<=8) often continues prior topic.
+        if words and words[0] in _GENERIC_SHORT_FOLLOWUP_MARKERS and len(words) <= 8:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def build_contextual_retrieval_query(
+    current_query: str,
+    recent_user_text: str | None,
+    recent_assistant_text: str | None = None,
+    max_recent_chars: int = 200,
+) -> str:
+    """Build a retrieval-only query that resolves anaphoric references.
+
+    Uses only the most relevant recent conversation context (immediately
+    preceding user/assistant exchange), not the whole conversation.
+
+    - current_query stays unchanged for the LLM (caller must preserve it).
+    - recent_user_text is the last completed user turn (e.g. "Kriscent क्या
+      काम करता है?") — truncated to max_recent_chars.
+    - recent_assistant_text is optional, used only if recent_user_text is empty
+      or very short, truncated similarly.
+
+    Returns contextualized query for RAG only, e.g.:
+        "Kriscent क्या काम करता है? और यह किस location पर है?"
+
+    No hardcoded entity names, no LLM call, deterministic, lightweight.
+    """
+    try:
+        cur = (current_query or "").strip()
+        if not cur:
+            return current_query
+        recent = (recent_user_text or "").strip()
+        if not recent and recent_assistant_text:
+            recent = (recent_assistant_text or "").strip()
+        if not recent:
+            return cur
+        # Avoid duplicating if recent already contains current or vice versa.
+        if cur.lower() in recent.lower() or recent.lower() in cur.lower():
+            return cur
+        # Truncate recent to avoid dumping entire conversation.
+        if len(recent) > max_recent_chars:
+            trunc = recent[:max_recent_chars]
+            sp = trunc.rfind(" ")
+            if sp > max_recent_chars * 0.6:
+                trunc = trunc[:sp]
+            recent = trunc
+        # Simple space concatenation — BM25 token overlap benefits from both.
+        return f"{recent} {cur}".strip()
+    except Exception:
+        return current_query
+
+
 # "hold on" family: never answer, just wait.
 _WAIT_RE = re.compile(
     r"^(?:एक|ek|one)\s?(?:मिनट|minute|min|सेकंड|second|sec|पल|moment)[.!]?$"

@@ -2452,6 +2452,7 @@ async def _entrypoint_body(ctx, setup_complete):
     def _precompute_rag(text: str) -> None:
         try:
             from app import rag as _rag_mod
+            from app.turn_rules import is_contextual_followup as _is_ctx, build_contextual_retrieval_query as _build_ctx_q
             key = _rag_mod.normalize_query(text)
         except Exception:
             return
@@ -2461,13 +2462,56 @@ async def _entrypoint_body(ctx, setup_complete):
             return  # "Ok," etc — answered deterministically by llm_node; no retrieval
         if _rag_mod.is_incomplete_turn(text):
             return  # fragment will be merged into the completed turn; don't spend CPU
+
+        # --- Conversational context for prefetch (same logic as builder hook) ---
+        # Uses only immediately preceding user turn, not entire conversation.
+        # Actual LLM user message remains unchanged; only retrieval query enriched.
+        recent_user = ""
+        try:
+            for entry in reversed(usage.get("transcripts", [])):
+                if entry.get("role") == "user":
+                    t = (entry.get("text") or "").strip()
+                    if t and t != text and len(t) >= 4:
+                        try:
+                            if not _rag_mod.is_acknowledgement(t) and not _rag_mod.is_incomplete_turn(t):
+                                recent_user = t
+                                break
+                        except Exception:
+                            recent_user = t
+                            break
+        except Exception:
+            recent_user = ""
+
+        retrieval_query = text
+        context_used = False
+        try:
+            if recent_user and _is_ctx(text):
+                _built = _build_ctx_q(text, recent_user)
+                if _built and _built != text:
+                    retrieval_query = _built
+                    context_used = True
+        except Exception:
+            retrieval_query = text
+            context_used = False
+
+        try:
+            if context_used:
+                logger.info(
+                    "🔎 [RAG_CONTEXT_QUERY] user_query='%s' retrieval_query='%s' context_used=yes source=prefetch recent_len=%d",
+                    text[:80],
+                    retrieval_query[:120],
+                    len(recent_user),
+                )
+        except Exception:
+            pass
+
         rag_prefetch_inflight.add(key)
 
         async def _work():
             try:
                 from app import rag as _rag_mod
                 res = await asyncio.wait_for(
-                    asyncio.to_thread(_rag_mod.build_context_detailed, cfg.knowledge, text, 3),
+                    asyncio.to_thread(_rag_mod.build_context_detailed, cfg.knowledge, retrieval_query, 3),
                     timeout=4,
                 )
                 hits = (res.get("text") or "").strip()
@@ -2477,6 +2521,8 @@ async def _entrypoint_body(ctx, setup_complete):
                     # Store the FULL detailed structure (text + kb/faq flags),
                     # not just the text — the turn hook then reports prefetch
                     # HITs with the exact same result structure as a MISS.
+                    # Key is original normalized query so final-turn lookup hits,
+                    # but result was built with contextual retrieval_query.
                     rag_prefetch[key] = res
             except Exception as e:
                 logger.debug(f"RAG precompute skipped: {e!r}")
