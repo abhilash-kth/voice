@@ -579,12 +579,37 @@ except Exception as e:
     logger.debug(f"async_toolset prewarm failed: {e}")
 
 # Prewarm tokenize and linecache to avoid 108ms tokenize.open during loop_monitor reporting
+# FIX: previous code did linecache.clearcache() which *empties* the cache, forcing
+# the loop monitor's report formatting (traceback.format_list -> linecache.getline
+# -> updatecache -> tokenize.open) to do synchronous file I/O ON the agent event
+# loop, triggering "event loop blocked for 176ms at tokenize.py:447 open".
+# Proper prewarm populates cache OFF the event loop at import time, so later
+# formatting hits cache and avoids tokenize.open entirely.
 try:
     import linecache
     import tokenize
-    # Pre-populate linecache for common files to avoid open() during reporting
-    linecache.clearcache()
-    logger.info("🔧 Prewarmed linecache/tokenize (reduces 108ms open block during loop_monitor reporting)")
+    import sys as _sys_lc
+    # Populate cache for already-loaded modules so loop_monitor formatting
+    # doesn't need to open files on the event loop
+    _warmed = 0
+    for _mod in list(_sys_lc.modules.values()):
+        try:
+            _fname = getattr(_mod, "__file__", None)
+            if _fname and isinstance(_fname, str) and _fname.endswith(".py"):
+                linecache.getlines(_fname)
+                _warmed += 1
+                if _warmed > 300:  # cap to avoid excessive startup work
+                    break
+        except Exception:
+            continue
+    # Also ensure tokenize and linecache themselves are cached
+    try:
+        linecache.getlines(tokenize.__file__)
+        linecache.getlines(linecache.__file__)
+        linecache.getlines(traceback.__file__)
+    except Exception:
+        pass
+    logger.info(f"🔧 Prewarmed linecache/tokenize for {_warmed} files (reduces tokenize.open block during loop_monitor reporting)")
 except Exception as e:
     logger.debug(f"linecache prewarm failed: {e}")
 
@@ -1082,7 +1107,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             except Exception as e:
                 # FIX: Log actual exception for 0/0 failures to diagnose root cause
                 # Previous 0/0 failures (Request 1 and 5) had no error logged, making root cause invisible
-                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={traceback.format_exc()[:1000]}")
+                # FIX: Avoid synchronous traceback.format_exc() on event loop
+                # (it triggers linecache -> tokenize.open() -> 176ms block at
+                # tokenize.py:447). Offload to thread so agent loop stays free.
+                try:
+                    _tb_full = await asyncio.to_thread(traceback.format_exc)
+                except Exception:
+                    _tb_full = f"{type(e).__name__}: {e}"
+                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb_full[:1000]}")
                 _is429, _lim, _used, _req, _ra = _rate_limit_fields(e)
                 if _is429:
                     # A 429 that surfaced mid-iteration (after any chunk) still
@@ -1715,7 +1747,21 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 model = self._prov_info.get('model_id', '') or 'unknown'
                 base_url = self._prov_info.get('base_url', '') or 'unknown'
                 _logger.error(f"LLM API ERROR provider={prov} model={model} base_url={base_url} Error={e} Type={type(e).__name__} After {(error_time-request_start)*1000:.0f}ms")
-                _logger.error(f"Full traceback: {traceback.format_exc()}")
+                # Avoid synchronous traceback.format_exc() on event loop (tokenize.open 176ms block)
+                # This is sync chat() path — cannot await. Log minimal now, schedule full traceback off-loop.
+                try:
+                    import asyncio as _aio_tb
+                    _loop_tb = _aio_tb.get_event_loop()
+                    def _log_tb_async():
+                        try:
+                            _tb = traceback.format_exc()
+                            _logger.error(f"Full traceback: {_tb[:2000]}")
+                        except Exception:
+                            pass
+                    # Schedule traceback logging off the critical path via thread
+                    _loop_tb.call_soon_threadsafe(lambda: _aio_tb.create_task(_aio_tb.to_thread(_log_tb_async)) if _loop_tb.is_running() else None)
+                except Exception:
+                    pass
                 raise
 
     _w = LLMTimingWrapper(llm_instance, timing_dict, provider_info)
@@ -2128,9 +2174,14 @@ async def entrypoint(ctx):
     try:
         await _entrypoint_body(ctx, setup_complete)
     except Exception as e:
+        # Avoid synchronous traceback.format_exc() on event loop (tokenize.open block)
+        try:
+            _tb_setup = await asyncio.to_thread(traceback.format_exc)
+        except Exception:
+            _tb_setup = f"{type(e).__name__}: {e}"
         logger.critical(
             "WORKER_JOB_SETUP_FAILED room=%s: %s: %s\n%s",
-            getattr(ctx.room, "name", ""), type(e).__name__, e, traceback.format_exc(),
+            getattr(ctx.room, "name", ""), type(e).__name__, e, _tb_setup,
         )
         try:
             meta = json.loads(ctx.job.metadata or "{}")
