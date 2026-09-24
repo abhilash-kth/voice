@@ -431,6 +431,18 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             # extensions is httpx-internal metadata, never sent on the wire
             _request.extensions["voice_rid"] = _rid
             _http_timing.note_send(model_id, _rid)
+            # httpx's request hook is before transport acquisition. httpcore's
+            # trace extension separates connection-pool wait, DNS/TCP/TLS,
+            # upload and response-header wait without touching the stream.
+            _trace_events = {}
+            async def _trace(_name, _info):
+                try:
+                    _phase, _edge = _name.rsplit(".", 1)
+                    _trace_events.setdefault(_phase, {})[_edge] = time.perf_counter()
+                except Exception:
+                    pass
+            _request.extensions["trace"] = _trace
+            _http_timing.set_trace(_rid, _trace_events)
             # Critical-path: log REQUEST_START immediately without blocking work.
             # The old code did JSON decode + hashing synchronously on the event
             # loop (107ms block warning) — that adds directly to
@@ -503,10 +515,12 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         try:
             _rid = _response.request.extensions.get("voice_rid", "?")
             _el = _http_timing.note_headers(_rid, _response.status_code)
+            _transport = _http_timing.trace_summary(_rid)
             logger.info(
-                "\U0001f310 [HTTP_RESPONSE_HEADERS] rid=%s model=%s status=%d request_start->response_headers=%s — headers boundary only; first streamed body bytes come later (see [HTTP_CHUNK])",
+                "\U0001f310 [HTTP_RESPONSE_HEADERS] rid=%s model=%s status=%d request_start->response_headers=%s transport=%s — headers boundary only; first streamed body bytes come later (see [HTTP_CHUNK])",
                 _rid, model_id, _response.status_code,
                 ("%.0fms" % _el) if _el >= 0 else "?",
+                _transport or "no_trace_events",
             )
         except Exception:
             pass
@@ -2130,16 +2144,36 @@ def build_voice_agent(
             first_audio / last_speech_end_to_first_audio) so the 🗣️ TTS line
             upgrades from "audio not measured" to REAL audio automatically.
             """
-            res = Agent.default.tts_node(self, text, model_settings)
-            if asyncio.iscoroutine(res):
-                res = await res
             tt = self._turn_timing_ref
-            if res is None or tt is None:
-                return res
-            tt["tts_request"] = time.time()
+            _tts_entered = time.time()
             _logger = logging.getLogger("voice-agent-saas-agent-builder")
 
+            async def _trace_text():
+                _first_text = True
+                async for _delta in text:
+                    if _first_text:
+                        _first_text = False
+                        _now = time.time()
+                        _ft = float(tt.get("first_token", 0) or 0) if tt is not None else 0
+                        _logger.info(
+                            "🔡 [TTS_TEXT_FIRST_DELTA] first_token_to_tts_node=%s tts_node_to_text=%dms chars=%d",
+                            (f"{(_now - _ft) * 1000:.0f}ms" if _ft and _now >= _ft else "na"),
+                            (_now - _tts_entered) * 1000,
+                            len(str(_delta)),
+                        )
+                    yield _delta
+
+            res = Agent.default.tts_node(self, _trace_text(), model_settings)
+            if asyncio.iscoroutine(res):
+                res = await res
+            if res is None or tt is None:
+                return res
+            tt["tts_request"] = _tts_entered
+
             async def _probe():
+                _logger.info("🔌 [TTS_STREAM_START] first_token_to_stream_start=%s",
+                    (f"{(time.time() - float(tt.get('first_token', 0))) * 1000:.0f}ms"
+                     if float(tt.get("first_token", 0) or 0) else "na"))
                 _first = True
                 async for frame in res:
                     if _first:

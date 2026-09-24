@@ -33,11 +33,32 @@ def note_send(model: str, rid: str) -> None:
     """Called from the httpx request hook when the SDK hands the request to
     the transport. Bounded growth: a call has ~15 requests; prune stale."""
     now = time.time()
-    _records[rid] = {"rid": rid, "model": model, "send_ts": now, "headers_ts": 0.0, "status": 0}
+    _records[rid] = {"rid": rid, "model": model, "send_ts": now, "headers_ts": 0.0, "status": 0, "trace": None}
     _model_last[model] = rid
     if len(_records) > 256:
         for k in [k for k, v in _records.items() if now - v["send_ts"] > 120.0][:128]:
             _records.pop(k, None)
+
+
+def set_trace(rid: str, events: dict) -> None:
+    rec = _records.get(rid)
+    if rec is not None:
+        rec["trace"] = events
+
+
+def trace_summary(rid: str) -> str:
+    """Return phase durations emitted by httpcore for a single request."""
+    rec = _records.get(rid)
+    events = rec.get("trace") if rec else None
+    if not events:
+        return ""
+    parts = []
+    for phase, edges in events.items():
+        start = edges.get("started")
+        end = edges.get("complete") or edges.get("completed") or edges.get("failed")
+        if start is not None and end is not None:
+            parts.append(f"{phase}={max(0, (end - start) * 1000):.0f}ms")
+    return ",".join(parts)
 
 
 def note_headers(rid: str, status: int) -> float:
