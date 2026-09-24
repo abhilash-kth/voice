@@ -790,8 +790,85 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
     """
     import asyncio as _asyncio
     import time as _time
+    import re as _re_own
     import logging as _logging
     _logger = _logging.getLogger("voice-agent-saas-worker")
+
+    def _is_recovery_probe() -> bool:
+        """True inside livekit's FallbackAdapter background health check.
+
+        1.8.2 marks a failed LLM unavailable and schedules
+        _try_recovery._recover_llm_task, which calls llm.chat() on the SAME
+        wrapped instance (a real HTTP request) while the fallback stream is
+        still answering the caller — the "primary/0-of-2 after fallback/1-of-2
+        while previous generation still active" log line. It is intentional
+        adapter behavior (lifecycle documented at the builder's
+        FallbackAdapter construction). We keep it OUT of turn accounting: no
+        generation bump, no shared timing reset, no billing record — it is
+        infrastructure cost, not the caller's conversation.
+        """
+        try:
+            _ct = _asyncio.current_task()
+            if _ct is None:
+                return False
+            return "_recover_llm_task" in repr(_ct.get_coro())
+        except Exception:
+            return False
+
+    def _rate_limit_fields(exc):
+        """(is_429, limit, used, requested, retry_after_ms) — ONLY numbers the
+        provider actually sent (headers / error body), never invented.
+        'unknown' marks what the provider did not report."""
+        try:
+            status = getattr(exc, "status_code", None)
+            msg = str(exc or "")
+            _ename = type(exc).__name__
+            is429 = (str(status) == "429") or (_ename == "RateLimitError") or (
+                "429" in msg and ("rate limit" in msg.lower() or "too many" in msg.lower())
+            )
+            if not is429:
+                return False, None, None, None, None
+            headers = {}
+            try:
+                _r = getattr(exc, "response", None)
+                if _r is not None:
+                    headers = {str(k).lower(): str(v) for k, v in dict(getattr(_r, "headers", {}) or {}).items()}
+            except Exception:
+                headers = {}
+            def _h(*names):
+                for n in names:
+                    v = headers.get(n)
+                    if v is not None:
+                        return v
+                return None
+            limit = _h("x-ratelimit-limit-tokens-minute", "x-ratelimit-limit-tokens", "x-ratelimit-limit-tokens-minute-uncached")
+            used = _h("x-ratelimit-used-tokens-minute", "x-ratelimit-remaining-tokens")
+            ra = _h("retry-after", "retry-after-tokens")
+            ra_ms = "unknown"
+            if ra is not None:
+                try:
+                    ra_ms = int(float(ra) * 1000)
+                except Exception:
+                    if str(ra).strip().lower().endswith("s"):
+                        try:
+                            ra_ms = int(float(str(ra).strip()[:-1]) * 1000)
+                        except Exception:
+                            pass
+            if limit is None:
+                m = _re_own.search(r"limit[^0-9]{0,12}([0-9]{3,})", msg, _re_own.IGNORECASE)
+                if m:
+                    limit = m.group(1)
+            if used is None:
+                m2 = _re_own.search(r"([0-9]{3,})\s*(?:tokens?\s*)?/\s*([0-9]{3,})", msg)
+                if m2:
+                    used = m2.group(1)
+            req = None
+            m3 = _re_own.search(r"request(?:ed)?[^0-9]{0,12}([0-9]{2,})", msg, _re_own.IGNORECASE)
+            if m3:
+                req = m3.group(1)
+            return True, limit or "unknown", used or "unknown", req or "unknown", ra_ms
+        except Exception:
+            return False, None, None, None, None
 
     try:
         is_fallback = hasattr(llm_instance, '_llm_instances') or hasattr(llm_instance, 'llm_instances') or 'FallbackAdapter' in str(type(llm_instance))
@@ -803,7 +880,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     # Avoid infinite recursion: only wrap if not already wrapped
                     if 'LLMTimingWrapper' not in str(type(inner_llm)):
                         _lbl = "primary/0-of-%d" % len(inner_list) if idx == 0 else "fallback/%d-of-%d" % (idx, len(inner_list))
-                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info, inst_label=_lbl)
+                        # 12:28 attribution fix: the builder stamps every LLM
+                        # instance with ITS OWN _prov_meta (agent_builder
+                        # _pm_attach). Passing the chain HEAD's provider_info to
+                        # every inner wrapper is what labelled OpenAI fallback
+                        # usage as provider=groq model=qwen3.8 — cached tokens
+                        # included, and priced it at the wrong model's rates.
+                        _info_i = getattr(inner_llm, "_prov_meta", None) or provider_info
+                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, _info_i, inst_label=_lbl)
                 return llm_instance
     except Exception as e:
         _logger.debug(f"Could not wrap FallbackAdapter inner LLMs: {e}")
@@ -812,15 +896,60 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
     if not original_chat:
         return llm_instance
 
+    class _ProbeStreamPassThrough:
+        """livekit FallbackAdapter recovery probes: pass chunks through and
+        record only the health outcome. No shared-timing writes at all — no
+        finally-block state mutation (a bare `return` in a generator's finally
+        would SWALLOW the probe's exception and falsely mark a rate-limited
+        instance healthy — so the isolation lives in this separate class, not
+        in a guard inside TimingStreamWrapper). No generation semantics, no
+        all_requests entry, no customer billing."""
+
+        def __init__(self, inner_stream, timing, prov_info, inst, req_start=None):
+            self._inner_stream = inner_stream
+            self._timing = timing
+            self._prov_info = prov_info
+            self._inst = inst
+            self._req_start = req_start or _time.time()
+
+        def __getattr__(self, name):
+            return getattr(self._inner_stream, name)
+
+        async def __aiter__(self):
+            try:
+                async for _pch in self._inner_stream:
+                    yield _pch
+                _logger.info("🧪 [LLM_RECOVERY_PROBE] provider=%s model=%s instance=%s result=healthy in %dms — instance stays in rotation; probe usage NOT billed to the call (infra cost, provider-side latency win only)", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), self._inst, int((_time.time() - self._req_start) * 1000))
+            except Exception as _pex:
+                _is429, _lim, _used, _req, _ra = _rate_limit_fields(_pex)
+                self._timing["probe_failures"] = int(self._timing.get("probe_failures", 0)) + 1
+                if _is429:
+                    _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=n/a probe=yes — background health check rate-limited; instance stays unavailable, the configured fallback keeps serving (no auto-retry on this model for turn traffic)", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), _lim, _used, _req, _ra, self._inst)
+                else:
+                    _logger.info("🧪 [LLM_RECOVERY_PROBE] provider=%s model=%s instance=%s result=unhealthy (%s) — instance stays out of rotation until the next real request's all-failed pass", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), self._inst, type(_pex).__name__)
+                raise
+
     class TimingStreamWrapper:
         """Wraps LLMStream to measure first_token TTFT and generation_complete."""
-        def __init__(self, inner_stream, timing, prov_info, req_start, gen=None):
+        def __init__(self, inner_stream, timing, prov_info, req_start, gen=None, seq=None, probe=False, inst="single/1"):
             self._inner_stream = inner_stream
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
             self._gen = gen
+            # 12:28 ownership: every stream carries the FULL identity of the
+            # request that produced it — turn generation, monotonic request
+            # sequence (which request currently owns shared timing state), the
+            # provider instance label and the probe flag. Usage, billing and
+            # cache state are read/written through THESE, never through
+            # whoever-last-wrote shared keys.
+            self._seq = seq
+            self._probe = probe
+            self._inst = inst
+            self._rid = "n/a"
             self._stale_logged = False
+            self._rejected_429 = False
+            self._counted = False
             self._first_token = True
             self._input_tokens = 0
             self._output_tokens = 0
@@ -843,6 +972,9 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             return getattr(self._inner_stream, name)
 
         async def __aiter__(self):
+            # (recovery probes use _ProbeStreamPassThrough — they never reach
+            # this class, so nothing below can be mutated by a background
+            # health check.)
             def _flush_first_logs():
                 if self._pending_first_logs:
                     for _lvl, _msg in self._pending_first_logs:
@@ -855,15 +987,33 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     now = _time.time()
                     if self._first_token:
                         self._first_token = False
-                        if self._gen is not None and int(self._timing.get("gen", 0)) != self._gen:
-                            # This stream was invalidated (barge-in / new turn)
-                            # after it started: the library still drains/cancels
-                            # it, but it must NOT write this turn's timing or
-                            # fire TTFT logs that would look like the NEW turn.
-                            # Billing below is untouched: a torn-down request
-                            # ends at 0/0 failed exactly as before.
+                        # Two independent staleness reasons, one gate:
+                        #  gen mismatch  → a barge-in/new turn invalidated this
+                        #                  generation (unchanged semantics);
+                        #  seq mismatch  → this attempt was SUPERSEDED within
+                        #                  its turn by the fallback switch (the
+                        #                  newer request owns shared state now).
+                        # A stream that owns neither may still finish cleanly
+                        # for its own billing record, but it never mutates the
+                        # live turn's timing.
+                        _stale_gen = self._gen is not None and int(self._timing.get("gen", 0)) != self._gen
+                        _stale_seq = self._seq is not None and int(self._timing.get("active_req_seq", 0)) != self._seq
+                        if _stale_gen or _stale_seq:
+                            # This stream no longer owns the live turn:
+                            #  _stale_gen → barge-in / new turn invalidated it
+                            #               (library still drains/cancels);
+                            #  _stale_seq → the FallbackAdapter replaced this
+                            #               attempt within the SAME turn.
+                            # Either way it must NOT write this turn's timing
+                            # or fire TTFT logs that would look like the NEW
+                            # owner. Its own per-stream accounting below still
+                            # completes honestly (a torn-down 429'd request
+                            # ends 0/0, success=False — never billed).
                             self._stale_logged = True
-                            _logger.info("🗑️ [STALE_GENERATION_DROPPED] callback_generation=%d current_generation=%s — late tokens from an invalidated turn are discarded", self._gen, self._timing.get("gen"))
+                            if _stale_gen:
+                                _logger.info("🗑️ [STALE_GENERATION_DROPPED] callback_generation=%d current_generation=%s — late tokens from an invalidated turn are discarded", self._gen, self._timing.get("gen"))
+                            else:
+                                _logger.info("🗑️ [STALE_GENERATION_DROPPED] reason=superseded_by_next_attempt instance=%s seq=%s active_seq=%s generation=%s — this request yielded the turn to the fallback/next attempt; its own billing record stays valid", self._inst, self._seq, self._timing.get("active_req_seq"), self._gen)
                         else:
                             first_token = now
                             self._timing["first_token"] = first_token
@@ -880,6 +1030,8 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                             try:
                                 from .http_timing import pop_for_model as _pop_ht
                                 _hrec = _pop_ht(str(model))
+                                if _hrec:
+                                    self._rid = str(_hrec.get("rid", "n/a")) or "n/a"
                                 if _hrec:
                                     _t0 = _hrec["send_ts"]; _t1 = _hrec["headers_ts"]
                                     # pop+format stay here (µs; keeps rid
@@ -931,33 +1083,88 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 # FIX: Log actual exception for 0/0 failures to diagnose root cause
                 # Previous 0/0 failures (Request 1 and 5) had no error logged, making root cause invisible
                 _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={traceback.format_exc()[:1000]}")
+                _is429, _lim, _used, _req, _ra = _rate_limit_fields(e)
+                if _is429:
+                    # A 429 that surfaced mid-iteration (after any chunk) still
+                    # means the turn was REJECTED by the provider: pin success
+                    # False for this stream regardless of partial evidence.
+                    self._rejected_429 = True
+                    # The 429 itself: provider-reported numbers only. The
+                    # adapter now switches to the configured fallback — we do
+                    # NOT retry this model for the turn (spec), and this failed
+                    # attempt is excluded from successful usage below (zero
+                    # chunks → not successful regardless of shared flags).
+                    self._timing["rate_limit_events"] = int(self._timing.get("rate_limit_events", 0)) + 1
+                    _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=%s rid=%s — request rejected BEFORE any token; excluded from billing; handing over to configured fallback (no retry on this model this turn)", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), _lim, _used, _req, _ra, self._inst, self._gen, self._rid)
                 raise
             finally:
                 _flush_first_logs()
                 try:
-                    if self._timing.get("_inflight_counted"):
+                    if getattr(self, "_counted", False):
                         self._timing["inflight_llm"] = max(0, int(self._timing.get("inflight_llm", 1)) - 1)
-                        self._timing["_inflight_counted"] = False
+                        self._counted = False
                 except Exception:
                     pass
                 gen_complete = _time.time()
-                self._timing["generation_complete"] = gen_complete
-                self._timing["llm_complete"] = gen_complete
                 gen_time = (gen_complete - self._req_start) * 1000
-                self._timing["generation_time_ms"] = gen_time
-                self._timing["input_tokens"] = self._input_tokens
-                self._timing["output_tokens"] = self._output_tokens
-                self._timing["cached_input_tokens"] = self._cached_tokens
-                self._timing["llm_active"] = False
+                # OWNERSHIP GATE (Task 1): only the request that still owns
+                # this turn's shared state — the current turn generation AND
+                # the latest sequence — may mutate it. A primary that the
+                # FallbackAdapter already replaced (newer active_req_seq) can
+                # no longer flip llm_active False or overwrite
+                # generation_complete/TTS-facing timing underneath the live
+                # fallback stream. Its OWN record below stays complete.
+                _own_state = (
+                    (self._gen is None or int(self._timing.get("gen", 0)) == self._gen)
+                    and (self._seq is None or int(self._timing.get("active_req_seq", 0)) == self._seq)
+                )
+                if _own_state:
+                    self._timing["generation_complete"] = gen_complete
+                    self._timing["llm_complete"] = gen_complete
+                    self._timing["generation_time_ms"] = gen_time
+                    self._timing["input_tokens"] = self._input_tokens
+                    self._timing["output_tokens"] = self._output_tokens
+                    self._timing["cached_input_tokens"] = self._cached_tokens
+                # llm_active DERIVES from the inflight gauge now: on a switch
+                # the dying stream must not deactivate while the replacement
+                # request is still counted inflight (and vice versa).
+                try:
+                    self._timing["llm_active"] = int(self._timing.get("inflight_llm", 0)) > 0
+                except Exception:
+                    self._timing["llm_active"] = False
                 prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                 model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
                 # FIX: Separate deterministic closing (intentional 0/0) from genuine empty LLM turns
                 # Do not report intentional closing request as LLM failure
                 is_closing = self._timing.get("is_closing", False)
                 is_deterministic_closing = is_closing and self._input_tokens == 0 and self._output_tokens == 0
-                # Only consider successful if output>0 or assistant_output_received, and not closing
-                is_success = (self._output_tokens > 0 or self._timing.get("assistant_output_received", False)) and not is_deterministic_closing
-                if is_success:
+                # 12:28 fix: success is judged on THIS stream's evidence only.
+                # The old shared 'assistant_output_received' flag made a 429'd
+                # attempt that yielded ZERO chunks count as SUCCESS whenever a
+                # sibling stream (the fallback answering the same turn) had
+                # output — rejected requests then polluted
+                # successful_requests/last_* state. Per-stream: output tokens
+                # reported, or at least one chunk actually streamed through
+                # THIS wrapper.
+                is_success = (self._output_tokens > 0 or not self._first_token) and not is_deterministic_closing and not self._rejected_429
+                # cached-token normalization (Task 4): a capability=none path
+                # gets ZERO cached for billing/cost — reported numbers stay in
+                # the telemetry but can never mint a discount that provider
+                # does not offer for this model. capability is read for THIS
+                # request's own provider/model pair (attribution-correct).
+                _cached_cost = int(self._cached_tokens or 0)
+                try:
+                    from app.llm_catalog import get_prompt_cache_capability as _gcc_own
+                    _cap_own = _gcc_own(str(prov), str(model))
+                    if _cached_cost > 0 and not _cap_own.get("supported"):
+                        _logger.warning(
+                            "⚠️ [CACHE_OWNERSHIP_MISMATCH] provider=%s model=%s capability=none reported_cached_tokens=%d request_id=%s generation=%s instance=%s — this exact provider/model exposes no prompt cache, so these tokens CANNOT belong to this request. They are excluded from its cost and the aggregated cached total. Usual source (pre-12:28 builds): the fallback instance was labelled with the chain head's provider_info — check [USAGE_OWNERSHIP] lines around request_id=%s for the OpenAI pair.",
+                            prov, model, _cached_cost, self._rid, self._gen, self._inst, self._rid,
+                        )
+                        _cached_cost = 0
+                except Exception:
+                    _cap_own = None
+                if is_success and _own_state:
                     # Preserve last successful turn metrics for final billing
                     try:
                         self._timing["last_ttft"] = self._timing.get("ttft_ms", 0)
@@ -981,6 +1188,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 request_record = {
                     "input": self._input_tokens,
                     "cached": self._cached_tokens,
+                    "cached_for_cost": _cached_cost,
                     "output": self._output_tokens,
                     "success": is_success,
                     "ttft": self._timing.get("ttft_ms", 0),
@@ -988,13 +1196,20 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     "provider": prov,
                     "model": model,
                     "is_closing": is_deterministic_closing,
+                    # ownership stamps (Task 1): which request, which instance,
+                    # which turn generation, which sequence — a record can only
+                    # ever describe the call that produced it.
+                    "rid": self._rid,
+                    "gen": self._gen,
+                    "seq": self._seq,
+                    "instance": self._inst,
                 }
                 self._timing["all_requests"].append(request_record)
                 
                 if is_success:
                     self._timing["aggregated_input"] += self._input_tokens
                     self._timing["aggregated_output"] += self._output_tokens
-                    self._timing["aggregated_cached"] += self._cached_tokens
+                    self._timing["aggregated_cached"] += _cached_cost
                     self._timing["successful_requests"] += 1
                     _logger.info(f"💰 AGGREGATED BILLING +{self._input_tokens}in +{self._output_tokens}out total {self._timing['aggregated_input']}in {self._timing['aggregated_output']}out across {self._timing['successful_requests']} successful, {self._timing['failed_requests']} failed")
                 elif is_deterministic_closing:
@@ -1023,22 +1238,37 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         except Exception:
                             pass
                 
-                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
+                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active={bool(self._timing.get('llm_active'))} is_closing={is_deterministic_closing}")
+                # Task 1 proof line — ONE per completed usage result, printed
+                # by the stream that OWNED the usage object (never by a shared
+                # accumulator): which request produced these tokens, from what
+                # usage source, and whether they enter billing.
+                _logger.info(
+                    "\U0001f50e [USAGE_OWNERSHIP] generation=%s request_id=%s provider=%s model=%s instance=%s seq=%s input=%d cached=%d cached_for_cost=%d output=%d usage_source=%s billing=%s owns_shared_state=%s",
+                    self._gen, self._rid, prov, model, self._inst, self._seq,
+                    self._input_tokens, self._cached_tokens, _cached_cost, self._output_tokens,
+                    "own_stream_usage_object" if self._usage_seen else "no_usage_returned_by_provider",
+                    "counted" if is_success else "excluded",
+                    "yes" if _own_state else "no_superseded",
+                )
                 try:
                     from app.llm_catalog import get_llm_model, calculate_llm_cost, get_prompt_cache_capability
                     model_meta = get_llm_model(prov, model) if prov and model else None
                     if model_meta:
-                        costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
+                        costs = calculate_llm_cost(model_meta, self._input_tokens, _cached_cost, self._output_tokens)
                         total_cost = costs['total_llm_cost']
                         # Calculate total aggregated cost
                         total_agg_cost = 0.0
                         try:
-                            # Sum cost of all successful requests
+                            # Sum cost of all successful requests — each entry
+                            # priced at ITS OWN provider/model (per-instance
+                            # _prov_meta), cached discount only up to what that
+                            # pair's capability supports (cached_for_cost).
                             for req in self._timing.get("all_requests", []):
                                 if req.get("success"):
                                     m = get_llm_model(req.get("provider",""), req.get("model",""))
                                     if m:
-                                        c = calculate_llm_cost(m, req["input"], req["cached"], req["output"])
+                                        c = calculate_llm_cost(m, req["input"], req.get("cached_for_cost", req["cached"]), req["output"])
                                         total_agg_cost += c['total_llm_cost']
                         except Exception:
                             total_agg_cost = total_cost
@@ -1093,12 +1323,16 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
 
     class TimingChatCM:
         """Async context manager that wraps inner LLM chat CM and returns TimingStreamWrapper."""
-        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start, gen=None):
+        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start, gen=None, seq=None, probe=False, inst="single/1", counted=False):
             self._inner_orig = inner_cm_or_coro
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
             self._gen = gen
+            self._seq = seq
+            self._probe = probe
+            self._inst = inst
+            self._counted = counted
             self._inner_cm = None
             self._inner_stream = None
 
@@ -1115,6 +1349,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 else:
                     stream = inner
             except BaseException as e:
+                if self._probe:
+                    # failed health check: outcome counter + rate-limit line
+                    # only; no shared turn state, no billing record.
+                    self._timing["probe_failures"] = int(self._timing.get("probe_failures", 0)) + 1
+                    _ok429, _l4, _u4, _r4, _ra4 = _rate_limit_fields(e)
+                    if _ok429:
+                        _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=n/a probe=yes — background health check rate-limited at connect; instance stays unavailable, fallback keeps serving", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), _l4, _u4, _r4, _ra4, self._inst)
+                    raise
                 # P6 root-cause hardening: a request that dies BEFORE streaming
                 # (provider/client raised, e.g. the observed
                 # "APIStatusError.__init__() missing 2 required positional
@@ -1123,18 +1365,57 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 # suppressed empty-turn diagnostics (state held "thinking") and
                 # made wedges invisible. Clear per-request state, log loudly,
                 # re-raise unchanged so LiveKit's own error path proceeds.
-                self._timing["llm_active"] = False
+                # 12:28: this path used to bypass ALL accounting (no inflight
+                # release, no failed record, failed_requests stayed 0 even for
+                # a 429 rejected at connect). Fixed: release what chat()
+                # counted, record the attempt as a genuine failure (never
+                # successful, never billed), and surface the rate limit.
                 _fail_now = _time.time()
+                try:
+                    if self._counted:
+                        self._timing["inflight_llm"] = max(0, int(self._timing.get("inflight_llm", 1)) - 1)
+                        self._counted = False
+                except Exception:
+                    pass
+                self._timing["llm_active"] = int(self._timing.get("inflight_llm", 0)) > 0
                 self._timing["generation_complete"] = _fail_now
                 self._timing["llm_complete"] = _fail_now
+                _ok429, _l4, _u4, _r4, _ra4 = _rate_limit_fields(e)
+                if _ok429:
+                    self._timing["rate_limit_events"] = int(self._timing.get("rate_limit_events", 0)) + 1
+                    _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=%s — rejected BEFORE any token at connect; excluded from billing; configured fallback takes over (no retry on this model this turn)", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), _l4, _u4, _r4, _ra4, self._inst, self._gen)
+                try:
+                    _own = (self._gen is None or int(self._timing.get("gen", 0)) == self._gen) and (self._seq is None or int(self._timing.get("active_req_seq", 0)) == self._seq)
+                    if _own:
+                        self._timing["failed_requests"] = int(self._timing.get("failed_requests", 0)) + 1
+                    self._timing.setdefault("all_requests", []).append({
+                        "input": 0, "cached": 0, "cached_for_cost": 0, "output": 0,
+                        "success": False, "ttft": 0.0,
+                        "gen_time": (_fail_now - self._req_start) * 1000,
+                        "provider": self._prov_info.get('provider', ''), "model": self._prov_info.get('model_id', ''),
+                        "is_closing": False, "rid": "n/a", "gen": self._gen, "seq": self._seq,
+                        "instance": self._inst, "failed_before_stream": True,
+                    })
+                except Exception:
+                    pass
                 _logger.error(
                     "❌ LLM REQUEST FAILED BEFORE STREAM [LLM_RESPONSE_COMPLETED] "
                     f"provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} "
-                    f"error={type(e).__name__}: {e} — llm_active cleared, turn not dropped"
+                    f"error={type(e).__name__}: {e} — recorded failed (not billed), turn not dropped"
+                )
+                _logger.info(
+                    "\U0001f50e [USAGE_OWNERSHIP] generation=%s request_id=%s provider=%s model=%s instance=%s seq=%s input=0 cached=0 cached_for_cost=0 output=0 usage_source=no_usage_returned_by_provider billing=excluded owns_shared_state=%s",
+                    self._gen, "n/a", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), self._inst, self._seq,
+                    "yes" if ((self._gen is None or int(self._timing.get("gen", 0)) == self._gen) and (self._seq is None or int(self._timing.get("active_req_seq", 0)) == self._seq)) else "no_superseded",
                 )
                 raise
             self._inner_stream = stream
-            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start, self._gen)
+            if self._probe:
+                return _ProbeStreamPassThrough(stream, self._timing, self._prov_info, self._inst, self._req_start)
+            _sw = TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start, self._gen, seq=self._seq, inst=self._inst)
+            _sw._counted = self._counted  # ownership of the inflight gauge moves to the stream
+            self._counted = False
+            return _sw
 
         async def __aexit__(self, exc_type, exc, tb):
             try:
@@ -1163,6 +1444,24 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             return getattr(self._inner, name)
 
         def chat(self, *args, **kwargs):
+            # Recovery-probe bypass (Task 2, 12:28): FallbackAdapter's
+            # background health check reaches this SAME wrapped instance while
+            # the fallback stream is still answering the caller. It must not be
+            # treated as a turn: no overlap warning, no active-flag churn, no
+            # generation/sequence ownership, no shared counter resets, no
+            # billing record — the isolated _ProbeStreamPassThrough only counts
+            # its outcome. (Intentional adapter behavior; lifecycle documented
+            # at the builder's FallbackAdapter construction — not patched.)
+            if _is_recovery_probe():
+                # Count EVERY probe attempt (started), outcome separately — the
+                # [FALLBACK_SUMMARY] line needs both to explain the overlap.
+                self._timing["recovery_probes"] = int(self._timing.get("recovery_probes", 0)) + 1
+                try:
+                    _logger.info("🧪 [LLM_RECOVERY_PROBE] provider=%s model=%s instance=%s starting — background health check, isolated from turn accounting", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), getattr(self, '_inst_label', 'single/1'))
+                    return TimingChatCM(self._inner.chat(*args, **kwargs), self._timing, self._prov_info, _time.time(), None, probe=True, inst=getattr(self, '_inst_label', 'single/1'))
+                except Exception:
+                    self._timing["probe_failures"] = int(self._timing.get("probe_failures", 0)) + 1
+                    raise
             # This is the critical fix: chat is SYNC, returns async CM, not coroutine
             # So `async with llm.chat(...) as stream` works
             # FIX: Prevent duplicate/invalidated LLM requests - exactly one REQUEST START per completed user turn
@@ -1182,11 +1481,19 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
             self._timing["llm_active"] = True
-            # Generation token: a barge-in bumps "gen"; this stream carries its
-            # birth gen so late callbacks can be identified as stale (see the
-            # [STALE_GENERATION_DROPPED] guard in TimingStreamWrapper).
-            _gen = int(self._timing.get("gen", 0)) + 1
-            self._timing["gen"] = _gen
+            # Generation token: "gen" is the TURN/barge-in epoch — only the
+            # interruption path bumps it (see [GENERATION_INVALIDATED]). The old
+            # per-chat() +1 here made a fallback switch or a health probe LOOK
+            # like a stale generation: the live fallback stream got
+            # [STALE_GENERATION_DROPPED] mid-answer and stopped publishing its
+            # own TTFT — the "stale-generation cancellation" of the 12:28 logs.
+            # Attempts belonging to ONE turn share its gen; per-request
+            # supersession is tracked by active_req_seq (which stream may write
+            # shared state) instead.
+            _gen = int(self._timing.get("gen", 0))
+            _seq = int(self._timing.get("llm_req_seq", 0)) + 1
+            self._timing["llm_req_seq"] = _seq
+            self._timing["active_req_seq"] = _seq
             self._timing["assistant_output_received"] = False
             # Task 2 (2026-09-24): log what actually builds the ~2900-token
             # request and PROVE prefix stability instead of assuming it. The
@@ -1194,6 +1501,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             # defs); OpenAI caches on shared prefixes >=1024 tokens, so a
             # stable hash with cached=0 points at the provider/account, while
             # a changing hash is our bug and the diff names the section.
+            _req_inflight = False
             try:
                 _cc = kwargs.get("chat_ctx")
                 if _cc is None and args:
@@ -1308,7 +1616,13 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     )
                     # inflight gauge for spike forensics (Task 5)
                     self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
-                    self._timing["_inflight_counted"] = True
+                    # Per-request ownership (12:28): this used to be the shared
+                    # "_inflight_counted" flag — with two overlapping streams
+                    # (fallback switch / barge-in) whichever finished first
+                    # consumed the flag and the OTHER skipped its own decrement,
+                    # pinning llm_active=True. The counter is owned by THIS
+                    # request now and travels on the CM/stream objects.
+                    _req_inflight = True
             except Exception as _pe:
                 # never silent again: one visible line per call is cheap and this
                 # exact silence is what hid the head_sha instrumentation failure in
@@ -1351,7 +1665,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             try:
                 inner_result = self._inner.chat(*args, **kwargs)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
-                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start, _gen)
+                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start, _gen, seq=_seq, inst=getattr(self, '_inst_label', 'single/1'), counted=_req_inflight)
             except Exception as e:
                 error_time = _time.time()
                 prov = self._prov_info.get('provider', '') or 'unknown'
@@ -3510,6 +3824,10 @@ async def _entrypoint_body(ctx, setup_complete):
                     else:
                         _cache_verdict = "unsupported (every request's provider/model has capability=none — reported honestly, no cache pretended)"
                     logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} capabilities={_cap_rollup} evaluated(hit+miss,usage-only)={_ch + _cm} hits={_ch} misses={_cm} unknown={_cu} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
+                    _rle = int(turn_timing.get("rate_limit_events", 0) or 0)
+                    _prb = int(turn_timing.get("recovery_probes", 0) or 0)
+                    _prf = int(turn_timing.get("probe_failures", 0) or 0)
+                    logger.info(f"🔁 [FALLBACK_SUMMARY] rate_limit_429={_rle} recovery_probes={_prb} probe_failures={_prf} overlapping_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} — probes are FallbackAdapter health checks (documented lifecycle, not patched) and are never billed to the call; each 429 produced one clean switch to the configured fallback, no turn-level retry on the failed model")
                     logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 discarded=0 would_cancel={int(turn_timing.get('spec_would_cancel', 0) or 0)} overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
                     _ls = turn_timing.get("latency_samples", [])
                     if _ls:

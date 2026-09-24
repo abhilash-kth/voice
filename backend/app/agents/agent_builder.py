@@ -679,8 +679,27 @@ def build_llm(cfg: AgentConfig) -> Any:
         except Exception as e:
             logger.warning(f"Could not log fallback LLM config: {e}")
 
+    def _pm_attach(inst, pair):
+        # 12:28 attribution fix: stamp each LLM instance with ITS OWN
+        # provider/model/base_url. The worker's timing wrapper used to hand the
+        # PRIMARY's provider_info to every FallbackAdapter inner instance, so an
+        # OpenAI fallback completion logged (and priced) as
+        # provider=groq model=qwen/qwen3.8-27b — including real cached tokens
+        # (1152/1536 — OpenAI 128-token cache blocks) appearing on "Groq"
+        # records. With the stamp, the wrapper reads identity from the instance
+        # that actually served; usage can never be attributed to the chain head.
+        try:
+            pr, mo, bu = pair.resolve_llm_provider_model()
+            inst._prov_meta = {"provider": pr, "model_id": mo, "base_url": bu or ""}
+        except Exception:
+            try:
+                inst._prov_meta = {"provider": pair.id, "model_id": (pair.config or {}).get("model", ""), "base_url": ""}
+            except Exception:
+                pass
+
     # Build primary with exact model, no silent substitution
     primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
+    _pm_attach(primary, primary_pair)
 
     # Build fallback chain - supports multiple models, provider/model separate
     fallbacks = []
@@ -732,6 +751,7 @@ def build_llm(cfg: AgentConfig) -> Any:
     for fb_pair in fallbacks:
         try:
             inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
+            _pm_attach(inst, fb_pair)
             fallback_instances.append(inst)
             fallback_ids.append(fb_pair.id)
         except Exception as e:
@@ -746,6 +766,23 @@ def build_llm(cfg: AgentConfig) -> Any:
     try:
         from livekit.agents import llm as llm_agents
         all_llms = [primary] + fallback_instances
+        # ── FallbackAdapter lifecycle (livekit-agents 1.8.2) — DOCUMENTED, not
+        # patched (per task spec). Exactly what the log sequence means:
+        #  FallbackLLMStream._run() walks the chain; per available instance it
+        #  calls llm.chat() — a WRAPPED call, one "LLM REQUEST START … primary/
+        #  0-of-2". Groq's 429 raises inside that attempt; the adapter logs
+        #  "…failed, switching to next LLM", marks the instance unavailable and
+        #  starts a BACKGROUND RECOVERY PROBE (_try_recovery →
+        #  _try_generate(check_recovery=True) → another real chat() on primary/
+        #  0-of-2 — the line seen while the fallback is still streaming; NOT a
+        #  duplicate turn request. It is labelled 🧪 [LLM_RECOVERY_PROBE] here,
+        #  kept out of turn accounting, latency state, generation ids and
+        #  customer billing (it is provider-infra cost, not the caller's).
+        #  Then _run continues to the next instance: "fallback/1-of-2" answers —
+        #  one valid active generation per turn, no retry on the 429'd model
+        #  (max_retry_per_llm=0 default), attempt_timeout=5.0s. A failed probe
+        #  leaves the instance unhealthy until the "all failed" pass of the
+        #  NEXT real request re-tries it.
         adapter = llm_agents.FallbackAdapter(all_llms)
         # Log full chain with exact provider/model/base_url
         try:
