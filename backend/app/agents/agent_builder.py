@@ -502,6 +502,19 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # OpenAI Chat Completions rejects reasoning_effort with tools for gpt-5.4-mini (400 error)
     # LiveKit 1.8.2+ has openai.responses.LLM that supports reasoning+tools via /v1/responses
     use_responses_api = False
+    # Task 2 (11:41 log): ONE capability lookup drives everything below —
+    # whether prompt_cache_key is sent (native_explicit only), whether the
+    # provider auto-caches (native_automatic: Groq's gpt-oss family — send
+    # NO field, they reject it with 400), or whether caching is genuinely
+    # absent for this exact model (e.g. groq qwen3.8 → honest unsupported,
+    # never a fake "miss"). Model selection itself is untouched.
+    try:
+        from ..llm_catalog import get_prompt_cache_capability as _gcc
+        _cache_cap = _gcc(provider_type or provider, model_id)
+    except Exception:
+        _cache_cap = {"supported": provider_type == "openai",
+                      "mode": "native_explicit" if provider_type == "openai" else "none",
+                      "configuration": ({"prompt_cache_key": f"voice-{model_id}-v1"} if provider_type == "openai" else None)}
     if model_meta and model_meta.get("reasoning_supported") and model_id.startswith("gpt-5"):
         # gpt-5.4-mini with end_call tool needs responses API for reasoning+tools
         use_responses_api = True
@@ -519,11 +532,11 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         # unsupported" on EVERY request (2026-09-19: gpt-oss-20b + qwen3.6-27b both
         # 400'd all turns -> FallbackAdapter exhausted -> 6s watchdog apology).
         # Only send it to api.openai.com.
-        if provider_type == "openai":
+        if _cache_cap["mode"] == "native_explicit":
             try:
                 # Use model_id as cache key for stable prefix caching
-                llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-                logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (per-request [CACHE] hit/miss is read from provider usage CompletionUsage.prompt_cached_tokens — real numbers only)")
+                llm_kwargs["prompt_cache_key"] = _cache_cap["configuration"]["prompt_cache_key"]
+                logger.info(f"🔧 Set prompt_cache_key={llm_kwargs['prompt_cache_key']} for prompt caching (capability=native_explicit; per-request [CACHE] hit/miss is read from provider usage CompletionUsage.prompt_cached_tokens — real numbers only)")
             except Exception:
                 pass
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
@@ -537,9 +550,9 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # to the same machine, so turns 2+ reuse the cached prefix (~30-60% lower
     # TTFT). OPENAI-ONLY: Groq/OpenRouter-compatible endpoints reject the field
     # with a 400 on every request, so apply it only when provider_type=openai.
-    if provider_type == "openai" and "prompt_cache_key" not in llm_kwargs:
-        llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-        logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 (prefix cache pinning — watch cached>0 from turn 2 on)")
+    if _cache_cap["mode"] == "native_explicit" and "prompt_cache_key" not in llm_kwargs:
+        llm_kwargs["prompt_cache_key"] = _cache_cap["configuration"]["prompt_cache_key"]
+        logger.info(f"🔧 Set prompt_cache_key={llm_kwargs['prompt_cache_key']} (prefix cache pinning — watch cached>0 from turn 2 on)")
 
     # Try responses API for gpt-5 reasoning models with tools (proper support)
     # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
@@ -608,8 +621,10 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
                     logger.info("🗄️ [CACHE] provider=openai model=%s cache_key=%s status=armed (key verified in plugin options; hit/miss is only reported from real usage.prompt_tokens_details.cached_tokens)", model_id, _ck)
                 else:
                     logger.warning("🗄️ [CACHE] provider=openai model=%s status=unsupported — prompt_cache_key did NOT reach the plugin's create kwargs (plugin too old or kwarg dropped); cached_input_tokens will stay 0; upgrade livekit-plugins-openai>=1.8 to enable", model_id)
+            elif _cache_cap["mode"] == "native_automatic":
+                logger.info("🗄️ [CACHE] provider=%s model=%s capability=native_automatic cache_status=automatic (provider prefix-caches on its own — NO client field sent; hit/miss will only be claimed from real usage.prompt_tokens_details.cached_tokens)", provider, model_id)
             else:
-                logger.info("🗄️ [CACHE] provider=%s model=%s cache_status=unsupported (prompt_cache_key is OpenAI-only; compatible endpoints reject it)", provider, model_id)
+                logger.info("🗄️ [CACHE] provider=%s model=%s capability=none cache_status=unsupported (this exact model exposes no provider-side prompt cache; no OpenAI-only fields are sent, nothing to hit or miss)", provider, model_id)
         except Exception as _cke:
             logger.debug(f"cache-key verification skipped: {_cke!r}")
         return llm_instance
@@ -1385,6 +1400,68 @@ def _frag_consume(tt, now_ts):
         else:
             dropped += 1
     return fresh, dropped
+
+
+def _strip_trailing_ack_turns(target: Any) -> int:
+    """Drop trailing pure-ack assistant messages from THIS TURN's ctx copy.
+
+    11:41 log defect #2: the previous turn's deterministic acknowledgement
+    ('जी, बताइए।') sat as the last assistant message right above the model's
+    answer slot, and the model pattern-completed instead of answering the
+    real question — even on RAG-hit turns, and it kept re-seeding the echo
+    each turn. `target` is the per-turn temp_mutable_chat_ctx (the library
+    discards it after generation; ChatContext.copy() owns a fresh items
+    list), so removal changes THIS request only — session history,
+    transcripts and billing stay intact. Detection reuses
+    rag.is_acknowledgement (the same turn_rules classifier that produces
+    deterministic acks) — no new string matching.
+    """
+    if target is None:
+        return 0
+    n = 0
+    try:
+        items = getattr(target, "items", None)
+        if not isinstance(items, list):
+            return 0
+        from .. import rag as _ack_rules
+        _outs = _ack_reply_texts(_ack_rules)
+        for k in range(len(items) - 1, -1, -1):
+            m = items[k]
+            if getattr(m, "type", "message") != "message" or getattr(m, "role", "") != "assistant":
+                break
+            txt = _chat_msg_text(m).strip()
+            if not txt or len(txt) > 40:
+                break
+            if not (_ack_rules.is_acknowledgement(txt) or txt in _outs):
+                break
+            del items[k]
+            n += 1
+            if n >= 3:
+                break
+    except Exception:
+        return n
+    return n
+
+
+_ACK_REPLY_OUTPUTS: set = set()
+
+
+def _ack_reply_texts(rules) -> frozenset:
+    """The exact strings turn_rules.ack_reply() can emit — probed at runtime
+    from the module's OWN function (its classifier seeds), never a copy of
+    its wording hardcoded here: if the deterministic reply ever changes, the
+    strip follows automatically. Assistant messages equal to a generated ack
+    reply (or classifying as a bare acknowledgement) are the echo template;
+    nothing else ever matches."""
+    global _ACK_REPLY_OUTPUTS
+    if not _ACK_REPLY_OUTPUTS:
+        try:
+            _ACK_REPLY_OUTPUTS = frozenset(
+                rules.ack_reply(w) for w in ("haan", "हाँ", "हां", "han", "जी", "ji", "ok", "yes", "thanks")
+            ) - {""}
+        except Exception:
+            return frozenset()
+    return _ACK_REPLY_OUTPUTS
 
 
 def _find_chat_ctx(obj) -> Any:
@@ -2374,6 +2451,10 @@ def build_voice_agent(
                 # model answered from generic priors). Same text = same injection cost
                 # (~600 tokens); correctness wins.
                 _rag_kind = "retrieved"
+                target = _find_chat_ctx(turn_ctx)
+                _nstripped = _strip_trailing_ack_turns(target)
+                if _nstripped:
+                    logger.info("🧹 [ACK_STRIPPED] removed %d trailing acknowledgement assistant message(s) from this turn's generation context (per-turn copy only — session history untouched)", _nstripped)
                 if not hits:
                     # ---- 0-hit turn: ONE cheap containment fallback over the
                     # cached corpus (rag.fallback_context — BM25/ranking
@@ -2408,7 +2489,6 @@ def build_voice_agent(
                         logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", user_text[:70])
                         logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
                         return  # nothing to inject, main retrieval AND fallback came up empty
-                target = _find_chat_ctx(turn_ctx)
                 if target is None:
                     logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
@@ -2438,9 +2518,26 @@ def build_voice_agent(
                     _header = (
                         f"{_RAG_PREFIX} Relevant business facts for THIS specific question:"
                     )
+                # 11:41 log defect #1 (ORDER, not presence — final_user=0c
+                # explained): agent_activity creates user_message BEFORE this
+                # hook, then inserts it into the generation ctx by
+                # created_at (_pipeline_reply_task_impl: chat_ctx.insert()).
+                # A plain add_message() stamps created_at=NOW — newer than the
+                # question — so [RAG] landed AFTER it: [..., USER question,
+                # [RAG] system]. The question was never the last message and
+                # the trailing system line read like new instructions. Anchor
+                # the block 1ms before the question instead: the library then
+                # slots the question right behind it — [..., [RAG] facts,
+                # USER question] — facts precede the question it grounds, and
+                # the question is last (stable prefix → dynamic RAG → user
+                # content, per the cache-prefix contract).
+                _inj_at = float(getattr(new_message, "created_at", 0.0) or 0.0) - 0.001
+                if _inj_at <= 0:
+                    _inj_at = _time.time() - 0.001
                 target.add_message(
                     role="system",
                     content=f"{_header}\n{hits}",
+                    created_at=_inj_at,
                 )
                 logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {user_text[:80]} (kb_used={kb_used}, faq_used={faq_used})")
                 logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d, kind=%s)", user_text[:70], len(hits), _rag_kind)

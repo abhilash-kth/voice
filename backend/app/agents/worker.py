@@ -1025,7 +1025,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 
                 _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
                 try:
-                    from app.llm_catalog import get_llm_model, calculate_llm_cost
+                    from app.llm_catalog import get_llm_model, calculate_llm_cost, get_prompt_cache_capability
                     model_meta = get_llm_model(prov, model) if prov and model else None
                     if model_meta:
                         costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
@@ -1051,28 +1051,41 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         # unsupported instead of pretending.
                         try:
                             _cached_now = int(self._cached_tokens or 0)
-                            _is_openai = "openai" in str(prov).lower()
                             _uk = bool(getattr(self, "_usage_seen", False))
-                            if _is_openai and not _uk:
-                                # Task 5 (02:31 call): all 12 requests failed
-                                # before any usage chunk existed and were all
-                                # logged cache_status=miss + counted as misses,
-                                # turning a broken-instrumentation run into a
-                                # false "not_engaging" cache verdict. A request
-                                # with NO usage returns no verdict at all.
-                                _ck_key = f"voice-{model}-v1"
-                                _ck_status = "unknown/error (no usage returned by provider — request failed or was invalidated; NOT counted as miss)"
-                            elif _is_openai:
-                                _ck_key = f"voice-{model}-v1"
-                                _ck_status = "hit" if _cached_now > 0 else "miss"
-                                if _cached_now > 0:
+                            # Task 2 (11:41 log): four honest states driven by
+                            # get_prompt_cache_capability(provider, model) — NOT
+                            # by a "provider == openai" guess. capability=none
+                            # (e.g. groq qwen3.8: no cached-token usage exists)
+                            # reports unsupported and never a "miss"; a
+                            # cache-capable request whose usage never arrived
+                            # is unknown, never a miss (02:31-call lesson);
+                            # hit/miss are claimed ONLY from real provider
+                            # usage counts.
+                            try:
+                                _cap = get_prompt_cache_capability(str(prov), str(model))
+                            except Exception:
+                                _cap = {"supported": "openai" in str(prov).lower(),
+                                        "mode": "native_explicit" if "openai" in str(prov).lower() else "none",
+                                        "configuration": None}
+                            _cap_mode = _cap.get("mode", "none")
+                            _cap_cfg = _cap.get("configuration") or {}
+                            if not _cap.get("supported"):
+                                _ck_key, _ck_status = "n/a", "unsupported (capability=none for this exact provider/model — nothing invented, nothing to hit or miss)"
+                                _cap_lbl = "none"
+                            else:
+                                _cap_lbl = _cap_mode
+                                _ck_key = _cap_cfg.get("prompt_cache_key") or "n/a (automatic — no client field)"
+                                if not _uk:
+                                    _ck_status = "unknown/error (no usage returned by provider — request failed or was invalidated; NOT counted as miss)"
+                                    self._timing["cache_unknown"] = self._timing.get("cache_unknown", 0) + 1
+                                elif _cached_now > 0:
+                                    _ck_status = "hit"
                                     self._timing["cache_hits"] = self._timing.get("cache_hits", 0) + 1
                                 else:
+                                    _ck_status = "miss"
                                     self._timing["cache_misses"] = self._timing.get("cache_misses", 0) + 1
-                            else:
-                                _ck_key, _ck_status = "n/a", "unsupported"
                             _uk_s = "yes" if _uk else "NO"
-                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} cache_key={_ck_key} usage_returned={_uk_s} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_tokens_est={self._timing.get('head_est_tokens','?')} stable_head_chars={self._timing.get('head_chars_log','?')} head_sha={self._timing.get('head_sha','?')} head_same_as_previous={self._timing.get('head_stable_prev','?')} (status only reflects provider usage; hash is content-free)")
+                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} capability={_cap_lbl} mode={_cap_mode} cache_key={_ck_key} usage_returned={_uk_s} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_hash={self._timing.get('head_sha','?')} stable_head_tokens_est={self._timing.get('head_est_tokens','?')} stable_head_chars={self._timing.get('head_chars_log','?')} head_same_as_previous={self._timing.get('head_stable_prev','?')} (status only reflects provider usage; hash is content-free)")
                         except Exception:
                             pass
                 except Exception as e:
@@ -1208,6 +1221,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _user_last_text = ""
                     _dyn_before_head = 0
                     _seen_user = False
+                    _user_last_is_final = False
                     _first_sys = None
                     for _i, _m in enumerate(_msgs):
                         _r = getattr(_m, "role", "") or ""
@@ -1221,14 +1235,16 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         else:
                             _seen_user = True
                             if _r == "user":
-                                # last USER message wherever it sits — when RAG
-                                # context was injected this turn the final entry
-                                # is the [RAG] system message (final_user=0c in
-                                # production logs), so a positional check would
-                                # miss the text the continuation-merge needs.
+                                # last USER message wherever it sits — the TEXT
+                                # feeds the continuation-merge. 11:41 fix: the
+                                # CHAR COUNT no longer requires the message to be
+                                # final (the old positional gate is what made
+                                # final_user=0c ambiguous between "question
+                                # missing" and "question present but not last").
+                                # Position is reported separately as question_is_last.
                                 _user_last_text = _t
-                                if _i == len(_msgs) - 1:
-                                    _user_last_chars = len(_t)
+                                _user_last_chars = len(_t)
+                                _user_last_is_final = _i == len(_msgs) - 1
                             else:
                                 _hist_chars += len(_t)
                                 _hist_msgs += 1
@@ -1256,8 +1272,39 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _dyn_rag_est_t = int(_rag_chars / 4.0)
                     _total_est_t = int(_total_chars / 4.0)
                     _logger.info(
-                        "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d tokens: stable_prompt=%d dynamic_rag=%d total_input_est=%d | sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc | tools_meta=%dc | head_sha=%s",
-                        _total_chars, _total_est_t, _head_est_t, _dyn_rag_est_t, _total_est_t, _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, _tools_chars, _sha,
+                        "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d tokens: stable_prompt=%d dynamic_rag=%d total_input_est=%d | sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc question_is_last=%s | tools_meta=%dc | head_sha=%s",
+                        _total_chars, _total_est_t, _head_est_t, _dyn_rag_est_t, _total_est_t, _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, "yes" if _user_last_is_final else "NO", _tools_chars, _sha,
+                    )
+                    # 11:41 log Task 1: PROVE the request shape instead of
+                    # inferring it. The [PROMPT] section line cannot distinguish
+                    # "question present but not last" from "question missing"
+                    # without this; the preview shows the real last message, the
+                    # counts show how many user messages arrived, and ack_mode /
+                    # incomplete_turn echo the governor flags on the SHARED turn
+                    # dict (a deterministic-ack turn never reaches chat(), so
+                    # ack_mode=yes here would mean a stale flag hijacked a real
+                    # request — the one failure mode the pop-on-entry guards are
+                    # supposed to make impossible). 60-char previews only: no
+                    # full customer content, no secrets.
+                    _last_m = _msgs[-1] if _msgs else None
+                    _dbg_prov = self._prov_info.get("provider", "") or self._timing.get("llm_provider", "") or "unknown"
+                    _dbg_model = self._prov_info.get("model_id", "") or getattr(self._inner, "model", "unknown") or "unknown"
+                    try:
+                        from app.llm_catalog import get_prompt_cache_capability as _gcc_dbg
+                        _dbg_cap = _gcc_dbg(str(_dbg_prov), str(_dbg_model)).get("mode", "?")
+                    except Exception:
+                        _dbg_cap = "?"
+                    _logger.info(
+                        "\U0001f52c [LLM_INPUT_DEBUG] generation=%s provider=%s model=%s capability=%s messages_count=%d last_message_role=%s last_message_preview='%s' current_user_turn='%s' user_messages=%d question_is_last=%s rag_present=%s rag_chars=%d ack_mode=%s incomplete_turn=%s",
+                        _gen, _dbg_prov, _dbg_model, _dbg_cap, len(_msgs),
+                        str(getattr(_last_m, "role", "?") or "?") if _last_m is not None else "?",
+                        (_mtext(_last_m)[:60].replace("\n", " ") if _last_m is not None else ""),
+                        _user_last_text[:60].replace("\n", " "),
+                        sum(1 for _m2 in _msgs if getattr(_m2, "role", "") == "user"),
+                        "yes" if _user_last_is_final else "NO",
+                        "yes" if _rag_chars else "no", _rag_chars,
+                        "yes" if self._timing.get("ack_reply") else "no",
+                        "yes" if self._timing.get("gov_turn_state") == "suppress" else "no",
                     )
                     # inflight gauge for spike forensics (Task 5)
                     self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
@@ -3443,17 +3490,26 @@ async def _entrypoint_body(ctx, setup_complete):
                 try:
                     _ch = int(turn_timing.get("cache_hits", 0) or 0)
                     _cm = int(turn_timing.get("cache_misses", 0) or 0)
+                    _cu = int(turn_timing.get("cache_unknown", 0) or 0)
                     _cached_total = sum(int(r.get("cached", 0) or 0) for r in all_reqs if r.get("success"))
-                    _openai_any = any("openai" in str(r.get("provider", "")).lower() for r in all_reqs)
+                    try:
+                        from app.llm_catalog import get_prompt_cache_capability as _gcc_sum
+                        _caps = [_gcc_sum(str(r.get("provider", "")), str(r.get("model", ""))) for r in all_reqs]
+                        _supported_any = any(c.get("supported") for c in _caps)
+                        _mode_set = sorted({c.get("mode", "none") for c in _caps}) if _caps else []
+                        _cap_rollup = "/".join(_mode_set) if _mode_set else "none"
+                    except Exception:
+                        _supported_any = any("openai" in str(r.get("provider", "")).lower() for r in all_reqs)
+                        _cap_rollup = "?"
                     if _ch > 0:
                         _cache_verdict = "working"
                     elif _cm > 0:
-                        _cache_verdict = "not_engaging (key armed+verified; every usage-returning request reported 0 cached — stable prefix vs 1024-token minimum or no cache routing; see per-request [CACHE] lines)"
-                    elif _openai_any:
-                        _cache_verdict = "unverifiable (no request returned usage — failed/invalidated requests are NOT cache misses; re-run when calls succeed)"
+                        _cache_verdict = "not_engaging (cache-capable path verified; every usage-returning request reported 0 cached — stable prefix vs provider minimum or routing; see per-request [CACHE] lines)"
+                    elif _supported_any:
+                        _cache_verdict = "unverifiable (no cache-capable request returned usage — failed/invalidated requests are NOT cache misses; re-run when calls succeed)"
                     else:
-                        _cache_verdict = "unsupported (no OpenAI path in this call)"
-                    logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} evaluated(hit+miss,usage-only)={_ch + _cm} hits={_ch} misses={_cm} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
+                        _cache_verdict = "unsupported (every request's provider/model has capability=none — reported honestly, no cache pretended)"
+                    logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} capabilities={_cap_rollup} evaluated(hit+miss,usage-only)={_ch + _cm} hits={_ch} misses={_cm} unknown={_cu} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
                     logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 discarded=0 would_cancel={int(turn_timing.get('spec_would_cancel', 0) or 0)} overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
                     _ls = turn_timing.get("latency_samples", [])
                     if _ls:
