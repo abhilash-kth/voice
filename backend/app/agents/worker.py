@@ -1253,9 +1253,11 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _head_est_t = int(_head_chars / 4.0)
                     self._timing["head_est_tokens"] = _head_est_t
                     _total_chars = _head_chars + _hist_chars + _rag_chars + _user_last_chars
+                    _dyn_rag_est_t = int(_rag_chars / 4.0)
+                    _total_est_t = int(_total_chars / 4.0)
                     _logger.info(
-                        "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc | tools_meta=%dc | head_sha=%s",
-                        _total_chars, int(_total_chars / 4.0), _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, _tools_chars, _sha,
+                        "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d tokens: stable_prompt=%d dynamic_rag=%d total_input_est=%d | sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc | tools_meta=%dc | head_sha=%s",
+                        _total_chars, _total_est_t, _head_est_t, _dyn_rag_est_t, _total_est_t, _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, _tools_chars, _sha,
                     )
                     # inflight gauge for spike forensics (Task 5)
                     self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1

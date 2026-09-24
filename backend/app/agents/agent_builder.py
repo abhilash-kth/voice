@@ -1424,11 +1424,26 @@ def _flatten_knowledge(kb: KnowledgeBase) -> list[str]:
 
 
 def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
+    """Build the permanent (stable-head) system prompt.
+
+    Global prompt-budget policy (2026-09-24): the stable prompt carries ONLY
+    behavioral rules. Company/KB/FAQ content is NOT part of it — the per-turn
+    RAG hook retrieves exactly the relevant chunks for the caller's question
+    and injects them as a [RAG] system message; when retrieval finds no
+    relevant hit (relevance floor), nothing is injected. Escape hatches keep
+    their old semantics: with VOICE_RAG_PER_TURN=0 the static KB/FAQ slices
+    return (they are the only grounding in that mode), and the
+    VOICE_KB_BUDGET_CHARS / VOICE_FAQ_BUDGET_CHARS /
+    VOICE_OWNER_PROMPT_BUDGET_CHARS env overrides still apply. The output is
+    deterministic per agent config, so the provider's prompt-cache prefix
+    (head_sha) stays stable across every turn and every call.
+    """
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
     kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
+    rag_on = _rag_per_turn_enabled()
     logger.info(
-        "📚 [KNOWLEDGE_BASE_INIT] Agent '%s' knowledge loaded: manual_text=%d chars, documents=%d, faq=%d items | Static budgets: KB=%d chars, FAQ=%d chars, Owner=%d chars",
+        "📚 [KNOWLEDGE_BASE_INIT] Agent '%s' knowledge loaded: manual_text=%d chars, documents=%d, faq=%d items | Static budgets: KB=%d chars, FAQ=%d chars, Owner=%d chars | stable-prompt policy: %s",
         cfg.name,
         len(getattr(cfg.knowledge, "text", "") or ""),
         len(getattr(cfg.knowledge, "documents", []) or []),
@@ -1436,51 +1451,26 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         kb_budget,
         faq_budget,
         owner_budget,
+        "KB/FAQ skipped — RAG per-turn injects only relevant chunks" if rag_on else "KB/FAQ included — RAG disabled for this call",
     )
 
     lines = [
-        f"You are {cfg.name}, a {persona} voice receptionist.",
-        "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
-        "SCRIPT RULE (critical for the voice engine): when the caller writes or speaks Hindi, write your ENTIRE answer in Devanagari script (देवनागरी) only — NEVER in Roman/Latin letters like 'Iske details nahi hain'. Roman-script Hindi sounds broken when spoken aloud. Phone numbers, digits and email addresses may stay as digits/Latin (Sarvam reads them correctly).",
-        "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
-        f"Preferred language: {lang}; use it when the caller's language is unclear.",
+        f"You are {cfg.name}, a {persona} voice receptionist on a live phone call.",
+        "Answer in the caller's language: English in -> English out; Hindi or Hinglish in -> Hindi in Devanagari script (देवनागरी) only — Roman-script Hindi sounds broken through TTS. Digits, phone numbers and emails stay as written. If the language is unclear, default to: " + lang + ".",
+        "Speak like a warm, efficient receptionist: 1-2 short spoken sentences, under 25 words, start answering immediately, no markdown, lists, emojis or preambles; never read back the caller's question, never repeat yourself, never greet or introduce yourself again (the greeting already played), never pitch services unprompted and never reveal being an AI.",
     ]
-    # Human rhythm + real latency win: a 1-3 word acknowledgment spoken as its
-    # OWN first sentence reaches the TTS the moment the LLM emits its first
-    # tokens, so the caller hears a response within ~1s instead of waiting for a
-    # full synthesized sentence. This is also how human receptionists answer.
+    # Human rhythm + real latency win: a 1-3 word acknowledgment as its OWN
+    # first sentence reaches TTS at the LLM's first tokens (~1s answer).
     # Env kill switch: VOICE_ACK_OPENERS=0.
     if os.getenv("VOICE_ACK_OPENERS", "1") == "1":
         lines.append(
-            "CONVERSATION RHYTHM (critical): begin EVERY answer with a very short natural "
-            "acknowledgment as its OWN complete sentence, in the caller's language — for "
-            "example 'जी.' / 'हाँ जी.' / 'अच्छा.' in Hindi, 'Sure.' / 'Right.' / 'Of course.' "
-            "in English — then give the full answer starting from the next sentence. Keep the "
-            "acknowledgment to 1-3 words, vary it naturally, and never use the same "
-            "acknowledgment twice in a row."
+            "Open every answer with a very short acknowledgment as its own complete sentence, in the caller's language ('जी.' / 'हाँ जी.' / 'Sure.'), 1-3 words, varied naturally, never the same one twice in a row; then give the full answer."
         )
     lines.append(
-        "ACK/INCOMPLETE TURNS: pure acknowledgements and trailing half-questions ('कि', "
-        "'और', 'एक minute') are handled deterministically BEFORE you are called; if one "
-        "still reaches you, reply with at most one short warm line ('जी।' / 'जी, बताइए।') "
-        "— never facts, never a repeated statement, never guess what was meant."
+        "ACK/INCOMPLETE TURNS: pure acknowledgements and half-spoken fragments ('कि', 'और', 'एक minute') are answered deterministically before you are called; if one still reaches you, reply with at most one short warm line ('जी, बताइए।') — never facts, never guesses about what was meant."
     )
     lines.append(
-        "Behave like a warm human receptionist. Never repeat yourself, never push "
-        "the same offer, never read out a list of services unprompted, and never "
-        "give a long preamble. Answer exactly what was asked, then stop. "
-        "ABSOLUTELY FORBIDDEN to add these after every answer: 'Aur kuch poochna hai?', "
-        "'Aur kuch jaanana chahenge?', 'Aapko aur kuch jaanana hai?', 'Kya aapko aur koi madad chahiye?', "
-        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?', "
-        "'Aur kuch janna chahenge?', and their Devanagari forms — 'क्या आपको और कुछ जानकारी चाहिए?', "
-        "'क्या आपको अभी कुछ और जानकारी चाहिए?', 'क्या मैं आपकी और मदद कर सकती हूँ?', "
-        "'क्या मैं आपकी किसी और तरह से मदद कर सकती हूँ?', 'और कुछ पूछना चाहेंगे?', 'और कुछ जानना चाहेंगे?' — "
-        "Only ask a follow-up when you are actively collecting missing required info "
-        "for a project enquiry (like phone, budget). If the caller says they have no more questions "
-        "(e.g., 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', "
-        "'नहीं और कोई मदद नहीं चाहिए', 'bas itna hi', 'that's all', 'no more questions'), "
-        "do NOT keep asking — treat it as closing and call end_call tool. "
-        "Never mention being an AI, a robot, or a bot."
+        "NEVER offer further help at the end of an answer: no 'Aur kuch poochna hai?', 'क्या मैं आपकी और मदद कर सकती हूँ?' or any variant — one answer, then stop and wait. Ask a follow-up only while actively collecting required enquiry details (name, phone, budget)."
     )
 
     extra = (cfg.knowledge.system_prompt or "").strip()
@@ -1498,7 +1488,11 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         lines.append("Instructions from the business owner:")
         lines.append(extra)
 
-    facts = _flatten_knowledge(cfg.knowledge)
+    # Static KB/FAQ slices are redundant while per-turn RAG injects the
+    # relevant chunks — they return only in RAG-off mode (single source of
+    # grounding there). Emptying the lists reuses the untouched budget/
+    # truncation logic below.
+    facts = _flatten_knowledge(cfg.knowledge) if not rag_on else []
     if facts:
         kept: list[str] = []
         used = 0
@@ -1533,7 +1527,7 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         lines.append("Relevant business facts to use when answering:")
         lines.append(query_context)
 
-    faq = getattr(cfg.knowledge, "faq", None) or []
+    faq = (getattr(cfg.knowledge, "faq", None) or []) if not rag_on else []
     if faq:
         faq_lines: list[str] = []
         used = 0
@@ -1568,14 +1562,24 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             lines.extend(faq_lines)
 
     lines.append("")
-    lines.append("FINAL CRITICAL RULES - ALWAYS FOLLOW:")
-    lines.append("- After answering, STOP. Do NOT add 'Aur kuch jaanana chahenge?' / 'Aur kuch poochna hai?' / 'Kya aapko aur koi madad chahiye?' unless you are actively collecting required project info. One answer = stop speaking and wait for caller.")
-    lines.append("- If caller asks for contact number/email, use ONLY the numbers/emails given in 'Instructions from the business owner' above. Never say you don't have them if they are in the owner instructions. Primary phone is +91-8947027625, sales email sales@kriscent.in, info email info@kriscent.in. Provide them exactly when asked.")
-    lines.append("- If caller says 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', 'नहीं और कोई मदद नहीं चाहिए', 'bas ho gaya', 'that's all', 'no more questions', 'ok thank you' as final, call end_call tool immediately — do not ask another follow-up.")
-    lines.append("- Keep every reply to 1-2 short sentences, under 25 words. No lists unless caller explicitly asks for list.")
-    lines.append("- ANTI-HALLUCINATION: Never invent financial data, balance, transactions, or office locations not in 'Business facts'. If user asks 'recent kaam' / 'recent work', explain Kriscent's recent projects from KB (IT services, AI agents, etc), NOT financial data. If info not in KB, say 'Mere paas iski exact jaankari nahi hai, main aapko Jaipur office se connect kara sakta hoon'.")
-    lines.append("- Be concise, warm, human. If caller says 'thank Kota' or 'accha laga' with thank, treat as closing — call end_call.")
+    lines.append(
+        "FACTS & HONESTY: ground every substantive answer ONLY in the owner instructions and any per-turn [RAG] business facts; when a retrieved fact directly answers the question, follow it exactly — numbers, prices and timings verbatim, never paraphrased. If nothing covers it, say plainly that you do not have that detail and offer to have the team follow up — never invent prices, offices, transactions or history. Give contact numbers or emails ONLY exactly as written in the owner instructions; if none are listed there, offer a callback instead."
+    )
 
+    _stable_chars = sum(len(x) + 1 for x in lines)
+    # ---- 📐 stable-prompt diagnostics: what the permanent head costs on
+    # EVERY request, measured at build time (the per-request [PROMPT] line in
+    # the worker shows the same numbers next to dynamic/RAG tokens).
+    logger.info(
+        "📐 [STABLE_PROMPT] chars=%d est_tokens=%d (4.0 chars/token) | sections: core+%sowner=%d kb_static=%s faq_static=%s | policy=behavior-only%s",
+        _stable_chars,
+        int(_stable_chars / 4.0),
+        "ack-rhythm " if os.getenv("VOICE_ACK_OPENERS", "1") == "1" else "",
+        len(extra),
+        "on" if not rag_on and facts else "off (RAG)",
+        "on" if not rag_on and faq else "off (RAG)",
+        "" if rag_on else " — RAG DISABLED: static slices re-included",
+    )
     return "\n".join(lines)
 
 
@@ -1717,22 +1721,7 @@ def build_voice_agent(
     # doesn't leave the caller in a silent, open call. Closing speech is now
     # deterministic: the tool itself speaks the fixed closing line.
     instructions += (
-        "\n\nCONVERSATION OPENING: The initial greeting has already been spoken by the application. "
-        "Never greet again, introduce yourself again, or say 'Namaste' in response to a "
-        "partial, interrupted, or unclear first user utterance. Acknowledge briefly and "
-        "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
-        "collection. End the call only when the caller clearly and explicitly asks to "
-        "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
-        "that's all, no more help, or no more questions — this INCLUDES Hindi hang-up grants "
-        "such as 'फ़ोन रख दीजिए', 'आप phone रख सकते', 'call kaat dijiye', and direct "
-        "'I need nothing more' answers like 'मुझे कुछ भी नहीं चाहिए', 'मुझे कोई जानकारी नहीं चाहिए', "
-        "'kuch bhi nahi chahiye', 'call cut kar dijiye', 'और तो मुझे कुछ नहीं जानना' as a standalone final "
-        "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
-        "especially when followed by another question. "
-        "When the caller explicitly says goodbye, do NOT try to generate your own closing sentence — "
-        "just call the end_call tool once. The system will speak a fixed deterministic closing line "
-        f"'{_get_closing_for_cfg(cfg)}' and then hang up. Never call the tool before the closing is needed, "
-        "and never call it for an ambiguous phrase."
+        "\n\nCALL LIFECYCLE: keep the call open after every normal answer, pause or detail-collection turn. End the call ONLY on a clear, standalone goodbye or hang-up grant in any language ('bye', 'ok bye', 'thank you' as a closer, 'that\'s all', 'no more questions/help', 'फ़ोन रख दीजिए', 'कॉल काट दीजिए', 'मुझे कुछ और नहीं चाहिए/जानना'). 'ok', or 'that\'s all for this question' followed by another question, is NOT a goodbye. On a real goodbye do not compose a closing sentence yourself: call the end_call tool once — the system speaks the fixed closing line and hangs up. Never call end_call at any other time."
     )
 
     async def _end_call() -> str:
