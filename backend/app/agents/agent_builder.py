@@ -431,6 +431,27 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             # extensions is httpx-internal metadata, never sent on the wire
             _request.extensions["voice_rid"] = _rid
             _http_timing.note_send(model_id, _rid)
+            # --- Provider-bound fingerprint for cache diagnosis (safe, no PII) ---
+            try:
+                import json as _js
+                import hashlib as _hl2
+                _body = _request.content
+                if _body:
+                    _j = _js.loads(_body.decode("utf-8", "ignore") if isinstance(_body, (bytes, bytearray)) else str(_body))
+                    _pck = _j.get("prompt_cache_key", "?")
+                    _msgs = _j.get("messages", [])
+                    _role_seq = ",".join([str(m.get("role", "?")) for m in _msgs])
+                    _len_seq = ",".join([str(len(str(m.get("content", "")))) for m in _msgs])
+                    _first_c = str(_msgs[0].get("content", "")) if _msgs else ""
+                    _first_hash = _hl2.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12] if _first_c else "?"
+                    _pref_c = "".join([str(m.get("content", "")) for m in _msgs[:2]])
+                    _pref_hash = _hl2.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12] if _pref_c else "?"
+                    logger.info(
+                        "\U0001f50d [HTTP_BODY_FINGERPRINT] rid=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s",
+                        _rid, model_id, _pck, len(_msgs), _role_seq, _len_seq, _first_hash, _pref_hash,
+                    )
+            except Exception as _e:
+                logger.debug(f"[HTTP_BODY_FINGERPRINT] failed: {_e!r}")
             logger.info(
                 "\U0001f310 [HTTP_REQUEST_START] rid=%s model=%s client_attempt#%d sdk_retry_count=%s path=%s — one send of one chat() attempt (see B/C distinction in builder comment; SDK retries are disabled by max_retries=0)",
                 _rid, model_id, _http_inst["n"],
@@ -2332,11 +2353,39 @@ def build_voice_agent(
                     except Exception:
                         _history_limit = 8
                         _trim_threshold = 12
-                    if isinstance(items, list) and len(items) > _trim_threshold:
-                        system_items = [m for m in items if getattr(m, "role", "") == "system"]
+                    if isinstance(items, list):
+                        # Cache fix (applies ALWAYS, not just when trimming): keep ONLY the stable
+                        # behavioral instructions at the very beginning (id=lk.agent_task.instructions)
+                        # as the cacheable prefix. All other system messages (prior_memory, lead_data,
+                        # prior RAG if ever left) are dynamic per customer/lead/turn and must be AFTER
+                        # history so the stable prefix remains byte-identical across turns and across
+                        # customers (cross-customer cache sharing). This guarantees the provider-bound
+                        # prompt starts with the identical stable head.
+                        _stable_sys = []
+                        _other_sys = []
+                        for m in items:
+                            if getattr(m, "role", "") == "system":
+                                if getattr(m, "id", "") == "lk.agent_task.instructions":
+                                    _stable_sys.append(m)
+                                else:
+                                    _other_sys.append(m)
+                        # If no explicit instructions id found (older contexts), treat first system as stable
+                        if not _stable_sys:
+                            _all_sys = [m for m in items if getattr(m, "role", "") == "system"]
+                            if _all_sys:
+                                _stable_sys = [_all_sys[0]]
+                                _other_sys = _all_sys[1:]
                         dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
-                        kept_dialogue = dialogue_items[-_history_limit:]
-                        target_ctx.items = system_items + kept_dialogue
+                        if len(items) > _trim_threshold:
+                            kept_dialogue = dialogue_items[-_history_limit:]
+                        else:
+                            kept_dialogue = dialogue_items
+                        # Order: stable behavioral → history (dynamic) → other dynamic system (prior_memory, lead_data)
+                        # RAG for THIS turn is injected later with created_at just before final user, so it lands after history as well.
+                        # For cache: stable at beginning, identical across turns/customers; dynamic after.
+                        if len(items) > _trim_threshold or _other_sys:
+                            target_ctx.items = _stable_sys + kept_dialogue + _other_sys
+                        # else: no reordering needed (only stable present)
                         logger.info("🧹 Trimmed conversation context to %s messages (voice latency: %s dialogue max, preserves name via prior_memory)", len(target_ctx.items), _history_limit)
                         trimmed_count = len(dialogue_items) - len(kept_dialogue)
                         if trimmed_count > 0:
