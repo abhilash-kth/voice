@@ -791,12 +791,16 @@ def _build_conn_options():
     from livekit.agents.voice.agent_session import SessionConnectOptions
 
     _conn = APIConnectOptions(max_retry=0, retry_interval=0.5, timeout=8.0)
-    # STT/TTS also get their own bound so a provider hiccup never stacks.
+    # Keep STT on the short media timeout. Google streaming TTS can emit audio
+    # before the RPC finishes; a six-second deadline was aborting normal closing
+    # streams mid-utterance. TTS gets LiveKit's normal 10s request budget while
+    # retaining the same single retry policy for failures before audio starts.
     _media_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=6.0)
+    _tts_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
     return SessionConnectOptions(
         llm_conn_options=_conn,
         stt_conn_options=_media_conn,
-        tts_conn_options=_media_conn,
+        tts_conn_options=_tts_conn,
     )
 
 
@@ -1042,6 +1046,9 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         else:
                             first_token = now
                             self._timing["first_token"] = first_token
+                            _first_token_mono_ns = _time.perf_counter_ns()
+                            self._timing["first_token_mono"] = _first_token_mono_ns
+                            self._timing["pipeline_stage"] = "llm_first_token"
                             ttft = (first_token - self._req_start) * 1000
                             self._timing["ttft_ms"] = ttft
                             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
@@ -1058,14 +1065,14 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                                 if _hrec:
                                     self._rid = str(_hrec.get("rid", "n/a")) or "n/a"
                                 if _hrec:
-                                    _t0 = _hrec["send_ts"]; _t1 = _hrec["headers_ts"]
+                                    _t0 = _hrec["send_mono_ns"]; _t1 = _hrec["headers_mono_ns"]
                                     # pop+format stay here (µs; keeps rid
                                     # attribution race-free), only the log IO
                                     # is deferred off the chunk-1 hop
                                     self._pending_first_logs.append((0,
-                                        "⏱️ [HTTP_CHUNK] rid=%s model=%s request_start->first_stream_chunk=%.0fms response_headers->first_stream_chunk=%.0fms (first chunk = first SSE delta decoded by the SDK — application-level boundary, NOT to be quoted as provider TTFB)" % (
+                                        "⏱️ [HTTP_CHUNK] rid=%s model=%s request_start->first_stream_chunk=%.0fms response_headers->first_stream_chunk=%.0fms monotonic_ns=%d (first chunk = first SSE delta decoded by the SDK — application-level boundary, NOT to be quoted as provider TTFB)" % (
                                             _hrec.get("rid", "?"), model,
-                                            (first_token - _t0) * 1000.0, (first_token - _t1) * 1000.0,
+                                            (_first_token_mono_ns - _t0) / 1e6, (_first_token_mono_ns - _t1) / 1e6, _first_token_mono_ns,
                                         )))
                             except Exception:
                                 pass
@@ -1476,6 +1483,8 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             return getattr(self._inner, name)
 
         def chat(self, *args, **kwargs):
+            _wrapper_entry_ns = _time.perf_counter_ns()
+            _logger.info("[TURN_TRACE] stage=llm_wrapper_enter monotonic_ns=%d call_id=%s turn_id=%s generation_id=%s", _wrapper_entry_ns, self._timing.get("call_id", "N/A"), self._timing.get("turn_id", "N/A"), self._timing.get("gen", "N/A"))
             # Recovery-probe bypass (Task 2, 12:28): FallbackAdapter's
             # background health check reaches this SAME wrapped instance while
             # the fallback stream is still answering the caller. It must not be
@@ -1510,8 +1519,19 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                 # The new request will be the valid one for this turn
             
             request_start = _time.time()
+            self._timing["request_start_mono"] = _time.perf_counter_ns()
+            self._timing["pipeline_stage"] = "llm_request_start"
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
+            self._timing["llm_request_start_ts"] = request_start
+            _request_mono = self._timing["request_start_mono"]
+            _callback_enter_mono = int(self._timing.get("callback_enter_mono_ns", 0) or 0)
+            _commit_to_request = (
+                f"{(_request_mono - _callback_enter_mono) / 1_000_000:.0f}ms"
+                if _callback_enter_mono > 0 and _request_mono >= _callback_enter_mono
+                else "N/A"
+            )
+            _logger.info("⏱️ [TURN_TIMING] callback_enter_to_llm_request_start_ms=%s", _commit_to_request)
             self._timing["llm_active"] = True
             # Generation token: "gen" is the TURN/barge-in epoch — only the
             # interruption path bumps it (see [GENERATION_INVALIDATED]). The old
@@ -1534,6 +1554,9 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             # stable hash with cached=0 points at the provider/account, while
             # a changing hash is our bug and the diff names the section.
             _req_inflight = False
+            _prompt_prepare_start_ns = _time.perf_counter_ns()
+            _token_estimate_ns = _fingerprint_ns = _cache_metadata_ns = 0
+            _token_estimate_start_ns = _fingerprint_start_ns = _cache_metadata_start_ns = 0
             try:
                 _cc = kwargs.get("chat_ctx")
                 if _cc is None and args:
@@ -1605,6 +1628,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     # builder can merge it into the caller's immediate
                     # continuation if the request is superseded pre-output.
                     self._timing["req_user_text"] = _user_last_text[:600]
+                    _token_estimate_start_ns = _time.perf_counter_ns()
                     _tools_chars = sum(len(str(getattr(_t0, "name", _t0))) + len(str(getattr(_t0, "parameters", ""))) for _t0 in _tools)
                     _head_chars = sum(len(_h) for _h in _head)
                     _sha = _hl.sha256(("\x1f".join(_head) + "#tools=" + repr(_tools_chars)).encode("utf-8", "ignore")).hexdigest()[:12]
@@ -1619,6 +1643,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _total_chars = _head_chars + _hist_chars + _rag_chars + _user_last_chars
                     _dyn_rag_est_t = int(_rag_chars / 4.0)
                     _total_est_t = int(_total_chars / 4.0)
+                    _token_estimate_ns = _time.perf_counter_ns() - _token_estimate_start_ns
                     _logger.info(
                         "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d tokens: stable_prompt=%d dynamic_rag=%d total_input_est=%d | sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc question_is_last=%s | tools_meta=%dc | head_sha=%s",
                         _total_chars, _total_est_t, _head_est_t, _dyn_rag_est_t, _total_est_t, _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, "yes" if _user_last_is_final else "NO", _tools_chars, _sha,
@@ -1637,11 +1662,13 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     _last_m = _msgs[-1] if _msgs else None
                     _dbg_prov = self._prov_info.get("provider", "") or self._timing.get("llm_provider", "") or "unknown"
                     _dbg_model = self._prov_info.get("model_id", "") or getattr(self._inner, "model", "unknown") or "unknown"
+                    _cache_metadata_start_ns = _time.perf_counter_ns()
                     try:
                         from app.llm_catalog import get_prompt_cache_capability as _gcc_dbg
                         _dbg_cap = _gcc_dbg(str(_dbg_prov), str(_dbg_model)).get("mode", "?")
                     except Exception:
                         _dbg_cap = "?"
+                    _cache_metadata_ns = _time.perf_counter_ns() - _cache_metadata_start_ns
                     _logger.info(
                         "\U0001f52c [LLM_INPUT_DEBUG] generation=%s provider=%s model=%s capability=%s messages_count=%d last_message_role=%s last_message_preview='%s' current_user_turn='%s' user_messages=%d question_is_last=%s rag_present=%s rag_chars=%d ack_mode=%s incomplete_turn=%s",
                         _gen, _dbg_prov, _dbg_model, _dbg_cap, len(_msgs),
@@ -1660,6 +1687,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     # full copy/transform of ~10k chars). Use the already-parsed
                     # _msgs list directly — same data, zero extra serialization.
                     # No cache logic changed, only diagnostic path.
+                    _fingerprint_start_ns = _time.perf_counter_ns()
                     try:
                         _prov_msgs = _msgs  # use existing parsed messages, not to_provider_format
                         _prov_role_seq = "?"
@@ -1689,6 +1717,8 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                         )
                     except Exception as _pb_e:
                         _logger.debug(f"[PROVIDER_BOUND] fingerprint failed: {_pb_e!r}")
+                    finally:
+                        _fingerprint_ns = _time.perf_counter_ns() - _fingerprint_start_ns
                     # inflight gauge for spike forensics (Task 5)
                     self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
                     # Per-request ownership (12:28): this used to be the shared
@@ -1706,6 +1736,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
                     self._timing["prompt_acct_warned"] = True
                     _logger.warning("[PROMPT] section accounting failed (once): %r", _pe)
                 _logger.debug(f"[PROMPT] section accounting skipped: {_pe!r}")
+            _prompt_prepare_ns = _time.perf_counter_ns() - _prompt_prepare_start_ns
             # Reset per-request metrics but preserve provider/model and aggregated billing
             # Preserve aggregated and is_closing
             preserved_aggregated = {
@@ -1738,7 +1769,11 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, in
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
             _logger.info(f"LLM REQUEST START [LLM_RESPONSE_STARTED] provider={prov} model={model} base_url={base_url} llm_instance={getattr(self, '_inst_label', 'single/1')} request_start={request_start} — a new line here on a DIFFERENT model+instance = LiveKit FallbackAdapter switching (mechanism B), NOT an SDK retry; duplicates on the same instance = invalidated-generation overlap (mechanism C)")
             try:
+                _request_build_start_ns = _time.perf_counter_ns()
                 inner_result = self._inner.chat(*args, **kwargs)
+                _request_build_ns = _time.perf_counter_ns() - _request_build_start_ns
+                _wrapper_total_ns = _time.perf_counter_ns() - _wrapper_entry_ns
+                _logger.info("[LLM_LOCAL_TIMING] prompt_prepare_ms=%.3f token_estimate_ms=%.3f fingerprint_ms=%.3f cache_metadata_ms=%.3f request_build_ms=%.3f wrapper_total_ms=%.3f call_id=%s turn_id=%s generation_id=%s", _prompt_prepare_ns/1e6, _token_estimate_ns/1e6, _fingerprint_ns/1e6, _cache_metadata_ns/1e6, _request_build_ns/1e6, _wrapper_total_ns/1e6, self._timing.get("call_id", "N/A"), self._timing.get("turn_id", "N/A"), _gen)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
                 return TimingChatCM(inner_result, self._timing, self._prov_info, request_start, _gen, seq=_seq, inst=getattr(self, '_inst_label', 'single/1'), counted=_req_inflight)
             except Exception as e:
@@ -1901,13 +1936,11 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # after 0.25s + 1 word) made the agent jump in on every breath and read as
     # robotic; worse, every false barge-in pushes a speech handle into LiveKit's
     # interrupt path — where the repeated 5s timeout errors came from.
-    # min_delay: how long the session waits after the last STT final before it
-    # assumes the user is done. The STT final itself already implies ~200ms of
-    # detected silence (Deepgram endpointing_ms=200), so 0.25s here keeps the
-    # total speech_end->LLM start near 450-550ms without cutting off natural
-    # Hindi mid-sentence pauses (0.1s would). Bump via VOICE_ENDPOINTING_MIN if
-    # callers get cut off; drop toward 0.15 only if the agent feels slow.
-    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.25"))
+    # The STT final already follows Deepgram's 200ms silence endpoint. Keep a
+    # further 200ms confirmation window for natural pauses, while avoiding the
+    # previous 250ms fixed floor on every completed turn. This does not change
+    # Deepgram configuration or interruption/continuation handling.
+    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.20"))
     max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
     # Interruption = the human barge-in contract:
     #  * min_words=2 is the semantic gate — a lone "haan/hmm/ok" backchannel or a
@@ -2004,6 +2037,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), "
         f"preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, "
         f"endpointing={min_delay}/{max_delay}, "
+        "stt_timeout=6.0s tts_timeout=10.0s, "
         f"interruption={'on' if allow_interruptions else 'off'} "
         f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words}, "
         f"false_resume={false_interruption_timeout}s)"
@@ -2447,33 +2481,165 @@ async def _entrypoint_body(ctx, setup_complete):
         "failed_requests": 0,
         "all_requests": [],  # list of {input, cached, output, success, ttft, gen_time, provider, model, is_closing}
         "is_closing": False,  # True when deterministic closing in progress
+        "call_id": str(getattr(ctx.room, "name", "unknown")),
+        "turn_id": 0,
+        "stt_final_mono_ns": 0,
+        "callback_enter_mono_ns": 0,
+        "callback_complete_mono_ns": 0,
     }
 
-    # Task 5 (2026-09-24): event-loop blocking detector. A provider spike
-    # (TTFT 3344ms) is only "network" if the worker loop was NOT saturated at
-    # that moment. Heartbeat every 50ms; drift >180ms means the loop itself
-    # delayed stream callbacks (TTS bursts, barge-in cascade) and we log it so
-    # [TTFT_SPIKE_CONTEXT] can be cross-read against [LOOP_LAG] timestamps.
+    _sync_callback_records = []
+    _turn_task_wait_samples = []
+    _loop_stack_samples = []
+    _loop_heartbeat = {"ns": time.monotonic_ns(), "active": False}
+    _loop_sampler_stop = threading.Event()
+    # Separate call-time loop stalls from worker startup/idle/shutdown stalls.
     async def _loop_lag_watch(_tt=turn_timing):
         import asyncio as _aio
         _last = time.perf_counter()
-        _n = 0
+        _active, _background = [], []
+        _counts = {"active": [0, 0, 0], "background": [0, 0, 0]}
+        _maxima = {"active": 0.0, "background": 0.0}
         try:
             while True:
                 await _aio.sleep(0.05)
                 _now = time.perf_counter()
-                _drift = (_now - _last - 0.05) * 1000.0
+                _drift = max(0.0, (_now - _last - 0.05) * 1000.0)
                 _last = _now
-                if _drift > 180.0:
-                    _n += 1
-                    if _n <= 20 or _n % 20 == 0:
-                        logging.getLogger("voice-agent-saas-worker").warning(
-                            "🐌 [LOOP_LAG] event loop blocked ~%.0fms (lag#%d) — stream/TTFT timing during this window is worker-side, not provider",
-                            _drift, _n,
-                        )
+                _sample_ns = time.monotonic_ns()
+                _room_obj = getattr(ctx, "room", None)
+                _active_call = bool(getattr(_room_obj, "remote_participants", {}))
+                _loop_heartbeat["ns"] = time.monotonic_ns()
+                _loop_heartbeat["active"] = _active_call
+                # Read-only stack samples for all live tasks during calls. At the
+                # end-of-turn metric, samples can be restricted to the precise
+                # decision->callback window and grouped by task/frame.
+                if _active_call:
+                    for _task in _aio.all_tasks():
+                        if _task is asyncio.current_task() or _task.done():
+                            continue
+                        _frames = _task.get_stack(limit=8)
+                        _stack = " <- ".join(
+                            f"{os.path.basename(_frame.f_code.co_filename)}:{_frame.f_lineno}:{_frame.f_code.co_name}"
+                            for _frame in _frames[-4:]
+                        ) or "stack_unavailable"
+                        _turn_task_wait_samples.append((_sample_ns, _task.get_name(), _stack))
+                    if len(_turn_task_wait_samples) > 8192:
+                        del _turn_task_wait_samples[:4096]
+                _kind = "active" if _active_call else "background"
+                _samples = _active if _active_call else _background
+                _samples.append(_drift)
+                if len(_samples) > 1200:
+                    del _samples[:600]
+                _maxima[_kind] = max(_maxima[_kind], _drift)
+                _counts[_kind][0] += int(_drift > 100.0)
+                _counts[_kind][1] += int(_drift > 200.0)
+                _counts[_kind][2] += int(_drift > 500.0)
+                if _drift > 100.0:
+                    _sorted = sorted(_samples)
+                    _p95 = _sorted[min(len(_sorted) - 1, int((len(_sorted) - 1) * 0.95))]
+                    _room = getattr(_room_obj, "name", "")
+                    _tag = "ACTIVE_CALL_LOOP_LAG" if _active_call else "BACKGROUND_LOOP_LAG"
+                    logging.getLogger("voice-agent-saas-worker").warning(
+                        "[%s] monotonic_ns=%d duration_ms=%.0f room=%s turn=%s generation=%s agent_state=%s pipeline_stage=%s max_ms=%.0f p95_ms=%.0f counts_gt100=%d counts_gt200=%d counts_gt500=%d",
+                        _tag, time.monotonic_ns(), _drift, _room,
+                        _tt.get("turn_id", "N/A"), _tt.get("gen", "N/A"),
+                        _tt.get("agent_state", "N/A"), _tt.get("pipeline_stage", "N/A"),
+                        _maxima[_kind], _p95, *_counts[_kind],
+                    )
         except asyncio.CancelledError:
             return
+        finally:
+            for _kind, _samples in (("active", _active), ("background", _background)):
+                if _samples:
+                    _sorted = sorted(_samples)
+                    _p95 = _sorted[min(len(_sorted) - 1, int((len(_sorted) - 1) * 0.95))]
+                    _tag = "ACTIVE_CALL_LOOP_STATS" if _kind == "active" else "BACKGROUND_LOOP_STATS"
+                    logging.getLogger("voice-agent-saas-worker").info(
+                        "[%s] room=%s max_ms=%.0f p95_ms=%.0f counts_gt100=%d counts_gt200=%d counts_gt500=%d",
+                        _tag, getattr(getattr(ctx, "room", None), "name", ""), _maxima[_kind], _p95,
+                        *_counts[_kind],
+                    )
     turn_timing["_loop_lag_task"] = asyncio.create_task(_loop_lag_watch())
+
+    def _sample_blocked_loop_stack(_loop_thread_id):
+        _stall_start_ns = 0
+        _last_stack_ns = 0
+        _latest_stack = ""
+        _stall_start_logged = False
+        while not _loop_sampler_stop.wait(0.025):
+            if not _loop_heartbeat["active"]:
+                continue
+            _now_ns = time.monotonic_ns()
+            _heartbeat_ns = int(_loop_heartbeat["ns"])
+            if _now_ns - _heartbeat_ns <= 100_000_000:
+                if _stall_start_ns:
+                    _end_ns = _heartbeat_ns
+                    _duration_ms = max(0.0, (_end_ns - _stall_start_ns) / 1_000_000)
+                    logger.warning("[CALLBACK_BLOCK_END] task=N/A active_frame=%s monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s state=%s stack=%s", _latest_stack.split(" <- ", 1)[0], _end_ns, _duration_ms, getattr(ctx.room, "name", ""), turn_timing.get("turn_id", "N/A"), turn_timing.get("gen", "N/A"), turn_timing.get("agent_state", "N/A"), _latest_stack)
+                    _loop_stack_samples.append((_stall_start_ns, _end_ns, _latest_stack))
+                    if len(_loop_stack_samples) > 1024:
+                        del _loop_stack_samples[:512]
+                    _stall_start_ns = 0
+                    _latest_stack = ""
+                    _stall_start_logged = False
+                continue
+            if not _stall_start_ns:
+                _stall_start_ns = _heartbeat_ns
+                _last_stack_ns = 0
+                _stall_start_logged = False
+            if _now_ns - _last_stack_ns < 50_000_000:
+                continue
+            _last_stack_ns = _now_ns
+            _frame = sys._current_frames().get(_loop_thread_id)
+            _frames = []
+            while _frame is not None:
+                _frames.append(f"{os.path.basename(_frame.f_code.co_filename)}:{_frame.f_lineno}:{_frame.f_code.co_name}")
+                _frame = _frame.f_back
+            _latest_stack = " <- ".join(_frames[:12]) or "stack_unavailable"
+            if len(_loop_stack_samples) > 1024:
+                del _loop_stack_samples[:512]
+            if not _stall_start_logged:
+                logger.warning("[CALLBACK_BLOCK_START] task=N/A active_frame=%s monotonic_ns=%d room=%s turn=%s generation=%s state=%s stack=%s", _latest_stack.split(" <- ", 1)[0], _stall_start_ns, getattr(ctx.room, "name", ""), turn_timing.get("turn_id", "N/A"), turn_timing.get("gen", "N/A"), turn_timing.get("agent_state", "N/A"), _latest_stack)
+                _stall_start_logged = True
+
+    _loop_thread_id = threading.get_ident()
+    _loop_stack_sampler = threading.Thread(target=_sample_blocked_loop_stack, args=(_loop_thread_id,), name="voice-loop-stack-sampler", daemon=True)
+    _loop_stack_sampler.start()
+
+    def _instrument_sync_callback(_name, _callback):
+        _code = getattr(_callback, "__code__", None)
+        _file = getattr(_code, "co_filename", "unknown")
+        _line = getattr(_code, "co_firstlineno", 0)
+        def _wrapped(*args, **kwargs):
+            _start_ns = time.monotonic_ns()
+            _task = asyncio.current_task()
+            _task_name = _task.get_name() if _task else "sync-event-callback"
+            try:
+                return _callback(*args, **kwargs)
+            finally:
+                _end_ns = time.monotonic_ns()
+                _record = {
+                    "name": _name, "task": _task_name, "start_ns": _start_ns, "end_ns": _end_ns,
+                    "duration_ms": (_end_ns - _start_ns) / 1_000_000,
+                    "file": _file, "line": _line, "turn": turn_timing.get("turn_id", "N/A"),
+                    "generation": turn_timing.get("gen", "N/A"), "room": getattr(ctx.room, "name", ""),
+                    "state": turn_timing.get("agent_state", "N/A"), "reported": False,
+                }
+                _sync_callback_records.append(_record)
+                if len(_sync_callback_records) > 1024:
+                    del _sync_callback_records[:512]
+                if _record["duration_ms"] >= 100.0:
+                    logger.warning("[CALLBACK_BLOCK_START] callback=%s task=%s monotonic_ns=%d room=%s turn=%s generation=%s state=%s file=%s line=%s", _name, _task_name, _start_ns, _record["room"], _record["turn"], _record["generation"], _record["state"], _file, _line)
+                    logger.warning("[CALLBACK_BLOCK_END] callback=%s task=%s monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s state=%s file=%s line=%s", _name, _task_name, _end_ns, _record["duration_ms"], _record["room"], _record["turn"], _record["generation"], _record["state"], _file, _line)
+                    _record["reported"] = True
+
+        return _wrapped
+    if os.getenv("VOICE_ASYNCIO_SLOW_CALLBACK_DIAGNOSTICS", "0").strip().lower() in ("1", "true", "yes"):
+        _diag_loop = asyncio.get_running_loop()
+        _diag_loop.set_debug(True)
+        _diag_loop.slow_callback_duration = 0.1
+        logger.warning("[ASYNCIO_SLOW_CALLBACK_DIAGNOSTICS] enabled threshold_ms=100 room=%s", getattr(ctx.room, "name", ""))
     
 
     # ------------------------------------------------------------------
@@ -2485,6 +2651,73 @@ async def _entrypoint_body(ctx, setup_complete):
         session = build_announcement_session(cfg)
     else:
         session = await build_assistant_session(cfg, turn_timing_ref=turn_timing)
+
+    # LiveKit 1.8.x emits EOUMetrics after the user-turn task. Its end_of_utterance_delay
+    # and transcription_delay let us recover final-to-turn-decision time without
+    # patching LiveKit internals: EOU delay minus transcription delay.
+    def _on_turn_metrics(ev):
+        _metrics = getattr(ev, "metrics", None)
+        if type(_metrics).__name__ != "EOUMetrics":
+            return
+        _eou = getattr(_metrics, "end_of_utterance_delay", None)
+        _trans = getattr(_metrics, "transcription_delay", None)
+        _hook = getattr(_metrics, "on_user_turn_completed_delay", None)
+        _final_ns = int(turn_timing.get("stt_final_mono_ns", 0) or 0)
+        _entered_ns = int(turn_timing.get("callback_enter_mono_ns", 0) or 0)
+        _eou_to_enter_ms = None
+        _final_to_eou_ms = None
+        if isinstance(_eou, (int, float)) and isinstance(_trans, (int, float)):
+            _final_to_eou_ms = max(0.0, (_eou - _trans) * 1000.0)
+            if _final_ns and _entered_ns:
+                _entered_delta = (_entered_ns - _final_ns) / 1_000_000
+                _eou_to_enter_ms = _entered_delta - _final_to_eou_ms
+        _decision_ns = (
+            _final_ns + int(_final_to_eou_ms * 1_000_000)
+            if _final_ns and _final_to_eou_ms is not None
+            else 0
+        )
+        if _decision_ns and _entered_ns:
+            _window_tasks = {}
+            for _sample_time, _task_name, _stack in _turn_task_wait_samples:
+                if _decision_ns <= _sample_time <= _entered_ns:
+                    _key = (_task_name, _stack)
+                    _span = _window_tasks.setdefault(_key, [_sample_time, _sample_time, 0])
+                    _span[1] = _sample_time
+                    _span[2] += 1
+            for (_task_name, _stack), (_first_ns, _last_ns, _samples) in _window_tasks.items():
+                logger.info("[ASYNC_TASK_WINDOW_SAMPLE] task=%s first_monotonic_ns=%d last_monotonic_ns=%d samples=%d room=%s turn=%s generation=%s stack=%s", _task_name, _first_ns, _last_ns, _samples, turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"), _stack)
+            for _block_start_ns, _block_end_ns, _block_stack in _loop_stack_samples:
+                if _block_start_ns < _entered_ns and _block_end_ns > _decision_ns:
+                    logger.warning("[TURN_WINDOW_BLOCK_STACK] start_monotonic_ns=%d end_monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s stack=%s", _block_start_ns, _block_end_ns, (_block_end_ns - _block_start_ns) / 1_000_000, turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"), _block_stack)
+            for _record in _sync_callback_records:
+                if _record["start_ns"] < _entered_ns and _record["end_ns"] > _decision_ns and not _record["reported"]:
+                    logger.warning("[CALLBACK_BLOCK_START] callback=%s task=%s monotonic_ns=%d room=%s turn=%s generation=%s state=%s file=%s line=%d", _record["name"], _record["task"], _record["start_ns"], _record["room"], _record["turn"], _record["generation"], _record["state"], _record["file"], _record["line"])
+                    logger.warning("[CALLBACK_BLOCK_END] callback=%s task=%s monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s state=%s file=%s line=%d", _record["name"], _record["task"], _record["end_ns"], _record["duration_ms"], _record["room"], _record["turn"], _record["generation"], _record["state"], _record["file"], _record["line"])
+                    _record["reported"] = True
+        logger.info(
+            "[TURN_TRACE] stage=turn_detection_decision monotonic_ns=%s source=%s call_id=%s turn_id=%s generation_id=%s speech_id=%s",
+            _decision_ns if _decision_ns else "N/A",
+            "derived_from_livekit_eou_metrics" if _decision_ns else "unavailable",
+            turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"),
+            getattr(_metrics, "speech_id", "N/A"),
+        )
+        logger.info(
+            "[ASYNC_TASK_DELAY] task=AgentActivity._user_turn_completed_task call_id=%s turn_id=%s schedule_to_start_ms=N/A turn_decision_to_callback_enter_ms=%s source=LiveKit_task_creation_is_internal",
+            turn_timing.get("call_id"), turn_timing.get("turn_id"),
+            f"{_eou_to_enter_ms:.1f}" if _eou_to_enter_ms is not None else "N/A",
+        )
+        logger.info(
+            "[LIVEKIT_EOU_METRICS] call_id=%s turn_id=%s generation_id=%s speech_id=%s final_to_turn_decision_ms=%s turn_decision_to_callback_enter_ms=%s callback_hook_ms=%s callback_schedule_to_start_ms=N/A source=LiveKit_internal_schedule_not_public",
+            turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"),
+            getattr(_metrics, "speech_id", "N/A"),
+            f"{_final_to_eou_ms:.1f}" if _final_to_eou_ms is not None else "N/A",
+            f"{_eou_to_enter_ms:.1f}" if _eou_to_enter_ms is not None else "N/A",
+            f"{float(_hook) * 1000:.1f}" if isinstance(_hook, (int, float)) else "N/A",
+        )
+    try:
+        session.on("metrics_collected", _on_turn_metrics)
+    except Exception as _metric_hook_error:
+        logger.warning("Could not attach LiveKit EOU metric listener: %s", _metric_hook_error)
 
     # ------------------------------------------------------------------
     # RAG precomputation (latency): the session AWAITs on_user_turn_completed
@@ -2679,6 +2912,9 @@ async def _entrypoint_body(ctx, setup_complete):
                 _now = time.time()
                 if _now - _last_tx_ts[0] > 0.7:
                     _last_tx_ts[0] = _now
+                    turn_timing["stt_final_ts"] = 0.0
+                    turn_timing["turn_commit_ts"] = 0.0
+                    turn_timing["llm_request_start_ts"] = 0.0
                     logger.info("🎙️ [USER_SPEECH_STARTED] first transcript: '%s'", text.strip()[:60])
             else:
                 _last_tx_ts[0] = time.time()
@@ -2696,7 +2932,21 @@ async def _entrypoint_body(ctx, setup_complete):
             # anyway (STT endpointing).
             if is_final and text.strip():
                 logger.info("📝 [USER_TRANSCRIPT_FINAL] '%s'", text.strip()[:80])
-                turn_timing["stt_final_ts"] = time.time()
+                _final_ts = time.time()
+                turn_timing["stt_final_ts"] = _final_ts
+                turn_timing["stt_final_mono_ns"] = time.monotonic_ns()
+                turn_timing["turn_id"] = int(turn_timing.get("turn_id", 0)) + 1
+                turn_timing["pipeline_stage"] = "stt_final"
+                logger.info("[TURN_TRACE] stage=stt_final monotonic_ns=%d call_id=%s room=%s turn_id=%s generation_id=%s", turn_timing["stt_final_mono_ns"], turn_timing.get("call_id"), getattr(ctx.room, "name", ""), turn_timing["turn_id"], turn_timing.get("gen", 0))
+                # STT final does not expose the acoustic speech-end timestamp.
+                # Keep this stage unavailable rather than reporting endpointing
+                # configuration as though it were a measured duration.
+                turn_timing["speech_end"] = 0.0
+                logger.info("⏱️ [TURN_TIMING] speech_end_to_stt_final_ms=N/A source=timestamp_unavailable")
+                # A newer final supersedes any uncommitted final. Avoid
+                # carrying commit/request timestamps across that boundary.
+                turn_timing["turn_commit_ts"] = 0.0
+                turn_timing["llm_request_start_ts"] = 0.0
                 # [PREEMPTIVE] would_cancel (Task 3, 2026-09-24): this FINAL
                 # arrived while the agent was mid-speech/thinking. Under naive
                 # speculative generation each one = a speculative request to
@@ -2721,7 +2971,7 @@ async def _entrypoint_body(ctx, setup_complete):
         attached_events = []
         for _ev_name in ("user_input_transcribed",):
             try:
-                session.on(_ev_name, _on_transcription)
+                session.on(_ev_name, _instrument_sync_callback("user_input_transcribed", _on_transcription))
                 attached_events.append(_ev_name)
             except Exception:
                 continue
@@ -2769,6 +3019,7 @@ async def _entrypoint_body(ctx, setup_complete):
     @ctx.room.on("disconnected")
     def _on_room_disconnected(*_):
         logger.info("Room disconnected event received")
+        _loop_sampler_stop.set()
         _ll = turn_timing.pop("_loop_lag_task", None)
         if _ll is not None:
             try:
@@ -3170,18 +3421,12 @@ async def _entrypoint_body(ctx, setup_complete):
             turn_timing["input_tokens"] = 0
             turn_timing["cached_input_tokens"] = 0
             turn_timing["output_tokens"] = 0
-            # Fresh speech_end and stt_final for this turn
-            # Deepgram does not expose the true VAD end time on the final event;
-            # all speech_end->X numbers below are estimates from this point.
-            turn_timing["speech_end"] = now - 0.25  # ESTIMATE: speech ended ~250ms before final
-            turn_timing["stt_final"] = now
-            # Calculate speech_end->STT_final
-            if turn_timing["speech_end"] > 0:
-                speech_to_stt = (now - turn_timing["speech_end"]) * 1000
-                logger.info(f"⏱️ TIMING speech_end->STT_final: {speech_to_stt:.0f}ms (text: {text[:50]}, words: {words_in_text})")
-                # Flag if exceeds 400ms target
-                if speech_to_stt > 600:
-                    logger.warning(f"🐢 Slow STT final: speech_end->STT_final {speech_to_stt:.0f}ms exceeds 400ms target (possible Deepgram delay)")
+            # Fresh timing values for this turn. Deepgram does not expose the
+            # acoustic speech-end timestamp, so speech_end remains unavailable.
+            _final_ts = float(turn_timing.get("stt_final_ts", 0.0) or 0.0)
+            turn_timing["speech_end"] = 0.0
+            turn_timing["stt_final"] = _final_ts
+            turn_timing["pipeline_stage"] = "turn_detected"
             # User turn committed — start a fresh silence window NOW rather than
             # only cancelling: if the agent then replies, the state transitions
             # cancel/re-arm this timer anyway; if the reply wedges, the call
@@ -3457,6 +3702,9 @@ async def _entrypoint_body(ctx, setup_complete):
                         turn_timing["speech_end"] = 0.0
                         turn_timing["stt_final"] = 0.0
                         turn_timing["turn_detected"] = 0.0
+                        turn_timing["stt_final_mono"] = 0.0
+                        turn_timing["turn_commit_mono"] = 0.0
+                        turn_timing["pipeline_stage"] = "user_speech"
                         turn_timing["llm_start"] = 0.0
                         turn_timing["request_start"] = 0.0
                         turn_timing["first_token"] = 0.0
@@ -3471,10 +3719,11 @@ async def _entrypoint_body(ctx, setup_complete):
             _real_note = f"REAL first audio at {_real_audio_ms:.0f}ms after speech_end (tts_node probe)" if _real_audio_ms else "no audio frame reached the tts_node this turn (silent turn or interrupted before speech)"
             logger.info(f"🗣️ TTS (LLM complete): {cleaned} (transcript-only event; {_real_note})")
 
-    session.on("conversation_item_added", on_item_added)
+    session.on("conversation_item_added", _instrument_sync_callback("conversation_item_added", on_item_added))
 
     def _on_state(ev):
         turn_timing["agent_state"] = ev.new_state
+        turn_timing["pipeline_stage"] = f"agent_state_{ev.new_state}"
         now = time.time()
         prev = state_tracker["state"]
         elapsed = now - state_tracker["since"]
@@ -3491,11 +3740,14 @@ async def _entrypoint_body(ctx, setup_complete):
             # Turn detected: listening -> thinking = endpointing triggered
             # This is speech_end + VAD + endpointing + STT final -> LLM request path
             turn_timing["turn_detected"] = now
-            if turn_timing["stt_final"] > 0:
+            turn_timing["turn_detected_mono"] = time.monotonic_ns()
+            if turn_timing["stt_final"] > 0 and now >= turn_timing["stt_final"]:
                 stt_to_turn = (now - turn_timing["stt_final"]) * 1000
                 logger.info(f"⏱️ TIMING STT_final->turn_detected (endpointing): {stt_to_turn:.0f}ms")
                 if stt_to_turn > 150:
                     logger.warning(f"🐢 Slow endpointing: STT_final->turn {stt_to_turn:.0f}ms exceeds 100ms target")
+            else:
+                logger.info("⏱️ TIMING STT_final->turn_detected (endpointing): N/A")
             if turn_timing["speech_end"] > 0:
                 speech_to_turn = (now - turn_timing["speech_end"]) * 1000
                 logger.info(f"⏱️ TIMING speech_end->turn_detected (VAD+STT+endpointing): {speech_to_turn:.0f}ms")
@@ -3503,9 +3755,11 @@ async def _entrypoint_body(ctx, setup_complete):
                     logger.warning(f"🐢 Slow turn detection: speech_end->turn {speech_to_turn:.0f}ms exceeds 500ms target (outlier!)")
             # Also log as LLM start (turn completed -> LLM request)
             turn_timing["llm_start"] = now
-            if turn_timing["stt_final"] > 0:
+            if turn_timing["stt_final"] > 0 and now >= turn_timing["stt_final"]:
                 stt_to_llm = (now - turn_timing["stt_final"]) * 1000
                 logger.info(f"⏱️ TIMING STT_final->LLM_start: {stt_to_llm:.0f}ms (target ≤100ms)")
+            else:
+                logger.info("⏱️ TIMING STT_final->LLM_start: N/A")
 
         elif prev == "thinking" and ev.new_state == "speaking":
             # First token -> first audio: LLM first token arrived, TTS starting
@@ -3514,6 +3768,7 @@ async def _entrypoint_body(ctx, setup_complete):
             # causing first_token->llm_complete to be calculated from speaking time, not actual first_token, leading to 6-9s delay logs
             if turn_timing.get("first_token", 0) == 0:
                 turn_timing["first_token"] = now
+                turn_timing["first_token_mono"] = time.monotonic_ns()
                 logger.info(f"ℹ️ first_token set from state thinking->speaking (no wrapper TTFT yet)")
             else:
                 # first_token already set by wrapper at actual TTFT time, preserve it
@@ -3614,6 +3869,9 @@ async def _entrypoint_body(ctx, setup_complete):
                 turn_timing["speech_end"] = 0.0
                 turn_timing["stt_final"] = 0.0
                 turn_timing["turn_detected"] = 0.0
+                turn_timing["stt_final_mono"] = 0.0
+                turn_timing["turn_commit_mono"] = 0.0
+                turn_timing["pipeline_stage"] = "user_speech"
                 turn_timing["llm_start"] = 0.0
                 turn_timing["request_start"] = 0.0
                 turn_timing["first_token"] = 0.0
@@ -3682,7 +3940,7 @@ async def _entrypoint_body(ctx, setup_complete):
         state_tracker["state"] = ev.new_state
         state_tracker["since"] = now
 
-    session.on("agent_state_changed", _on_state)
+    session.on("agent_state_changed", _instrument_sync_callback("agent_state_changed", _on_state))
 
     # ------------------------------------------------------------------
     # P4/P6 diagnostics: reply-stall probe + [SPEECH_CREATED] marker.
@@ -3813,7 +4071,7 @@ async def _entrypoint_body(ctx, setup_complete):
         except Exception:
             pass
 
-    session.on("speech_created", _on_speech_created)
+    session.on("speech_created", _instrument_sync_callback("speech_created", _on_speech_created))
 
     # Start recording if the agent has it on — but DO NOT block the call from
     # connecting. A missing/unavailable Egress service used to add ~21s before
