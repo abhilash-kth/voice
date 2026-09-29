@@ -50,6 +50,10 @@ def _import_voice_runtime() -> None:
         import livekit.plugins.sarvam  # noqa: F401
     except ImportError:
         pass  # optional plugin
+    try:
+        import livekit.plugins.cartesia  # noqa: F401
+    except ImportError:
+        pass  # optional plugin
 
 
 async def warm_voice_runtime() -> None:

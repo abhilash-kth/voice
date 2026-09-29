@@ -197,11 +197,11 @@ so nothing is silently substituted at call time.
 > already saved against it keep validating and running, and its legacy catalog ids
 > (`openrouter_gemma*`) now resolve to `google:gemini-2.5-flash-lite`.
 
-**Sarvam needs one package** in the worker venv (already in `backend/requirements.txt`):
+**Sarvam and Cartesia each need one package** in the worker venv (already in `backend/requirements.txt`):
 
 ```bash
 cd backend && source .venv/bin/activate
-pip install "livekit-plugins-sarvam>=1.4.1"
+pip install "livekit-plugins-sarvam>=1.4.1" "livekit-plugins-cartesia>=1.7.1"
 ```
 
 Add the keys you use to `backend/.env` (empty keys simply make that provider
@@ -217,16 +217,20 @@ OPENROUTER_API_KEY=        # deprecated: only for pre-existing agents
 ```
 
 **TTS** — Sarvam Bulbul v3/v2 (₹3.0 / ₹1.5 per 1,000 chars, 11 Indian languages,
-streaming), Google Chirp 3: HD (default), ElevenLabs (optional). The OpenRouter
+streaming), Google Chirp 3: HD (default), Cartesia Sonic 3 (₹4.2 per 1,000
+chars, 40+ languages, WebSocket streaming with sub-100ms first audio,
+`CARTESIA_API_KEY=`), ElevenLabs (optional). The OpenRouter
 TTS entries are deprecated and hidden.
 
 **Language + gender** are chosen in the agent form:
 
 * `language` sets the STT locale and the spoken locale (`hi` → `hi-IN`, `ta` →
   `ta-IN`, `kn` → `kn-IN`, …). `hi-Latn`/`multi` keep Hindi speech with
-  code-mix transcription.
+  code-mix transcription. Cartesia takes bare ISO-639-1 codes, so the same
+  `hi-IN` choice is passed as `hi`.
 * `gender` selects the voice — Google `female` → `Leda`, `male` → `Charon`,
-  `neutral` → `Zephyr`; Sarvam `female` → `priya`, `male` → `shubh`. An explicit
+  `neutral` → `Zephyr`; Sarvam `female` → `priya`, `male` → `shubh`;
+  Cartesia `female` → `Katie`, `male` → `Daniel`. An explicit
   `voice` in the agent's TTS config always wins.
 
 `gender` is a new column on the `Agent` table, so after deploying run:
