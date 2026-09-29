@@ -230,8 +230,9 @@ TTS entries are deprecated and hidden.
   `hi-IN` choice is passed as `hi`.
 * `gender` selects the voice — Google `female` → `Leda`, `male` → `Charon`,
   `neutral` → `Zephyr`; Sarvam `female` → `priya`, `male` → `shubh`;
-  Cartesia `female` → `Katie`, `male` → `Daniel`. An explicit
-  `voice` in the agent's TTS config always wins.
+  Cartesia `female` → `4459a9a5-…`, `male` → `cb9c954d-…` (your Cartesia
+  account's Indian-accent voices; extend the list in `backend/app/catalog.py`).
+  An explicit `voice` in the agent's TTS config always wins.
 
 `gender` is a new column on the `Agent` table, so after deploying run:
 

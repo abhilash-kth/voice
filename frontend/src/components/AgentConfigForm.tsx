@@ -450,8 +450,13 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const renderOptions = (pid: string) => {
     const p = providerByName[pid];
     if (!p?.options) return null;
+    // Non-array entries in options (e.g. cartesia's voice_labels map) are
+    // metadata for labelling, not selects — Object.entries would otherwise try
+    // to .map() a dict and crash the form.
+    const voiceLabels: Record<string, string> =
+      ((p as any).options as Record<string, unknown>)?.voice_labels as Record<string, string> || {};
     return Object.entries(p.options).map(([optName, optVals]) => {
-      if (!optVals || optVals.length === 0) return null;
+      if (!Array.isArray(optVals) || optVals.length === 0) return null;
       const current = optionVals[pid]?.[optName] || optVals[0];
       return (
         <label key={optName} className="flex flex-col gap-1 text-xs">
@@ -466,13 +471,19 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
               }))
             }
           >
-            {optVals.map((o) => (
-              <option key={o} value={o}>
-                {optName === "model" && (p as any).cost?.per_1k_in != null
-                  ? `${o} — ₹${(p as any).cost.per_1k_in}/1K in · ₹${(p as any).cost.per_1k_out}/1K out`
-                  : o}
-              </option>
-            ))}
+            {optVals.map((o) => {
+              let label = o;
+              if (optName === "model" && (p as any).cost?.per_1k_in != null) {
+                label = `${o} — ₹${(p as any).cost.per_1k_in}/1K in · ₹${(p as any).cost.per_1k_out}/1K out`;
+              } else if (optName === "voice" && voiceLabels[o]) {
+                label = `${voiceLabels[o]} (${o.slice(0, 8)}…)`;
+              }
+              return (
+                <option key={o} value={o}>
+                  {label}
+                </option>
+              );
+            })}
           </select>
         </label>
       );
