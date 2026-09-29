@@ -1215,15 +1215,14 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         # "multi"→"hi" (Sonic 3 is natively code-mixed, so Hinglish is fine).
         target_language = overrides.get("language") or locale_for_language(configured_language).split("-")[0]
         # Gender selects the voice unless one was chosen explicitly. Cartesia voice
-        # ids are UUIDs (public library ids are account-independent; cloned voice
-        # ids from the user's dashboard work too). Documented public voices:
-        # Katie (female) = the plugin's own default; Daniel (male) per Cartesia
-        # tts-models docs (2026).
+        # ids are account-specific UUIDs; the defaults below are the operator's
+        # Indian-accent voices (add more in backend/app/catalog.py options.voice).
+        # An explicit `voice` in the agent's tts config always wins.
         gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
         _default_voices = {
-            "female": "f786b574-daa5-4673-aa0c-cbe3e8534c02",  # Katie
-            "male": "47c38ca4-5f35-497b-b1a3-415245fb35e1",    # Daniel
-            "neutral": "f786b574-daa5-4673-aa0c-cbe3e8534c02", # Katie
+            "female": "4459a9a5-69d6-4680-b970-e13dc51845b6",
+            "male": "cb9c954d-bcaa-43ed-82bf-aeb5e88a3cb5",
+            "neutral": "4459a9a5-69d6-4680-b970-e13dc51845b6",
         }
         voice = overrides.get("voice") or _default_voices.get(gender, _default_voices["female"])
         kwargs = dict(
