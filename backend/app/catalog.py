@@ -164,6 +164,35 @@ CATALOG: Dict[str, Any] = {
             "cost": {"per_1k_chars": 30.00},
             "options": {"voice": ["pNInz6obpgDQGcFmaJgB", "onwK4e9ZLuTAKqWW03F9"]},
         },
+        "cartesia_sonic3": {
+            "kind": "tts",
+            "display_name": "Cartesia Sonic 3 (ultra-low-latency, 40+ languages)",
+            "provider": "cartesia",
+            "model": "sonic-3",
+            "voice": "f786b574-daa5-4673-aa0c-cbe3e8534c02",  # Katie (plugin default, female)
+            "language": "hi",
+            "tier": "paid",
+            "requires_key": True,
+            "key_env": "CARTESIA_API_KEY",
+            "cost": {"per_1k_chars": 4.2},
+            "options": {
+                "model": ["sonic-3", "sonic-2", "sonic-turbo", "sonic"],
+                # Public Cartesia voice ids (docs.cartesia.ai › tts-models › latest
+                # + livekit.plugins.cartesia default). Public-library ids are
+                # account-independent; a cloned voice from YOUR Cartesia dashboard
+                # also works — set its id in the agent's tts config as `voice`.
+                "voice": [
+                    "f786b574-daa5-4673-aa0c-cbe3e8534c02",  # Katie — female (en)
+                    "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Jacqueline — female (en-US)
+                    "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4",  # Skylar — female (en-US)
+                    "47c38ca4-5f35-497b-b1a3-415245fb35e1",  # Daniel — male (en-US)
+                ],
+                # Bare ISO-639-1 codes (Cartesia rejects full locales like hi-IN).
+                "language": ["hi", "en", "bn", "ta", "te", "kn", "ml", "gu", "mr", "pa", "es", "fr", "de", "pt", "zh", "ja"],
+                "genders": ["female", "male", "neutral"],
+            },
+            "notes": "₹4.2/1k chars (~$50/1M). WebSocket streaming with sub-100ms first audio; Sonic 3 handles Hinglish code-mix. Gender picks the voice (female→Katie, male→Daniel); the agent language drives the spoken language.",
+        },
         "openrouter_flux_tts": {
             "kind": "tts", "deprecated": True,
             "display_name": "OpenRouter Deepgram Flux TTS (FREE, English only)",
