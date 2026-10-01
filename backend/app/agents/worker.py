@@ -22,10 +22,28 @@ import sys
 import asyncio
 import logging
 import time
+import uuid
 import json
-from typing import Any, Iterator, Optional
-
+import traceback
 import aiohttp
+# Hoisted (03:08:14 log: a first-time module import tokenized for 273ms INSIDE
+# the event loop): hashlib used to be lazily imported on the first LLM request
+# of every call, right inside [PROMPT]. Import once at startup instead.
+import hashlib as _hl
+
+# Same lesson, applied to the modules whose first real import landed during an
+# active call (see the prewarm() blocks): the first STT interim used to import
+# app.rag ON THE LOOP (rag → models/pydantic chain → rank_bm25), which is the
+# tokenize/parse stall the monitor blamed on "tokenize.py"/numpy frames while
+# the import lock starved everything else. Import at process start; the
+# function-local "from app import rag" lines then cost ~200ns dict lookups.
+# Guarded so a bare `python worker.py` without the app package on sys.path
+# still starts.
+try:
+    from app import rag as _rag_preload  # noqa: F401
+except Exception:
+    pass
+from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
 # Thread limits. Cap the BLAS/math libs to 1 thread (avoids per-thread pool
@@ -88,7 +106,8 @@ try:  # noqa: E402
 except ImportError:  # package is optional (pip install livekit-plugins-sarvam)
     _sarvam_plugin = None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from app.config import setup_logging
+setup_logging()
 logger = logging.getLogger("voice-agent-saas-worker")
 
 # FIX: 314ms synchronous SSL initialization block on LiveKit agent event loop
@@ -499,6 +518,40 @@ async def warm_tts_off_loop(tts_inst: Any, timeout: float = 3.0) -> bool:
     return warmed
 
 
+# ---------------------------------------------------------------------------
+# Call-failure surfacing
+# ---------------------------------------------------------------------------
+async def _mark_call_failed(call_id: str, user_id: str, error: str) -> None:
+    """Best-effort: record WHY a call failed so the UI can surface it.
+
+    Called from the worker's failure path. The DB may not be initialized yet
+    (the failure may have happened before DB init), so init on the agent loop
+    with a short timeout and give up quietly if unavailable — the room is still
+    cut and the job still shuts down by the caller. The reason lands in the
+    call row's `usage` JSON (`{"error": ...}`), which the UI reads while the
+    caller is still in the "waiting for agent" state.
+    """
+    if not call_id:
+        return
+    global _DB_INIT_DONE
+    try:
+        if not _DB_INIT_DONE:
+            try:
+                await asyncio.wait_for(db_init(), timeout=6)
+                _DB_INIT_DONE = True
+            except Exception as e:
+                logger.warning(f"Could not init DB to mark call {call_id} failed: {e!r}")
+                return
+        await repo.update_call(call_id, {
+            "status": "failed",
+            "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+            "usage": {"error": (error or "unknown worker error")[:2000]},
+        })
+        logger.info(f"⛔ Call {call_id} marked failed with reason: {error[:300]}")
+    except Exception as e:
+        logger.warning(f"Could not mark call {call_id} failed in DB: {e!r}")
+
+
 try:
     import google.auth.crypt._cryptography_rsa
     import google.auth._service_account_info
@@ -526,20 +579,59 @@ except Exception as e:
     logger.debug(f"async_toolset prewarm failed: {e}")
 
 # Prewarm tokenize and linecache to avoid 108ms tokenize.open during loop_monitor reporting
+# FIX: previous code did linecache.clearcache() which *empties* the cache, forcing
+# the loop monitor's report formatting (traceback.format_list -> linecache.getline
+# -> updatecache -> tokenize.open) to do synchronous file I/O ON the agent event
+# loop, triggering "event loop blocked for 176ms at tokenize.py:447 open".
+# Proper prewarm populates cache OFF the event loop at import time, so later
+# formatting hits cache and avoids tokenize.open entirely.
 try:
     import linecache
     import tokenize
-    # Pre-populate linecache for common files to avoid open() during reporting
-    linecache.clearcache()
-    logger.info("🔧 Prewarmed linecache/tokenize (reduces 108ms open block during loop_monitor reporting)")
+    import sys as _sys_lc
+    # Populate cache for already-loaded modules so loop_monitor formatting
+    # doesn't need to open files on the event loop
+    _warmed = 0
+    for _mod in list(_sys_lc.modules.values()):
+        try:
+            _fname = getattr(_mod, "__file__", None)
+            if _fname and isinstance(_fname, str) and _fname.endswith(".py"):
+                linecache.getlines(_fname)
+                _warmed += 1
+                if _warmed > 300:  # cap to avoid excessive startup work
+                    break
+        except Exception:
+            continue
+    # Also ensure tokenize and linecache themselves are cached
+    try:
+        linecache.getlines(tokenize.__file__)
+        linecache.getlines(linecache.__file__)
+        linecache.getlines(traceback.__file__)
+    except Exception:
+        pass
+    logger.info(f"🔧 Prewarmed linecache/tokenize for {_warmed} files (reduces tokenize.open block during loop_monitor reporting)")
 except Exception as e:
     logger.debug(f"linecache prewarm failed: {e}")
 
 # Also patch aiohttp TCPConnector creation if needed - but http_context patch should be enough
 
 
+# Task 5 (2026-09-24): make the OpenAI SDK's own retry/error telemetry visible —
+# openai._base_client logs "Retrying request to /v1/chat/completions" (429/5xx
+# backoff) at INFO. TTFT spikes of ~2-3.5s match 1-2 backoff retries exactly;
+# without these lines we cannot distinguish provider retry from network.
+try:
+    import logging as _logging_oai
+    _logging_oai.getLogger("openai").setLevel(_logging_oai.INFO)
+    _logging_oai.getLogger("httpx").setLevel(_logging_oai.WARNING)
+except Exception:
+    pass
+
 # Latency fix globals: cache DB init and agent lookup per process
 _DB_INIT_DONE = False
+# Preemptive gate state of the current call (set by build_assistant_session;
+# read by finalize_billing's [PREEMPTIVE] summary — worker process == one call).
+_PREEMPTIVE_ENABLED_FOR_LOG = False
 _AGENT_CACHE: dict = {}  # key -> {"rec": ..., "ts": float}
 _AGENT_CACHE_TTL = 30.0
 _VAD_CACHE = None
@@ -699,197 +791,113 @@ def _build_conn_options():
     from livekit.agents.voice.agent_session import SessionConnectOptions
 
     _conn = APIConnectOptions(max_retry=0, retry_interval=0.5, timeout=8.0)
-    # STT/TTS also get their own bound so a provider hiccup never stacks.
+    # Keep STT on the short media timeout. Google streaming TTS can emit audio
+    # before the RPC finishes; a six-second deadline was aborting normal closing
+    # streams mid-utterance. TTS gets LiveKit's normal 10s request budget while
+    # retaining the same single retry policy for failures before audio starts.
     _media_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=6.0)
+    _tts_conn = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
     return SessionConnectOptions(
         llm_conn_options=_conn,
         stt_conn_options=_media_conn,
-        tts_conn_options=_media_conn,
+        tts_conn_options=_tts_conn,
     )
 
 
-def _create_tts_timing_wrapper(tts_instance, timing_dict):
-    """Wrap TTS instance to measure actual TTS pipeline timing.
-
-    Measures REAL pipeline (not LLM completion):
-    - tts_request: when text first sent to TTS (first chunk)
-    - first_tts_audio: when first audio chunk returned from TTS (REAL)
-    - first_audio: first audible audio (REAL, set by wrapper)
-    - speech_end->first_audio: REAL total latency (target ~1-1.5s)
-    - Works with any TTS provider (Google, ElevenLabs, OpenRouter) - no hardcoding
-    - Verified preemptive_tts compatibility: wrapper preserves streaming interface
-    """
-    original_synthesize = getattr(tts_instance, 'synthesize', None)
-
-    class TTSTimingWrapper:
-        def __init__(self, inner, timing):
-            self._inner = inner
-            self._timing = timing
-            try:
-                self.capabilities = getattr(inner, 'capabilities', None)
-                self._opts = getattr(inner, '_opts', None)
-                self._label = getattr(inner, '_label', None)
-            except Exception:
-                pass
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-        async def synthesize(self, text, **kwargs):
-            now = time.time()
-            if self._timing.get("first_token", 0) > 0 and self._timing.get("tts_request", 0) == 0:
-                self._timing["tts_request"] = now
-                first_token = self._timing.get("first_token", 0)
-                if first_token > 0:
-                    logger.info(f"⏱️ TIMING first_token->tts_request (text_chunk→TTS): {(now-first_token)*1000:.0f}ms (text: {text[:50]})")
-                if self._timing.get("llm_start", 0) > 0:
-                    logger.info(f"⏱️ TIMING llm_start->tts_request: {(now-self._timing['llm_start'])*1000:.0f}ms")
-            first_chunk = True
-            try:
-                async for chunk in self._inner.synthesize(text, **kwargs):
-                    if first_chunk:
-                        now_audio = time.time()
-                        if self._timing.get("first_tts_audio", 0) == 0:
-                            self._timing["first_tts_audio"] = now_audio
-                            if self._timing.get("tts_request", 0) > 0:
-                                logger.info(f"⏱️ TIMING tts_request->first_tts_audio (TTS synthesis): {(now_audio-self._timing['tts_request'])*1000:.0f}ms")
-                            if self._timing.get("first_token", 0) > 0:
-                                logger.info(f"⏱️ TIMING first_token->first_tts_audio (REAL TTS): {(now_audio-self._timing['first_token'])*1000:.0f}ms")
-                                if self._timing.get("first_audio", 0) == 0:
-                                    self._timing["first_audio"] = now_audio
-                                    logger.info(f"⏱️ TIMING first_token->first_audio (REAL TTS audio): {(now_audio-self._timing['first_token'])*1000:.0f}ms")
-                                if self._timing.get("speech_end", 0) > 0:
-                                    total = (now_audio-self._timing['speech_end'])*1000
-                                    logger.info(f"⏱️ TIMING speech_end->first_audio (REAL total): {total:.0f}ms (target ~1-1.5s)")
-                                    self._timing["last_speech_end_to_first_audio"] = total
-                                    # Full breakdown with REAL TTS
-                                    if self._timing.get("stt_final",0) and self._timing.get("turn_detected",0) and self._timing.get("llm_start",0) and self._timing.get("first_token",0):
-                                        logger.info(
-                                            f"📊 TURN BREAKDOWN (REAL): speech_end->STT_final {(self._timing['stt_final']-self._timing['speech_end'])*1000:.0f}ms | "
-                                            f"STT_final->turn {(self._timing['turn_detected']-self._timing['stt_final'])*1000:.0f}ms | "
-                                            f"turn->LLM {(self._timing['llm_start']-self._timing['turn_detected'])*1000:.0f}ms | "
-                                            f"LLM->first_token {(self._timing['first_token']-self._timing['llm_start'])*1000:.0f}ms | "
-                                            f"first_token->tts_request {(self._timing.get('tts_request',0)-self._timing['first_token'])*1000:.0f}ms | "
-                                            f"tts_request->first_audio {(now_audio-self._timing.get('tts_request',now_audio))*1000:.0f}ms | "
-                                            f"TOTAL {total:.0f}ms"
-                                        )
-                                    # Reset for next turn after REAL audio
-                                    self._timing["speech_end"] = 0.0
-                                    self._timing["stt_final"] = 0.0
-                                    self._timing["turn_detected"] = 0.0
-                                    self._timing["llm_start"] = 0.0
-                                    self._timing["first_token"] = 0.0
-                                    self._timing["tts_request"] = 0.0
-                                    self._timing["first_tts_audio"] = 0.0
-                                    self._timing["llm_complete"] = 0.0
-                                    self._timing["first_audio"] = 0.0
-                        first_chunk = False
-                    yield chunk
-            except Exception as e:
-                logger.warning(f"TTS synthesize wrapper error: {e}")
-                raise
-
-        def stream(self, **kwargs):
-            inner_stream = self._inner.stream(**kwargs)
-            timing = self._timing
-
-            class StreamWrapper:
-                def __init__(self, inner_stream, timing):
-                    self._inner_stream = inner_stream
-                    self._timing = timing
-                    self._first_chunk = True
-
-                def __getattr__(self, name):
-                    return getattr(self._inner_stream, name)
-
-                async def __aenter__(self):
-                    await self._inner_stream.__aenter__()
-                    return self
-
-                async def __aexit__(self, *args):
-                    return await self._inner_stream.__aexit__(*args)
-
-                def push_text(self, text):
-                    now = time.time()
-                    if timing.get("first_token", 0) > 0 and timing.get("tts_request", 0) == 0 and text and text.strip():
-                        timing["tts_request"] = now
-                        logger.info(f"⏱️ TIMING first_token->tts_request (stream push): {(now-timing['first_token'])*1000:.0f}ms (chunk: {text[:50]})")
-                    return self._inner_stream.push_text(text)
-
-                async def __aiter__(self):
-                    async for chunk in self._inner_stream:
-                        if self._first_chunk:
-                            now_audio = time.time()
-                            if timing.get("first_tts_audio", 0) == 0:
-                                timing["first_tts_audio"] = now_audio
-                                if timing.get("tts_request", 0) > 0:
-                                    logger.info(f"⏱️ TIMING tts_request->first_tts_audio (stream): {(now_audio-timing['tts_request'])*1000:.0f}ms")
-                                if timing.get("first_token", 0) > 0:
-                                    logger.info(f"⏱️ TIMING first_token->first_tts_audio (REAL stream): {(now_audio-timing['first_token'])*1000:.0f}ms")
-                                    if timing.get("first_audio", 0) == 0:
-                                        timing["first_audio"] = now_audio
-                                        logger.info(f"⏱️ TIMING first_token->first_audio (REAL stream audio): {(now_audio-timing['first_token'])*1000:.0f}ms")
-                                    if timing.get("speech_end", 0) > 0:
-                                        total = (now_audio-timing['speech_end'])*1000
-                                        logger.info(f"⏱️ TIMING speech_end->first_audio (REAL stream total): {total:.0f}ms")
-                                        timing["last_speech_end_to_first_audio"] = total
-                                        if timing.get("stt_final",0) and timing.get("turn_detected",0) and timing.get("llm_start",0) and timing.get("first_token",0):
-                                            logger.info(
-                                                f"📊 TURN BREAKDOWN (REAL stream): speech_end->STT_final {(timing['stt_final']-timing['speech_end'])*1000:.0f}ms | "
-                                                f"STT_final->turn {(timing['turn_detected']-timing['stt_final'])*1000:.0f}ms | "
-                                                f"turn->LLM {(timing['llm_start']-timing['turn_detected'])*1000:.0f}ms | "
-                                                f"LLM->first_token {(timing['first_token']-timing['llm_start'])*1000:.0f}ms | "
-                                                f"first_token->tts_request {(timing.get('tts_request',0)-timing['first_token'])*1000:.0f}ms | "
-                                                f"tts_request->first_audio {(now_audio-timing.get('tts_request',now_audio))*1000:.0f}ms | "
-                                                f"TOTAL {total:.0f}ms"
-                                            )
-                                        timing["speech_end"] = 0.0
-                                        timing["stt_final"] = 0.0
-                                        timing["turn_detected"] = 0.0
-                                        timing["llm_start"] = 0.0
-                                        timing["first_token"] = 0.0
-                                        timing["tts_request"] = 0.0
-                                        timing["first_tts_audio"] = 0.0
-                                        timing["llm_complete"] = 0.0
-                                        timing["first_audio"] = 0.0
-                            self._first_chunk = False
-                        yield chunk
-
-                async def aclose(self):
-                    try:
-                        return await self._inner_stream.aclose()
-                    except Exception:
-                        pass
-
-                def close(self):
-                    try:
-                        return self._inner_stream.close()
-                    except Exception:
-                        pass
-
-            return StreamWrapper(inner_stream, timing)
-
-    return TTSTimingWrapper(tts_instance, timing_dict)
-
-
-
-def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
+def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None, inst_label=None):
     """Fixed LLM timing wrapper that properly implements async context manager protocol.
-
+    
     LiveKit's LLM.chat returns an async context manager (LLMStream), used as:
         async with llm.chat(chat_ctx=...) as stream:
             async for chunk in stream:
-
+    
     Previous buggy version made chat async def returning StreamWrapper directly,
     causing TypeError: 'coroutine' object does not support async context manager.
-
+    
     Fixed version: chat is sync def returning a custom async CM that wraps inner CM,
     and whose __aenter__ returns a TimingStreamWrapper that measures TTFT.
     """
     import asyncio as _asyncio
     import time as _time
+    import re as _re_own
     import logging as _logging
     _logger = _logging.getLogger("voice-agent-saas-worker")
+
+    def _is_recovery_probe() -> bool:
+        """True inside livekit's FallbackAdapter background health check.
+
+        1.8.2 marks a failed LLM unavailable and schedules
+        _try_recovery._recover_llm_task, which calls llm.chat() on the SAME
+        wrapped instance (a real HTTP request) while the fallback stream is
+        still answering the caller — the "primary/0-of-2 after fallback/1-of-2
+        while previous generation still active" log line. It is intentional
+        adapter behavior (lifecycle documented at the builder's
+        FallbackAdapter construction). We keep it OUT of turn accounting: no
+        generation bump, no shared timing reset, no billing record — it is
+        infrastructure cost, not the caller's conversation.
+        """
+        try:
+            _ct = _asyncio.current_task()
+            if _ct is None:
+                return False
+            return "_recover_llm_task" in repr(_ct.get_coro())
+        except Exception:
+            return False
+
+    def _rate_limit_fields(exc):
+        """(is_429, limit, used, requested, retry_after_ms) — ONLY numbers the
+        provider actually sent (headers / error body), never invented.
+        'unknown' marks what the provider did not report."""
+        try:
+            status = getattr(exc, "status_code", None)
+            msg = str(exc or "")
+            _ename = type(exc).__name__
+            is429 = (str(status) == "429") or (_ename == "RateLimitError") or (
+                "429" in msg and ("rate limit" in msg.lower() or "too many" in msg.lower())
+            )
+            if not is429:
+                return False, None, None, None, None
+            headers = {}
+            try:
+                _r = getattr(exc, "response", None)
+                if _r is not None:
+                    headers = {str(k).lower(): str(v) for k, v in dict(getattr(_r, "headers", {}) or {}).items()}
+            except Exception:
+                headers = {}
+            def _h(*names):
+                for n in names:
+                    v = headers.get(n)
+                    if v is not None:
+                        return v
+                return None
+            limit = _h("x-ratelimit-limit-tokens-minute", "x-ratelimit-limit-tokens", "x-ratelimit-limit-tokens-minute-uncached")
+            used = _h("x-ratelimit-used-tokens-minute", "x-ratelimit-remaining-tokens")
+            ra = _h("retry-after", "retry-after-tokens")
+            ra_ms = "unknown"
+            if ra is not None:
+                try:
+                    ra_ms = int(float(ra) * 1000)
+                except Exception:
+                    if str(ra).strip().lower().endswith("s"):
+                        try:
+                            ra_ms = int(float(str(ra).strip()[:-1]) * 1000)
+                        except Exception:
+                            pass
+            if limit is None:
+                m = _re_own.search(r"limit[^0-9]{0,12}([0-9]{3,})", msg, _re_own.IGNORECASE)
+                if m:
+                    limit = m.group(1)
+            if used is None:
+                m2 = _re_own.search(r"([0-9]{3,})\s*(?:tokens?\s*)?/\s*([0-9]{3,})", msg)
+                if m2:
+                    used = m2.group(1)
+            req = None
+            m3 = _re_own.search(r"request(?:ed)?[^0-9]{0,12}([0-9]{2,})", msg, _re_own.IGNORECASE)
+            if m3:
+                req = m3.group(1)
+            return True, limit or "unknown", used or "unknown", req or "unknown", ra_ms
+        except Exception:
+            return False, None, None, None, None
 
     try:
         is_fallback = hasattr(llm_instance, '_llm_instances') or hasattr(llm_instance, 'llm_instances') or 'FallbackAdapter' in str(type(llm_instance))
@@ -900,7 +908,15 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 for idx, inner_llm in enumerate(inner_list):
                     # Avoid infinite recursion: only wrap if not already wrapped
                     if 'LLMTimingWrapper' not in str(type(inner_llm)):
-                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, provider_info)
+                        _lbl = "primary/0-of-%d" % len(inner_list) if idx == 0 else "fallback/%d-of-%d" % (idx, len(inner_list))
+                        # 12:28 attribution fix: the builder stamps every LLM
+                        # instance with ITS OWN _prov_meta (agent_builder
+                        # _pm_attach). Passing the chain HEAD's provider_info to
+                        # every inner wrapper is what labelled OpenAI fallback
+                        # usage as provider=groq model=qwen3.8 — cached tokens
+                        # included, and priced it at the wrong model's rates.
+                        _info_i = getattr(inner_llm, "_prov_meta", None) or provider_info
+                        inner_list[idx] = _create_llm_timing_wrapper(inner_llm, timing_dict, _info_i, inst_label=_lbl)
                 return llm_instance
     except Exception as e:
         _logger.debug(f"Could not wrap FallbackAdapter inner LLMs: {e}")
@@ -909,75 +925,286 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
     if not original_chat:
         return llm_instance
 
-    class TimingStreamWrapper:
-        """Wraps LLMStream to measure first_token TTFT and generation_complete."""
-        def __init__(self, inner_stream, timing, prov_info, req_start):
+    class _ProbeStreamPassThrough:
+        """livekit FallbackAdapter recovery probes: pass chunks through and
+        record only the health outcome. No shared-timing writes at all — no
+        finally-block state mutation (a bare `return` in a generator's finally
+        would SWALLOW the probe's exception and falsely mark a rate-limited
+        instance healthy — so the isolation lives in this separate class, not
+        in a guard inside TimingStreamWrapper). No generation semantics, no
+        all_requests entry, no customer billing."""
+
+        def __init__(self, inner_stream, timing, prov_info, inst, req_start=None):
             self._inner_stream = inner_stream
             self._timing = timing
             self._prov_info = prov_info
-            self._req_start = req_start
-            self._first_token = True
-            self._input_tokens = 0
-            self._output_tokens = 0
-            self._cached_tokens = 0
+            self._inst = inst
+            self._req_start = req_start or _time.time()
 
         def __getattr__(self, name):
             return getattr(self._inner_stream, name)
 
         async def __aiter__(self):
             try:
+                async for _pch in self._inner_stream:
+                    yield _pch
+                _logger.info("🧪 [LLM_RECOVERY_PROBE] provider=%s model=%s instance=%s result=healthy in %dms — instance stays in rotation; probe usage NOT billed to the call (infra cost, provider-side latency win only)", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), self._inst, int((_time.time() - self._req_start) * 1000))
+            except Exception as _pex:
+                _is429, _lim, _used, _req, _ra = _rate_limit_fields(_pex)
+                self._timing["probe_failures"] = int(self._timing.get("probe_failures", 0)) + 1
+                if _is429:
+                    _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=n/a probe=yes — background health check rate-limited; instance stays unavailable, the configured fallback keeps serving (no auto-retry on this model for turn traffic)", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), _lim, _used, _req, _ra, self._inst)
+                else:
+                    _logger.info("🧪 [LLM_RECOVERY_PROBE] provider=%s model=%s instance=%s result=unhealthy (%s) — instance stays out of rotation until the next real request's all-failed pass", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), self._inst, type(_pex).__name__)
+                raise
+
+    class TimingStreamWrapper:
+        """Wraps LLMStream to measure first_token TTFT and generation_complete."""
+        def __init__(self, inner_stream, timing, prov_info, req_start, gen=None, seq=None, probe=False, inst="single/1"):
+            self._inner_stream = inner_stream
+            self._timing = timing
+            self._prov_info = prov_info
+            self._req_start = req_start
+            self._gen = gen
+            # 12:28 ownership: every stream carries the FULL identity of the
+            # request that produced it — turn generation, monotonic request
+            # sequence (which request currently owns shared timing state), the
+            # provider instance label and the probe flag. Usage, billing and
+            # cache state are read/written through THESE, never through
+            # whoever-last-wrote shared keys.
+            self._seq = seq
+            self._probe = probe
+            self._inst = inst
+            self._rid = "n/a"
+            self._stale_logged = False
+            self._rejected_429 = False
+            self._counted = False
+            self._first_token = True
+            self._input_tokens = 0
+            self._output_tokens = 0
+            self._cached_tokens = 0
+            # True iff the provider actually returned a usage object on this
+            # stream. Task 5 (2026-09-24): failed/invalidated requests have
+            # input=0 because NO usage came back — they must never be
+            # counted as cache misses; cache_status becomes an explicit
+            # "unknown" verdict driven by this flag.
+            self._usage_seen = False
+            # Task 7 (2026-09-24): the FIRST decoded chunk is the critical
+            # path to TTS. First-token log LINES are queued here and emitted
+            # when the NEXT chunk arrives (long after the pipeline received
+            # chunk #1) or in finally — timing dict writes stay immediate so
+            # everything downstream (authoritative TTFT, COST, GENERATION
+            # COMPLETE) sees real values and real ordering.
+            self._pending_first_logs: list = []
+
+        def __getattr__(self, name):
+            return getattr(self._inner_stream, name)
+
+        async def __aiter__(self):
+            # (recovery probes use _ProbeStreamPassThrough — they never reach
+            # this class, so nothing below can be mutated by a background
+            # health check.)
+            def _flush_first_logs():
+                if self._pending_first_logs:
+                    for _lvl, _msg in self._pending_first_logs:
+                        (_logger.warning if _lvl else _logger.info)(_msg)
+                    self._pending_first_logs.clear()
+
+            try:
                 async for chunk in self._inner_stream:
+                    _flush_first_logs()
                     now = _time.time()
                     if self._first_token:
                         self._first_token = False
-                        first_token = now
-                        self._timing["first_token"] = first_token
-                        ttft = (first_token - self._req_start) * 1000
-                        self._timing["ttft_ms"] = ttft
-                        prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
-                        model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
-                        _logger.info(f"LLM TTFT provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)")
-                        if self._timing.get("llm_start", 0) > 0:
-                            _logger.info(f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)")
-                        if self._timing.get("speech_end", 0) > 0:
-                            _logger.info(f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms")
+                        # Two independent staleness reasons, one gate:
+                        #  gen mismatch  → a barge-in/new turn invalidated this
+                        #                  generation (unchanged semantics);
+                        #  seq mismatch  → this attempt was SUPERSEDED within
+                        #                  its turn by the fallback switch (the
+                        #                  newer request owns shared state now).
+                        # A stream that owns neither may still finish cleanly
+                        # for its own billing record, but it never mutates the
+                        # live turn's timing.
+                        _stale_gen = self._gen is not None and int(self._timing.get("gen", 0)) != self._gen
+                        _stale_seq = self._seq is not None and int(self._timing.get("active_req_seq", 0)) != self._seq
+                        if _stale_gen or _stale_seq:
+                            # This stream no longer owns the live turn:
+                            #  _stale_gen → barge-in / new turn invalidated it
+                            #               (library still drains/cancels);
+                            #  _stale_seq → the FallbackAdapter replaced this
+                            #               attempt within the SAME turn.
+                            # Either way it must NOT write this turn's timing
+                            # or fire TTFT logs that would look like the NEW
+                            # owner. Its own per-stream accounting below still
+                            # completes honestly (a torn-down 429'd request
+                            # ends 0/0, success=False — never billed).
+                            self._stale_logged = True
+                            if _stale_gen:
+                                _logger.info("🗑️ [STALE_GENERATION_DROPPED] callback_generation=%d current_generation=%s — late tokens from an invalidated turn are discarded", self._gen, self._timing.get("gen"))
+                            else:
+                                _logger.info("🗑️ [STALE_GENERATION_DROPPED] reason=superseded_by_next_attempt instance=%s seq=%s active_seq=%s generation=%s — this request yielded the turn to the fallback/next attempt; its own billing record stays valid", self._inst, self._seq, self._timing.get("active_req_seq"), self._gen)
+                        else:
+                            first_token = now
+                            self._timing["first_token"] = first_token
+                            _first_token_mono_ns = _time.perf_counter_ns()
+                            self._timing["first_token_mono"] = _first_token_mono_ns
+                            self._timing["pipeline_stage"] = "llm_first_token"
+                            ttft = (first_token - self._req_start) * 1000
+                            self._timing["ttft_ms"] = ttft
+                            prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
+                            model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
+                            self._pending_first_logs.append((0, f"LLM TTFT [LLM_FIRST_TOKEN] provider={prov} model={model} TTFT={ttft:.0f}ms (first_token - request_start)"))
+                            # Task 2 boundaries: join the two httpx hook
+                            # timestamps for THIS attempt (rid) to the first
+                            # decoded stream chunk, measured here — without
+                            # consuming or touching the stream (the stream
+                            # continues through this loop normally).
+                            try:
+                                from .http_timing import pop_for_model as _pop_ht
+                                _hrec = _pop_ht(str(model))
+                                if _hrec:
+                                    self._rid = str(_hrec.get("rid", "n/a")) or "n/a"
+                                if _hrec:
+                                    _t0 = _hrec["send_mono_ns"]; _t1 = _hrec["headers_mono_ns"]
+                                    # pop+format stay here (µs; keeps rid
+                                    # attribution race-free), only the log IO
+                                    # is deferred off the chunk-1 hop
+                                    self._pending_first_logs.append((0,
+                                        "⏱️ [HTTP_CHUNK] rid=%s model=%s request_start->first_stream_chunk=%.0fms response_headers->first_stream_chunk=%.0fms monotonic_ns=%d (first chunk = first SSE delta decoded by the SDK — application-level boundary, NOT to be quoted as provider TTFB)" % (
+                                            _hrec.get("rid", "?"), model,
+                                            (_first_token_mono_ns - _t0) / 1e6, (_first_token_mono_ns - _t1) / 1e6, _first_token_mono_ns,
+                                        )))
+                            except Exception:
+                                pass
+                            if ttft > 1800:
+                                # Task 5 forensics: what was around this request?
+                                self._pending_first_logs.append((1, f"🐢 [TTFT_SPIKE_CONTEXT] TTFT={ttft:.0f}ms inflight_llm={self._timing.get('inflight_llm',0)} overlapping_starts={self._timing.get('overlapping_starts',0)} head_sha={self._timing.get('head_sha','?')} — cross-check openai._base_client retry lines (429/timeout backoff) and [LOOP_LAG] events"))
+                            if self._timing.get("llm_start", 0) > 0:
+                                self._pending_first_logs.append((0, f"TIMING LLM_start->first_token: {(first_token-self._timing['llm_start'])*1000:.0f}ms (TTFT)"))
+                            if self._timing.get("speech_end", 0) > 0:
+                                self._pending_first_logs.append((0, f"TIMING speech_end->first_token: {(first_token-self._timing['speech_end'])*1000:.0f}ms"))
                     try:
                         usage = getattr(chunk, 'usage', None)
                         if usage:
+                            self._usage_seen = True
                             self._input_tokens = getattr(usage, 'prompt_tokens', 0) or getattr(usage, 'input_tokens', 0) or self._input_tokens
                             self._output_tokens = getattr(usage, 'completion_tokens', 0) or getattr(usage, 'output_tokens', 0) or self._output_tokens
-                            prompt_details = getattr(usage, 'prompt_tokens_details', None)
-                            if prompt_details:
-                                self._cached_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
+                            # ROOT CAUSE of "cached=0 on every request" (real call
+                            # 2026-09-24 01:55): livekit 1.8 maps OpenAI's
+                            # usage.prompt_tokens_details.cached_tokens into
+                            # CompletionUsage.prompt_cached_tokens at the inference
+                            # layer (livekit/agents/inference/llm.py:475-486) and
+                            # that details attribute is GONE from the object we
+                            # receive. Reading only prompt_tokens_details made
+                            # cached silently 0 even if the provider reported hits.
+                            # Read the mapped field first; keep the raw-shape and
+                            # dict fallbacks for other adapters.
+                            _cached_v = getattr(usage, 'prompt_cached_tokens', None)
+                            if _cached_v is None and isinstance(usage, dict):
+                                _pd = usage.get('prompt_tokens_details') or usage.get('input_tokens_details') or {}
+                                _cached_v = _pd.get('cached_tokens') if isinstance(_pd, dict) else getattr(_pd, 'cached_tokens', None)
+                            if _cached_v is None:
+                                prompt_details = getattr(usage, 'prompt_tokens_details', None)
+                                if prompt_details is not None:
+                                    _cached_v = getattr(prompt_details, 'cached_tokens', 0)
+                            self._cached_tokens = int(_cached_v or 0)
                     except Exception:
                         pass
                     yield chunk
             except Exception as e:
                 # FIX: Log actual exception for 0/0 failures to diagnose root cause
                 # Previous 0/0 failures (Request 1 and 5) had no error logged, making root cause invisible
-                import traceback as _tb
-                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb.format_exc()[:1000]}")
+                # FIX: Avoid synchronous traceback.format_exc() on event loop
+                # (it triggers linecache -> tokenize.open() -> 176ms block at
+                # tokenize.py:447). Offload to thread so agent loop stays free.
+                try:
+                    _tb_full = await asyncio.to_thread(traceback.format_exc)
+                except Exception:
+                    _tb_full = f"{type(e).__name__}: {e}"
+                _logger.error(f"❌ LLM STREAM EXCEPTION provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} Error={e} Type={type(e).__name__} input={self._input_tokens} output={self._output_tokens} Traceback={_tb_full[:1000]}")
+                _is429, _lim, _used, _req, _ra = _rate_limit_fields(e)
+                if _is429:
+                    # A 429 that surfaced mid-iteration (after any chunk) still
+                    # means the turn was REJECTED by the provider: pin success
+                    # False for this stream regardless of partial evidence.
+                    self._rejected_429 = True
+                    # The 429 itself: provider-reported numbers only. The
+                    # adapter now switches to the configured fallback — we do
+                    # NOT retry this model for the turn (spec), and this failed
+                    # attempt is excluded from successful usage below (zero
+                    # chunks → not successful regardless of shared flags).
+                    self._timing["rate_limit_events"] = int(self._timing.get("rate_limit_events", 0)) + 1
+                    _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=%s rid=%s — request rejected BEFORE any token; excluded from billing; handing over to configured fallback (no retry on this model this turn)", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), _lim, _used, _req, _ra, self._inst, self._gen, self._rid)
                 raise
             finally:
+                _flush_first_logs()
+                try:
+                    if getattr(self, "_counted", False):
+                        self._timing["inflight_llm"] = max(0, int(self._timing.get("inflight_llm", 1)) - 1)
+                        self._counted = False
+                except Exception:
+                    pass
                 gen_complete = _time.time()
-                self._timing["generation_complete"] = gen_complete
-                self._timing["llm_complete"] = gen_complete
                 gen_time = (gen_complete - self._req_start) * 1000
-                self._timing["generation_time_ms"] = gen_time
-                self._timing["input_tokens"] = self._input_tokens
-                self._timing["output_tokens"] = self._output_tokens
-                self._timing["cached_input_tokens"] = self._cached_tokens
-                self._timing["llm_active"] = False
+                # OWNERSHIP GATE (Task 1): only the request that still owns
+                # this turn's shared state — the current turn generation AND
+                # the latest sequence — may mutate it. A primary that the
+                # FallbackAdapter already replaced (newer active_req_seq) can
+                # no longer flip llm_active False or overwrite
+                # generation_complete/TTS-facing timing underneath the live
+                # fallback stream. Its OWN record below stays complete.
+                _own_state = (
+                    (self._gen is None or int(self._timing.get("gen", 0)) == self._gen)
+                    and (self._seq is None or int(self._timing.get("active_req_seq", 0)) == self._seq)
+                )
+                if _own_state:
+                    self._timing["generation_complete"] = gen_complete
+                    self._timing["llm_complete"] = gen_complete
+                    self._timing["generation_time_ms"] = gen_time
+                    self._timing["input_tokens"] = self._input_tokens
+                    self._timing["output_tokens"] = self._output_tokens
+                    self._timing["cached_input_tokens"] = self._cached_tokens
+                # llm_active DERIVES from the inflight gauge now: on a switch
+                # the dying stream must not deactivate while the replacement
+                # request is still counted inflight (and vice versa).
+                try:
+                    self._timing["llm_active"] = int(self._timing.get("inflight_llm", 0)) > 0
+                except Exception:
+                    self._timing["llm_active"] = False
                 prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', 'unknown')
                 model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', 'unknown')
                 # FIX: Separate deterministic closing (intentional 0/0) from genuine empty LLM turns
                 # Do not report intentional closing request as LLM failure
                 is_closing = self._timing.get("is_closing", False)
                 is_deterministic_closing = is_closing and self._input_tokens == 0 and self._output_tokens == 0
-                # Only consider successful if output>0 or assistant_output_received, and not closing
-                is_success = (self._output_tokens > 0 or self._timing.get("assistant_output_received", False)) and not is_deterministic_closing
-                if is_success:
-                    # Update last_successful_metrics for billing preservation
+                # 12:28 fix: success is judged on THIS stream's evidence only.
+                # The old shared 'assistant_output_received' flag made a 429'd
+                # attempt that yielded ZERO chunks count as SUCCESS whenever a
+                # sibling stream (the fallback answering the same turn) had
+                # output — rejected requests then polluted
+                # successful_requests/last_* state. Per-stream: output tokens
+                # reported, or at least one chunk actually streamed through
+                # THIS wrapper.
+                is_success = (self._output_tokens > 0 or not self._first_token) and not is_deterministic_closing and not self._rejected_429
+                # cached-token normalization (Task 4): a capability=none path
+                # gets ZERO cached for billing/cost — reported numbers stay in
+                # the telemetry but can never mint a discount that provider
+                # does not offer for this model. capability is read for THIS
+                # request's own provider/model pair (attribution-correct).
+                _cached_cost = int(self._cached_tokens or 0)
+                try:
+                    from app.llm_catalog import get_prompt_cache_capability as _gcc_own
+                    _cap_own = _gcc_own(str(prov), str(model))
+                    if _cached_cost > 0 and not _cap_own.get("supported"):
+                        _logger.warning(
+                            "⚠️ [CACHE_OWNERSHIP_MISMATCH] provider=%s model=%s capability=none reported_cached_tokens=%d request_id=%s generation=%s instance=%s — this exact provider/model exposes no prompt cache, so these tokens CANNOT belong to this request. They are excluded from its cost and the aggregated cached total. Usual source (pre-12:28 builds): the fallback instance was labelled with the chain head's provider_info — check [USAGE_OWNERSHIP] lines around request_id=%s for the OpenAI pair.",
+                            prov, model, _cached_cost, self._rid, self._gen, self._inst, self._rid,
+                        )
+                        _cached_cost = 0
+                except Exception:
+                    _cap_own = None
+                if is_success and _own_state:
+                    # Preserve last successful turn metrics for final billing
                     try:
                         self._timing["last_ttft"] = self._timing.get("ttft_ms", 0)
                         self._timing["last_gen_time"] = gen_time
@@ -986,7 +1213,7 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                         self._timing["last_cached"] = self._cached_tokens
                     except Exception:
                         pass
-
+                
                 # FIX: Aggregated billing using actual successful provider usage
                 # Ensure aggregated fields exist
                 if "aggregated_input" not in self._timing:
@@ -996,10 +1223,11 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     self._timing["successful_requests"] = 0
                     self._timing["failed_requests"] = 0
                     self._timing["all_requests"] = []
-
+                
                 request_record = {
                     "input": self._input_tokens,
                     "cached": self._cached_tokens,
+                    "cached_for_cost": _cached_cost,
                     "output": self._output_tokens,
                     "success": is_success,
                     "ttft": self._timing.get("ttft_ms", 0),
@@ -1007,13 +1235,20 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                     "provider": prov,
                     "model": model,
                     "is_closing": is_deterministic_closing,
+                    # ownership stamps (Task 1): which request, which instance,
+                    # which turn generation, which sequence — a record can only
+                    # ever describe the call that produced it.
+                    "rid": self._rid,
+                    "gen": self._gen,
+                    "seq": self._seq,
+                    "instance": self._inst,
                 }
                 self._timing["all_requests"].append(request_record)
-
+                
                 if is_success:
                     self._timing["aggregated_input"] += self._input_tokens
                     self._timing["aggregated_output"] += self._output_tokens
-                    self._timing["aggregated_cached"] += self._cached_tokens
+                    self._timing["aggregated_cached"] += _cached_cost
                     self._timing["successful_requests"] += 1
                     _logger.info(f"💰 AGGREGATED BILLING +{self._input_tokens}in +{self._output_tokens}out total {self._timing['aggregated_input']}in {self._timing['aggregated_output']}out across {self._timing['successful_requests']} successful, {self._timing['failed_requests']} failed")
                 elif is_deterministic_closing:
@@ -1021,54 +1256,205 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 else:
                     self._timing["failed_requests"] += 1
                     _logger.info(f"⚠️ LLM request failed/invalidated: input={self._input_tokens} output={self._output_tokens} success={is_success} closing={is_deterministic_closing} (excluded from aggregated, failed {self._timing['failed_requests']})")
-
-                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active=False is_closing={is_deterministic_closing}")
+                    _bi_recent = (_time.time() - float(self._timing.get("last_bargein_ts", 0.0))) < 1.0
+                    _logger.info("🔇 [LLM_CANCELLED] reason=%s generation=%s — superseded request never billed; the new completed turn owns the one live request", "user_barge_in" if _bi_recent else "user_continued", self._timing.get("gen", 0))
+                    # 03:07 K-exam fix: killed BEFORE any token = the caller was
+                    # still speaking (VAD split mid-utterance); the question
+                    # that was cut off must stay mergeable with its
+                    # continuation. Tagged with this request's generation so the
+                    # builder only adopts it while that generation is still
+                    # current (a late teardown can never contaminate two turns
+                    # later). Barge-in DURING an answer is excluded:
+                    # first_token is nonzero once any output was streamed.
+                    if not self._timing.get("first_token", 0):
+                        try:
+                            _uxt = str(self._timing.get("req_user_text") or "").strip()
+                            if _uxt:
+                                self._timing["overwritten_turn"] = {
+                                    "text": _uxt, "ts": _time.time(),
+                                    "gen": int(self._timing.get("gen", 0) or 0),
+                                }
+                        except Exception:
+                            pass
+                
+                _logger.info(f"LLM GENERATION COMPLETE provider={prov} model={model} generation_time={gen_time:.0f}ms input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} success={is_success} active={bool(self._timing.get('llm_active'))} is_closing={is_deterministic_closing}")
+                # Task 1 proof line — ONE per completed usage result, printed
+                # by the stream that OWNED the usage object (never by a shared
+                # accumulator): which request produced these tokens, from what
+                # usage source, and whether they enter billing.
+                _logger.info(
+                    "\U0001f50e [USAGE_OWNERSHIP] generation=%s request_id=%s provider=%s model=%s instance=%s seq=%s input=%d cached=%d cached_for_cost=%d output=%d usage_source=%s billing=%s owns_shared_state=%s",
+                    self._gen, self._rid, prov, model, self._inst, self._seq,
+                    self._input_tokens, self._cached_tokens, _cached_cost, self._output_tokens,
+                    "own_stream_usage_object" if self._usage_seen else "no_usage_returned_by_provider",
+                    "counted" if is_success else "excluded",
+                    "yes" if _own_state else "no_superseded",
+                )
                 try:
-                    from app.llm_catalog import get_llm_model, calculate_llm_cost
+                    from app.llm_catalog import get_llm_model, calculate_llm_cost, get_prompt_cache_capability
                     model_meta = get_llm_model(prov, model) if prov and model else None
                     if model_meta:
-                        costs = calculate_llm_cost(model_meta, self._input_tokens, self._cached_tokens, self._output_tokens)
+                        costs = calculate_llm_cost(model_meta, self._input_tokens, _cached_cost, self._output_tokens)
                         total_cost = costs['total_llm_cost']
                         # Calculate total aggregated cost
                         total_agg_cost = 0.0
                         try:
-                            # Sum cost of all successful requests
+                            # Sum cost of all successful requests — each entry
+                            # priced at ITS OWN provider/model (per-instance
+                            # _prov_meta), cached discount only up to what that
+                            # pair's capability supports (cached_for_cost).
                             for req in self._timing.get("all_requests", []):
                                 if req.get("success"):
                                     m = get_llm_model(req.get("provider",""), req.get("model",""))
                                     if m:
-                                        c = calculate_llm_cost(m, req["input"], req["cached"], req["output"])
+                                        c = calculate_llm_cost(m, req["input"], req.get("cached_for_cost", req["cached"]), req["output"])
                                         total_agg_cost += c['total_llm_cost']
                         except Exception:
                             total_agg_cost = total_cost
-                        _logger.info(f"LLM COST provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${total_cost:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success} aggregated_successful={self._timing.get('successful_requests',0)} total_agg_cost=${total_agg_cost:.6f} is_closing={is_deterministic_closing}")
+                        _logger.info(f"LLM COST [LLM_RESPONSE_COMPLETED] provider={prov} model={model} input={self._input_tokens} cached={self._cached_tokens} output={self._output_tokens} input_cost=${costs['input_cost']:.6f} output_cost=${costs['output_cost']:.6f} total=${total_cost:.6f} TTFT={self._timing.get('ttft_ms',0):.0f}ms gen_time={gen_time:.0f}ms success={is_success} aggregated_successful={self._timing.get('successful_requests',0)} total_agg_cost=${total_agg_cost:.6f} is_closing={is_deterministic_closing}")
                         _logger.info(f"📊 BILLING SUMMARY successful={self._timing.get('successful_requests',0)} failed={self._timing.get('failed_requests',0)} total_input={self._timing.get('aggregated_input',0)} total_cached={self._timing.get('aggregated_cached',0)} total_output={self._timing.get('aggregated_output',0)} total_cost=${total_agg_cost:.6f}")
+                        # Task 1 (2026-09-24): explicit cache status per
+                        # request, derived ONLY from provider usage. hit is
+                        # claimed when cached_input_tokens>0 — mere presence
+                        # of the key is never claimed; non-OpenAI paths say
+                        # unsupported instead of pretending.
+                        try:
+                            _cached_now = int(self._cached_tokens or 0)
+                            _uk = bool(getattr(self, "_usage_seen", False))
+                            # Task 2 (11:41 log): four honest states driven by
+                            # get_prompt_cache_capability(provider, model) — NOT
+                            # by a "provider == openai" guess. capability=none
+                            # (e.g. groq qwen3.8: no cached-token usage exists)
+                            # reports unsupported and never a "miss"; a
+                            # cache-capable request whose usage never arrived
+                            # is unknown, never a miss (02:31-call lesson);
+                            # hit/miss are claimed ONLY from real provider
+                            # usage counts.
+                            try:
+                                _cap = get_prompt_cache_capability(str(prov), str(model))
+                            except Exception:
+                                _cap = {"supported": "openai" in str(prov).lower(),
+                                        "mode": "native_explicit" if "openai" in str(prov).lower() else "none",
+                                        "configuration": None}
+                            _cap_mode = _cap.get("mode", "none")
+                            _cap_cfg = _cap.get("configuration") or {}
+                            if not _cap.get("supported"):
+                                _ck_key, _ck_status = "n/a", "unsupported (capability=none for this exact provider/model — nothing invented, nothing to hit or miss)"
+                                _cap_lbl = "none"
+                            else:
+                                _cap_lbl = _cap_mode
+                                _ck_key = _cap_cfg.get("prompt_cache_key") or "n/a (automatic — no client field)"
+                                if not _uk:
+                                    _ck_status = "unknown/error (no usage returned by provider — request failed or was invalidated; NOT counted as miss)"
+                                    self._timing["cache_unknown"] = self._timing.get("cache_unknown", 0) + 1
+                                elif _cached_now > 0:
+                                    _ck_status = "hit"
+                                    self._timing["cache_hits"] = self._timing.get("cache_hits", 0) + 1
+                                else:
+                                    _ck_status = "miss"
+                                    self._timing["cache_misses"] = self._timing.get("cache_misses", 0) + 1
+                            _uk_s = "yes" if _uk else "NO"
+                            _logger.info(f"🗄️ [CACHE] provider={prov} model={model} capability={_cap_lbl} mode={_cap_mode} cache_key={_ck_key} usage_returned={_uk_s} cached_input_tokens={_cached_now} cache_status={_ck_status} stable_head_hash={self._timing.get('head_sha','?')} stable_head_tokens_est={self._timing.get('head_est_tokens','?')} stable_head_chars={self._timing.get('head_chars_log','?')} head_same_as_previous={self._timing.get('head_stable_prev','?')} (status only reflects provider usage; hash is content-free)")
+                        except Exception:
+                            pass
                 except Exception as e:
                     _logger.debug(f"Could not calculate LLM cost: {e}")
 
     class TimingChatCM:
         """Async context manager that wraps inner LLM chat CM and returns TimingStreamWrapper."""
-        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start):
+        def __init__(self, inner_cm_or_coro, timing, prov_info, req_start, gen=None, seq=None, probe=False, inst="single/1", counted=False):
             self._inner_orig = inner_cm_or_coro
             self._timing = timing
             self._prov_info = prov_info
             self._req_start = req_start
+            self._gen = gen
+            self._seq = seq
+            self._probe = probe
+            self._inst = inst
+            self._counted = counted
             self._inner_cm = None
             self._inner_stream = None
 
         async def __aenter__(self):
             # Resolve inner if it's a coroutine (some LLM impls have async chat)
             inner = self._inner_orig
-            if _asyncio.iscoroutine(inner):
-                inner = await inner
-            self._inner_cm = inner
-            # Enter inner CM
-            if hasattr(inner, '__aenter__'):
-                stream = await inner.__aenter__()
-            else:
-                stream = inner
+            try:
+                if _asyncio.iscoroutine(inner):
+                    inner = await inner
+                self._inner_cm = inner
+                # Enter inner CM
+                if hasattr(inner, '__aenter__'):
+                    stream = await inner.__aenter__()
+                else:
+                    stream = inner
+            except BaseException as e:
+                if self._probe:
+                    # failed health check: outcome counter + rate-limit line
+                    # only; no shared turn state, no billing record.
+                    self._timing["probe_failures"] = int(self._timing.get("probe_failures", 0)) + 1
+                    _ok429, _l4, _u4, _r4, _ra4 = _rate_limit_fields(e)
+                    if _ok429:
+                        _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=n/a probe=yes — background health check rate-limited at connect; instance stays unavailable, fallback keeps serving", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), _l4, _u4, _r4, _ra4, self._inst)
+                    raise
+                # P6 root-cause hardening: a request that dies BEFORE streaming
+                # (provider/client raised, e.g. the observed
+                # "APIStatusError.__init__() missing 2 required positional
+                # arguments" crash) used to leave llm_active=True forever —
+                # TimingStreamWrapper's finally never ran. The stale flag
+                # suppressed empty-turn diagnostics (state held "thinking") and
+                # made wedges invisible. Clear per-request state, log loudly,
+                # re-raise unchanged so LiveKit's own error path proceeds.
+                # 12:28: this path used to bypass ALL accounting (no inflight
+                # release, no failed record, failed_requests stayed 0 even for
+                # a 429 rejected at connect). Fixed: release what chat()
+                # counted, record the attempt as a genuine failure (never
+                # successful, never billed), and surface the rate limit.
+                _fail_now = _time.time()
+                try:
+                    if self._counted:
+                        self._timing["inflight_llm"] = max(0, int(self._timing.get("inflight_llm", 1)) - 1)
+                        self._counted = False
+                except Exception:
+                    pass
+                self._timing["llm_active"] = int(self._timing.get("inflight_llm", 0)) > 0
+                self._timing["generation_complete"] = _fail_now
+                self._timing["llm_complete"] = _fail_now
+                _ok429, _l4, _u4, _r4, _ra4 = _rate_limit_fields(e)
+                if _ok429:
+                    self._timing["rate_limit_events"] = int(self._timing.get("rate_limit_events", 0)) + 1
+                    _logger.warning("🚦 [RATE_LIMIT] provider=%s model=%s limit=%s used=%s requested=%s retry_after_ms=%s instance=%s generation=%s — rejected BEFORE any token at connect; excluded from billing; configured fallback takes over (no retry on this model this turn)", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), _l4, _u4, _r4, _ra4, self._inst, self._gen)
+                try:
+                    _own = (self._gen is None or int(self._timing.get("gen", 0)) == self._gen) and (self._seq is None or int(self._timing.get("active_req_seq", 0)) == self._seq)
+                    if _own:
+                        self._timing["failed_requests"] = int(self._timing.get("failed_requests", 0)) + 1
+                    self._timing.setdefault("all_requests", []).append({
+                        "input": 0, "cached": 0, "cached_for_cost": 0, "output": 0,
+                        "success": False, "ttft": 0.0,
+                        "gen_time": (_fail_now - self._req_start) * 1000,
+                        "provider": self._prov_info.get('provider', ''), "model": self._prov_info.get('model_id', ''),
+                        "is_closing": False, "rid": "n/a", "gen": self._gen, "seq": self._seq,
+                        "instance": self._inst, "failed_before_stream": True,
+                    })
+                except Exception:
+                    pass
+                _logger.error(
+                    "❌ LLM REQUEST FAILED BEFORE STREAM [LLM_RESPONSE_COMPLETED] "
+                    f"provider={self._prov_info.get('provider','')} model={self._prov_info.get('model_id','')} "
+                    f"error={type(e).__name__}: {e} — recorded failed (not billed), turn not dropped"
+                )
+                _logger.info(
+                    "\U0001f50e [USAGE_OWNERSHIP] generation=%s request_id=%s provider=%s model=%s instance=%s seq=%s input=0 cached=0 cached_for_cost=0 output=0 usage_source=no_usage_returned_by_provider billing=excluded owns_shared_state=%s",
+                    self._gen, "n/a", self._prov_info.get('provider',''), self._prov_info.get('model_id',''), self._inst, self._seq,
+                    "yes" if ((self._gen is None or int(self._timing.get("gen", 0)) == self._gen) and (self._seq is None or int(self._timing.get("active_req_seq", 0)) == self._seq)) else "no_superseded",
+                )
+                raise
             self._inner_stream = stream
-            return TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start)
+            if self._probe:
+                return _ProbeStreamPassThrough(stream, self._timing, self._prov_info, self._inst, self._req_start)
+            _sw = TimingStreamWrapper(stream, self._timing, self._prov_info, self._req_start, self._gen, seq=self._seq, inst=self._inst)
+            _sw._counted = self._counted  # ownership of the inflight gauge moves to the stream
+            self._counted = False
+            return _sw
 
         async def __aexit__(self, exc_type, exc, tb):
             try:
@@ -1097,6 +1483,26 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             return getattr(self._inner, name)
 
         def chat(self, *args, **kwargs):
+            _wrapper_entry_ns = _time.perf_counter_ns()
+            _logger.info("[TURN_TRACE] stage=llm_wrapper_enter monotonic_ns=%d call_id=%s turn_id=%s generation_id=%s", _wrapper_entry_ns, self._timing.get("call_id", "N/A"), self._timing.get("turn_id", "N/A"), self._timing.get("gen", "N/A"))
+            # Recovery-probe bypass (Task 2, 12:28): FallbackAdapter's
+            # background health check reaches this SAME wrapped instance while
+            # the fallback stream is still answering the caller. It must not be
+            # treated as a turn: no overlap warning, no active-flag churn, no
+            # generation/sequence ownership, no shared counter resets, no
+            # billing record — the isolated _ProbeStreamPassThrough only counts
+            # its outcome. (Intentional adapter behavior; lifecycle documented
+            # at the builder's FallbackAdapter construction — not patched.)
+            if _is_recovery_probe():
+                # Count EVERY probe attempt (started), outcome separately — the
+                # [FALLBACK_SUMMARY] line needs both to explain the overlap.
+                self._timing["recovery_probes"] = int(self._timing.get("recovery_probes", 0)) + 1
+                try:
+                    _logger.info("🧪 [LLM_RECOVERY_PROBE] provider=%s model=%s instance=%s starting — background health check, isolated from turn accounting", self._prov_info.get('provider', ''), self._prov_info.get('model_id', ''), getattr(self, '_inst_label', 'single/1'))
+                    return TimingChatCM(self._inner.chat(*args, **kwargs), self._timing, self._prov_info, _time.time(), None, probe=True, inst=getattr(self, '_inst_label', 'single/1'))
+                except Exception:
+                    self._timing["probe_failures"] = int(self._timing.get("probe_failures", 0)) + 1
+                    raise
             # This is the critical fix: chat is SYNC, returns async CM, not coroutine
             # So `async with llm.chat(...) as stream` works
             # FIX: Prevent duplicate/invalidated LLM requests - exactly one REQUEST START per completed user turn
@@ -1107,15 +1513,230 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
                 prev_start = self._timing.get("request_start", 0)
                 elapsed = _time.time() - prev_start if prev_start else 0
                 _logger.warning(f"⚠️ LLM REQUEST START while previous still active (elapsed {elapsed:.2f}s) - previous will be cancelled and return 0/0, this is duplicate/invalidated request. Ensuring exactly one valid per turn by marking previous as invalidated, not failed.")
+                self._timing["overlapping_starts"] = self._timing.get("overlapping_starts", 0) + 1
                 # Mark previous as invalidated, not failed, to prevent duplicate counting
                 # Don't increment failed_requests for superseded preemptive/invalidated
                 # The new request will be the valid one for this turn
-
+            
             request_start = _time.time()
+            self._timing["request_start_mono"] = _time.perf_counter_ns()
+            self._timing["pipeline_stage"] = "llm_request_start"
             self._timing["request_start"] = request_start
             self._timing["llm_start"] = request_start
+            self._timing["llm_request_start_ts"] = request_start
+            _request_mono = self._timing["request_start_mono"]
+            _callback_enter_mono = int(self._timing.get("callback_enter_mono_ns", 0) or 0)
+            _commit_to_request = (
+                f"{(_request_mono - _callback_enter_mono) / 1_000_000:.0f}ms"
+                if _callback_enter_mono > 0 and _request_mono >= _callback_enter_mono
+                else "N/A"
+            )
+            _logger.info("⏱️ [TURN_TIMING] callback_enter_to_llm_request_start_ms=%s", _commit_to_request)
             self._timing["llm_active"] = True
+            # Generation token: "gen" is the TURN/barge-in epoch — only the
+            # interruption path bumps it (see [GENERATION_INVALIDATED]). The old
+            # per-chat() +1 here made a fallback switch or a health probe LOOK
+            # like a stale generation: the live fallback stream got
+            # [STALE_GENERATION_DROPPED] mid-answer and stopped publishing its
+            # own TTFT — the "stale-generation cancellation" of the 12:28 logs.
+            # Attempts belonging to ONE turn share its gen; per-request
+            # supersession is tracked by active_req_seq (which stream may write
+            # shared state) instead.
+            _gen = int(self._timing.get("gen", 0))
+            _seq = int(self._timing.get("llm_req_seq", 0)) + 1
+            self._timing["llm_req_seq"] = _seq
+            self._timing["active_req_seq"] = _seq
             self._timing["assistant_output_received"] = False
+            # Task 2 (2026-09-24): log what actually builds the ~2900-token
+            # request and PROVE prefix stability instead of assuming it. The
+            # hash covers the stable head (leading system messages + tool
+            # defs); OpenAI caches on shared prefixes >=1024 tokens, so a
+            # stable hash with cached=0 points at the provider/account, while
+            # a changing hash is our bug and the diff names the section.
+            _req_inflight = False
+            _prompt_prepare_start_ns = _time.perf_counter_ns()
+            _token_estimate_ns = _fingerprint_ns = _cache_metadata_ns = 0
+            _token_estimate_start_ns = _fingerprint_start_ns = _cache_metadata_start_ns = 0
+            try:
+                _cc = kwargs.get("chat_ctx")
+                if _cc is None and args:
+                    _cc = args[0]
+                if _cc is not None:
+                    _mf = getattr(_cc, "messages", None)
+                    # livekit-agents 1.8.2: ChatContext.messages is a METHOD
+                    # (returns list[ChatMessage]) — the previous direct getattr
+                    # produced a bound method, list() raised TypeError, and the
+                    # whole block died in a debug-level except: every production
+                    # request logged stable_head_chars=?/head_sha=?/inflight 0.
+                    _msgs = list(_mf() if callable(_mf) else (_mf or []))
+                    def _mtext(m):
+                        c = getattr(m, "content", "")
+                        if isinstance(c, str):
+                            return c
+                        if isinstance(c, list):
+                            return " ".join(str(getattr(p, "text", p)) for p in c)
+                        return str(c or "")
+                    _head: list = []
+                    _hist_chars = 0
+                    _hist_msgs = 0
+                    _rag_chars = 0
+                    _user_last_chars = 0
+                    _user_last_text = ""
+                    _dyn_before_head = 0
+                    _seen_user = False
+                    _user_last_is_final = False
+                    _first_sys = None
+                    for _i, _m in enumerate(_msgs):
+                        _r = getattr(_m, "role", "") or ""
+                        _t = _mtext(_m)
+                        _mid = getattr(_m, "id", "") or ""
+                        # Cache fix: ONLY the behavioral instructions (id=lk.agent_task.instructions)
+                        # are the stable cacheable prefix. All other system messages (prior_memory,
+                        # lead_data, RAG) are dynamic and must be counted as dynamic, not stable,
+                        # even if they appear before first user in older contexts. This makes the
+                        # logged stable_head reflect the TRUE provider-bound cacheable prefix.
+                        _is_stable = (_mid == "lk.agent_task.instructions") or (_r == "system" and _first_sys is None and not _seen_user and "[RAG]" not in _t[:80] and "Prior conversation" not in _t[:80] and "contact list" not in _t[:80].lower())
+                        # For first_sys detection, only stable instructions count as head start
+                        if _r == "system" and _first_sys is None and _is_stable:
+                            _first_sys = _i
+                        if _r == "system" and _is_stable and not _seen_user:
+                            _head.append(_t)
+                        elif _r == "system":
+                            _rag_chars += len(_t)
+                        else:
+                            _seen_user = True
+                            if _r == "user":
+                                # last USER message wherever it sits — the TEXT
+                                # feeds the continuation-merge. 11:41 fix: the
+                                # CHAR COUNT no longer requires the message to be
+                                # final (the old positional gate is what made
+                                # final_user=0c ambiguous between "question
+                                # missing" and "question present but not last").
+                                # Position is reported separately as question_is_last.
+                                _user_last_text = _t
+                                _user_last_chars = len(_t)
+                                _user_last_is_final = _i == len(_msgs) - 1
+                            else:
+                                _hist_chars += len(_t)
+                                _hist_msgs += 1
+                    _tools = kwargs.get("tools")
+                    if _tools is None and len(args) > 1:
+                        _tools = args[1]
+                    _tools = _tools or []
+                    _dyn_before_head = int(_first_sys or 0)
+                    # 03:07 K-exam fix: remember this request's question so the
+                    # builder can merge it into the caller's immediate
+                    # continuation if the request is superseded pre-output.
+                    self._timing["req_user_text"] = _user_last_text[:600]
+                    _token_estimate_start_ns = _time.perf_counter_ns()
+                    _tools_chars = sum(len(str(getattr(_t0, "name", _t0))) + len(str(getattr(_t0, "parameters", ""))) for _t0 in _tools)
+                    _head_chars = sum(len(_h) for _h in _head)
+                    _sha = _hl.sha256(("\x1f".join(_head) + "#tools=" + repr(_tools_chars)).encode("utf-8", "ignore")).hexdigest()[:12]
+                    _prev_sha = self._timing.get("head_sha") or ""
+                    _stable = "yes" if (not _prev_sha or _prev_sha == _sha) else "NO"
+                    self._timing["head_sha"] = _sha
+                    self._timing["head_sha_prev"] = _prev_sha
+                    self._timing["head_stable_prev"] = _stable
+                    self._timing["head_chars_log"] = _head_chars
+                    _head_est_t = int(_head_chars / 4.0)
+                    self._timing["head_est_tokens"] = _head_est_t
+                    _total_chars = _head_chars + _hist_chars + _rag_chars + _user_last_chars
+                    _dyn_rag_est_t = int(_rag_chars / 4.0)
+                    _total_est_t = int(_total_chars / 4.0)
+                    _token_estimate_ns = _time.perf_counter_ns() - _token_estimate_start_ns
+                    _logger.info(
+                        "\U0001f9ee [PROMPT] chars=%d est_total_tokens=%d tokens: stable_prompt=%d dynamic_rag=%d total_input_est=%d | sections: stable_head=%dc(~%dt) same_as_previous_turn=%s dynamic_prefix_before_stable_head=%d | history=%dc/%dmsg | rag_inject=%dc | final_user=%dc question_is_last=%s | tools_meta=%dc | head_sha=%s",
+                        _total_chars, _total_est_t, _head_est_t, _dyn_rag_est_t, _total_est_t, _head_chars, _head_est_t, _stable, _dyn_before_head, _hist_chars, _hist_msgs, _rag_chars, _user_last_chars, "yes" if _user_last_is_final else "NO", _tools_chars, _sha,
+                    )
+                    # 11:41 log Task 1: PROVE the request shape instead of
+                    # inferring it. The [PROMPT] section line cannot distinguish
+                    # "question present but not last" from "question missing"
+                    # without this; the preview shows the real last message, the
+                    # counts show how many user messages arrived, and ack_mode /
+                    # incomplete_turn echo the governor flags on the SHARED turn
+                    # dict (a deterministic-ack turn never reaches chat(), so
+                    # ack_mode=yes here would mean a stale flag hijacked a real
+                    # request — the one failure mode the pop-on-entry guards are
+                    # supposed to make impossible). 60-char previews only: no
+                    # full customer content, no secrets.
+                    _last_m = _msgs[-1] if _msgs else None
+                    _dbg_prov = self._prov_info.get("provider", "") or self._timing.get("llm_provider", "") or "unknown"
+                    _dbg_model = self._prov_info.get("model_id", "") or getattr(self._inner, "model", "unknown") or "unknown"
+                    _cache_metadata_start_ns = _time.perf_counter_ns()
+                    try:
+                        from app.llm_catalog import get_prompt_cache_capability as _gcc_dbg
+                        _dbg_cap = _gcc_dbg(str(_dbg_prov), str(_dbg_model)).get("mode", "?")
+                    except Exception:
+                        _dbg_cap = "?"
+                    _cache_metadata_ns = _time.perf_counter_ns() - _cache_metadata_start_ns
+                    _logger.info(
+                        "\U0001f52c [LLM_INPUT_DEBUG] generation=%s provider=%s model=%s capability=%s messages_count=%d last_message_role=%s last_message_preview='%s' current_user_turn='%s' user_messages=%d question_is_last=%s rag_present=%s rag_chars=%d ack_mode=%s incomplete_turn=%s",
+                        _gen, _dbg_prov, _dbg_model, _dbg_cap, len(_msgs),
+                        str(getattr(_last_m, "role", "?") or "?") if _last_m is not None else "?",
+                        (_mtext(_last_m)[:60].replace("\n", " ") if _last_m is not None else ""),
+                        _user_last_text[:60].replace("\n", " "),
+                        sum(1 for _m2 in _msgs if getattr(_m2, "role", "") == "user"),
+                        "yes" if _user_last_is_final else "NO",
+                        "yes" if _rag_chars else "no", _rag_chars,
+                        "yes" if self._timing.get("ack_reply") else "no",
+                        "yes" if self._timing.get("gov_turn_state") == "suppress" else "no",
+                    )
+                    # --- Provider-bound fingerprint for cache diagnosis (safe, no PII) ---
+                    # Latency fix: avoid duplicate ChatContext -> provider format
+                    # serialization on the event loop (to_provider_format does a
+                    # full copy/transform of ~10k chars). Use the already-parsed
+                    # _msgs list directly — same data, zero extra serialization.
+                    # No cache logic changed, only diagnostic path.
+                    _fingerprint_start_ns = _time.perf_counter_ns()
+                    try:
+                        _prov_msgs = _msgs  # use existing parsed messages, not to_provider_format
+                        _prov_role_seq = "?"
+                        _prov_len_seq = "?"
+                        _prov_first_hash = "?"
+                        _prov_prefix_hash = "?"
+                        _prov_prefix_same = "?"
+                        if _prov_msgs:
+                            _prov_role_seq = ",".join([str(getattr(m, "role", "?")) for m in _prov_msgs])
+                            _prov_len_seq = ",".join([str(len(_mtext(m))) for m in _prov_msgs])
+                            _first_c = _mtext(_prov_msgs[0]) if _prov_msgs else ""
+                            _prov_first_hash = _hl.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12] if _first_c else "?"
+                            _pref_c = "".join([_mtext(m) for m in _prov_msgs[:2]])
+                            _prov_prefix_hash = _hl.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12] if _pref_c else "?"
+                            _prev_pref = self._timing.get("prov_prefix_hash", "")
+                            _prov_prefix_same = "yes" if (not _prev_pref or _prev_pref == _prov_prefix_hash) else "NO"
+                            self._timing["prov_prefix_hash"] = _prov_prefix_hash
+                            self._timing["prov_prefix_hash_prev"] = _prev_pref
+                        _pck = getattr(getattr(self._inner, "_opts", None), "prompt_cache_key", None) or getattr(self._inner, "prompt_cache_key", None) or "?"
+                        # Never log full content, only hashes/lengths/roles
+                        # Cache diagnostics: show stable_head size to prove >1024 eligibility
+                        _stable_chars_log = self._timing.get("head_chars_log", "?")
+                        _stable_tokens_log = self._timing.get("head_est_tokens", "?")
+                        _logger.info(
+                            "\U0001f50d [PROVIDER_BOUND] provider=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s prefix_same_as_previous=%s app_head_sha=%s app_head_same=%s stable_head_chars=%s stable_head_tokens_est=%s",
+                            _dbg_prov, _dbg_model, _pck, len(_prov_msgs), _prov_role_seq, _prov_len_seq, _prov_first_hash, _prov_prefix_hash, _prov_prefix_same, _sha, _stable, _stable_chars_log, _stable_tokens_log,
+                        )
+                    except Exception as _pb_e:
+                        _logger.debug(f"[PROVIDER_BOUND] fingerprint failed: {_pb_e!r}")
+                    finally:
+                        _fingerprint_ns = _time.perf_counter_ns() - _fingerprint_start_ns
+                    # inflight gauge for spike forensics (Task 5)
+                    self._timing["inflight_llm"] = int(self._timing.get("inflight_llm", 0)) + 1
+                    # Per-request ownership (12:28): this used to be the shared
+                    # "_inflight_counted" flag — with two overlapping streams
+                    # (fallback switch / barge-in) whichever finished first
+                    # consumed the flag and the OTHER skipped its own decrement,
+                    # pinning llm_active=True. The counter is owned by THIS
+                    # request now and travels on the CM/stream objects.
+                    _req_inflight = True
+            except Exception as _pe:
+                # never silent again: one visible line per call is cheap and this
+                # exact silence is what hid the head_sha instrumentation failure in
+                # the 02:12 call.
+                if not self._timing.get("prompt_acct_warned"):
+                    self._timing["prompt_acct_warned"] = True
+                    _logger.warning("[PROMPT] section accounting failed (once): %r", _pe)
+                _logger.debug(f"[PROMPT] section accounting skipped: {_pe!r}")
+            _prompt_prepare_ns = _time.perf_counter_ns() - _prompt_prepare_start_ns
             # Reset per-request metrics but preserve provider/model and aggregated billing
             # Preserve aggregated and is_closing
             preserved_aggregated = {
@@ -1146,27 +1767,49 @@ def _create_llm_timing_wrapper(llm_instance, timing_dict, provider_info=None):
             prov = self._prov_info.get('provider', '') or self._timing.get('llm_provider', '') or 'unknown'
             model = self._prov_info.get('model_id', '') or self._timing.get('llm_model', '') or getattr(self._inner, 'model', 'unknown') or 'unknown'
             base_url = self._prov_info.get('base_url', '') or 'https://api.openai.com/v1'
-            _logger.info(f"LLM REQUEST START provider={prov} model={model} base_url={base_url} request_start={request_start}")
+            _logger.info(f"LLM REQUEST START [LLM_RESPONSE_STARTED] provider={prov} model={model} base_url={base_url} llm_instance={getattr(self, '_inst_label', 'single/1')} request_start={request_start} — a new line here on a DIFFERENT model+instance = LiveKit FallbackAdapter switching (mechanism B), NOT an SDK retry; duplicates on the same instance = invalidated-generation overlap (mechanism C)")
             try:
+                _request_build_start_ns = _time.perf_counter_ns()
                 inner_result = self._inner.chat(*args, **kwargs)
+                _request_build_ns = _time.perf_counter_ns() - _request_build_start_ns
+                _wrapper_total_ns = _time.perf_counter_ns() - _wrapper_entry_ns
+                _logger.info("[LLM_LOCAL_TIMING] prompt_prepare_ms=%.3f token_estimate_ms=%.3f fingerprint_ms=%.3f cache_metadata_ms=%.3f request_build_ms=%.3f wrapper_total_ms=%.3f call_id=%s turn_id=%s generation_id=%s", _prompt_prepare_ns/1e6, _token_estimate_ns/1e6, _fingerprint_ns/1e6, _cache_metadata_ns/1e6, _request_build_ns/1e6, _wrapper_total_ns/1e6, self._timing.get("call_id", "N/A"), self._timing.get("turn_id", "N/A"), _gen)
                 # inner_result may be coroutine or CM - handle both in TimingChatCM
-                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start)
+                return TimingChatCM(inner_result, self._timing, self._prov_info, request_start, _gen, seq=_seq, inst=getattr(self, '_inst_label', 'single/1'), counted=_req_inflight)
             except Exception as e:
                 error_time = _time.time()
                 prov = self._prov_info.get('provider', '') or 'unknown'
                 model = self._prov_info.get('model_id', '') or 'unknown'
                 base_url = self._prov_info.get('base_url', '') or 'unknown'
                 _logger.error(f"LLM API ERROR provider={prov} model={model} base_url={base_url} Error={e} Type={type(e).__name__} After {(error_time-request_start)*1000:.0f}ms")
-                import traceback
-                _logger.error(f"Full traceback: {traceback.format_exc()}")
+                # Avoid synchronous traceback.format_exc() on event loop (tokenize.open 176ms block)
+                # This is sync chat() path — cannot await. Log minimal now, schedule full traceback off-loop.
+                try:
+                    import asyncio as _aio_tb
+                    _loop_tb = _aio_tb.get_event_loop()
+                    def _log_tb_async():
+                        try:
+                            _tb = traceback.format_exc()
+                            _logger.error(f"Full traceback: {_tb[:2000]}")
+                        except Exception:
+                            pass
+                    # Schedule traceback logging off the critical path via thread
+                    _loop_tb.call_soon_threadsafe(lambda: _aio_tb.create_task(_aio_tb.to_thread(_log_tb_async)) if _loop_tb.is_running() else None)
+                except Exception:
+                    pass
                 raise
 
-    return LLMTimingWrapper(llm_instance, timing_dict, provider_info)
+    _w = LLMTimingWrapper(llm_instance, timing_dict, provider_info)
+    try:
+        _w._inst_label = inst_label or "single/1"
+    except Exception:
+        pass
+    return _w
 
 
 def _create_llm_failure_logging_wrapper(llm_instance, cfg):
     """Wrap LLM to log failures with provider/model/base_url for 404 debugging.
-
+    
     Logs explicit provider/model/base_url when LLM fails, to debug 404 like:
     - openai_gpt_4_1_mini gpt-4.1-mini @ https://api.openai.com/v1 404
     - groq_gpt_oss openai/gpt-oss-120b @ https://api.groq.com/openai/v1 404
@@ -1245,7 +1888,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
                     logger.info(f"🤖 LLM fallback chain length: {len(inner)}")
             else:
                 logger.info(f"🤖 LLM single provider built: {llm_type}")
-
+            
             # Set provider/model in timing_dict for cost tracking and wrap with timing
             if turn_timing_ref is not None:
                 try:
@@ -1284,40 +1927,34 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             llm_inst = _create_llm_failure_logging_wrapper(llm_inst, cfg)
         logger.info(f"⏱️ provider build sync fallback {time.time()-build_t0:.2f}s")
 
-    # Wrap TTS with timing instrumentation if timing ref provided - works with any provider
-    if turn_timing_ref is not None:
-        try:
-            is_fallback = hasattr(tts_inst, '_tts_instances') or hasattr(tts_inst, 'tts_instances') or 'FallbackAdapter' in str(type(tts_inst))
-            if is_fallback:
-                try:
-                    inner_list = getattr(tts_inst, '_tts_instances', None) or getattr(tts_inst, 'tts_instances', None) or getattr(tts_inst, '_instances', None)
-                    if inner_list:
-                        for idx, inner_tts in enumerate(inner_list):
-                            inner_list[idx] = _create_tts_timing_wrapper(inner_tts, turn_timing_ref)
-                        logger.info(f"🔧 TTS timing wrapper applied to FallbackAdapter ({len(inner_list)} providers)")
-                    else:
-                        tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
-                except Exception as e:
-                    logger.warning(f"Could not wrap FallbackAdapter inner TTS: {e}, wrapping outer")
-                    tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
-            else:
-                tts_inst = _create_tts_timing_wrapper(tts_inst, turn_timing_ref)
-                logger.info(f"🔧 TTS timing wrapper applied")
-        except Exception as e:
-            logger.warning(f"Could not apply TTS timing wrapper: {e}")
+    # Use the real TTS instance. A timing wrapper around synthesize/stream
+    # broke session.say() (opening line generated, nothing heard).
+    logger.info("🔧 TTS left unwrapped so the opening line can play")
 
     # Turn-taking: how long the agent waits before it assumes the user is done,
     # and how easily the user can barge in. The old values (0.20/0.55, interrupt
     # after 0.25s + 1 word) made the agent jump in on every breath and read as
     # robotic; worse, every false barge-in pushes a speech handle into LiveKit's
     # interrupt path — where the repeated 5s timeout errors came from.
-    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.35"))
+    # The STT final already follows Deepgram's 200ms silence endpoint. Keep a
+    # further 200ms confirmation window for natural pauses, while avoiding the
+    # previous 250ms fixed floor on every completed turn. This does not change
+    # Deepgram configuration or interruption/continuation handling.
+    min_delay = float(os.getenv("VOICE_ENDPOINTING_MIN", "0.20"))
     max_delay = float(os.getenv("VOICE_ENDPOINTING_MAX", "0.75"))
-    # min_words is the knob that actually gates interruptions in LiveKit; a
-    # 0.5s / 2-word floor filters coughs, "hmm", and echo without making the
-    # agent feel un-interruptible.
-    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.5"))
+    # Interruption = the human barge-in contract:
+    #  * min_words=2 is the semantic gate — a lone "haan/hmm/ok" backchannel or a
+    #    cough must NOT cut the agent off mid-sentence (humans don't stop for
+    #    those either), while a real 2+ word barge-in stops it immediately.
+    #  * min_duration=0.35 (was 0.5) — once the gate passes, cut fast; a human
+    #    stops talking within ~200-400ms of being spoken over.
+    #  * resume_false_interruption keeps LiveKit's automatic recovery: if a
+    #    "barge-in" turns out to be noise (no words, silence), the agent resumes
+    #    its sentence instead of dying — false_interruption_timeout controls how
+    #    quickly it recovers (default SDK 2.0s felt like a freeze; 1.5s here).
+    min_interruption_duration = float(os.getenv("VOICE_MIN_INTERRUPTION_DURATION", "0.35"))
     min_interruption_words = int(os.getenv("VOICE_MIN_INTERRUPTION_WORDS", "2"))
+    false_interruption_timeout = float(os.getenv("VOICE_FALSE_INTERRUPTION_TIMEOUT", "1.5"))
     allow_interruptions = os.getenv("VOICE_ALLOW_INTERRUPTIONS", "1") == "1"
     turn_detection_mode = os.getenv("VOICE_TURN_DETECTION", "stt").strip().lower()
     if turn_detection_mode not in ("vad", "stt", "realtime_llm", "manual"):
@@ -1335,7 +1972,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
     # When KB empty, keep preemptive enabled for faster responses
     preemptive_tts_enabled = os.getenv("VOICE_PREEMPTIVE_TTS", "0") == "1"
     env_preemptive = os.getenv("VOICE_PREEMPTIVE", "1") == "1"
-
+    
     # Check if KB has content and if RAG enabled
     has_kb = False
     rag_enabled = True
@@ -1349,7 +1986,7 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             rag_enabled = True
     except Exception:
         rag_enabled = True
-
+    
     try:
         kb = getattr(cfg, 'knowledge', None)
         if kb:
@@ -1359,12 +1996,19 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
             has_kb = has_text or has_docs or has_faq
     except Exception:
         has_kb = False
-
+    
     # FIX ROOT CAUSE: When KB/FAQ RAG is enabled, preemptive must be disabled BEFORE turn begins
     # Verify runtime Session config, not just config variable
     # Exactly one LLM REQUEST START per completed user turn, no preemptive that can be invalidated by RAG mutation
     # Previous bug: only disabled when has_kb, but RAG is always enabled, so preemptive still caused duplicate 0/0 failures
     # New: disable preemptive whenever RAG enabled (which is default), regardless of has_kb, to prevent any invalidation
+    # NOTE 2026-09-24 (verified against livekit-agents 1.8.2): a discarded preemptive
+    # attempt is NOT free — perform_llm_inference starts before the scheduling gate, so
+    # every invalidation = one billed prompt. The global flag therefore stays False.
+    # Acknowledgements get NO speculative generation at all: the turn governor in
+    # agent_builder answers them deterministically inside Agent.llm_node (zero API).
+    # (The 2026-09-23 VOICE_PREEMPTIVE_ACK toggle experiment was replaced by that
+    # deterministic path per the 2026-09-24 spec — simpler, cheaper, no cancellation.)
     if rag_enabled and env_preemptive:
         preemptive_enabled = False
         logger.info(f"🔧 RAG+preemptive ROOT FIX: RAG enabled={rag_enabled} has_kb={has_kb}, disabling preemptive to prevent duplicate/invalidated LLM requests (was {env_preemptive} from env). Ensures exactly one REQUEST START per turn, no preemptive invalidation by RAG mutation.")
@@ -1373,16 +2017,30 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
         logger.info(f"🔧 RAG+preemptive fix: KB present (has_kb={has_kb}), disabling preemptive to prevent duplicate LLM requests (was {env_preemptive} from env).")
     else:
         preemptive_enabled = env_preemptive
-
+    
     # Verify runtime Session config will have preemptive disabled
     logger.info(f"🔧 FINAL Session config verification: preemptive={preemptive_enabled} (env {env_preemptive}, rag_enabled {rag_enabled}, has_kb {has_kb}) - must be False when RAG enabled to prevent duplicate")
-
+    # Task 2 (2026-09-24): the gate is architectural, not timid. 1.8.x builds
+    # speculative generations from the bare agent.chat_ctx WITHOUT running
+    # on_user_turn_completed (agent_activity.on_preemptive_generation), then
+    # reuses one only if the ctx is still equivalent at commit. Per-turn RAG
+    # injection mutates the committed ctx, so speculation on knowledge turns is
+    # generated UNGROUNDED (~3K tokens billed) and discarded; on non-injected
+    # turns (pure ACKs) a speculative reply could be REUSED and bypass the
+    # deterministic ack path. Keeping it off is the safe answer the spec asks
+    # for; enabling needs a context-stable design, not a flag flip.
+    logger.info(f"🔇 [PREEMPTIVE] enabled={preemptive_enabled} reason='per-turn RAG injection makes speculative ctx stale (guaranteed discard+billed); reuse would bypass deterministic ACKs' started=0 cancelled=0 reused=0 discarded=0 — every caller FINAL spoken while the agent was speaking/thinking is counted as would_cancel: under naive speculation each would have been a billed-then-discarded duplicate")
+    global _PREEMPTIVE_ENABLED_FOR_LOG
+    _PREEMPTIVE_ENABLED_FOR_LOG = bool(preemptive_enabled)
+    
     logger.info(
         f"🔧 Session config: preemptive={preemptive_enabled} (env {env_preemptive}, has_kb {has_kb}), "
         f"preemptive_tts={preemptive_tts_enabled}, turn_detection={turn_detection_mode}, "
         f"endpointing={min_delay}/{max_delay}, "
+        "stt_timeout=6.0s tts_timeout=10.0s, "
         f"interruption={'on' if allow_interruptions else 'off'} "
-        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words})"
+        f"(min_duration={min_interruption_duration}s, min_words={min_interruption_words}, "
+        f"false_resume={false_interruption_timeout}s)"
     )
 
     return AgentSession(
@@ -1399,6 +2057,8 @@ async def build_assistant_session(cfg: AgentConfig, turn_timing_ref=None):
                 "mode": "vad",
                 "min_duration": min_interruption_duration,
                 "min_words": min_interruption_words,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": false_interruption_timeout,
             },
             "preemptive_generation": {
                 "enabled": preemptive_enabled,
@@ -1420,6 +2080,14 @@ def build_announcement_session(cfg: AgentConfig):
         tts=build_tts(cfg),
         conn_options=_build_conn_options(),
         turn_handling={
+            # Announcement has no STT/VAD at all, so the library's default
+            # "vad"-style turn detector can only fail: every call logs
+            # "TurnDetector requires a VAD model" and the session runs on a
+            # half-configured detector. "manual" is the honest setting — the
+            # script is a single non-interactive playback; end-of-utterance
+            # detection is irrelevant here (assistant calls keep their own
+            # turn_detection=stt path untouched).
+            "turn_detection": "manual",
             "endpointing": {"min_delay": 0.2, "max_delay": 0.5},
             "interruption": {"enabled": False},          # the script must not be cut off
             "preemptive_generation": {"enabled": False},
@@ -1476,6 +2144,104 @@ async def start_egress(room: str) -> Optional[str]:
 # Entrypoint
 # ---------------------------------------------------------------------------
 async def entrypoint(ctx):
+    """LiveKit job entrypoint — the worker's failure contract.
+
+    Any exception during setup (agent load, provider build, session start) used
+    to kill the job silently: the room stayed open with no agent, the UI waited
+    on "Waiting for agent to connect..." forever, and the call row stayed
+    "planned". Now every setup failure:
+
+      1. logs CRITICAL with the full traceback,
+      2. marks the call "failed" in the DB with the reason (the UI polls this
+         and shows the caller the real error instead of an endless spinner),
+      3. deletes the room (the caller's browser disconnects instead of hanging
+         in a silent room),
+      4. shuts the job down (frees the worker process for the next dispatch).
+
+    A 90-second setup watchdog additionally force-fails jobs whose setup hangs
+    (stuck provider build / DB init / dead loop) so one sick job can't clog
+    dispatch — the classic "second call goes silent" symptom.
+    """
+    # FIRST observable link of the dispatch chain on the worker side. If the
+    # API logs CALL_START -> ROOM_CREATED -> AGENT_DISPATCH_SENT but this line
+    # never appears, LiveKit never offered the job to this worker (dispatch
+    # dropped / worker not registered at dispatch time) — never a code issue.
+    try:
+        _md = getattr(getattr(ctx, "job", None), "metadata", "") or ""
+        logger.info(
+            "[JOB_RECEIVED] room=%s job_id=%s worker_agent=%s metadata=%s",
+            getattr(getattr(ctx, "room", None), "name", ""),
+            getattr(getattr(ctx, "job", None), "id", ""),
+            WORKER_AGENT_NAME,
+            _md[:200],
+        )
+        # P9 lifecycle marker: the job is now owned by THIS process (pid ties
+        # every later log line to a concrete runner process — two "initializing
+        # job runner" lines are two idle processes, not two worker instances).
+        logger.info(
+            "[JOB_ACCEPTED] job_id=%s room=%s pid=%s agent_name=%s",
+            getattr(getattr(ctx, "job", None), "id", ""),
+            getattr(getattr(ctx, "room", None), "name", ""),
+            os.getpid(),
+            WORKER_AGENT_NAME,
+        )
+    except Exception:
+        pass
+    setup_complete = {"done": False}
+
+    async def _setup_watchdog():
+        try:
+            await asyncio.sleep(90.0)
+        except asyncio.CancelledError:
+            return
+        if not setup_complete["done"]:
+            logger.critical(
+                "⛔ Setup exceeded 90s — force-shutting job to free the worker "
+                "process (stuck provider build / DB init / event loop)"
+            )
+            try:
+                ctx.shutdown()
+            except Exception:
+                pass
+
+    watchdog_task = asyncio.create_task(_setup_watchdog())
+    try:
+        await _entrypoint_body(ctx, setup_complete)
+    except Exception as e:
+        # Avoid synchronous traceback.format_exc() on event loop (tokenize.open block)
+        try:
+            _tb_setup = await asyncio.to_thread(traceback.format_exc)
+        except Exception:
+            _tb_setup = f"{type(e).__name__}: {e}"
+        logger.critical(
+            "WORKER_JOB_SETUP_FAILED room=%s: %s: %s\n%s",
+            getattr(ctx.room, "name", ""), type(e).__name__, e, _tb_setup,
+        )
+        try:
+            meta = json.loads(ctx.job.metadata or "{}")
+        except Exception:
+            meta = {}
+        await _mark_call_failed(
+            meta.get("call_id", ""), meta.get("user_id", ""), f"{type(e).__name__}: {e}"
+        )
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
+        try:
+            ctx.shutdown()
+        except Exception:
+            pass
+        raise
+    finally:
+        if not watchdog_task.done():
+            watchdog_task.cancel()
+
+
+async def _entrypoint_body(ctx, setup_complete):
     from livekit.agents import AgentSession
     from app.agents.agent_builder import (
         build_vad,
@@ -1487,6 +2253,15 @@ async def entrypoint(ctx):
     )
 
     call_start = time.time()
+
+    # Connect to the LiveKit room immediately per LiveKit Agents architecture.
+    # Satisfies the 10-second connection deadline and initializes WebRTC transport
+    # concurrently while agent config and models are prepared.
+    try:
+        await ctx.connect()
+        logger.info("⚡ LiveKit room connected immediately: %s", getattr(ctx.room, "name", ""))
+    except Exception as exc:
+        logger.warning("ctx.connect() warning: %r (session.start will attempt connect)", exc)
 
     # --- Latency fix: DB init was 2.33s per job + 1.13s lookup + 8.62s None->listening
     # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
@@ -1507,54 +2282,6 @@ async def entrypoint(ctx):
     except Exception as _e:
         logger.debug(f"SSL ensure failed: {_e!r}")
 
-    db_t0 = time.time()
-    db_just_initialized = False
-    if not _DB_INIT_DONE:
-        try:
-            # DB init MUST run on the agent's own event loop.
-            #
-            # An earlier version ran it as
-            #   asyncio.to_thread(lambda: asyncio.new_event_loop().run_until_complete(db_init()))
-            # which connected the *process-wide* Prisma singleton (engine +
-            # httpx connection pool) to a throwaway loop in a worker thread. The
-            # next real query — repo.get_agent() on the agent loop — then hung
-            # until the 3s lookup timeout, showing up as
-            #   "agent lookup attempt 1/2 failed (3.01s): "  (empty message = TimeoutError)
-            # and adding ~4.5s before the greeting.
-            #
-            # The 1359ms SSL block this hack was working around is already fixed
-            # globally by the cached httpx/SSL-context patch at import time, so
-            # connecting on-loop is cheap now. One synchronous piece remains in
-            # connect(): prisma_client first verifies the engine binary with
-            # `prisma-engine --version` via subprocess (~200ms on Windows).
-            # Run that check off the audio loop once, before connecting.
-            try:
-                def _ensure_prisma_engine_binary() -> bool:
-                    import importlib
-                    for mod_base in ("prisma_client", "prisma"):
-                        try:
-                            paths = importlib.import_module(f"{mod_base}.binaries.paths")
-                            utils = importlib.import_module(f"{mod_base}.engine.utils")
-                            utils.ensure(paths.BINARY_PATHS.query_engine)
-                            return True
-                        except Exception:
-                            continue
-                    return False
-                if await asyncio.to_thread(_ensure_prisma_engine_binary):
-                    logger.info("🔥 Prewarm: Prisma engine binary verified off-loop (avoids ~200ms subprocess spawn on agent loop during DB connect)")
-            except Exception:
-                pass  # db_init() will do the check itself; never block the call
-            await asyncio.wait_for(db_init(), timeout=8)
-            _DB_INIT_DONE = True
-            db_just_initialized = True
-            logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
-        except Exception as exc:
-            logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
-    else:
-        logger.info(f"⏱️ DB init 0.00s (cached)")
-
-    # Agent lookup cache (in-memory, 30s TTL) to avoid 1.13s DB hit per call
-
     try:
         meta = json.loads(ctx.job.metadata or "{}")
     except Exception:
@@ -1564,65 +2291,128 @@ async def entrypoint(ctx):
     phone = meta.get("phone")
     call_id = meta.get("call_id", "")
     user_id = meta.get("user_id", "")
-    # Per-lead data for dynamic scripts (bulk-call campaigns). Every lead's columns
-    # can be referenced in the greeting/announcement text as {column_name}.
     lead_data = meta.get("lead_data") or {}
+    meta_agent_config = meta.get("agent_config")
+
+    logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
+    logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
+
+    logger.info("[CALL_START] room=%s agent_id=%s mode=%s call_id=%s", getattr(ctx.room, "name", ""), agent_id, mode, call_id)
+    logger.info("[AGENT_SELECTED] room=%s agent_id=%s user_id=%s mode=%s", getattr(ctx.room, "name", ""), agent_id, user_id, mode)
 
     rec = None
-    cache_key = f"{agent_id}:{user_id}"
-    cache_entry = _AGENT_CACHE.get(cache_key) if agent_id and user_id else None
-    if cache_entry and (time.time() - cache_entry["ts"]) < _AGENT_CACHE_TTL:
-        rec = cache_entry["rec"]
-        logger.info(f"⏱️ agent lookup 0.00s (cached, age {time.time()-cache_entry['ts']:.1f}s)")
-    elif agent_id and user_id:
-        lookup_t0 = time.time()
-        # Right after a fresh connect the first query still pays the cold TLS
-        # handshake to Postgres/Neon (~1.5-4s). Cancelling it at 3s and retrying
-        # just wastes 3s and can leave the engine's connection pool in a bad
-        # state, so give a cold first attempt more room.
-        timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
-        for attempt in range(2):  # Reduced from 3 to 2 attempts for faster fail
+    if agent_id:
+        try:
+            from app.config import DATA_DIR
+            cache_file = DATA_DIR / f"agent_{agent_id}.json"
+            if cache_file.exists():
+                rec = json.loads(cache_file.read_text(encoding="utf-8"))
+                logger.info("⚡ Fast-path: Agent '%s' loaded from local cache in 0ms (no DB delay)", rec.get("name", agent_id))
+        except Exception as exc:
+            logger.warning("Could not read agent cache file: %r", exc)
+
+    if rec is not None:
+        # Warm DB connection in background so billing/cleanup at end of call is instant
+        if not _DB_INIT_DONE:
+            async def _bg_db_init():
+                global _DB_INIT_DONE
+                try:
+                    await asyncio.wait_for(db_init(), timeout=10)
+                    _DB_INIT_DONE = True
+                    logger.info("⏱️ Background DB init completed ready for billing")
+                except Exception as exc:
+                    logger.warning("Background DB init failed: %r", exc)
+            asyncio.create_task(_bg_db_init())
+    else:
+        db_t0 = time.time()
+        db_just_initialized = False
+        if not _DB_INIT_DONE:
             try:
-                rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
-                logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
-                _AGENT_CACHE[cache_key] = {"rec": rec, "ts": time.time()}
-                break
+                try:
+                    def _ensure_prisma_engine_binary() -> bool:
+                        import importlib
+                        for mod_base in ("prisma_client", "prisma"):
+                            try:
+                                paths = importlib.import_module(f"{mod_base}.binaries.paths")
+                                utils = importlib.import_module(f"{mod_base}.engine.utils")
+                                utils.ensure(paths.BINARY_PATHS.query_engine)
+                                return True
+                            except Exception:
+                                continue
+                        return False
+                    if await asyncio.to_thread(_ensure_prisma_engine_binary):
+                        logger.info("🔥 Prewarm: Prisma engine binary verified off-loop")
+                except Exception:
+                    pass
+                await asyncio.wait_for(db_init(), timeout=8)
+                _DB_INIT_DONE = True
+                db_just_initialized = True
+                logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
             except Exception as exc:
-                # %r, not %s: a bare TimeoutError stringifies to "" and the old
-                # log line read "failed (3.01s): " with no reason at all.
-                logger.warning(
-                    "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
-                    attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
-                )
-                if attempt < 1:
-                    await asyncio.sleep(0.15)
+                logger.error("database initialization unavailable (%.2fs); continuing voice call: %r", time.time()-db_t0, exc)
+        else:
+            try:
+                await asyncio.wait_for(db_init(), timeout=5)
+                logger.info("⏱️ DB init rechecked on this event loop")
+            except Exception as exc:
+                _DB_INIT_DONE = False
+                logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
+
+        if agent_id and user_id:
+            lookup_t0 = time.time()
+            timeouts = [6.0, 3.0] if db_just_initialized else [3.0, 3.0]
+            for attempt in range(2):
+                try:
+                    rec = await asyncio.wait_for(repo.get_agent(agent_id, user_id), timeout=timeouts[attempt])
+                    logger.info(f"⏱️ agent lookup ok attempt {attempt+1} in {time.time()-lookup_t0:.2f}s")
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "agent lookup attempt %s/2 failed (%.2fs, timeout=%.1fs): %r",
+                        attempt + 1, time.time() - lookup_t0, timeouts[attempt], exc,
+                    )
+                    if attempt < 1:
+                        await asyncio.sleep(0.15)
 
     if rec is None:
-        # fall back to the default demo agent so the worker never crashes
+        if agent_id and agent_id != "demo":
+            logger.error(
+                "[CALL_ERROR] room=%s Agent '%s' not found for user %s. Refusing silent fallback.",
+                getattr(ctx.room, "name", ""), agent_id, user_id,
+            )
+            if call_id and user_id:
+                try:
+                    await repo.update_call(call_id, {
+                        "status": "failed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+                except Exception:
+                    pass
+            try:
+                ctx.shutdown()
+            except Exception:
+                pass
+            return
+        logger.info("[AGENT_SELECTED] room=%s Using default demo agent config", getattr(ctx.room, "name", ""))
         from app.sample import default_config
         cfg = default_config()
-        agent_id = agent_id or "demo"
+        agent_id = "demo"
     else:
         cfg = AgentConfig(**rec)
 
     logger.info(f"📞 agent={cfg.name} mode={mode} phone={phone} call={call_id}")
 
-    # Ensure the call record exists / is in-progress.
-    call_record = None
-    if call_id and user_id:
-        call_record = await repo.get_call(call_id, user_id)
-    if call_record is None:
-        call_record = await repo.create_call({
-            "user_id": user_id or "demo",
-            "agent_id": agent_id or "demo",
-            "mode": mode,
-            "phone": phone or None,
-            "room": ctx.room.name,
-            "status": "in-progress",
-            "started_at": time.strftime("%Y-%m-%d %H:%M"),
-        })
-    else:
-        await repo.update_call(call_record["id"], {"status": "in-progress", "room": ctx.room.name})
+    # Ensure the call record status is tracked in-progress asynchronously without blocking audio
+    call_record = {"id": call_id or f"call_{uuid.uuid4().hex[:8]}", "user_id": user_id}
+    async def _mark_call_in_progress():
+        try:
+            if not _DB_INIT_DONE:
+                await asyncio.wait_for(db_init(), timeout=10)
+            if call_id and user_id:
+                await repo.update_call(call_id, {"status": "in-progress", "room": getattr(ctx.room, "name", "")})
+        except Exception as e:
+            logger.warning("Could not mark call in-progress: %s", e)
+    asyncio.create_task(_mark_call_in_progress())
 
     usage = {"tts_chars": 0, "llm_input_tokens": 0, "llm_output_tokens": 0,
              "user_speech_seconds": 0.0, "transcripts": []}
@@ -1644,9 +2434,14 @@ async def entrypoint(ctx):
     else:
         customer_key = ctx.room.name
     memory_enabled = bool(getattr(cfg, "memory_enabled", True))
-    prior_memory = memory.load(customer_key) if memory_enabled else ""
+    prior_memory = (await asyncio.to_thread(memory.load, customer_key)) if memory_enabled else ""
 
-    greeting = cfg.greeting or f"Namaste! Main {cfg.name} hoon. Aap kaise madad kar sakta hoon?"
+    if (cfg.greeting or "").strip():
+        greeting = cfg.greeting
+    elif (getattr(cfg, "language", "hi") or "hi").lower().startswith("en"):
+        greeting = f"Hello, this is {cfg.name}. How can I help you?"
+    else:
+        greeting = f"Namaste! Main {cfg.name} hoon. Aap kaise madad kar sakta hoon?"
     # Dynamic script: substitute {column} placeholders with this lead's values
     # (used by bulk-call campaigns so every call is personalized).
     greeting = leadfile.render_template(greeting, lead_data)
@@ -1686,29 +2481,504 @@ async def entrypoint(ctx):
         "failed_requests": 0,
         "all_requests": [],  # list of {input, cached, output, success, ttft, gen_time, provider, model, is_closing}
         "is_closing": False,  # True when deterministic closing in progress
+        "call_id": str(getattr(ctx.room, "name", "unknown")),
+        "turn_id": 0,
+        "stt_final_mono_ns": 0,
+        "callback_enter_mono_ns": 0,
+        "callback_complete_mono_ns": 0,
     }
 
-    # Preserve last successful metrics for final billing (fix 0ms telemetry)
-    last_successful_metrics = {
-        "ttft_ms": 0.0,
-        "generation_time_ms": 0.0,
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-        "provider": "",
-        "model": "",
-    }
+    _sync_callback_records = []
+    _turn_task_wait_samples = []
+    _loop_stack_samples = []
+    _loop_heartbeat = {"ns": time.monotonic_ns(), "active": False}
+    _loop_sampler_stop = threading.Event()
+    # Separate call-time loop stalls from worker startup/idle/shutdown stalls.
+    async def _loop_lag_watch(_tt=turn_timing):
+        import asyncio as _aio
+        _last = time.perf_counter()
+        _active, _background = [], []
+        _counts = {"active": [0, 0, 0], "background": [0, 0, 0]}
+        _maxima = {"active": 0.0, "background": 0.0}
+        try:
+            while True:
+                await _aio.sleep(0.05)
+                _now = time.perf_counter()
+                _drift = max(0.0, (_now - _last - 0.05) * 1000.0)
+                _last = _now
+                _sample_ns = time.monotonic_ns()
+                _room_obj = getattr(ctx, "room", None)
+                _active_call = bool(getattr(_room_obj, "remote_participants", {}))
+                _loop_heartbeat["ns"] = time.monotonic_ns()
+                _loop_heartbeat["active"] = _active_call
+                # Read-only stack samples for all live tasks during calls. At the
+                # end-of-turn metric, samples can be restricted to the precise
+                # decision->callback window and grouped by task/frame.
+                if _active_call:
+                    for _task in _aio.all_tasks():
+                        if _task is asyncio.current_task() or _task.done():
+                            continue
+                        _frames = _task.get_stack(limit=8)
+                        _stack = " <- ".join(
+                            f"{os.path.basename(_frame.f_code.co_filename)}:{_frame.f_lineno}:{_frame.f_code.co_name}"
+                            for _frame in _frames[-4:]
+                        ) or "stack_unavailable"
+                        _turn_task_wait_samples.append((_sample_ns, _task.get_name(), _stack))
+                    if len(_turn_task_wait_samples) > 8192:
+                        del _turn_task_wait_samples[:4096]
+                _kind = "active" if _active_call else "background"
+                _samples = _active if _active_call else _background
+                _samples.append(_drift)
+                if len(_samples) > 1200:
+                    del _samples[:600]
+                _maxima[_kind] = max(_maxima[_kind], _drift)
+                _counts[_kind][0] += int(_drift > 100.0)
+                _counts[_kind][1] += int(_drift > 200.0)
+                _counts[_kind][2] += int(_drift > 500.0)
+                if _drift > 100.0:
+                    _sorted = sorted(_samples)
+                    _p95 = _sorted[min(len(_sorted) - 1, int((len(_sorted) - 1) * 0.95))]
+                    _room = getattr(_room_obj, "name", "")
+                    _tag = "ACTIVE_CALL_LOOP_LAG" if _active_call else "BACKGROUND_LOOP_LAG"
+                    logging.getLogger("voice-agent-saas-worker").warning(
+                        "[%s] monotonic_ns=%d duration_ms=%.0f room=%s turn=%s generation=%s agent_state=%s pipeline_stage=%s max_ms=%.0f p95_ms=%.0f counts_gt100=%d counts_gt200=%d counts_gt500=%d",
+                        _tag, time.monotonic_ns(), _drift, _room,
+                        _tt.get("turn_id", "N/A"), _tt.get("gen", "N/A"),
+                        _tt.get("agent_state", "N/A"), _tt.get("pipeline_stage", "N/A"),
+                        _maxima[_kind], _p95, *_counts[_kind],
+                    )
+        except asyncio.CancelledError:
+            return
+        finally:
+            for _kind, _samples in (("active", _active), ("background", _background)):
+                if _samples:
+                    _sorted = sorted(_samples)
+                    _p95 = _sorted[min(len(_sorted) - 1, int((len(_sorted) - 1) * 0.95))]
+                    _tag = "ACTIVE_CALL_LOOP_STATS" if _kind == "active" else "BACKGROUND_LOOP_STATS"
+                    logging.getLogger("voice-agent-saas-worker").info(
+                        "[%s] room=%s max_ms=%.0f p95_ms=%.0f counts_gt100=%d counts_gt200=%d counts_gt500=%d",
+                        _tag, getattr(getattr(ctx, "room", None), "name", ""), _maxima[_kind], _p95,
+                        *_counts[_kind],
+                    )
+    turn_timing["_loop_lag_task"] = asyncio.create_task(_loop_lag_watch())
+
+    def _sample_blocked_loop_stack(_loop_thread_id):
+        _stall_start_ns = 0
+        _last_stack_ns = 0
+        _latest_stack = ""
+        _stall_start_logged = False
+        while not _loop_sampler_stop.wait(0.025):
+            if not _loop_heartbeat["active"]:
+                continue
+            _now_ns = time.monotonic_ns()
+            _heartbeat_ns = int(_loop_heartbeat["ns"])
+            if _now_ns - _heartbeat_ns <= 100_000_000:
+                if _stall_start_ns:
+                    _end_ns = _heartbeat_ns
+                    _duration_ms = max(0.0, (_end_ns - _stall_start_ns) / 1_000_000)
+                    logger.warning("[CALLBACK_BLOCK_END] task=N/A active_frame=%s monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s state=%s stack=%s", _latest_stack.split(" <- ", 1)[0], _end_ns, _duration_ms, getattr(ctx.room, "name", ""), turn_timing.get("turn_id", "N/A"), turn_timing.get("gen", "N/A"), turn_timing.get("agent_state", "N/A"), _latest_stack)
+                    _loop_stack_samples.append((_stall_start_ns, _end_ns, _latest_stack))
+                    if len(_loop_stack_samples) > 1024:
+                        del _loop_stack_samples[:512]
+                    _stall_start_ns = 0
+                    _latest_stack = ""
+                    _stall_start_logged = False
+                continue
+            if not _stall_start_ns:
+                _stall_start_ns = _heartbeat_ns
+                _last_stack_ns = 0
+                _stall_start_logged = False
+            if _now_ns - _last_stack_ns < 50_000_000:
+                continue
+            _last_stack_ns = _now_ns
+            _frame = sys._current_frames().get(_loop_thread_id)
+            _frames = []
+            while _frame is not None:
+                _frames.append(f"{os.path.basename(_frame.f_code.co_filename)}:{_frame.f_lineno}:{_frame.f_code.co_name}")
+                _frame = _frame.f_back
+            _latest_stack = " <- ".join(_frames[:12]) or "stack_unavailable"
+            if len(_loop_stack_samples) > 1024:
+                del _loop_stack_samples[:512]
+            if not _stall_start_logged:
+                logger.warning("[CALLBACK_BLOCK_START] task=N/A active_frame=%s monotonic_ns=%d room=%s turn=%s generation=%s state=%s stack=%s", _latest_stack.split(" <- ", 1)[0], _stall_start_ns, getattr(ctx.room, "name", ""), turn_timing.get("turn_id", "N/A"), turn_timing.get("gen", "N/A"), turn_timing.get("agent_state", "N/A"), _latest_stack)
+                _stall_start_logged = True
+
+    _loop_thread_id = threading.get_ident()
+    _loop_stack_sampler = threading.Thread(target=_sample_blocked_loop_stack, args=(_loop_thread_id,), name="voice-loop-stack-sampler", daemon=True)
+    _loop_stack_sampler.start()
+
+    def _instrument_sync_callback(_name, _callback):
+        _code = getattr(_callback, "__code__", None)
+        _file = getattr(_code, "co_filename", "unknown")
+        _line = getattr(_code, "co_firstlineno", 0)
+        def _wrapped(*args, **kwargs):
+            _start_ns = time.monotonic_ns()
+            _task = asyncio.current_task()
+            _task_name = _task.get_name() if _task else "sync-event-callback"
+            try:
+                return _callback(*args, **kwargs)
+            finally:
+                _end_ns = time.monotonic_ns()
+                _record = {
+                    "name": _name, "task": _task_name, "start_ns": _start_ns, "end_ns": _end_ns,
+                    "duration_ms": (_end_ns - _start_ns) / 1_000_000,
+                    "file": _file, "line": _line, "turn": turn_timing.get("turn_id", "N/A"),
+                    "generation": turn_timing.get("gen", "N/A"), "room": getattr(ctx.room, "name", ""),
+                    "state": turn_timing.get("agent_state", "N/A"), "reported": False,
+                }
+                _sync_callback_records.append(_record)
+                if len(_sync_callback_records) > 1024:
+                    del _sync_callback_records[:512]
+                if _record["duration_ms"] >= 100.0:
+                    logger.warning("[CALLBACK_BLOCK_START] callback=%s task=%s monotonic_ns=%d room=%s turn=%s generation=%s state=%s file=%s line=%s", _name, _task_name, _start_ns, _record["room"], _record["turn"], _record["generation"], _record["state"], _file, _line)
+                    logger.warning("[CALLBACK_BLOCK_END] callback=%s task=%s monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s state=%s file=%s line=%s", _name, _task_name, _end_ns, _record["duration_ms"], _record["room"], _record["turn"], _record["generation"], _record["state"], _file, _line)
+                    _record["reported"] = True
+
+        return _wrapped
+    if os.getenv("VOICE_ASYNCIO_SLOW_CALLBACK_DIAGNOSTICS", "0").strip().lower() in ("1", "true", "yes"):
+        _diag_loop = asyncio.get_running_loop()
+        _diag_loop.set_debug(True)
+        _diag_loop.slow_callback_duration = 0.1
+        logger.warning("[ASYNCIO_SLOW_CALLBACK_DIAGNOSTICS] enabled threshold_ms=100 room=%s", getattr(ctx.room, "name", ""))
+    
 
     # ------------------------------------------------------------------
     # Mode: assistant (STT+LLM+TTS) vs announcement (fixed script only).
     # ------------------------------------------------------------------
     agent_mode = getattr(cfg, "agent_mode", "assistant") or "assistant"
+    logger.info("[AGENT_WAITING] room=%s agent_id=%s name=%s agent_mode=%s", getattr(ctx.room, "name", ""), agent_id, cfg.name, agent_mode)
     if agent_mode == "announcement":
         session = build_announcement_session(cfg)
     else:
-        # Async build to avoid blocking job executor (was 3.46s sync -> unresponsive)
-        # Pass turn_timing_ref to enable TTS timing wrapper (measures real TTS audio)
         session = await build_assistant_session(cfg, turn_timing_ref=turn_timing)
+
+    # LiveKit 1.8.x emits EOUMetrics after the user-turn task. Its end_of_utterance_delay
+    # and transcription_delay let us recover final-to-turn-decision time without
+    # patching LiveKit internals: EOU delay minus transcription delay.
+    def _on_turn_metrics(ev):
+        _metrics = getattr(ev, "metrics", None)
+        if type(_metrics).__name__ != "EOUMetrics":
+            return
+        _eou = getattr(_metrics, "end_of_utterance_delay", None)
+        _trans = getattr(_metrics, "transcription_delay", None)
+        _hook = getattr(_metrics, "on_user_turn_completed_delay", None)
+        _final_ns = int(turn_timing.get("stt_final_mono_ns", 0) or 0)
+        _entered_ns = int(turn_timing.get("callback_enter_mono_ns", 0) or 0)
+        _eou_to_enter_ms = None
+        _final_to_eou_ms = None
+        if isinstance(_eou, (int, float)) and isinstance(_trans, (int, float)):
+            _final_to_eou_ms = max(0.0, (_eou - _trans) * 1000.0)
+            if _final_ns and _entered_ns:
+                _entered_delta = (_entered_ns - _final_ns) / 1_000_000
+                _eou_to_enter_ms = _entered_delta - _final_to_eou_ms
+        _decision_ns = (
+            _final_ns + int(_final_to_eou_ms * 1_000_000)
+            if _final_ns and _final_to_eou_ms is not None
+            else 0
+        )
+        if _decision_ns and _entered_ns:
+            _window_tasks = {}
+            for _sample_time, _task_name, _stack in _turn_task_wait_samples:
+                if _decision_ns <= _sample_time <= _entered_ns:
+                    _key = (_task_name, _stack)
+                    _span = _window_tasks.setdefault(_key, [_sample_time, _sample_time, 0])
+                    _span[1] = _sample_time
+                    _span[2] += 1
+            for (_task_name, _stack), (_first_ns, _last_ns, _samples) in _window_tasks.items():
+                logger.info("[ASYNC_TASK_WINDOW_SAMPLE] task=%s first_monotonic_ns=%d last_monotonic_ns=%d samples=%d room=%s turn=%s generation=%s stack=%s", _task_name, _first_ns, _last_ns, _samples, turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"), _stack)
+            for _block_start_ns, _block_end_ns, _block_stack in _loop_stack_samples:
+                if _block_start_ns < _entered_ns and _block_end_ns > _decision_ns:
+                    logger.warning("[TURN_WINDOW_BLOCK_STACK] start_monotonic_ns=%d end_monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s stack=%s", _block_start_ns, _block_end_ns, (_block_end_ns - _block_start_ns) / 1_000_000, turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"), _block_stack)
+            for _record in _sync_callback_records:
+                if _record["start_ns"] < _entered_ns and _record["end_ns"] > _decision_ns and not _record["reported"]:
+                    logger.warning("[CALLBACK_BLOCK_START] callback=%s task=%s monotonic_ns=%d room=%s turn=%s generation=%s state=%s file=%s line=%d", _record["name"], _record["task"], _record["start_ns"], _record["room"], _record["turn"], _record["generation"], _record["state"], _record["file"], _record["line"])
+                    logger.warning("[CALLBACK_BLOCK_END] callback=%s task=%s monotonic_ns=%d duration_ms=%.3f room=%s turn=%s generation=%s state=%s file=%s line=%d", _record["name"], _record["task"], _record["end_ns"], _record["duration_ms"], _record["room"], _record["turn"], _record["generation"], _record["state"], _record["file"], _record["line"])
+                    _record["reported"] = True
+        logger.info(
+            "[TURN_TRACE] stage=turn_detection_decision monotonic_ns=%s source=%s call_id=%s turn_id=%s generation_id=%s speech_id=%s",
+            _decision_ns if _decision_ns else "N/A",
+            "derived_from_livekit_eou_metrics" if _decision_ns else "unavailable",
+            turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"),
+            getattr(_metrics, "speech_id", "N/A"),
+        )
+        logger.info(
+            "[ASYNC_TASK_DELAY] task=AgentActivity._user_turn_completed_task call_id=%s turn_id=%s schedule_to_start_ms=N/A turn_decision_to_callback_enter_ms=%s source=LiveKit_task_creation_is_internal",
+            turn_timing.get("call_id"), turn_timing.get("turn_id"),
+            f"{_eou_to_enter_ms:.1f}" if _eou_to_enter_ms is not None else "N/A",
+        )
+        logger.info(
+            "[LIVEKIT_EOU_METRICS] call_id=%s turn_id=%s generation_id=%s speech_id=%s final_to_turn_decision_ms=%s turn_decision_to_callback_enter_ms=%s callback_hook_ms=%s callback_schedule_to_start_ms=N/A source=LiveKit_internal_schedule_not_public",
+            turn_timing.get("call_id"), turn_timing.get("turn_id"), turn_timing.get("gen", "N/A"),
+            getattr(_metrics, "speech_id", "N/A"),
+            f"{_final_to_eou_ms:.1f}" if _final_to_eou_ms is not None else "N/A",
+            f"{_eou_to_enter_ms:.1f}" if _eou_to_enter_ms is not None else "N/A",
+            f"{float(_hook) * 1000:.1f}" if isinstance(_hook, (int, float)) else "N/A",
+        )
+    try:
+        session.on("metrics_collected", _on_turn_metrics)
+    except Exception as _metric_hook_error:
+        logger.warning("Could not attach LiveKit EOU metric listener: %s", _metric_hook_error)
+
+    # ------------------------------------------------------------------
+    # RAG precomputation (latency): the session AWAITs on_user_turn_completed
+    # before the LLM starts, and per-turn RAG (BM25 over the knowledge base)
+    # used to run inside that hook — 27-105ms+ added to every single turn.
+    # Instead, run retrieval on each STT interim (while the user is still
+    # finishing the sentence, i.e. during the endpointing silence) and cache
+    # the result by normalized text. The final text almost always matches the
+    # last interim, so the awaited hook becomes a dict lookup (~0ms).
+    # ------------------------------------------------------------------
+    rag_prefetch: dict = {}
+    rag_prefetch_inflight: set = set()
+    # [USER_SPEECH_STARTED] edge detector state (mutable cell; updated from
+    # the transcription handler, which is sync and loop-local).
+    _last_tx_ts = [0.0]
+    _last_bargein_ts = [0.0]  # edge debounce for the immediate barge-in interrupt
+
+    def _precompute_rag(text: str) -> None:
+        try:
+            from app import rag as _rag_mod
+            from app.turn_rules import is_contextual_followup as _is_ctx, build_contextual_retrieval_query as _build_ctx_q
+            key = _rag_mod.normalize_query(text)
+        except Exception:
+            return
+        if len(key) < 4 or key in rag_prefetch or key in rag_prefetch_inflight:
+            return
+        if _rag_mod.is_acknowledgement(text):
+            return  # "Ok," etc — answered deterministically by llm_node; no retrieval
+        if _rag_mod.is_incomplete_turn(text):
+            return  # fragment will be merged into the completed turn; don't spend CPU
+
+        # --- Conversational context for prefetch (same logic as builder hook) ---
+        # Uses only immediately preceding user turn, not entire conversation.
+        # Actual LLM user message remains unchanged; only retrieval query enriched.
+        recent_user = ""
+        try:
+            for entry in reversed(usage.get("transcripts", [])):
+                if entry.get("role") == "user":
+                    t = (entry.get("text") or "").strip()
+                    if t and t != text and len(t) >= 4:
+                        try:
+                            if not _rag_mod.is_acknowledgement(t) and not _rag_mod.is_incomplete_turn(t):
+                                recent_user = t
+                                break
+                        except Exception:
+                            recent_user = t
+                            break
+        except Exception:
+            recent_user = ""
+
+        retrieval_query = text
+        context_used = False
+        try:
+            if recent_user and _is_ctx(text):
+                _built = _build_ctx_q(text, recent_user)
+                if _built and _built != text:
+                    retrieval_query = _built
+                    context_used = True
+        except Exception:
+            retrieval_query = text
+            context_used = False
+
+        try:
+            if context_used:
+                logger.info(
+                    "🔎 [RAG_CONTEXT_QUERY] user_query='%s' retrieval_query='%s' context_used=yes source=prefetch recent_len=%d",
+                    text[:80],
+                    retrieval_query[:120],
+                    len(recent_user),
+                )
+        except Exception:
+            pass
+
+        rag_prefetch_inflight.add(key)
+
+        async def _work():
+            try:
+                from app import rag as _rag_mod
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(_rag_mod.build_context_detailed, cfg.knowledge, retrieval_query, 3),
+                    timeout=4,
+                )
+                hits = (res.get("text") or "").strip()
+                if hits:
+                    if len(rag_prefetch) > 8:   # bound the cache to one utterance worth
+                        rag_prefetch.pop(next(iter(rag_prefetch)))
+                    # Store the FULL detailed structure (text + kb/faq flags),
+                    # not just the text — the turn hook then reports prefetch
+                    # HITs with the exact same result structure as a MISS.
+                    # Key is original normalized query so final-turn lookup hits,
+                    # but result was built with contextual retrieval_query.
+                    rag_prefetch[key] = res
+            except Exception as e:
+                logger.debug(f"RAG precompute skipped: {e!r}")
+            finally:
+                rag_prefetch_inflight.discard(key)
+
+        try:
+            asyncio.ensure_future(_work())
+        except Exception:
+            rag_prefetch_inflight.discard(key)
+
+    def _on_transcription(ev) -> None:
+        try:
+            # v1 UserInputTranscribedEvent carries `.transcript` (+ `.is_final`);
+            # legacy "transcription" events used `.text`.
+            text = getattr(ev, "transcript", None) or getattr(ev, "text", None) or ""
+            is_final = bool(getattr(ev, "is_final", False))
+            # --- Immediate barge-in cancellation (2026-09-24 00:53 log) ---
+            # The library gates its own interruption behind min_words=2 +
+            # turn-commit logic, so "Ok" (1 word) at 00:53:34.191 was detected
+            # but the agent kept talking until 00:53:35.770 — 1.57s of
+            # non-interruptible output, with the (truncated) assistant item
+            # committing at 00:53:35.857. We keep the library gate as-is and
+            # add our own trigger on the FIRST transcript edge while the agent
+            # is speaking: session.interrupt() is the library's supported
+            # cancellation (AgentActivity.interrupt -> cancels preemptive
+            # generation + the live LLM/TTS tasks + flushes playback, commits
+            # only the already-played audio as the assistant item, then flips
+            # speaking->listening). force=False so protected speeches — the
+            # deterministic closing say() with allow_interruptions=False —
+            # keep playing. Stale-output protection: turn_timing["gen"] is
+            # bumped here BEFORE interrupting, and every LLM stream stamps its
+            # birth gen in the timing wrapper; a late callback from an
+            # invalidated generation logs [STALE_GENERATION_DROPPED] instead
+            # of touching this turn's timing.
+            try:
+                if text.strip() and not is_final and state_tracker.get("state") == "speaking":
+                    _now_b = time.time()
+                    if _now_b - _last_bargein_ts[0] <= 0.30:
+                        pass  # debounce: one cancellation per user-utterance onset
+                    elif turn_timing.get("is_closing", False):
+                        logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech during the protected closing speech — not interrupting")
+                    else:
+                        _gen0 = int(turn_timing.get("gen", 0))
+                        _llm_was = bool(turn_timing.get("llm_active", False))
+                        _in_greet = bool(turn_timing.get("greeting_active", False))
+                        _last_bargein_ts[0] = _now_b
+                        turn_timing["last_bargein_ts"] = _now_b
+                        if _in_greet:
+                            logger.info("🗣️ [USER_SPEECH_DURING_GREETING] caller spoke over the greeting: '%s' — cancelling, not waiting for min_words/turn-commit", text.strip()[:40])
+                        logger.info("🔇 [AGENT_INTERRUPTED_BY_USER] caller resumed speech — interrupting immediately (no wait for the min_words gate / turn commit)")
+                        logger.info("⚡ [INTERRUPTION_START] generation=%d transcript='%s'", _gen0, text.strip()[:40])
+                        if _llm_was:
+                            # interrupt() below tears the pipeline down; annotate the
+                            # intent up front so the completion log pairs read right.
+                            logger.info("🧠 [LLM_CANCELLED] reason=user_barge_in generation=%d", _gen0)
+                        logger.info("🔈 [TTS_CANCELLED] reason=user_barge_in generation=%d (playback flush + truncate via SpeechHandle)", _gen0)
+                        turn_timing["gen"] = _gen0 + 1
+                        logger.info("🚫 [GENERATION_INVALIDATED] generation=%d — current is now %d; late callbacks from %d cannot publish", _gen0, _gen0 + 1, _gen0)
+                        try:
+                            _fut = session.interrupt()
+                            if _in_greet:
+                                logger.info("⛔ [GREETING_INTERRUPTED] generation=%d — greeting speech + TTS + playback cancelled", _gen0)
+
+                            def _barge_done(_f, _g=_gen0, _ig=_in_greet):
+                                try:
+                                    if not _f.cancelled() and _f.exception() is None:
+                                        logger.info("✅ [INTERRUPTION_COMPLETE] generation=%d — agent returned to listening", _g)
+                                        if _ig:
+                                            # session.interrupt()'s future completes only AFTER the
+                                            # library finished teardown: playback flushed, the
+                                            # played-partial committed to chat_ctx, state ->
+                                            # listening. That is the proof the greeting AUDIO
+                                            # stopped (not just a log). tell the builder on_enter.
+                                            turn_timing["greeting_interrupted"] = True
+                                            turn_timing["greeting_bargein_ts"] = time.time()
+                                            logger.info("🔇 [GREETING_CANCELLED] generation=%d — greeting audio actually stopped (playout flushed + partial committed)", _g)
+                                            # "when I interrupt the greeting it should ALSO
+                                            # listen": from this instant the floor belongs to
+                                            # the caller. The 6s apology is suppressed while
+                                            # this window is fresh (see _silence_fallback) and
+                                            # the 30s no-response watchdog still guards real
+                                            # silence — the agent waits like a human being
+                                            # interrupted, it does not talk back over them.
+                                            logger.info("👂 [GREETING_LISTENING] caller owns the floor — agent listens until their utterance endpoint-finishes; no apology, no resume")
+                                except Exception:
+                                    pass
+
+                            _fut.add_done_callback(_barge_done)
+                        except RuntimeError as _ie:
+                            # session not running / current speech disallows
+                            # interruptions: nothing we should force past.
+                            logger.info("ℹ️ immediate interrupt skipped: %s", _ie)
+            except Exception:
+                pass
+            if text.strip():
+                _precompute_rag(text)
+                # P4 marker — utterance-start edge: first transcript after a
+                # >0.7s gap is treated as [USER_SPEECH_STARTED] (interims fire
+                # every ~200ms, so logging each one would spam the call log).
+                _now = time.time()
+                if _now - _last_tx_ts[0] > 0.7:
+                    _last_tx_ts[0] = _now
+                    turn_timing["stt_final_ts"] = 0.0
+                    turn_timing["turn_commit_ts"] = 0.0
+                    turn_timing["llm_request_start_ts"] = 0.0
+                    logger.info("🎙️ [USER_SPEECH_STARTED] first transcript: '%s'", text.strip()[:60])
+            else:
+                _last_tx_ts[0] = time.time()
+            # P5 ROOT-CAUSE FIX (watchdog sync, 2026-09-23 call at 21:45):
+            # the no-response watchdog was cancelled ONLY via
+            # conversation_item_added / agent_state_changed. When the reply
+            # pipeline stalled (no LLM ever started), neither event fired, so
+            # the 30s timer armed at greeting-end FIRED while the user was
+            # actively speaking and the call was auto-cut. STT finals are
+            # authoritative proof of user activity that flows on its own event
+            # (this handler is what drives RAG prefetch, so it demonstrably
+            # works even when the reply pipeline wedges): reset the clock on
+            # every final with text. Interims don't reset — they fire too
+            # often; a user mid-utterance emits finals every few seconds
+            # anyway (STT endpointing).
+            if is_final and text.strip():
+                logger.info("📝 [USER_TRANSCRIPT_FINAL] '%s'", text.strip()[:80])
+                _final_ts = time.time()
+                turn_timing["stt_final_ts"] = _final_ts
+                turn_timing["stt_final_mono_ns"] = time.monotonic_ns()
+                turn_timing["turn_id"] = int(turn_timing.get("turn_id", 0)) + 1
+                turn_timing["pipeline_stage"] = "stt_final"
+                logger.info("[TURN_TRACE] stage=stt_final monotonic_ns=%d call_id=%s room=%s turn_id=%s generation_id=%s", turn_timing["stt_final_mono_ns"], turn_timing.get("call_id"), getattr(ctx.room, "name", ""), turn_timing["turn_id"], turn_timing.get("gen", 0))
+                # STT final does not expose the acoustic speech-end timestamp.
+                # Keep this stage unavailable rather than reporting endpointing
+                # configuration as though it were a measured duration.
+                turn_timing["speech_end"] = 0.0
+                logger.info("⏱️ [TURN_TIMING] speech_end_to_stt_final_ms=N/A source=timestamp_unavailable")
+                # A newer final supersedes any uncommitted final. Avoid
+                # carrying commit/request timestamps across that boundary.
+                turn_timing["turn_commit_ts"] = 0.0
+                turn_timing["llm_request_start_ts"] = 0.0
+                # [PREEMPTIVE] would_cancel (Task 3, 2026-09-24): this FINAL
+                # arrived while the agent was mid-speech/thinking. Under naive
+                # speculative generation each one = a speculative request to
+                # cancel+discard (billed tokens, no reuse) — and in THIS call
+                # style these continuations are the NORM (fragment merges).
+                if turn_timing.get("agent_state") in ("speaking", "thinking"):
+                    turn_timing["spec_would_cancel"] = int(turn_timing.get("spec_would_cancel", 0)) + 1
+                    logger.info("🔇 [PREEMPTIVE] would_cancel=1 (FINAL during '%s' state — avoided by design)", turn_timing.get("agent_state"))
+                # One call does it all: cancels the armed window (single
+                # [WATCHDOG_CANCELLED]+[WATCHDOG_ARMED] log) and starts a fresh
+                # full window measured from this utterance.
+                _schedule_no_response(reason="user_transcript_final")
+                # P4 diagnostic: start the reply-stall probe for this turn.
+                _arm_stall_probe(text.strip())
+        except Exception:
+            pass
+
+    if agent_mode != "announcement":
+        # livekit-agents v1 emits "user_input_transcribed" for every STT interim
+        # and final; the legacy "transcription" event never fires on 1.x, so we
+        # attach the single live event name.
+        attached_events = []
+        for _ev_name in ("user_input_transcribed",):
+            try:
+                session.on(_ev_name, _instrument_sync_callback("user_input_transcribed", _on_transcription))
+                attached_events.append(_ev_name)
+            except Exception:
+                continue
+        if attached_events:
+            logger.info(f"🔧 RAG precompute armed on STT events: {attached_events}")
+        else:
+            logger.debug("transcription hook unavailable (RAG precompute off)")
 
     # ------------------------------------------------------------------
     # Silence watchdog + No-response watchdog.
@@ -1721,6 +2991,7 @@ async def entrypoint(ctx):
     #    (configurable per agent, e.g. 30 sec), speak the agent's
     #    no_response_message and hang up. Requested by user.
     # ------------------------------------------------------------------
+    call_finished = asyncio.Event()
     call_closed = {"done": False}
     closing_requested = {"done": False}
     closing_in_progress = {"done": False}
@@ -1733,12 +3004,57 @@ async def entrypoint(ctx):
         "pending": None,
         "fallback_say": None,
     }
-    # No-response tracking: last time user spoke or agent spoke
+    # No-response tracking: last time user spoke or agent spoke.
+    # `gen` is a monotonically increasing arming generation: every (re)arm or
+    # cancel bumps it and each scheduled handler captures its generation, so a
+    # stale handler left over from an earlier window can NEVER fire after a
+    # cancel/reset (P5: no false no-response while the caller is talking).
     no_response_state = {
         "last_activity": time.time(),
         "task": None,
         "triggered": False,
+        "gen": 0,
     }
+
+    @ctx.room.on("disconnected")
+    def _on_room_disconnected(*_):
+        logger.info("Room disconnected event received")
+        _loop_sampler_stop.set()
+        _ll = turn_timing.pop("_loop_lag_task", None)
+        if _ll is not None:
+            try:
+                _ll.cancel()
+            except Exception:
+                pass
+        try:
+            _cancel_no_response(reason="call_end_room_disconnected")
+            _cancel_stall_probe(reason="call_end_room_disconnected")
+        except Exception:
+            pass
+        call_finished.set()
+
+    @session.on("close")
+    def _on_session_close(*_):
+        logger.info("Session close event received")
+        try:
+            _cancel_no_response(reason="call_end_session_close")
+            _cancel_stall_probe(reason="call_end_session_close")
+        except Exception:
+            pass
+        call_finished.set()
+
+    async def _on_job_shutdown(*_):
+        call_finished.set()
+        # P2: this job thread's event loop is about to close — release its
+        # Prisma client (per-loop registry) so engine processes do not pile
+        # up in the worker. Best-effort, never blocks shutdown.
+        try:
+            from app.db import release_current_loop
+            await asyncio.wait_for(release_current_loop(), timeout=6)
+        except Exception:
+            pass
+
+    ctx.add_shutdown_callback(_on_job_shutdown)
 
     async def _do_deterministic_closing():
         # Prevent duplicate closings, but allow if already closing to ensure completion
@@ -1797,18 +3113,28 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning(f"Deterministic closing outer failed: {e}")
             await asyncio.sleep(1.0)
-        # Now auto-cut the call
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         logger.info("✂️ Auto-cutting call after deterministic closing TTS")
         try:
             session.shutdown(drain=False)
         except Exception:
             pass
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
         try:
             ctx.shutdown()
         except Exception:
             pass
+        call_finished.set()
 
     def _schedule_deterministic_closing():
+        if agent_mode == "announcement":
+            return
         if closing_in_progress["done"]:
             return
         if closing_task_ref["task"] is not None and not closing_task_ref["task"].done():
@@ -1878,6 +3204,28 @@ async def entrypoint(ctx):
                     return
         except Exception:
             pass
+        # Barge-in-aware suppression (2026-09-24, "it should also listen"):
+        # this exact apology was spoken OVER the caller right after a
+        # greeting-cancel + interrupted-generation cascade (01:55:41.875 —
+        # caller heard 'Sorry, temporary technical problem' while still
+        # talking, and then asked the agent what the problem was). If a
+        # barge-in/greeting-interrupt just happened, or the caller's speech
+        # onset is <1.2s old (they may still be mid-sentence), SILENCE is the
+        # correct behavior — their next FINAL re-arms everything normally.
+        # Only this apology is suppressed; the 30s no-response watchdog and
+        # every other path are untouched.
+        try:
+            _nowfb = time.time()
+            _gb_age = _nowfb - float(turn_timing.get("greeting_bargein_ts", 0) or 0)
+            _bb_age = _nowfb - float(turn_timing.get("last_bargein_ts", 0) or 0)
+            if _gb_age < LLM_FALLBACK_DELAY + 1.0 or _bb_age < 1.2:
+                logger.info(
+                    "🛟 fallback suppressed: recent interrupt (greeting-barge %.1fs ago, any-barge %.1fs ago) — listening, not speaking over the caller",
+                    _gb_age if _gb_age < 1e9 else -1, _bb_age if _bb_age < 1e9 else -1,
+                )
+                return
+        except Exception:
+            pass
         logger.warning(
             f"🛟 No LLM reply within {LLM_FALLBACK_DELAY:.0f}s of the user's turn "
             "(rate-limited 429 or failed generation) — speaking a fallback line "
@@ -1894,13 +3242,15 @@ async def entrypoint(ctx):
             logger.warning(f"🛟 could not arm silence watchdog: {e}")
 
     # ---------- No-response handling — robust scheduled timer ----------
-    def _cancel_no_response():
+    def _cancel_no_response(reason: str = "cancel"):
         t = no_response_state.get("task")
+        no_response_state["gen"] = no_response_state.get("gen", 0) + 1  # stale-task guard
         if t is not None and not t.done():
             t.cancel()
+            logger.info(f"⏱️ [WATCHDOG_CANCELLED] gen={no_response_state['gen']} reason={reason}")
         no_response_state["task"] = None
 
-    async def _no_response_timeout_handler():
+    async def _no_response_timeout_handler(gen: int):
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
         no_response_msg = (getattr(cfg, "no_response_message", "") or
                            "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
@@ -1908,12 +3258,25 @@ async def entrypoint(ctx):
             await asyncio.sleep(idle_timeout)
         except asyncio.CancelledError:
             return
+        # Stale-window guard: if this handler was re-armed/cancelled while it
+        # slept, its generation no longer matches — never act on old windows.
+        if gen != no_response_state.get("gen"):
+            return
         if call_closed["done"] or closing_in_progress["done"] or closing_requested["done"] or no_response_state.get("triggered"):
             return
+        ag = agent_holder.get("agent")
+        if ag is not None and getattr(ag, "_opening_started", False) and not getattr(ag, "_opening_done", False):
+            logger.info("⏱️ No-response timer fired during the opening line — not interrupting it")
+            _schedule_no_response()
+            return
         elapsed = time.time() - no_response_state.get("last_activity", 0)
-        # If user spoke during sleep, task would have been cancelled; double-check
+        # Defensive double-check against the per-final activity clock: if the
+        # user spoke during the sleep window, skip AND re-arm a full window
+        # (the old code returned without re-arming, silently disabling the
+        # watchdog for the remainder of the call).
         if elapsed < idle_timeout - 0.5:
-            logger.info(f"⏱️ No-response timer fired but user spoke {elapsed:.1f}s ago (timeout {idle_timeout}s) — skipping")
+            logger.info(f"⏱️ No-response timer fired but user spoke {elapsed:.1f}s ago (timeout {idle_timeout}s) — skipping and re-arming")
+            _schedule_no_response()
             return
         # Only trigger when waiting for user
         cur_state = state_tracker.get("state")
@@ -1922,6 +3285,7 @@ async def entrypoint(ctx):
             _schedule_no_response()
             return
         no_response_state["triggered"] = True
+        logger.info(f"⏱️ [WATCHDOG_FIRED] gen={gen} — no user response for {elapsed:.0f}s (timeout {idle_timeout}s)")
         # Mark call as closing to prevent re-arming watchdog on listening transition
         call_closed["done"] = True
         closing_in_progress["done"] = True
@@ -1956,62 +3320,56 @@ async def entrypoint(ctx):
         except Exception as e:
             logger.warning(f"No-response outer failed: {e}")
             await asyncio.sleep(1.0)
+        logger.info("[CALL_END_REQUESTED] source=timeout reason=no_response")
         logger.info("✂️ Auto-cutting call after no-response TTS")
         try:
             session.shutdown(drain=False)
         except Exception:
             pass
+        room_name = getattr(ctx.room, "name", None)
+        if room_name:
+            try:
+                from app.telephony import end_active_room
+                await end_active_room(room_name)
+            except Exception:
+                pass
         try:
             ctx.shutdown()
         except Exception:
             pass
+        call_finished.set()
 
-    def _schedule_no_response():
+    def _schedule_no_response(reason: str = "re-arm"):
+        # Announcement mode reads a script and hangs up. A silence timer would
+        # interrupt that script or start a second goodbye.
+        if agent_mode == "announcement":
+            return
         if no_response_state.get("triggered") or call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
             logger.info("⏱️ Not arming no-response — call already closing/triggered")
             return
-        _cancel_no_response()
+        _cancel_no_response(reason=reason)
         idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
         no_response_msg = (getattr(cfg, "no_response_message", "") or
                            "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
         no_response_state["last_activity"] = time.time()
+        no_response_state["gen"] = no_response_state.get("gen", 0) + 1
+        gen = no_response_state["gen"]
         try:
-            no_response_state["task"] = asyncio.ensure_future(_no_response_timeout_handler())
-            logger.info(f"⏱️ No-response watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}' (scheduled)")
+            no_response_state["task"] = asyncio.ensure_future(_no_response_timeout_handler(gen))
+            logger.info(f"⏱️ [WATCHDOG_ARMED] gen={gen} timeout={idle_timeout}s -> '{no_response_msg[:60]}'")
         except Exception as e:
             logger.warning(f"Could not arm no-response watchdog: {e}")
-
-    # Fallback loop monitor (kept for safety, primary is scheduled timer)
-    async def _no_response_monitor():
-        idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-        no_response_msg = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
-        logger.info(f"⏱️ No-response loop watchdog armed: {idle_timeout}s -> '{no_response_msg[:60]}'")
-        await asyncio.sleep(2)
-        while not call_closed["done"] and not closing_in_progress["done"] and not no_response_state.get("triggered"):
-            try:
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                return
-            if closing_requested["done"] or closing_in_progress["done"] or call_closed["done"]:
-                continue
-            elapsed = time.time() - no_response_state.get("last_activity", 0)
-            cur_state = state_tracker.get("state")
-            if cur_state not in ("listening", None):
-                if cur_state in ("speaking", "thinking"):
-                    no_response_state["last_activity"] = time.time()
-                continue
-            if elapsed >= idle_timeout and not no_response_state.get("triggered"):
-                if no_response_state.get("task") is None or no_response_state["task"].done():
-                    logger.info(f"⏱️ Loop detected no response {elapsed:.0f}s — triggering")
-                    await _no_response_timeout_handler()
-                return
 
     def on_item_added(ev):
         # Allow system closing/no-response messages even after call_closed is set
         # to ensure transcript logging works; otherwise early return hides TTS log
         try:
             _item_role = getattr(getattr(ev, "item", None), "role", None)
+            # P4 chain marker: proves on_user_turn_completed's chat-context
+            # insert ran (reply pipeline alive past scheduling).
+            _it = getattr(ev, "item", None)
+            _tx = _msg_text(_it) if _it is not None else ""
+            logger.info("💬 [CONVERSATION_ITEM] role=%s len=%d text='%s'", _item_role, len(_tx or ""), (_tx or "")[:60])
         except Exception:
             _item_role = None
         if call_closed["done"] and _item_role != "assistant" and not no_response_state.get("triggered"):
@@ -2057,26 +3415,24 @@ async def entrypoint(ctx):
             turn_timing["llm_complete"] = 0.0
             turn_timing["generation_complete"] = 0.0
             turn_timing["first_audio"] = 0.0
+            turn_timing["last_speech_end_to_first_audio"] = 0.0
             turn_timing["ttft_ms"] = 0.0
             turn_timing["generation_time_ms"] = 0.0
             turn_timing["input_tokens"] = 0
             turn_timing["cached_input_tokens"] = 0
             turn_timing["output_tokens"] = 0
-            # Fresh speech_end and stt_final for this turn
-            turn_timing["speech_end"] = now - 0.25  # approximate speech end 250ms before final
-            turn_timing["stt_final"] = now
-            # Calculate speech_end->STT_final
-            if turn_timing["speech_end"] > 0:
-                speech_to_stt = (now - turn_timing["speech_end"]) * 1000
-                logger.info(f"⏱️ TIMING speech_end->STT_final: {speech_to_stt:.0f}ms (text: {text[:50]}, words: {words_in_text})")
-                # Flag if exceeds 400ms target
-                if speech_to_stt > 600:
-                    logger.warning(f"🐢 Slow STT final: speech_end->STT_final {speech_to_stt:.0f}ms exceeds 400ms target (possible Deepgram delay)")
-            # Reset speech_end for next turn after logging
-            # Keep it for total calculation until first_audio
-            # User spoke — cancel any pending no-response timer (user is active)
-            _cancel_no_response()
-            no_response_state["last_activity"] = now
+            # Fresh timing values for this turn. Deepgram does not expose the
+            # acoustic speech-end timestamp, so speech_end remains unavailable.
+            _final_ts = float(turn_timing.get("stt_final_ts", 0.0) or 0.0)
+            turn_timing["speech_end"] = 0.0
+            turn_timing["stt_final"] = _final_ts
+            turn_timing["pipeline_stage"] = "turn_detected"
+            # User turn committed — start a fresh silence window NOW rather than
+            # only cancelling: if the agent then replies, the state transitions
+            # cancel/re-arm this timer anyway; if the reply wedges, the call
+            # still ends after the timeout instead of sitting in dead air
+            # forever (an old cancel-only path left exactly that hole).
+            _schedule_no_response(reason="user_turn_committed")
             words = max(len(text.split()), 1)
             usage["llm_input_tokens"] += int(words * 1.3)
             usage["user_speech_seconds"] += (words / 150.0) * 60.0
@@ -2176,9 +3532,19 @@ async def entrypoint(ctx):
             reply_tracker["empty_spoken"] = False
             _schedule_silence_fallback(now)
         elif role == "assistant":
+            # Post-barge-in clarity (00:53:35.857 log): when an interrupted
+            # generation still yields an assistant item, LiveKit commits ONLY
+            # the audio actually played before the interrupt (truncated text).
+            # That is correct library semantics — flag it so the log reads
+            # intentionally, not like a missed cancellation.
+            try:
+                if (time.time() - float(turn_timing.get("last_bargein_ts", 0.0))) < 1.5:
+                    logger.info("ℹ️ assistant item committed after a barge-in — truncated to played audio per LiveKit semantics (generation=%s)", turn_timing.get("gen", 0))
+            except Exception:
+                pass
             # Mark assistant output received for empty-turn race fix
             turn_timing["assistant_output_received"] = True
-            # Update last_successful_metrics for billing preservation
+            # Preserve last successful turn metrics for final billing
             try:
                 if turn_timing.get("ttft_ms",0) > 0:
                     turn_timing["last_ttft"] = turn_timing.get("ttft_ms",0)
@@ -2191,7 +3557,7 @@ async def entrypoint(ctx):
                 turn_timing["last_model"] = turn_timing.get("llm_model","")
             except Exception:
                 pass
-
+            
             # Log raw assistant item for debugging empty turns
             raw_text = _msg_text(item)
             is_tool = _item_is_tool_related(item)
@@ -2218,6 +3584,17 @@ async def entrypoint(ctx):
             # Reset no-response timer when agent speaks - timeout starts after agent finishes
             no_response_state["last_activity"] = now
             cleaned = clean_reply_text(text)
+            if (
+                cleaned == FALLBACK_REPLY
+                and text.strip()
+                and turn_timing.get("gov_turn_state") == "ack"
+            ):
+                # Deterministic ack replies ("जी।") are INTENTIONALLY 3-4 chars;
+                # the "< 4 chars => fallback" rule in clean_reply_text must not
+                # rewrite them into the apology (00:31:31 log did exactly that:
+                # llm_node answered 'Ok.' with 'जी।' and the caller heard
+                # "Sorry, mujhe yeh samajh nahi aaya" instead).
+                cleaned = text.strip()
             # Never let the LLM close a call on its own. Models sometimes emit
             # a farewell after ambiguous STT fragments such as "company go".
             # Only transcript-level explicit intent may produce a closing TTS.
@@ -2272,8 +3649,13 @@ async def entrypoint(ctx):
             # conversation_item_added is delayed (after TTS speaking), so we should NOT treat it as authoritative for latency.
             # Only set llm_complete if REAL audio not yet happened, and don't log fallback if REAL already happened.
             now_llm_complete = time.time()
-            has_real_audio = turn_timing.get("first_audio", 0) > 0 or turn_timing.get("first_tts_audio", 0) > 0 or turn_timing.get("last_speech_end_to_first_audio", 0) > 0
-
+            # REAL audio only counts when the TTS wrapper (or the audio
+            # listener) stamped it; the assistant conversation-item event is
+            # transcript lag and must never masquerade as "audio" (the old
+            # last_speech_end_to_first_audio in this expression made every turn
+            # after the first inherit a bogus "REAL audio at 11431ms").
+            has_real_audio = turn_timing.get("first_audio", 0) > 0 or turn_timing.get("first_tts_audio", 0) > 0
+            
             # Only set llm_complete if not already set AND real audio not yet happened (avoid delayed overwrite)
             if turn_timing.get("llm_complete", 0) == 0 and not has_real_audio:
                 turn_timing["llm_complete"] = now_llm_complete
@@ -2288,33 +3670,41 @@ async def entrypoint(ctx):
                 if turn_timing["first_token"] > 0:
                     delay = (now_llm_complete - turn_timing["first_token"]) * 1000
                     if delay > 5000:
-                        logger.info(f"ℹ️ Delayed conversation_item_added {delay:.0f}ms after first_token (REAL audio already at {turn_timing.get('last_speech_end_to_first_audio',0):.0f}ms) - not authoritative, REAL stream is authoritative")
+                        logger.info(f"ℹ️ Delayed conversation_item_added {delay:.0f}ms after first_token (REAL audio already measured) - not authoritative, REAL stream is authoritative")
                 # Don't overwrite llm_complete if already set from REAL path
                 if turn_timing.get("llm_complete", 0) == 0:
                     turn_timing["llm_complete"] = now_llm_complete
-
-            # Fallback for say() calls without TTS wrapper - only if REAL audio never happened
+            
+            # TTS is intentionally left unwrapped (so the greeting can play
+            # immediately), so most turns never get an audio timestamp. The
+            # numbers below then measure when the assistant's *transcript item*
+            # was committed — NOT when audio started. (Real human-perceived
+            # speech start is visible from [AGENT_STATE] -> speaking.) Never
+            # label these as first_audio again: turn 23:35:57 logged a bogus
+            # "first audio at 12015ms" that was pure item_added lag.
             if turn_timing.get("first_tts_audio", 0) == 0 and turn_timing.get("first_audio", 0) == 0 and not has_real_audio:
                 if turn_timing["first_token"] > 0:
-                    token_to_audio = (now_llm_complete - turn_timing["first_token"]) * 1000
-                    logger.info(f"⏱️ TIMING first_token->first_audio (fallback no wrapper): {token_to_audio:.0f}ms")
+                    token_to_item = (now_llm_complete - turn_timing["first_token"]) * 1000
+                    logger.info(f"⏱️ TIMING first_token->item_added (transcript lag, audio not measured): {token_to_item:.0f}ms")
                 if turn_timing["speech_end"] > 0:
-                    speech_to_audio = (now_llm_complete - turn_timing["speech_end"]) * 1000
-                    logger.info(f"⏱️ TIMING speech_end->first_audio (fallback): {speech_to_audio:.0f}ms")
-                    turn_timing["last_speech_end_to_first_audio"] = speech_to_audio
+                    speech_to_item = (now_llm_complete - turn_timing["speech_end"]) * 1000
+                    logger.info(f"⏱️ TIMING speech_end->item_added (transcript lag, audio not measured): {speech_to_item:.0f}ms")
                     if turn_timing["stt_final"] > 0 and turn_timing["turn_detected"] > 0 and turn_timing["llm_start"] > 0 and turn_timing["first_token"] > 0:
                         logger.info(
-                            f"📊 TURN BREAKDOWN (fallback): speech_end->STT_final {(turn_timing['stt_final']-turn_timing['speech_end'])*1000:.0f}ms | "
+                            f"📊 TURN BREAKDOWN (to transcript item): speech_end->STT_final {(turn_timing['stt_final']-turn_timing['speech_end'])*1000:.0f}ms est | "
                             f"STT_final->turn {(turn_timing['turn_detected']-turn_timing['stt_final'])*1000:.0f}ms | "
                             f"turn->LLM {(turn_timing['llm_start']-turn_timing['turn_detected'])*1000:.0f}ms | "
                             f"LLM->first_token {(turn_timing['first_token']-turn_timing['llm_start'])*1000:.0f}ms | "
-                            f"first_token->audio {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms | "
-                            f"TOTAL {speech_to_audio:.0f}ms"
+                            f"first_token->item_added {(now_llm_complete-turn_timing['first_token'])*1000:.0f}ms | "
+                            f"TOTAL {speech_to_item:.0f}ms (audio start: see [AGENT_STATE] speaking)"
                         )
                     if turn_timing.get("tts_request", 0) == 0:
                         turn_timing["speech_end"] = 0.0
                         turn_timing["stt_final"] = 0.0
                         turn_timing["turn_detected"] = 0.0
+                        turn_timing["stt_final_mono"] = 0.0
+                        turn_timing["turn_commit_mono"] = 0.0
+                        turn_timing["pipeline_stage"] = "user_speech"
                         turn_timing["llm_start"] = 0.0
                         turn_timing["request_start"] = 0.0
                         turn_timing["first_token"] = 0.0
@@ -2325,28 +3715,39 @@ async def entrypoint(ctx):
                         turn_timing["first_audio"] = 0.0
                         turn_timing["ttft_ms"] = 0.0
                         turn_timing["generation_time_ms"] = 0.0
-            logger.info(f"🗣️ TTS (LLM complete): {cleaned} (REAL audio was at {turn_timing.get('last_speech_end_to_first_audio',0):.0f}ms, this is transcript only)")
+            _real_audio_ms = turn_timing.get("last_speech_end_to_first_audio", 0)
+            _real_note = f"REAL first audio at {_real_audio_ms:.0f}ms after speech_end (tts_node probe)" if _real_audio_ms else "no audio frame reached the tts_node this turn (silent turn or interrupted before speech)"
+            logger.info(f"🗣️ TTS (LLM complete): {cleaned} (transcript-only event; {_real_note})")
 
-    session.on("conversation_item_added", on_item_added)
+    session.on("conversation_item_added", _instrument_sync_callback("conversation_item_added", on_item_added))
 
     def _on_state(ev):
+        turn_timing["agent_state"] = ev.new_state
+        turn_timing["pipeline_stage"] = f"agent_state_{ev.new_state}"
         now = time.time()
         prev = state_tracker["state"]
         elapsed = now - state_tracker["since"]
         if prev == "thinking" and elapsed > 2.5:
             logger.warning(f"🐢 Slow turn: agent was in 'thinking' for {elapsed:.2f}s")
-        logger.info(f"🔄 state {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        logger.info(f"🔄 [AGENT_STATE] {prev} -> {ev.new_state} ({elapsed:.2f}s)")
+        # Reply-stall probe: any forward progress into thinking/speaking means
+        # the reply pipeline is alive — stand the diagnostic timer down.
+        if ev.new_state in ("thinking", "speaking"):
+            _cancel_stall_probe(reason=f"agent_state_{ev.new_state}")
 
         # --- Production timing instrumentation ---
         if prev == "listening" and ev.new_state == "thinking":
             # Turn detected: listening -> thinking = endpointing triggered
             # This is speech_end + VAD + endpointing + STT final -> LLM request path
             turn_timing["turn_detected"] = now
-            if turn_timing["stt_final"] > 0:
+            turn_timing["turn_detected_mono"] = time.monotonic_ns()
+            if turn_timing["stt_final"] > 0 and now >= turn_timing["stt_final"]:
                 stt_to_turn = (now - turn_timing["stt_final"]) * 1000
                 logger.info(f"⏱️ TIMING STT_final->turn_detected (endpointing): {stt_to_turn:.0f}ms")
                 if stt_to_turn > 150:
                     logger.warning(f"🐢 Slow endpointing: STT_final->turn {stt_to_turn:.0f}ms exceeds 100ms target")
+            else:
+                logger.info("⏱️ TIMING STT_final->turn_detected (endpointing): N/A")
             if turn_timing["speech_end"] > 0:
                 speech_to_turn = (now - turn_timing["speech_end"]) * 1000
                 logger.info(f"⏱️ TIMING speech_end->turn_detected (VAD+STT+endpointing): {speech_to_turn:.0f}ms")
@@ -2354,9 +3755,11 @@ async def entrypoint(ctx):
                     logger.warning(f"🐢 Slow turn detection: speech_end->turn {speech_to_turn:.0f}ms exceeds 500ms target (outlier!)")
             # Also log as LLM start (turn completed -> LLM request)
             turn_timing["llm_start"] = now
-            if turn_timing["stt_final"] > 0:
+            if turn_timing["stt_final"] > 0 and now >= turn_timing["stt_final"]:
                 stt_to_llm = (now - turn_timing["stt_final"]) * 1000
                 logger.info(f"⏱️ TIMING STT_final->LLM_start: {stt_to_llm:.0f}ms (target ≤100ms)")
+            else:
+                logger.info("⏱️ TIMING STT_final->LLM_start: N/A")
 
         elif prev == "thinking" and ev.new_state == "speaking":
             # First token -> first audio: LLM first token arrived, TTS starting
@@ -2365,12 +3768,13 @@ async def entrypoint(ctx):
             # causing first_token->llm_complete to be calculated from speaking time, not actual first_token, leading to 6-9s delay logs
             if turn_timing.get("first_token", 0) == 0:
                 turn_timing["first_token"] = now
+                turn_timing["first_token_mono"] = time.monotonic_ns()
                 logger.info(f"ℹ️ first_token set from state thinking->speaking (no wrapper TTFT yet)")
             else:
                 # first_token already set by wrapper at actual TTFT time, preserve it
                 existing_age = (now - turn_timing["first_token"]) * 1000
                 logger.info(f"ℹ️ first_token already set {existing_age:.0f}ms ago by wrapper (TTFT {turn_timing.get('ttft_ms',0):.0f}ms), preserving authoritative")
-
+            
             if turn_timing["llm_start"] > 0:
                 llm_to_token = (now - turn_timing["llm_start"]) * 1000
                 logger.info(f"⏱️ TIMING LLM_start->first_token: {llm_to_token:.0f}ms (target ≤500ms) (wrapper TTFT {turn_timing.get('ttft_ms',0):.0f}ms is authoritative)")
@@ -2386,7 +3790,17 @@ async def entrypoint(ctx):
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
-
+            if turn_timing.get("gov_turn_state") == "suppress":
+                # Incomplete fragment: llm_node deliberately produced nothing so
+                # the caller can continue their sentence. Silence here is the
+                # feature — do not run the empty-turn warning/fallback ladder.
+                # The 15s silence fallback + 30s watchdog still recover the call
+                # if the caller stops mid-thought.
+                logger.info("⏸️ thinking->listening on an INCOMPLETE_TURN — staying silent, awaiting continuation")
+                state_tracker["state"] = ev.new_state
+                state_tracker["since"] = now
+                return
+            
             # Previous bug: detector fired before async LLM stream finished (0.04-0.08s)
             # Evidence: LLM REQUEST START, then thinking->listening 0.04s, then TTFT 800ms, then GENERATION COMPLETE
             # This means empty detection raced with active stream.
@@ -2395,7 +3809,7 @@ async def entrypoint(ctx):
             has_output = turn_timing.get("assistant_output_received", False) or turn_timing.get("first_token",0) > 0
             gen_complete = turn_timing.get("generation_complete",0)
             request_start = turn_timing.get("request_start",0)
-
+            
             if is_llm_active:
                 # LLM still streaming, don't treat as empty - this is the race fix
                 # FIX: Don't update state_tracker to listening, keep thinking to prevent new REQUEST START while previous active
@@ -2409,7 +3823,7 @@ async def entrypoint(ctx):
                 # Do NOT update state_tracker, keep as thinking, do NOT reset timing, keep active request alive
                 # This ensures exactly one valid LLM request per completed user turn
                 return
-
+            
             # Only if LLM terminated and no output, then it's truly empty
             # FIX: Check is_closing again before warning
             if turn_timing.get("is_closing", False):
@@ -2417,7 +3831,7 @@ async def entrypoint(ctx):
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
-
+            
             if not has_output and gen_complete == 0 and request_start > 0:
                 # LLM terminated with no output and no assistant item - check if it was 0-token generation
                 if turn_timing.get("output_tokens",0) == 0 and turn_timing.get("input_tokens",0) == 0:
@@ -2448,13 +3862,16 @@ async def entrypoint(ctx):
                 state_tracker["state"] = ev.new_state
                 state_tracker["since"] = now
                 return
-
+            
             if turn_timing["speech_end"] != 0 and turn_timing["first_audio"] == 0 and not is_llm_active:
                 # Only reset if LLM not active
                 logger.info(f"🔄 Resetting turn_timing after confirmed empty turn (LLM terminated, no output) to avoid next-turn outlier")
                 turn_timing["speech_end"] = 0.0
                 turn_timing["stt_final"] = 0.0
                 turn_timing["turn_detected"] = 0.0
+                turn_timing["stt_final_mono"] = 0.0
+                turn_timing["turn_commit_mono"] = 0.0
+                turn_timing["pipeline_stage"] = "user_speech"
                 turn_timing["llm_start"] = 0.0
                 turn_timing["request_start"] = 0.0
                 turn_timing["first_token"] = 0.0
@@ -2480,6 +3897,7 @@ async def entrypoint(ctx):
                     turn_timing["assistant_output_received"] = False
 
         elif ev.new_state == "listening" and prev == "speaking":
+            turn_timing["playout_end_ts"] = time.time()
             # Agent finished speaking, now listening: estimate speech_end for next turn
             # Reset timing for next turn, but keep last turn's metrics for final calc
             # Actually speech_end will be set when user starts speaking? We need VAD hook.
@@ -2522,7 +3940,138 @@ async def entrypoint(ctx):
         state_tracker["state"] = ev.new_state
         state_tracker["since"] = now
 
-    session.on("agent_state_changed", _on_state)
+    session.on("agent_state_changed", _instrument_sync_callback("agent_state_changed", _on_state))
+
+    # ------------------------------------------------------------------
+    # P4/P6 diagnostics: reply-stall probe + [SPEECH_CREATED] marker.
+    # After a user transcript FINAL the healthy chain is:
+    #   [USER_TRANSCRIPT_FINAL] -> [USER_TURN_COMPLETED] (agent hook)
+    #   -> [SPEECH_CREATED] -> [AGENT_STATE] listening -> thinking
+    #   -> LLM REQUEST START -> first_token -> TTS -> speaking
+    # If nothing reaches thinking/speaking within ~6s of the final, the reply
+    # pipeline is stalled inside LiveKit's scheduling/authorization layer
+    # (observed 2026-09-23 21:45: greeting fine, turn committed, RAG
+    # injected, then no thinking, no LLM request, billing 0/0 for 18+s).
+    # The probe ONLY logs a red-alert; it never retries and never calls
+    # generate_reply — a forced retry would mask the root cause.
+    # ------------------------------------------------------------------
+    stall_probe = {"task": None, "gen": 0, "armed_for": "", "armed_ts": 0.0, "handle": None}
+
+    def _reply_stall_snapshot() -> str:
+        """Deep state dump of LiveKit's scheduling internals at wedge time.
+
+        Distinguishes the three possible stuck points inside
+        ``_pipeline_reply_task`` (all produce IDENTICAL silence in logs):
+          A. handle never scheduled  -> scheduler didn't pop it (queue/starvation)
+          B. scheduled+authorized but user-silence gate open/closed mismatch
+          C. handle already interrupted (silent drop path)
+        Read-only getattr everywhere; never raises — diagnostics must not
+        change call behavior.
+        """
+        try:
+            act = getattr(session, "_activity", None)
+            if act is None:
+                return "snapshot: activity=None"
+            def _ev(e):
+                try:
+                    return e.is_set()
+                except Exception:
+                    return "?"
+            def _fd(f):
+                try:
+                    return f.done()
+                except Exception:
+                    return "?"
+            q = list(getattr(act, "_speech_q", None) or [])
+            cs = getattr(act, "_current_speech", None)
+            parts = [
+                f"scheduling_paused={getattr(act, '_scheduling_paused', '?')}",
+                f"new_turns_blocked={getattr(act, '_new_turns_blocked', '?')}",
+                f"scheduler_task_done={_fd(getattr(act, '_scheduling_atask', None))}",
+                f"queue_len={len(q)}",
+                f"user_silence_event_set={_ev(getattr(act, '_user_silence_event', None))}",
+                f"authorization_allowed={_ev(getattr(act, '_authorization_allowed', None))}",
+                f"user_state={getattr(getattr(act, '_session', None), 'user_state', None)}",
+            ]
+            h = stall_probe.get("handle")
+            for label, s in (("pending_reply", h), ("current_speech", cs)):
+                if s is None:
+                    parts.append(f"{label}=None")
+                    continue
+                parts.append(
+                    f"{label}[id={getattr(s, 'id', '?')} scheduled={getattr(s, 'scheduled', '?')}"
+                    f" interrupted={getattr(s, 'interrupted', '?')} done={s.done() if callable(getattr(s, 'done', None)) else '?'}"
+                    f" scheduled_fut_done={_fd(getattr(s, '_scheduled_fut', None))}"
+                    f" authorized={_ev(getattr(s, '_authorize_event', None))}"
+                    f" generations_open={sum(0 if _fd(g) else 1 for g in (getattr(s, '_generations', None) or []))}]"
+                )
+            if q:
+                parts.append("queued=" + ",".join(
+                    f"(h={getattr(x[2], 'id', '?')},sched={getattr(x[2], 'scheduled', '?')},int={getattr(x[2], 'interrupted', '?')})"
+                    for x in q[:5]
+                ))
+            age = time.time() - stall_probe.get("armed_ts", time.time())
+            parts.append(f"seconds_since_final={age:.1f}")
+            return "snapshot: " + " ".join(parts)
+        except Exception as e:
+            return f"snapshot: unavailable ({e!r})"
+
+    def _cancel_stall_probe(reason: str = "progress"):
+        t = stall_probe.get("task")
+        stall_probe["gen"] = stall_probe.get("gen", 0) + 1
+        if t is not None and not t.done():
+            t.cancel()
+            logger.debug(f"[REPLY_PROBE_CANCELLED] gen={stall_probe['gen']} reason={reason}")
+        stall_probe["task"] = None
+
+    async def _stall_probe_handler(gen: int):
+        try:
+            await asyncio.sleep(6.0)
+        except asyncio.CancelledError:
+            return
+        if gen != stall_probe.get("gen"):
+            return
+        if call_closed["done"] or closing_in_progress["done"] or closing_requested["done"]:
+            return
+        cur = state_tracker.get("state")
+        if cur in ("thinking", "speaking"):
+            return
+        since = time.time() - stall_probe.get("armed_ts", time.time())
+        logger.error(
+            f"🚨 [REPLY_STALLED] no agent thinking/speaking {since:.1f}s after user final "
+            f"'{stall_probe.get('armed_for', '')[:60]}' (agent state={cur}). {_reply_stall_snapshot()}"
+        )
+
+    def _arm_stall_probe(text: str) -> None:
+        if agent_mode == "announcement":
+            return
+        _cancel_stall_probe(reason="re-arm")
+        stall_probe["gen"] = stall_probe.get("gen", 0) + 1
+        gen = stall_probe["gen"]
+        stall_probe["armed_for"] = text
+        stall_probe["armed_ts"] = time.time()
+        try:
+            stall_probe["task"] = asyncio.ensure_future(_stall_probe_handler(gen))
+        except Exception:
+            stall_probe["task"] = None
+
+    def _on_speech_created(ev) -> None:
+        try:
+            handle = getattr(ev, "speech_handle", None)
+            if getattr(ev, "source", "") == "generate_reply":
+                # remember the latest pending reply handle so the stall probe
+                # can dump its exact wait-state (scheduled/authorized/gate)
+                stall_probe["handle"] = handle
+            logger.info(
+                "🔊 [SPEECH_CREATED] id=%s source=%s user_initiated=%s",
+                getattr(handle, "id", "?") if handle is not None else "?",
+                getattr(ev, "source", "?"),
+                getattr(ev, "user_initiated", "?"),
+            )
+        except Exception:
+            pass
+
+    session.on("speech_created", _instrument_sync_callback("speech_created", _on_speech_created))
 
     # Start recording if the agent has it on — but DO NOT block the call from
     # connecting. A missing/unavailable Egress service used to add ~21s before
@@ -2545,12 +4094,15 @@ async def entrypoint(ctx):
     if agent_mode == "announcement":
         script = getattr(cfg, "announce_text", "") or greeting
         script = leadfile.render_template(script, lead_data)
+        if not (script or "").strip():
+            script = greeting or f"Hello, this is {cfg.name}."
         agent = build_announce_agent(cfg, announce_text=script)
-        logger.info("📢 mode=announcement (fixed-script only, no STT/LLM)")
+        logger.info("[ANNOUNCEMENT_STARTED] room=%s agent_id=%s script=%s", getattr(ctx.room, "name", ""), agent_id, script[:60])
     else:
-        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing)
-        logger.info("💬 mode=assistant (STT+LLM+TTS)")
+        agent = build_voice_agent(cfg, greeting=greeting, prior_memory=prior_memory, lead_data=lead_data, turn_timing_ref=turn_timing, rag_prefetch=rag_prefetch)
+        logger.info("[ASSISTANT_STARTED] room=%s agent_id=%s greeting=%s", getattr(ctx.room, "name", ""), agent_id, greeting[:60])
     agent_holder["agent"] = agent
+    logger.info("[AGENT_STARTED] room=%s agent_id=%s agent_mode=%s", getattr(ctx.room, "name", ""), agent_id, agent_mode)
 
     # Server-side noise cancellation. Two tiers:
     #   * NOISE_CANCELLATION=krisp -> server-side Krisp (BVC) filter. Only works on
@@ -2561,42 +4113,15 @@ async def entrypoint(ctx):
     #     and Deepgram STT uses its built-in VAD (`vad_events=True`), which rejects
     #     non-speech/noise frames before they reach the LLM.
     room_options = None
-    nc_mode = os.getenv("NOISE_CANCELLATION", "").strip().lower()
-    if nc_mode == "krisp":
-        try:
-            from livekit import rtc
-            from livekit.agents.voice import room_io
-            room_options = room_io.RoomOptions(
-                close_on_disconnect=False,
-                input_options=room_io.RoomInputOptions(
-                    noise_cancellation=rtc.NoiseCancellationOptions(provider="krisp"),
-                )
-            )
-            logger.info("🎤 Krisp noise cancellation enabled (close_on_disconnect=False).")
-        except Exception as e:
-            logger.warning(
-                "Krisp noise cancellation unavailable (%s). To enable it on LiveKit "
-                "Cloud: pip install livekit-krisp-noise-cancellation and set "
-                "NOISE_CANCELLATION=krisp. For a self-hosted demo, leave it unset — "
-                "browser calls get WebRTC noise suppression and Deepgram VAD filters "
-                "non-speech.", e,
-            )
-            # Fallback: still ensure close_on_disconnect=False even if Krisp fails
-            try:
-                from livekit.agents.voice import room_io as _rio
-                room_options = _rio.RoomOptions(close_on_disconnect=False)
-                logger.info("🎤 RoomOptions(close_on_disconnect=False) armed as fallback after Krisp failure.")
-            except Exception:
-                pass
-    else:
-        try:
-            from livekit.agents.voice import room_io as _rio
-            room_options = _rio.RoomOptions(close_on_disconnect=False)
-            logger.info("🎤 RoomOptions(close_on_disconnect=False) armed (TTS goodbye protected).")
-        except Exception as e:
-            logger.warning(f"Could not set RoomOptions close_on_disconnect=False: {e}")
-        if nc_mode:
-            logger.warning(f"Unknown NOISE_CANCELLATION='{nc_mode}' (expected 'krisp'); skipping.")
+    try:
+        from livekit.agents.voice import room_io as _rio
+        room_options = _rio.RoomOptions(
+            close_on_disconnect=False,
+            delete_room_on_close=False,
+        )
+        logger.info("🎤 RoomOptions(close_on_disconnect=False, delete_room_on_close=False) armed.")
+    except Exception as e:
+        logger.warning(f"Could not set RoomOptions: {e}")
 
     # ------------------------------------------------------------------
     # Finalization (idempotent) + call-end watchdog.
@@ -2623,7 +4148,7 @@ async def entrypoint(ctx):
                 # Try current timing first, then last successful, then usage
                 llm_provider = turn_timing.get("llm_provider") or turn_timing.get("last_provider") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[0] if hasattr(cfg.providers, 'get_primary_llm') else cfg.providers.llm.id)
                 llm_model = turn_timing.get("llm_model") or turn_timing.get("last_model") or (cfg.providers.get_primary_llm().resolve_llm_provider_model()[1] if hasattr(cfg.providers, 'get_primary_llm') else (cfg.providers.llm.config or {}).get("model", ""))
-
+                
                 # FIX: Use aggregated successful provider usage, not last/preserved timing object's token counts
                 # Final billing must equal sum of successful requests
                 aggregated_input = turn_timing.get("aggregated_input", 0)
@@ -2632,7 +4157,7 @@ async def entrypoint(ctx):
                 successful_count = turn_timing.get("successful_requests", 0)
                 failed_count = turn_timing.get("failed_requests", 0)
                 all_reqs = turn_timing.get("all_requests", [])
-
+                
                 # Calculate total cost from aggregated
                 total_llm_cost = 0.0
                 try:
@@ -2645,7 +4170,7 @@ async def entrypoint(ctx):
                                 total_llm_cost += c['total_llm_cost']
                 except Exception as e:
                     logger.debug(f"Could not calculate total aggregated cost: {e}")
-
+                
                 if aggregated_input > 0 and successful_count > 0:
                     llm_input = aggregated_input
                     llm_output = aggregated_output
@@ -2661,11 +4186,11 @@ async def entrypoint(ctx):
                     llm_output = turn_timing.get("output_tokens", 0) or turn_timing.get("last_output", 0) or usage["llm_output_tokens"]
                     logger.warning(f"⚠️ FINAL BILLING no aggregated successful usage, fallback to last/word count: input={llm_input} output={llm_output} (successful {successful_count}, failed {failed_count})")
                     logger.info(f"📊 FINAL BILLING FALLBACK successful_requests={successful_count} failed_requests={failed_count} total_input_tokens={llm_input} total_cached_tokens={llm_cached} total_output_tokens={llm_output} total_llm_cost=${total_llm_cost:.6f}")
-
+                
                 # TTFT and gen_time: current, then last, preserve actual measured values
                 ttft = turn_timing.get("ttft_ms", 0) or turn_timing.get("last_ttft", 0)
                 gen_time = turn_timing.get("generation_time_ms", 0) or turn_timing.get("last_gen_time", 0)
-
+                
                 # For final billing, also log average TTFT/gen_time across successful
                 if all_reqs:
                     successful_reqs = [r for r in all_reqs if r['success']]
@@ -2673,10 +4198,47 @@ async def entrypoint(ctx):
                         avg_ttft = sum(r['ttft'] for r in successful_reqs) / len(successful_reqs)
                         avg_gen = sum(r['gen_time'] for r in successful_reqs) / len(successful_reqs)
                         logger.info(f"📊 FINAL BILLING averages across {len(successful_reqs)} successful: avg TTFT {avg_ttft:.0f}ms avg gen_time {avg_gen:.0f}ms last TTFT {ttft:.0f}ms last gen {gen_time:.0f}ms")
-
+                # Task 1/2/3 call-level metric summaries (real numbers only).
+                try:
+                    _ch = int(turn_timing.get("cache_hits", 0) or 0)
+                    _cm = int(turn_timing.get("cache_misses", 0) or 0)
+                    _cu = int(turn_timing.get("cache_unknown", 0) or 0)
+                    _cached_total = sum(int(r.get("cached", 0) or 0) for r in all_reqs if r.get("success"))
+                    try:
+                        from app.llm_catalog import get_prompt_cache_capability as _gcc_sum
+                        _caps = [_gcc_sum(str(r.get("provider", "")), str(r.get("model", ""))) for r in all_reqs]
+                        _supported_any = any(c.get("supported") for c in _caps)
+                        _mode_set = sorted({c.get("mode", "none") for c in _caps}) if _caps else []
+                        _cap_rollup = "/".join(_mode_set) if _mode_set else "none"
+                    except Exception:
+                        _supported_any = any("openai" in str(r.get("provider", "")).lower() for r in all_reqs)
+                        _cap_rollup = "?"
+                    if _ch > 0:
+                        _cache_verdict = "working"
+                    elif _cm > 0:
+                        _cache_verdict = "not_engaging (cache-capable path verified; every usage-returning request reported 0 cached — stable prefix vs provider minimum or routing; see per-request [CACHE] lines)"
+                    elif _supported_any:
+                        _cache_verdict = "unverifiable (no cache-capable request returned usage — failed/invalidated requests are NOT cache misses; re-run when calls succeed)"
+                    else:
+                        _cache_verdict = "unsupported (every request's provider/model has capability=none — reported honestly, no cache pretended)"
+                    logger.info(f"🗄️ [CACHE] summary: requests={len(all_reqs)} capabilities={_cap_rollup} evaluated(hit+miss,usage-only)={_ch + _cm} hits={_ch} misses={_cm} unknown={_cu} cached_tokens_total={_cached_total} verdict={_cache_verdict}")
+                    _rle = int(turn_timing.get("rate_limit_events", 0) or 0)
+                    _prb = int(turn_timing.get("recovery_probes", 0) or 0)
+                    _prf = int(turn_timing.get("probe_failures", 0) or 0)
+                    logger.info(f"🔁 [FALLBACK_SUMMARY] rate_limit_429={_rle} recovery_probes={_prb} probe_failures={_prf} overlapping_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} — probes are FallbackAdapter health checks (documented lifecycle, not patched) and are never billed to the call; each 429 produced one clean switch to the configured fallback, no turn-level retry on the failed model")
+                    logger.info(f"🔇 [PREEMPTIVE] summary: enabled={globals().get('_PREEMPTIVE_ENABLED_FOR_LOG', False)} started=0 cancelled=0 reused=0 discarded=0 would_cancel={int(turn_timing.get('spec_would_cancel', 0) or 0)} overlapping_llm_starts={int(turn_timing.get('overlapping_starts', 0) or 0)} (gated off by design while per-turn RAG injection exists)")
+                    _ls = turn_timing.get("latency_samples", [])
+                    if _ls:
+                        def _avg(k, _src=_ls):
+                            _v = [x[k] for x in _src if isinstance(x, dict) and x.get(k) is not None and x[k] >= 0]
+                            return (sum(_v) / len(_v)) if _v else float("nan")
+                        logger.info(f"🔊 [LATENCY] summary over {len(_ls)} spoken turns: avg speech_to_first_audio_ms={_avg('speech_end_to_first_audio_ms'):.0f} avg ttft_to_first_audio_ms={_avg('tts_synth_ms'):.0f} avg turn_commit_ms={_avg('turn_commit_ms'):.0f} (first audio measured on the REAL TTS frame stream via Agent.tts_node)")
+                except Exception as _le:
+                    logger.debug(f"call metric summaries skipped: {_le!r}")
+                
                 if ttft == 0 and gen_time == 0:
                     logger.warning(f"⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")
-
+                
                 logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms successful={successful_count} failed={failed_count} total_cost=${total_llm_cost:.6f} (aggregated authoritative)")
             except Exception as e:
                 logger.debug(f"Could not get V2 billing info: {e}")
@@ -2730,6 +4292,26 @@ async def entrypoint(ctx):
                     logger.warning(f"Billing POST exception, will fallback to direct DB: {e!r}", exc_info=True)
                     billing_posted = False
 
+            # Preserve a failure reason recorded earlier on this call (the
+            # setup-failure path writes usage.error into the DB before the
+            # shutdown callbacks run — a blind overwrite would wipe it and the
+            # UI would lose the "why").
+            try:
+                from app.db import get_prisma
+                prior_row = await get_prisma().call.find_unique(where={"id": call_record["id"]})
+                if prior_row is not None:
+                    prior_dict = repo._call_dict(prior_row)
+                    prior_error = (prior_dict.get("usage") or {}).get("error")
+                    if prior_error:
+                        usage["error"] = prior_error
+                        # A setup failure is a failed, unbilled call. (If a real
+                        # conversation had run long before a late failure, keep
+                        # the status the duration check produced.)
+                        if not real_call:
+                            status = "failed"
+            except Exception:
+                pass
+
             # Fallback local update (ensures call is marked completed even if backend unreachable)
             try:
                 await repo.update_call(call_record["id"], {
@@ -2744,27 +4326,21 @@ async def entrypoint(ctx):
             except Exception as e:
                 logger.warning(f"Local call update failed: {e}")
 
-            # Safety net: ALWAYS check wallet deduction — if backend failed or returned non-200,
-            # deduct directly via DB (idempotent, checks existing spend transaction)
-            if real_call:
+            # Fallback direct wallet deduct only if backend /api/billing/log failed
+            if real_call and not billing_posted:
                 try:
                     has_spend = False
                     try:
                         has_spend = await repo.has_spend_for_call(call_record.get("user_id", user_id), call_record["id"])
                     except Exception as he:
                         logger.warning(f"has_spend check failed: {he}")
-                        has_spend = False
                     if not has_spend:
                         charge = float(costs.get("client_price_inr", 0) or 0)
                         if charge > 0:
                             wallet = await repo.deduct(call_record.get("user_id", user_id), charge, note=f"Call {call_record['id']}")
-                            logger.info(f"💸 Wallet auto-deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)} (billing_posted={billing_posted})")
-                        else:
-                            logger.info(f"Call {call_record['id']} has zero charge, no deduction needed")
-                    else:
-                        logger.info(f"💰 Wallet already deducted for call {call_record['id']} (billing_posted={billing_posted}) — skipping direct deduct")
+                            logger.info(f"💸 Wallet fallback deducted ₹{charge} for call {call_record['id']} — remaining balance ₹{wallet.get('balance', 0)}")
                 except Exception as de:
-                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}", exc_info=True)
+                    logger.warning(f"Direct wallet deduct failed for call {call_record['id']}: {de!r}")
 
         except Exception as e:
             logger.exception(f"finalize_billing error: {e}")
@@ -2780,98 +4356,215 @@ async def entrypoint(ctx):
     # tab, network drop, or clicking "Leave"). Closing the session unblocks
     # session.start(), which lets the job shut down and run finalize_billing.
     async def watch_call_end():
+        """End this job only after the human caller has actually left.
+
+        close_on_disconnect is off so a goodbye can finish. That also meant a
+        hung-up browser could leave the only worker process stuck inside
+        session.start(). The next call — after the user picked a different
+        agent — was dispatched to nobody and stayed silent.
+
+        A caller who is still connected is not idle. Silence is the no-response
+        timer's job. This watcher only releases the job once the caller is gone.
+        """
         room = ctx.room
-        caller_joined = asyncio.Event()
-        caller_left = asyncio.Event()
+        released = {"done": False}
+        saw_human = {"yes": False}
+        gone_since = {"t": 0.0}
 
-        def _on_connected(participant):
-            if participant != room.local_participant:
-                caller_joined.set()
+        def _kind(participant) -> int:
+            kind = getattr(participant, "kind", 0)
+            try:
+                return int(kind)
+            except Exception:
+                return 0
 
-        def _on_disconnected(participant):
-            # If we are already in deterministic closing, don't trigger hangup watchdog
-            # — let closing TTS finish fully before cutting
-            if closing_in_progress["done"]:
-                logger.info("👋 Caller disconnected during deterministic closing — letting goodbye TTS finish before cut")
-                if not room.remote_participants:
-                    caller_left.set()
+        def _is_human(participant) -> bool:
+            if participant is None or participant == getattr(room, "local_participant", None):
+                return False
+            # 1 ingress, 2 egress, 4 agent — not the person on the call.
+            if _kind(participant) in (1, 2, 4):
+                return False
+            identity = (getattr(participant, "identity", "") or "").lower()
+            if identity.startswith("eg_") or "egress" in identity:
+                return False
+            return True
+
+        def _humans():
+            try:
+                return [p for p in room.remote_participants.values() if _is_human(p)]
+            except Exception:
+                return []
+
+        async def _release(reason: str, source: str = "timeout"):
+            if released["done"]:
                 return
+            released["done"] = True
             call_closed["done"] = True
-            # Cancel pending fallback speech immediately when the caller leaves.
-            # Otherwise the watchdog can try to speak into a closed AgentSession.
+            logger.info(
+                "[CALL_END_REQUESTED] source=%s reason=%s room=%s agent_id=%s",
+                source, reason, getattr(ctx.room, "name", ""), agent_id,
+            )
             _cancel_pending()
+            _cancel_no_response()
             fallback_task = reply_tracker.get("fallback_say")
             if fallback_task is not None and not fallback_task.done():
                 fallback_task.cancel()
             reply_tracker["fallback_say"] = None
-            # "remote participants" = the caller(s). When there are none left and
-            # we previously saw at least one caller, the call is over.
-            if not room.remote_participants:
-                caller_left.set()
+            try:
+                session.shutdown(drain=False)
+            except Exception as e:
+                logger.warning("session.shutdown on caller leave failed: %r", e)
+
+            room_name = getattr(ctx.room, "name", None)
+            if room_name:
+                try:
+                    from app.telephony import end_active_room
+                    await end_active_room(room_name)
+                except Exception:
+                    pass
+
+            try:
+                ctx.shutdown()
+            except Exception as e:
+                logger.warning("ctx.shutdown failed: %r", e)
+
+            logger.info("[CALL_ENDED] room=%s agent_id=%s reason=%s", getattr(ctx.room, "name", ""), agent_id, reason)
+            call_finished.set()
+
+        def _on_connected(participant):
+            if not _is_human(participant):
+                return
+            saw_human["yes"] = True
+            gone_since["t"] = 0.0
+            logger.info("[AGENT_JOINED] room=%s Caller joined: %s", getattr(room, "name", ""), getattr(participant, "identity", "?"))
+
+        def _on_disconnected(participant):
+            if not _is_human(participant):
+                return
+            if _humans():
+                return
+            gone_since["t"] = time.time()
+            logger.info("👤 Caller disconnected: %s (grace period active)", getattr(participant, "identity", "?"))
 
         room.on("participant_connected", _on_connected)
         room.on("participant_disconnected", _on_disconnected)
-        try:
-            # The caller may already be in the room before this watcher attaches.
-            if room.remote_participants:
-                caller_joined.set()
-            await caller_joined.wait()
-            idle_timeout = max(15, int(getattr(cfg, "no_response_timeout_seconds", 30) or 30))
-            try:
-                await asyncio.wait_for(caller_left.wait(), timeout=idle_timeout)
-            except asyncio.TimeoutError:
-                # Keep this deterministic and customer-configurable. Do not run
-                # the LLM for an idle caller; speak the saved line once, then hang up.
-                message = (getattr(cfg, "no_response_message", "") or
-                           "I did not hear a response, so I will end the call now. Thank you for calling.").strip()
-                _cancel_pending()
-                _cancel_no_response()
-                no_response_state["triggered"] = True
-                call_closed["done"] = True
-                closing_in_progress["done"] = True
-                fallback_task = reply_tracker.get("fallback_say")
-                if fallback_task is not None and not fallback_task.done():
-                    fallback_task.cancel()
-                try:
-                    await session.say(message, allow_interruptions=False)
-                except Exception as exc:
-                    logger.info("Idle timeout message could not be played because the session closed: %s", exc)
-                logger.info("⏱️ Caller inactive for %ss — ending call.", idle_timeout)
-                try:
-                    session.shutdown(drain=False)
-                except Exception:
-                    pass
-                try:
-                    ctx.shutdown()
-                except Exception:
-                    pass
-                return
-            logger.info("👋 Caller hang up — ending call.")
-        finally:
-            room.off("participant_connected", _on_connected)
-            room.off("participant_disconnected", _on_disconnected)
-        # Close the agent session so the job can wind down and finalize.
-        try:
-            session.shutdown(drain=False)
-        except Exception as e:
-            logger.warning(f"session.shutdown failed: {e}")
-        try:
-            ctx.shutdown()
-        except Exception as e:
-            logger.warning(f"could not trigger job shutdown: {e}")
+        initial_humans = _humans()
+        if initial_humans:
+            saw_human["yes"] = True
+            logger.info("[AGENT_JOINED] room=%s Caller already in room (%d): %s", getattr(room, "name", ""), len(initial_humans), [p.identity for p in initial_humans])
 
+        try:
+            while not released["done"]:
+                await asyncio.sleep(0.5)
+                # Announcement agent manages its own completion — don't interfere while it's playing
+                if agent_mode == "announcement":
+                    ag = agent_holder.get("agent")
+                    if ag is not None and getattr(ag, "_opening_started", False) and not getattr(ag, "_opening_done", False):
+                        continue
+
+                humans = _humans()
+                if humans:
+                    saw_human["yes"] = True
+                    gone_since["t"] = 0.0
+                    continue
+                if not saw_human["yes"]:
+                    continue
+                if gone_since["t"] == 0.0:
+                    gone_since["t"] = time.time()
+                    continue
+                # Generous 12-second grace period (NOT 1.5s!) before deciding caller is truly gone
+                if time.time() - gone_since["t"] >= 12.0:
+                    await _release("user_ended", source="timeout")
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            try:
+                room.off("participant_connected", _on_connected)
+                room.off("participant_disconnected", _on_disconnected)
+            except Exception:
+                pass
+
+    async def _backup_opening_line():
+        """Speak the greeting/script if on_enter never started.
+
+        A connected browser call that stays silent is the bug this covers.
+        """
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            return
+        if call_closed["done"] or closing_in_progress["done"]:
+            return
+        ag = agent_holder.get("agent")
+        if ag is not None and getattr(ag, "_opening_started", False):
+            return
+        if state_tracker.get("state") == "speaking":
+            return
+        if any((t.get("text") or "").strip() and t.get("role") == "agent" for t in usage["transcripts"]):
+            return
+        if agent_mode == "announcement":
+            line = (getattr(cfg, "announce_text", "") or greeting or "").strip()
+        else:
+            line = (greeting or "").strip()
+        if not line:
+            logger.warning("🛟 No greeting or script configured — nothing to speak")
+            return
+        logger.warning("🛟 Opening line had not started — speaking it now (%s)", agent_mode)
+        try:
+            # Assistant-mode greetings must be interruptible (the primary path
+            # in agent_builder.speak_opening_line passes True now too); this
+            # fallback line was the same hard-protected pattern. Announcements
+            # stay one-way.
+            handle = session.say(line, allow_interruptions=(agent_mode != "announcement"))
+            waiter = getattr(handle, "wait_for_playout", None)
+            if callable(waiter):
+                await asyncio.wait_for(waiter(), timeout=45)
+            elif handle is not None:
+                await asyncio.wait_for(handle, timeout=45)
+            logger.info("✅ Backup opening line finished")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("backup opening line failed: %s: %r", type(e).__name__, e)
+
+    # Deduplication check: if another agent has already connected to this room, exit immediately
+    try:
+        remote_agents = [
+            p for p in ctx.room.remote_participants.values()
+            if getattr(p, "kind", None) == 4
+            or getattr(p, "is_agent", False)
+            or (getattr(p, "identity", "") or "").startswith("agent-")
+        ]
+        if remote_agents:
+            logger.warning(
+                "⚠️ Duplicate agent already present in room %s (%s). Exiting this runner to prevent duplicate audio.",
+                getattr(ctx.room, "name", ""),
+                [getattr(p, "identity", "") for p in remote_agents],
+            )
+            call_closed["done"] = True
+            ctx.shutdown()
+            return
+    except Exception as e:
+        logger.debug("duplicate agent check: %r", e)
+
+    opening_backup = asyncio.create_task(_backup_opening_line())
     watchdog = asyncio.create_task(watch_call_end())
-    # Primary: scheduled timer (resets on activity), fallback: loop monitor
-    loop_monitor_task = asyncio.create_task(_no_response_monitor())
 
     start_kwargs: dict = {"agent": agent, "room": ctx.room}
     if room_options is not None:
         start_kwargs["room_options"] = room_options
+    setup_complete["done"] = True   # setup finished — release the setup watchdog
     try:
         await session.start(**start_kwargs)
+        # Keep entrypoint alive until the call completes so background watchdogs run
+        await call_finished.wait()
+    except Exception as e:
+        logger.exception("session.start failed — job will exit so the worker can take the next call: %r", e)
+        raise
     finally:
+        opening_backup.cancel()
         watchdog.cancel()
-        loop_monitor_task.cancel()
         _cancel_no_response()
         if egress_task is not None:
             egress_task.cancel()
@@ -2898,7 +4591,7 @@ def _billing_report(costs, usage, duration, turn_timing_ref=None) -> str:
         display_output = usage['llm_output_tokens']
         successful = 0
         failed = 0
-
+    
     return (
         "\n" + "=" * 64 + "\n"
         f"📊 BILLING  duration={duration}s ({costs['duration_mins']} min)\n"
@@ -2982,6 +4675,16 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
 
 
 def prewarm(proc):
+    setup_logging()
+    # Job processes must keep ONLY livekit's IPC LogQueueHandler: our own
+    # QueueListener prints directly to the console too, so without this purge
+    # every job log line appears twice, all of it synchronously on the loop.
+    try:
+        from app.config import purge_sync_root_handlers
+        purge_sync_root_handlers(job_proc=True)
+    except Exception:
+        pass
+
     # Production prewarm: VAD + Google auth + hyphenator + async_toolset off loop
     # Fixes: 406ms onnxruntime VAD, 176ms Google auth crypt, 256ms hyphenation re.split, 101ms async_toolset import
     # VAD 0.20/0.30/0.20/0.55 production-tuned for 300-400ms speech_end->STT_final + less CPU
@@ -3005,7 +4708,7 @@ def prewarm(proc):
             logger.info(f"🔥 Prewarm: VAD hot (production 0.20/0.30/0.20/0.55) - cached in worker, agent_builder cache set failed: {_e}")
     except Exception as e:
         logger.warning(f"VAD prewarm failed: {e}")
-
+    
     # Prewarm Google auth crypt off loop to avoid 176ms and 198ms blocks
     try:
         import google.auth.crypt._cryptography_rsa as _crypt_rsa
@@ -3016,7 +4719,7 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: Google auth crypt + oauth2.credentials imported (avoids 176ms and 198ms blocks during TTS)")
     except Exception as e:
         logger.debug(f"Google auth prewarm failed: {e}")
-
+    
     # Prewarm hyphenator off loop to avoid 256ms/391ms block at re.split in _basic_hyphenator
     try:
         from livekit.agents.tokenize._basic_hyphenator import Hyphenator, PATTERNS, EXCEPTIONS
@@ -3024,13 +4727,58 @@ def prewarm(proc):
         logger.info("🔥 Prewarm: Hyphenator hot (avoids 256ms/391ms re.split block in transcription synchronizer)")
     except Exception as e:
         logger.debug(f"Hyphenator prewarm failed: {e}")
-
+    
     # Prewarm async_toolset import off loop to avoid 101ms block
     try:
         import livekit.agents.llm.async_toolset as _async_toolset
         logger.info("🔥 Prewarm: async_toolset imported (avoids 101ms import block)")
     except Exception as e:
         logger.debug(f"async_toolset prewarm failed: {e}")
+
+    # Prewarm (03:07–03:09 log): the remaining application-owned loop blocks
+    # were module loads and first-execution costs, NOT audio math — the first
+    # STT interim imported app.rag (+ pydantic validators for KnowledgeItem),
+    # the first LLM completion imported app.llm_catalog inside the billing
+    # block, hangup imports app.telephony/db. Job processes spawn fresh
+    # (multiprocessing_context="spawn"), so warm per-job HERE; everything
+    # below is import/constructor calls only — no state the live pipeline
+    # reads, so a failure here changes nothing but the first-turn timing.
+    try:
+        from app import rag as _rag_pw
+        _kb0 = _rag_pw.KnowledgeBase(text="prewarm warmup sample corpus tokens")
+        # exercises build_index, _index_for, BM25 fast+fallback paths,
+        # normalize_query, and the first KnowledgeItem validation (pydantic
+        # model_rebuild imports inspect→tokenize — must never happen
+        # mid-utterance either).
+        _rag_pw.build_index(_kb0)
+        _rag_pw.build_context_detailed(_kb0, "warmup query", top_k=1)
+        _rag_pw.normalize_query(" Ok  warmup ")
+        logger.info("🔥 Prewarm: RAG stack hot (rag import chain, index build, validators — 0ms module load on first interim)")
+    except Exception as e:
+        logger.debug(f"RAG prewarm failed: {e}")
+    try:
+        import app.llm_catalog  # noqa: F401  (billing cost calc: first LLM completion)
+        import app.telephony  # noqa: F401   (end_active_room: hangup path)
+        import app.db  # noqa: F401          (release_current_loop/get_prisma)
+        logger.info("🔥 Prewarm: llm_catalog/telephony/db imported (billing + hangup paths load-free)")
+    except Exception as e:
+        logger.debug(f"billing/telephony prewarm failed: {e}")
+
+    # Prewarm Pydantic ChatMessage and ChatContext validation schemas off the agent loop.
+    # In Pydantic v2, ChatMessage.__init__ triggers model_rebuild() upon first invocation.
+    # On Windows, this took 7259ms inside entrypoint. Prewarming here compiles it off-loop.
+    try:
+        from app.agents.agent_builder import warm_agent_builder_schemas
+        warm_agent_builder_schemas()
+    except Exception as e:
+        logger.debug(f"ChatMessage prewarm failed: {e}")
+
+    try:
+        from livekit.agents.voice import Agent as _VoiceAgent, room_io as _room_io
+        _ = _room_io.RoomOptions(close_on_disconnect=False, delete_room_on_close=False)
+        logger.info("🔥 Prewarm: Voice Agent & RoomOptions imported")
+    except Exception as e:
+        logger.debug(f"Voice Agent prewarm failed: {e}")
 
     # Warm the Google TTS *credentials* before the first customer response so the
     # ~163-198ms JSON/RSA parse never lands on the agent event loop.
@@ -3079,14 +4827,46 @@ def prewarm(proc):
             logger.info("🔥 Prewarm: no Google credentials file found, skipping TTS credential prewarm")
     except Exception as e:
         logger.debug(f"Google TTS prewarm failed: {e!r}")
-
+    
     # NOTE: DB prewarm removed - it used asyncio.run() which closes event loop, causing
     # "Event loop is closed" on next Prisma call -> 1.73s retry. DB is cached per process
     # via the _DB_INIT_DONE global and connected ON the agent loop in entrypoint() (the
     # 1359ms SSL block that pushed it off-loop is fixed by the cached SSL context patch).
 
 
+def _worker_load(worker) -> float:
+    """Calculate load based on actual active jobs rather than Windows event-loop jitter.
+
+    Default CPU-sampling load_fnc in livekit-agents spikes to 1.0 on Windows due to
+    asyncio IOCP polling (GetQueuedCompletionStatus) and synchronous console I/O,
+    falsely marking the worker as 'at full capacity, marking as unavailable' and
+    dropping incoming calls.
+    """
+    # Supervisor-side housekeeping, piggybacked on a tick that runs on the main
+    # loop: livekit's CLI adds a synchronous JSON console handler to root AFTER
+    # our async setup — every record would otherwise print twice and stall the
+    # loop 150-350ms per burst on Windows console writes.
+    try:
+        from app.config import purge_sync_root_handlers
+        purge_sync_root_handlers()
+    except Exception:
+        pass
+    try:
+        active = len(getattr(worker, "active_jobs", []) or [])
+        max_jobs = int(os.getenv("MAX_CONCURRENT_CALLS", "10"))
+        return min(float(active) / float(max_jobs), 1.0)
+    except Exception:
+        return 0.0
+
+
 if __name__ == "__main__":
+    setup_logging()
+    try:
+        from app.agents.agent_builder import warm_agent_builder_schemas
+        warm_agent_builder_schemas()
+    except Exception:
+        pass
+
     from livekit.agents import WorkerOptions, cli
 
     # livekit-agents v1 ships a Typer CLI that requires a subcommand
@@ -3099,13 +4879,16 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            # Pre-warm one idle worker process so the first call connects fast
-            # instead of paying the plugin-import + VAD-load cost on every call.
-            # Bump this for more concurrent calls; set 0 to never pre-warm.
-            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "1")),
+            # Two idle processes so a call that is still winding down cannot
+            # block the next one. One stuck job used to make "change agent and
+            # call again" look like the worker had silently stopped.
+            num_idle_processes=int(os.getenv("NUM_IDLE_PROCESSES", "2")),
+            shutdown_process_timeout=float(os.getenv("SHUTDOWN_PROCESS_TIMEOUT", "12")),
             agent_name=WORKER_AGENT_NAME,
             # Windows doesn't support the default "forkserver" context; "spawn"
             # is portable and works on Windows/macOS/Linux alike.
             multiprocessing_context="spawn",
+            load_fnc=_worker_load,
+            load_threshold=float(os.getenv("WORKER_LOAD_THRESHOLD", "0.95")),
         )
     )

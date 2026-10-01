@@ -368,6 +368,7 @@ LLM_MODELS: List[Dict[str, Any]] = [
     {
         "provider": "groq",
         "model_id": "openai/gpt-oss-120b",
+        "prompt_cache": {"mode": "native_automatic"},
         "display_name": "GPT-OSS 120B",
         "base_url": "https://api.groq.com/openai/v1",
         "input_price_per_1m": 0.15,
@@ -388,6 +389,7 @@ LLM_MODELS: List[Dict[str, Any]] = [
     {
         "provider": "groq",
         "model_id": "openai/gpt-oss-20b",
+        "prompt_cache": {"mode": "native_automatic"},
         "display_name": "GPT-OSS 20B",
         "base_url": "https://api.groq.com/openai/v1",
         "input_price_per_1m": 0.075,
@@ -408,6 +410,7 @@ LLM_MODELS: List[Dict[str, Any]] = [
     {
         "provider": "groq",
         "model_id": "openai/gpt-oss-safeguard-20b",
+        "prompt_cache": {"mode": "native_automatic"},
         "display_name": "GPT-OSS Safeguard 20B (free)",
         "base_url": "https://api.groq.com/openai/v1",
         "input_price_per_1m": 0.075,
@@ -431,6 +434,30 @@ LLM_MODELS: List[Dict[str, Any]] = [
     # llama-3.1-8b-instant + llama-3.3-70b-versatile retired 2026-08-16
     # qwen/qwen3-32b + llama-4-scout retired 2026-07-17
     # -> replacements per Groq: openai/gpt-oss-20b, openai/gpt-oss-120b, qwen/qwen3.6-27b
+    # Qwen3.6 27B -> Qwen3.8 27B swap 2026-09-24 (user request; Groq lists 3.8 as the
+    # current Qwen: console.groq.com/docs/model/qwen/qwen3.8-27b). 3.6 stays callable
+    # for agents that saved it explicitly, but is hidden from pickers as deprecated.
+    {
+        "provider": "groq",
+        "model_id": "qwen/qwen3.8-27b",
+        "display_name": "Qwen3.8 27B",
+        "base_url": "https://api.groq.com/openai/v1",
+        "input_price_per_1m": 0.8,
+        "cached_input_price_per_1m": 0.0,
+        "output_price_per_1m": 4.0,
+        "context_window": 131072,
+        "max_output_tokens": 16384,
+        "reasoning_supported": True,
+        "reasoning_default": "none",
+        "streaming_supported": True,
+        "tool_calling_supported": True,
+        "structured_output_supported": True,
+        "expected_speed": "very_fast",
+        "status": "active", "free_tier": True,
+        "capabilities": ["chat", "reasoning", "tools", "vision"],
+        "notes": "Free tier (rate-limited). Qwen3.6's successor on Groq: 27B dense, thinking/instruct dual mode (reasoning_effort none=default-for-voice; low/medium/high supported), vision (2048 tokens per image), ~450+ tps. Pricing $0.80/$4.00 per 1M — no prompt-cache discount, and Groq still rejects prompt_cache_key, so caching stays OpenAI-only.",
+        "tier": "free",
+    },
     {
         "provider": "groq",
         "model_id": "qwen/qwen3.6-27b",
@@ -447,9 +474,9 @@ LLM_MODELS: List[Dict[str, Any]] = [
         "tool_calling_supported": True,
         "structured_output_supported": True,
         "expected_speed": "very_fast",
-        "status": "active", "free_tier": True,
+        "status": "deprecated", "free_tier": True,
         "capabilities": ["chat", "reasoning", "tools", "vision"],
-        "notes": "Free. Groq's recommended Llama/Qwen3 replacement (27B dense, thinking mode). Best multilingual quality on the free tier; strong Hindi.",
+        "notes": "Superseded by qwen/qwen3.8-27b (2026-09-24): hidden from pickers, still valid for agents that saved it explicitly. Free. Groq's former recommended Llama/Qwen3 replacement (27B dense, thinking mode); strong Hindi.",
         "tier": "free",
     },
     {
@@ -834,7 +861,54 @@ def list_providers(include_deprecated: bool = False) -> List[Dict[str, Any]]:
     return [p for p in LLM_PROVIDERS.values()
             if include_deprecated or p.get("status") != "deprecated"]
 
-
+# ---------------------------------------------------------------------------
+# Prompt-cache capability layer (Task 2, 2026-09-24).
+#
+# The old code hard-labelled caching as "prompt_cache_key is OpenAI-only,
+# everyone else unsupported". That was half-wrong twice over: OpenAI does
+# have automatic prefix caching (the key pins routing), and Groq DOES do
+# native prompt caching — AUTOMATICALLY, zero client fields, for the models
+# it lists (console.groq.com/docs/prompt-caching, retrieved 2026-09-24: the
+# gpt-oss family; usage exposes authoritative
+# usage.prompt_tokens_details.cached_tokens). What Groq does NOT accept is
+# the OpenAI-only prompt_cache_key FIELD (it 400'd every request on
+# 2026-09-19) and it exposes no cached-token usage for qwen/*, so those
+# models are honestly capability=none — not "a cache that silently misses".
+#
+# Modes:
+#   native_explicit   provider accepts our prompt_cache_key and its usage
+#                     reports cached tokens (OpenAI chat API).
+#   native_automatic  provider prefix-caches automatically; NEVER send
+#                     OpenAI-only fields; hit/miss counted only when usage
+#                     actually carries the cached-tokens detail.
+#   none              no provider-side cache for this model. Report
+#                     cache_status=unsupported; never label a request "miss"
+#                     (there is no cache to miss), never invent fields.
+# This layer must NEVER trigger a model substitution — customers choose the
+# provider/model; caching is informational and field-shaping only.
+# ---------------------------------------------------------------------------
+def get_prompt_cache_capability(provider: str, model_id: str) -> Dict[str, Any]:
+    """{supported, mode, configuration} for one provider+model pair."""
+    p = str(provider or "").strip().lower()
+    m = str(model_id or "").strip().lower()
+    entry = None
+    try:
+        entry = get_llm_model(p, m) or get_llm_model_by_id(m)
+    except Exception:
+        entry = None
+    pc = entry.get("prompt_cache") if isinstance(entry, dict) else None
+    if not isinstance(pc, dict):
+        # provider defaults (hooks for other providers: absent = none —
+        # add an explicit entry to a catalog model dict to enable support,
+        # never by sending unknown fields on the wire).
+        pc = {"mode": "native_explicit"} if p == "openai" else {"mode": "none"}
+    mode = str(pc.get("mode") or "none")
+    if mode == "native_explicit":
+        return {"supported": True, "mode": mode,
+                "configuration": {"prompt_cache_key": "voice-%s-v1" % (m or "model")}}
+    if mode == "native_automatic":
+        return {"supported": True, "mode": mode, "configuration": None}
+    return {"supported": False, "mode": "none", "configuration": None}
 def list_all_providers() -> List[Dict[str, Any]]:
     """Every provider including deprecated — for validation/legacy display only."""
     return list(LLM_PROVIDERS.values())

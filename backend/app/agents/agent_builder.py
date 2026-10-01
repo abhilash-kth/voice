@@ -14,6 +14,8 @@ the API).
 """
 from __future__ import annotations
 
+import time
+
 import asyncio
 import logging
 import os
@@ -29,7 +31,6 @@ from ..config import (
     OPENROUTER_API_KEY,
     GEMINI_API_KEY,
     SARVAM_API_KEY,
-    LLM_MODEL,
 )
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
@@ -389,7 +390,160 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # Only OpenAI-compatible providers ride on an AsyncOpenAI client: Gemini's
     # plugin builds its own SDK client and would reject these kwargs.
     _native_google = provider_type == "google"
-    client = None if _native_google else AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+    # Task 1/2 (2026-09-24 02:31 post-mortem): the previous hook version used
+    # SYNC callbacks on an AsyncClient — httpx awaits every event hook, so
+    # `await None` raised TypeError inside EVERY request (the regression that
+    # failed all 12 requests of the 02:31 call). The 02:31 run is INVALID for
+    # provider-latency conclusions by this file's fault; nothing below changes
+    # request behavior: api_key/base_url/model/max_retries are exactly as
+    # before, limits/timeout mirror the openai plugin's own defaults
+    # (livekit conn_options still override per-request timeout), and every
+    # hook body is wrapped so instrumentation can never fail a call. Hooks
+    # only READ: the stream is not consumed (the response hook fires on
+    # headers arrival, before any body iteration — that is the
+    # HTTP_RESPONSE_HEADERS boundary; FIRST_STREAM_CHUNK is measured by the
+    # worker's stream wrapper via the shared http_timing store).
+    # Mechanism labels (Task 4 — these are NOT all "SDK retries"):
+    #   A OpenAI SDK retry   → impossible here: max_retries=0; if ever
+    #                           enabled, the x-stainless-retry-count header
+    #                           this line echoes becomes >0 per send.
+    #   B LiveKit FallbackAdapter switching → a NEW chat() on a DIFFERENT
+    #                           instance: visible as the next [PROMPT]/
+    #                           REQUEST START line carrying a different model
+    #                           + llm_instance tag (and library's own
+    #                           "switching to next LLM"/"recovery failed").
+    #   C application duplicate/invalidated generation → the worker's
+    #                           "LLM REQUEST START while previous still
+    #                           active" line, not this one.
+    # client_attempt# counts sends sharing ONE httpx client (per LLM
+    # instance): with B/C above it is a correlation counter, not a retry
+    # claim. Rid joins this line to [HTTP_RESPONSE_HEADERS] and
+    # [HTTP_CHUNK] even when attempts interleave.
+    import uuid as _uuid_mod
+    import httpx as _httpx
+    from . import http_timing as _http_timing
+    _http_inst = {"n": 0}
+
+    async def _on_http_send(_request):
+        try:
+            _http_inst["n"] += 1
+            _rid = _uuid_mod.uuid4().hex[:8]
+            # extensions is httpx-internal metadata, never sent on the wire
+            _request.extensions["voice_rid"] = _rid
+            _http_timing.note_send(model_id, _rid)
+            # httpx's request hook is before transport acquisition. httpcore's
+            # trace extension separates connection-pool wait, DNS/TCP/TLS,
+            # upload and response-header wait without touching the stream.
+            _trace_events = {}
+            async def _trace(_name, _info):
+                try:
+                    _phase, _edge = _name.rsplit(".", 1)
+                    _trace_events.setdefault(_phase, {})[_edge] = time.perf_counter()
+                except Exception:
+                    pass
+            _request.extensions["trace"] = _trace
+            _http_timing.set_trace(_rid, _trace_events)
+            # Critical-path: log REQUEST_START immediately without blocking work.
+            # The old code did JSON decode + hashing synchronously on the event
+            # loop (107ms block warning) — that adds directly to
+            # request_start->response_headers and delays audio/turn handling.
+            logger.info(
+                "\U0001f310 [HTTP_REQUEST_START] monotonic_ns=%d rid=%s model=%s client_attempt#%d sdk_retry_count=%s path=%s — one send of one chat() attempt (see B/C distinction in builder comment; SDK retries are disabled by max_retries=0)",
+                time.monotonic_ns(), _rid, model_id, _http_inst["n"],
+                _request.headers.get("x-stainless-retry-count", "absent"),
+                _request.url.path,
+            )
+            # --- Provider-bound fingerprint off critical path ---
+            # Offload JSON parsing + hashing to a background task / thread so it
+            # never blocks the agent event loop. Cache is FIXED and working
+            # (1792 hit), so diagnostic can be async. No PII, only hashes/lens.
+            try:
+                _body_snapshot = _request.content  # bytes, safe to capture
+                if _body_snapshot:
+                    import asyncio as _aio2
+
+                    def _parse_fp():
+                        try:
+                            import json as _js
+                            import hashlib as _hl2
+
+                            _j = _js.loads(
+                                _body_snapshot.decode("utf-8", "ignore")
+                                if isinstance(_body_snapshot, (bytes, bytearray))
+                                else str(_body_snapshot)
+                            )
+                            _pck = _j.get("prompt_cache_key", "?")
+                            _msgs = _j.get("messages", []) or []
+                            _role_seq = ",".join([str(m.get("role", "?")) for m in _msgs])
+                            _len_seq = ",".join([str(len(str(m.get("content", "")))) for m in _msgs])
+                            _first_c = str(_msgs[0].get("content", "")) if _msgs else ""
+                            _first_hash = (
+                                _hl2.sha256(_first_c.encode("utf-8", "ignore")).hexdigest()[:12]
+                                if _first_c
+                                else "?"
+                            )
+                            _pref_c = "".join([str(m.get("content", "")) for m in _msgs[:2]])
+                            _pref_hash = (
+                                _hl2.sha256(_pref_c.encode("utf-8", "ignore")).hexdigest()[:12]
+                                if _pref_c
+                                else "?"
+                            )
+                            return (_pck, len(_msgs), _role_seq, _len_seq, _first_hash, _pref_hash)
+                        except Exception:
+                            return None
+
+                    async def _log_fp():
+                        try:
+                            _res = await _aio2.to_thread(_parse_fp)
+                            if _res is None:
+                                return
+                            _pck, _cnt, _role_seq, _len_seq, _first_hash, _pref_hash = _res
+                            logger.info(
+                                "\U0001f50d [HTTP_BODY_FINGERPRINT] rid=%s model=%s prompt_cache_key=%s prov_messages=%d role_seq=%s len_seq=%s first_hash=%s prefix_hash=%s",
+                                _rid, model_id, _pck, _cnt, _role_seq, _len_seq, _first_hash, _pref_hash,
+                            )
+                        except Exception as _e:
+                            logger.debug(f"[HTTP_BODY_FINGERPRINT] failed: {_e!r}")
+
+                    _aio2.create_task(_log_fp())
+            except Exception as _e:
+                logger.debug(f"[HTTP_BODY_FINGERPRINT] schedule failed: {_e!r}")
+        except Exception:
+            pass
+
+    async def _on_http_headers(_response):
+        try:
+            _rid = _response.request.extensions.get("voice_rid", "?")
+            _el = _http_timing.note_headers(_rid, _response.status_code)
+            _transport = _http_timing.trace_summary(_rid)
+            logger.info(
+                "\U0001f310 [HTTP_RESPONSE_HEADERS] monotonic_ns=%d rid=%s model=%s status=%d request_start->response_headers=%s transport=%s — headers boundary only; first streamed body bytes come later (see [HTTP_CHUNK])",
+                time.monotonic_ns(), _rid, model_id, _response.status_code,
+                ("%.0fms" % _el) if _el >= 0 else "?",
+                _transport or "no_trace_events",
+            )
+        except Exception:
+            pass
+
+    async def _on_http_error(_request):
+        try:
+            _rid = _request.extensions.get("voice_rid", "?")
+            logger.warning(
+                "\U0001f310 [HTTP_ERROR] rid=%s model=%s — transport-level failure (connect/pool/read). The 02:31 TypeError regression came from sync hooks being awaited by httpx; hooks are async since that fix, so a line here now means a real network problem.",
+                _rid, model_id,
+            )
+        except Exception:
+            pass
+
+    client = None if _native_google else AsyncOpenAI(
+        api_key=api_key, base_url=base_url, max_retries=0,
+        http_client=_httpx.AsyncClient(
+            event_hooks={"request": [_on_http_send], "response": [_on_http_headers], "error": [_on_http_error]},
+            follow_redirects=True,
+            limits=_httpx.Limits(max_connections=50, max_keepalive_connections=50, keepalive_expiry=120.0),
+            timeout=_httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
+        ),
+    )
     llm_kwargs = {
         "model": model_id,  # EXACT model as selected, no rewriting
         "max_completion_tokens": _cap,
@@ -421,6 +575,19 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # OpenAI Chat Completions rejects reasoning_effort with tools for gpt-5.4-mini (400 error)
     # LiveKit 1.8.2+ has openai.responses.LLM that supports reasoning+tools via /v1/responses
     use_responses_api = False
+    # Task 2 (11:41 log): ONE capability lookup drives everything below —
+    # whether prompt_cache_key is sent (native_explicit only), whether the
+    # provider auto-caches (native_automatic: Groq's gpt-oss family — send
+    # NO field, they reject it with 400), or whether caching is genuinely
+    # absent for this exact model (e.g. groq qwen3.8 → honest unsupported,
+    # never a fake "miss"). Model selection itself is untouched.
+    try:
+        from ..llm_catalog import get_prompt_cache_capability as _gcc
+        _cache_cap = _gcc(provider_type or provider, model_id)
+    except Exception:
+        _cache_cap = {"supported": provider_type == "openai",
+                      "mode": "native_explicit" if provider_type == "openai" else "none",
+                      "configuration": ({"prompt_cache_key": f"voice-{model_id}-v1"} if provider_type == "openai" else None)}
     if model_meta and model_meta.get("reasoning_supported") and model_id.startswith("gpt-5"):
         # gpt-5.4-mini with end_call tool needs responses API for reasoning+tools
         use_responses_api = True
@@ -438,15 +605,27 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
         # unsupported" on EVERY request (2026-09-19: gpt-oss-20b + qwen3.6-27b both
         # 400'd all turns -> FallbackAdapter exhausted -> 6s watchdog apology).
         # Only send it to api.openai.com.
-        if provider_type == "openai":
+        if _cache_cap["mode"] == "native_explicit":
             try:
                 # Use model_id as cache key for stable prefix caching
-                llm_kwargs["prompt_cache_key"] = f"voice-{model_id}-v1"
-                logger.info(f"🔧 Set prompt_cache_key=voice-{model_id}-v1 for prompt caching (may reduce TTFT, cached tokens currently 0)")
+                llm_kwargs["prompt_cache_key"] = _cache_cap["configuration"]["prompt_cache_key"]
+                logger.info(f"🔧 Set prompt_cache_key={llm_kwargs['prompt_cache_key']} for prompt caching (capability=native_explicit; per-request [CACHE] hit/miss is read from provider usage CompletionUsage.prompt_cached_tokens — real numbers only)")
             except Exception:
                 pass
     elif "gpt-oss" in low or "o1" in low or "o3" in low or "o4" in low:
         llm_kwargs["reasoning_effort"] = reasoning
+
+    # Prefix-cache pinning for OpenAI's AUTOMATIC 1024+ token prompt cache:
+    # without a stable prompt_cache_key, requests get load-balanced across
+    # backend machines and the big static prefix (system + owner prompt + tool
+    # defs, ~1.5-2K tokens) never hits — production logs showed cached=0 on
+    # every turn and TTFT 1.2-2.3s on gpt-4.1-mini. A stable key pins requests
+    # to the same machine, so turns 2+ reuse the cached prefix (~30-60% lower
+    # TTFT). OPENAI-ONLY: Groq/OpenRouter-compatible endpoints reject the field
+    # with a 400 on every request, so apply it only when provider_type=openai.
+    if _cache_cap["mode"] == "native_explicit" and "prompt_cache_key" not in llm_kwargs:
+        llm_kwargs["prompt_cache_key"] = _cache_cap["configuration"]["prompt_cache_key"]
+        logger.info(f"🔧 Set prompt_cache_key={llm_kwargs['prompt_cache_key']} (prefix cache pinning — watch cached>0 from turn 2 on)")
 
     # Try responses API for gpt-5 reasoning models with tools (proper support)
     # Verified: chat/completions with reasoning_effort+tools returns 400 for gpt-5.4-nano/mini per LiveKit community
@@ -502,6 +681,25 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     try:
         llm_instance = _instantiate_llm(provider_type, llm_kwargs)
         logger.info(f"✅ LLM instance built successfully: provider={provider} model={model_id} provider_type={provider_type}")
+        # Task 1 (2026-09-24): don't CLAIM caching — verify the key survived
+        # constructor -> plugin options. livekit-plugins-openai >=1.8 maps
+        # OpenAILLMOptions.prompt_cache_key into chat() create kwargs
+        # (llm.py: `_opts.prompt_cache_key` -> top-level param); if the
+        # installed plugin is older, the option is silently dead and cached
+        # tokens stay 0 forever -> say so loudly instead of pretending.
+        try:
+            _ck = getattr(getattr(llm_instance, "_opts", None), "prompt_cache_key", None)
+            if provider_type == "openai":
+                if _ck:
+                    logger.info("🗄️ [CACHE] provider=openai model=%s cache_key=%s status=armed (key verified in plugin options; hit/miss is only reported from real usage.prompt_tokens_details.cached_tokens)", model_id, _ck)
+                else:
+                    logger.warning("🗄️ [CACHE] provider=openai model=%s status=unsupported — prompt_cache_key did NOT reach the plugin's create kwargs (plugin too old or kwarg dropped); cached_input_tokens will stay 0; upgrade livekit-plugins-openai>=1.8 to enable", model_id)
+            elif _cache_cap["mode"] == "native_automatic":
+                logger.info("🗄️ [CACHE] provider=%s model=%s capability=native_automatic cache_status=automatic (provider prefix-caches on its own — NO client field sent; hit/miss will only be claimed from real usage.prompt_tokens_details.cached_tokens)", provider, model_id)
+            else:
+                logger.info("🗄️ [CACHE] provider=%s model=%s capability=none cache_status=unsupported (this exact model exposes no provider-side prompt cache; no OpenAI-only fields are sent, nothing to hit or miss)", provider, model_id)
+        except Exception as _cke:
+            logger.debug(f"cache-key verification skipped: {_cke!r}")
         return llm_instance
     except Exception as e:
         logger.error(
@@ -526,7 +724,7 @@ def build_llm(cfg: AgentConfig) -> Any:
         primary_pair = cfg.providers.get_primary_llm()
         fallback_pair = cfg.providers.get_fallback_llm()
     except AttributeError:
-        primary_pair = cfg.providers.llm
+        primary_pair = getattr(cfg.providers, "llm", None)
         fallback_pair = getattr(cfg.providers, "llm_fallback", None)
         if not fallback_pair:
             try:
@@ -535,6 +733,10 @@ def build_llm(cfg: AgentConfig) -> Any:
                     fallback_pair = fp.llm
             except Exception:
                 pass
+
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="openai_gpt4o_mini", config={})
 
     # Log LLM PROVIDER CONFIG for primary
     try:
@@ -550,8 +752,54 @@ def build_llm(cfg: AgentConfig) -> Any:
         except Exception as e:
             logger.warning(f"Could not log fallback LLM config: {e}")
 
+    def _pm_attach(inst, pair):
+        # 12:28 attribution fix: stamp each LLM instance with ITS OWN
+        # provider/model/base_url. The worker's timing wrapper used to hand the
+        # PRIMARY's provider_info to every FallbackAdapter inner instance, so an
+        # OpenAI fallback completion logged (and priced) as
+        # provider=groq model=qwen/qwen3.8-27b — including real cached tokens
+        # (1152/1536 — OpenAI 128-token cache blocks) appearing on "Groq"
+        # records. With the stamp, the wrapper reads identity from the instance
+        # that actually served; usage can never be attributed to the chain head.
+        try:
+            pr, mo, bu = pair.resolve_llm_provider_model()
+            inst._prov_meta = {"provider": pr, "model_id": mo, "base_url": bu or ""}
+        except Exception:
+            try:
+                inst._prov_meta = {"provider": pair.id, "model_id": (pair.config or {}).get("model", ""), "base_url": ""}
+            except Exception:
+                pass
+
     # Build primary with exact model, no silent substitution
     primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
+    _pm_attach(primary, primary_pair)
+
+    # Cache fix v3: make prompt_cache_key per-agent so that per-agent owner/KB/FAQ
+    # content is genuinely identical for same key. Global key voice-gpt-4.1-mini-v1
+    # caused cross-agent thrashing and violated "identical for same cache key"
+    # principle when stable included per-agent content. Per-agent key restores
+    # reliable within-agent caching while still using native_explicit mode.
+    try:
+        _agent_short = (getattr(cfg, "id", "") or getattr(cfg, "name", "") or "")[:12]
+        _agent_short = "".join(c for c in _agent_short if c.isalnum())[:8] or "agent"
+        # Resolve model_id for key
+        try:
+            _, _model_id_for_key, _ = primary_pair.resolve_llm_provider_model()
+        except Exception:
+            _model_id_for_key = (primary_pair.config or {}).get("model", "gpt-4.1-mini")
+        _per_agent_key = f"voice-{_model_id_for_key}-{_agent_short}-v1"
+        # Only for OpenAI (native_explicit)
+        try:
+            from ..llm_catalog import get_prompt_cache_capability as _gcc_key
+            _cap_for_key = _gcc_key("openai", _model_id_for_key)
+            if _cap_for_key.get("mode") == "native_explicit":
+                if hasattr(primary, "_opts") and hasattr(primary._opts, "prompt_cache_key"):
+                    primary._opts.prompt_cache_key = _per_agent_key
+                    logger.info(f"🔧 Per-agent prompt_cache_key={_per_agent_key} (agent {_agent_short}) for reliable caching — identical for same agent across turns")
+        except Exception as _ke:
+            logger.debug(f"Per-agent cache key setup skipped: {_ke!r}")
+    except Exception as _e:
+        logger.debug(f"Per-agent cache key outer skipped: {_e!r}")
 
     # Build fallback chain - supports multiple models, provider/model separate
     fallbacks = []
@@ -603,6 +851,26 @@ def build_llm(cfg: AgentConfig) -> Any:
     for fb_pair in fallbacks:
         try:
             inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
+            _pm_attach(inst, fb_pair)
+            # Per-agent cache key for fallback too (same agent short as primary)
+            try:
+                _agent_short_fb = (getattr(cfg, "id", "") or getattr(cfg, "name", "") or "")[:12]
+                _agent_short_fb = "".join(c for c in _agent_short_fb if c.isalnum())[:8] or "agent"
+                try:
+                    _, _model_id_fb, _ = fb_pair.resolve_llm_provider_model()
+                except Exception:
+                    _model_id_fb = (fb_pair.config or {}).get("model", "gpt-4.1-mini")
+                _per_agent_key_fb = f"voice-{_model_id_fb}-{_agent_short_fb}-v1"
+                try:
+                    from ..llm_catalog import get_prompt_cache_capability as _gcc_fb
+                    _cap_fb = _gcc_fb("openai", _model_id_fb)
+                    if _cap_fb.get("mode") == "native_explicit":
+                        if hasattr(inst, "_opts") and hasattr(inst._opts, "prompt_cache_key"):
+                            inst._opts.prompt_cache_key = _per_agent_key_fb
+                except Exception:
+                    pass
+            except Exception:
+                pass
             fallback_instances.append(inst)
             fallback_ids.append(fb_pair.id)
         except Exception as e:
@@ -617,6 +885,23 @@ def build_llm(cfg: AgentConfig) -> Any:
     try:
         from livekit.agents import llm as llm_agents
         all_llms = [primary] + fallback_instances
+        # ── FallbackAdapter lifecycle (livekit-agents 1.8.2) — DOCUMENTED, not
+        # patched (per task spec). Exactly what the log sequence means:
+        #  FallbackLLMStream._run() walks the chain; per available instance it
+        #  calls llm.chat() — a WRAPPED call, one "LLM REQUEST START … primary/
+        #  0-of-2". Groq's 429 raises inside that attempt; the adapter logs
+        #  "…failed, switching to next LLM", marks the instance unavailable and
+        #  starts a BACKGROUND RECOVERY PROBE (_try_recovery →
+        #  _try_generate(check_recovery=True) → another real chat() on primary/
+        #  0-of-2 — the line seen while the fallback is still streaming; NOT a
+        #  duplicate turn request. It is labelled 🧪 [LLM_RECOVERY_PROBE] here,
+        #  kept out of turn accounting, latency state, generation ids and
+        #  customer billing (it is provider-infra cost, not the caller's).
+        #  Then _run continues to the next instance: "fallback/1-of-2" answers —
+        #  one valid active generation per turn, no retry on the 429'd model
+        #  (max_retry_per_llm=0 default), attempt_timeout=5.0s. A failed probe
+        #  leaves the instance unhealthy until the "all failed" pass of the
+        #  NEXT real request re-tries it.
         adapter = llm_agents.FallbackAdapter(all_llms)
         # Log full chain with exact provider/model/base_url
         try:
@@ -635,79 +920,6 @@ def build_llm(cfg: AgentConfig) -> Any:
         return adapter
     except Exception as e:
         logger.error(f"❌ Could not build LLM FallbackAdapter {fallback_ids}: {e} - using primary only, error: {e}")
-        return primary
-
-    except Exception as e:
-        logger.warning(f"Groq auto-prefer check failed: {e}")
-
-    # Build primary (respects user's choice now that auto-swap default is 0)
-    primary = _build_llm_from_pair(primary_pair, getattr(cfg, "language", "hi"))
-
-    # Only use what user selected - no fixed fallback injection
-    # User explicitly said: "Don't add inside the fixed fallback. Only user will select all the things"
-    fallbacks = []
-    fallback_pair = getattr(cfg.providers, "llm_fallback", None)
-    if not fallback_pair:
-        try:
-            fp = getattr(cfg, "fallback_providers", None)
-            if fp and getattr(fp, "llm", None):
-                fallback_pair = fp.llm
-        except Exception:
-            pass
-
-    if fallback_pair:
-        if not (fallback_pair.id == primary_pair.id and (fallback_pair.config or {}).get("model") == (primary_pair.config or {}).get("model")):
-            fallbacks.append(fallback_pair)
-
-    # Safety net for observed 404 pattern: groq_gpt_oss (120b) sometimes 404s (recovery failed)
-    # Ensure groq_gpt_oss_20b is available as last resort if 120b is anywhere in chain and 20b not already present
-    # This preserves user intent (Groq) while handling 404, with explicit logging (not silent)
-    try:
-        chain_ids = [primary_pair.id] + [fb.id for fb in fallbacks]
-        has_120b = "groq_gpt_oss" in chain_ids
-        has_20b = "groq_gpt_oss_20b" in chain_ids
-        if has_120b and not has_20b:
-            from ..models import ProviderPair
-            safety_pair = ProviderPair(id="groq_gpt_oss_20b", config={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 80})
-            fallbacks.append(safety_pair)
-            logger.info(f"🛡️ Added safety fallback groq_gpt_oss_20b (20b) because chain contains groq_gpt_oss (120b) which observed 404 recovery failed - ensures at least one Groq model works")
-    except Exception as e:
-        logger.debug(f"Could not add safety fallback: {e}")
-
-    if not fallbacks:
-        return primary
-
-    fallback_instances = []
-    fallback_ids = []
-    for fb_pair in fallbacks:
-        try:
-            inst = _build_llm_from_pair(fb_pair, getattr(cfg, "language", "hi"))
-            fallback_instances.append(inst)
-            fallback_ids.append(fb_pair.id)
-        except Exception as e:
-            logger.warning(f"⚠️ Could not build LLM fallback {fb_pair.id}: {e} — skipping")
-
-    if not fallback_instances:
-        return primary
-
-    try:
-        from livekit.agents import llm as llm_agents
-        all_llms = [primary] + fallback_instances
-        adapter = llm_agents.FallbackAdapter(all_llms)
-        chain_str = " -> ".join([primary_pair.id] + fallback_ids)
-        # Log full chain with models and base_urls for debugging 404
-        try:
-            chain_details = []
-            for pair in [primary_pair] + [fb for fb in fallbacks]:
-                cat_model = pair.config.get("model") if pair.config else "from catalog"
-                base = pair.config.get("base_url") if pair.config and pair.config.get("base_url") else ("https://api.groq.com/openai/v1" if pair.id.startswith("groq") else "https://api.openai.com/v1" if pair.id.startswith("openai") else "https://openrouter.ai/api/v1")
-                chain_details.append(f"{pair.id}({cat_model} @ {base})")
-            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback) | Details: {' -> '.join(chain_details)}")
-        except Exception:
-            logger.info(f"🔁 LLM FallbackAdapter armed: {chain_str} (user-selected only, no fixed fallback)")
-        return adapter
-    except Exception as e:
-        logger.warning(f"⚠️ Could not build LLM FallbackAdapter {fallback_ids}: {e} — using primary only")
         return primary
 
 
@@ -757,30 +969,52 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
     # Production Deepgram tuning for 300-400ms speech_end->STT_final:
     # - endpointing_ms 200ms: Deepgram waits 200ms silence before final (was default 25ms)
     # - utterance_end_ms 1000ms: wait 1s for utterance end, allows natural pause in Hindi without premature final
-    # - interim_results True: needed for preemptive generation (LLM warm while user speaking)
+    # - interim_results True: feeds RAG prefetch + lets the library accumulate
+    #   continuations into one final (preemptive generation stays OFF — see the
+    #   verified note in worker.build_conversational_session)
     # - vad_events True: Deepgram VAD filters non-speech, rejects noise before LLM
     # - no_delay True: send final immediately, don't buffer
     # - smart_format True: better punctuation for Hindi/Hinglish sentence completion detection
+    from ..catalog import CATALOG
+    cat_stt = CATALOG.get("stt", {}).get(sel.id, {})
+    default_model = cat_stt.get("model") or ("nova-3" if "nova3" in sel.id or "nova-3" in sel.id else "nova-2")
+    model_name = str(overrides.get("model") or default_model).strip()
     stt_kwargs = dict(
-        model=overrides.get("model", "nova-2"),
+        model=model_name,
         language=overrides.get("language", "hi"),
-        keywords=keywords,
         interim_results=bool(overrides.get("interim_results", True)),
         vad_events=bool(overrides.get("vad_events", True)),
         no_delay=bool(overrides.get("no_delay", True)),
         filler_words=bool(overrides.get("filler_words", True)),
         api_key=overrides.get("api_key") or DEEPGRAM_API_KEY or None,
     )
+    # Deepgram API compatibility:
+    # - Nova-3 models require Keyterm Prompting (list of strings via 'keyterm' parameter)
+    # - Nova-2, Nova-1, Enhanced, Base models use Keywords (list of (keyword, boost) tuples via 'keywords')
+    if model_name.lower().startswith("nova-3"):
+        keyterms = [k[0] if isinstance(k, (tuple, list)) else str(k) for k in keywords]
+        stt_kwargs["keyterm"] = keyterms
+    elif "nova-2" in model_name.lower():
+        stt_kwargs["keywords"] = keywords
     # Try to add production latency params with correct names, fallback gracefully if not supported
     # Correct param is endpointing_ms (not endpointing) per installed plugin 1.8.2
     # Preserve utterance_end_ms, smart_format, punctuate - don't drop all on single failure
     optional_params = {}
     # Support both endpointing_ms and legacy endpointing for backward compat
     # Deepgram's own end-of-speech detection must NOT beat the session's
-    # endpointing (min_delay 0.35s). 200ms fired before silero's min_silence,
-    # so LiveKit logged "stt end of speech received while vad is still in a
-    # speech segment, flushing vad" and cut users off mid-sentence.
-    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "300"))
+    # endpointing. The session endpointing min is 0.25s and the silero VAD
+    # min_silence is 0.35s, so 200ms is the largest value that still fires
+    # before either layer — the final lands ~200ms after the user stops
+    # talking, and the session adds its adaptive 0.25-0.75s on top. (The old
+    # 300ms added a full extra 100ms of dead air to every turn.)
+    # DECIDED 2026-09-23 against raising this to ~400ms despite split-turn logs
+    # (23:19 + 23:36 calls): the observed splits had 1-2s pauses between
+    # fragments (user composing thoughts), which endpointing cannot merge at
+    # any value under a second — and >250ms here would let the session VAD
+    # (min_silence 0.35s) beat Deepgram's final, committing turns with partial
+    # text (more "flushing vad"). Fixed at the answer layer instead: the
+    # INCOMPLETE TURNS prompt rule + acknowledgement gate above.
+    _dg_endpointing_default = int(os.getenv("VOICE_STT_ENDPOINTING_MS", "200"))
     # utterance_end is the fallback final when endpointing never fires (long
     # pause): 1000ms added a full second of dead air on slow speakers — but
     # Deepgram REJECTS utterance_end_ms below 1000 (WS handshake returns 400
@@ -841,7 +1075,10 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_stt(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.stt
+    primary_pair = getattr(cfg.providers, "stt", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="deepgram_nova2", config={})
     primary = _build_stt_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "stt_fallback", None)
@@ -1009,7 +1246,10 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
 
 
 def build_tts(cfg: AgentConfig) -> Any:
-    primary_pair = cfg.providers.tts
+    primary_pair = getattr(cfg.providers, "tts", None) if hasattr(cfg, "providers") else None
+    if not primary_pair:
+        from ..models import ProviderPair
+        primary_pair = ProviderPair(id="google_wavenet_hi", config={})
     primary = _build_tts_from_pair(primary_pair, cfg)
 
     fallback_pair = getattr(cfg.providers, "tts_fallback", None)
@@ -1138,9 +1378,13 @@ _OWNER_PROMPT_BUDGET_CHARS_DEFAULT = 4000
 # KB 800 (was 1200), FAQ 400 (was 800), owner 2000 (was 2500), prior_memory 800 (was unlimited 40 turns ~4000 tokens)
 # Total static ~3200 chars ~800 tokens + RAG 500 + history 8*150=1200 = ~2500 tokens (was 3500-3700)
 # Prior_memory 40 turns -> 800 chars preserves recent cross-call context without bloating
-_KB_BUDGET_CHARS_VOICE_RAG = 800
-_FAQ_BUDGET_CHARS_VOICE_RAG = 400
-_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 2000
+# v3 (2026-09-24 cache fix): 1126-token stable was borderline <1024 real tokens → cached=0 miss.
+# Restore larger genuinely stable prefix: KB 2500 FAQ 1200 owner 3000 matches historical
+# cache-hit size (~2350 tokens est) and is still bounded to avoid Groq 429s.
+# This is natural business content, not artificial padding.
+_KB_BUDGET_CHARS_VOICE_RAG = 2500
+_FAQ_BUDGET_CHARS_VOICE_RAG = 1200
+_OWNER_PROMPT_BUDGET_CHARS_VOICE_RAG = 3000
 _PRIOR_MEMORY_BUDGET_CHARS_VOICE_RAG = 800
 
 # Legacy module-level constants kept for backward compat / logging, but
@@ -1245,6 +1489,141 @@ def _chat_msg_text(item) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Incomplete-turn fragment state machine — the 03:07 call fix.
+#
+# Production evidence (03:07:39→03:08:44): a held fragment "Ok और" was
+# merged into EVERY following turn — the buffer had no consume step, so it
+# accumulated duplicates ("merged 3 fragment(s): 'Ok और Ok और और इसका
+# office...'") and contaminated RAG queries for the rest of the call. Two
+# additional first-answer failures were visible in the same log: the real
+# K-exam question DID retrieve (2 hits), but its LLM request was clobbered
+# 104ms in by the caller's own next FINAL ("वह क्या है?" — one continuous
+# speech burst split by VAD), and that bare pronoun follow-up then went to
+# RAG alone → 0 hits → "मेरे पास जानकारी नहीं है". Repeats worked only
+# because the contaminated buffer accidentally carried the question text.
+#
+# Rules implemented here (per spec, no keyword special-casing):
+#   - fragments are TIMESTAMPED and CONSUMED (buffer cleared) when merged;
+#   - ACK turns and drops also clear — a new independent turn starts clean;
+#   - fragments older than _FRAGMENT_TTL_S never merge (stale evidence);
+#   - a turn whose request was superseded BEFORE producing any output is
+#     strong evidence the caller is still in the same utterance (worker tags
+#     it via turn_timing["overwritten_turn"] with its generation token); the
+#     just-killed question merges forward with the immediate continuation,
+#     so the FIRST valid question gets its retrieved context — with the same
+#     clean query the repeat had to fight for. The gen tag makes a late
+#     teardown unable to contaminate a turn two generations later.
+# ---------------------------------------------------------------------------
+_FRAGMENT_TTL_S = 12.0
+_SUPERSEDED_MERGE_MAX_AGE_S = 6.0
+
+
+def _frag_norm(p, now_ts):
+    if isinstance(p, (tuple, list)) and len(p) == 2:
+        try:
+            return str(p[0]), float(p[1] or 0.0)
+        except Exception:
+            return str(p[0]), now_ts
+    return str(p), now_ts
+
+
+def _frag_append_fresh(tt, texts, now_ts):
+    """Append texts to the fragment buffer after dropping TTL-stale entries."""
+    pend = []
+    for q in (tt.get("pending_fragments") or []):
+        t, ts = _frag_norm(q, now_ts)
+        if t and now_ts - ts <= _FRAGMENT_TTL_S:
+            pend.append((t, ts))
+    for t in texts:
+        if t:
+            pend.append((str(t), now_ts))
+    pend = pend[-4:]
+    if pend:
+        tt["pending_fragments"] = pend
+    else:
+        tt.pop("pending_fragments", None)
+    return pend
+
+
+def _frag_consume(tt, now_ts):
+    """TAKE the whole buffer and CLEAR it (the missing consume step).
+    Returns (fresh_texts, dropped_stale_count)."""
+    raw = list(tt.get("pending_fragments") or [])
+    if raw:
+        tt.pop("pending_fragments", None)
+    fresh, dropped = [], 0
+    for q in raw:
+        t, ts = _frag_norm(q, now_ts)
+        if t and now_ts - ts <= _FRAGMENT_TTL_S:
+            fresh.append(t)
+        else:
+            dropped += 1
+    return fresh, dropped
+
+
+def _strip_trailing_ack_turns(target: Any) -> int:
+    """Drop trailing pure-ack assistant messages from THIS TURN's ctx copy.
+
+    11:41 log defect #2: the previous turn's deterministic acknowledgement
+    ('जी, बताइए।') sat as the last assistant message right above the model's
+    answer slot, and the model pattern-completed instead of answering the
+    real question — even on RAG-hit turns, and it kept re-seeding the echo
+    each turn. `target` is the per-turn temp_mutable_chat_ctx (the library
+    discards it after generation; ChatContext.copy() owns a fresh items
+    list), so removal changes THIS request only — session history,
+    transcripts and billing stay intact. Detection reuses
+    rag.is_acknowledgement (the same turn_rules classifier that produces
+    deterministic acks) — no new string matching.
+    """
+    if target is None:
+        return 0
+    n = 0
+    try:
+        items = getattr(target, "items", None)
+        if not isinstance(items, list):
+            return 0
+        from .. import rag as _ack_rules
+        _outs = _ack_reply_texts(_ack_rules)
+        for k in range(len(items) - 1, -1, -1):
+            m = items[k]
+            if getattr(m, "type", "message") != "message" or getattr(m, "role", "") != "assistant":
+                break
+            txt = _chat_msg_text(m).strip()
+            if not txt or len(txt) > 40:
+                break
+            if not (_ack_rules.is_acknowledgement(txt) or txt in _outs):
+                break
+            del items[k]
+            n += 1
+            if n >= 3:
+                break
+    except Exception:
+        return n
+    return n
+
+
+_ACK_REPLY_OUTPUTS: set = set()
+
+
+def _ack_reply_texts(rules) -> frozenset:
+    """The exact strings turn_rules.ack_reply() can emit — probed at runtime
+    from the module's OWN function (its classifier seeds), never a copy of
+    its wording hardcoded here: if the deterministic reply ever changes, the
+    strip follows automatically. Assistant messages equal to a generated ack
+    reply (or classifying as a bare acknowledgement) are the echo template;
+    nothing else ever matches."""
+    global _ACK_REPLY_OUTPUTS
+    if not _ACK_REPLY_OUTPUTS:
+        try:
+            _ACK_REPLY_OUTPUTS = frozenset(
+                rules.ack_reply(w) for w in ("haan", "हाँ", "हां", "han", "जी", "ji", "ok", "yes", "thanks")
+            ) - {""}
+        except Exception:
+            return frozenset()
+    return _ACK_REPLY_OUTPUTS
+
+
 def _find_chat_ctx(obj) -> Any:
     """Return the mutable ChatContext from a v1 turn context (defensively)."""
     candidates = [obj]
@@ -1282,33 +1661,54 @@ def _flatten_knowledge(kb: KnowledgeBase) -> list[str]:
 
 
 def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
+    """Build the permanent (stable-head) system prompt.
+
+    Global prompt-budget policy (2026-09-24): the stable prompt carries ONLY
+    behavioral rules. Company/KB/FAQ content is NOT part of it — the per-turn
+    RAG hook retrieves exactly the relevant chunks for the caller's question
+    and injects them as a [RAG] system message; when retrieval finds no
+    relevant hit (relevance floor), nothing is injected. Escape hatches keep
+    their old semantics: with VOICE_RAG_PER_TURN=0 the static KB/FAQ slices
+    return (they are the only grounding in that mode), and the
+    VOICE_KB_BUDGET_CHARS / VOICE_FAQ_BUDGET_CHARS /
+    VOICE_OWNER_PROMPT_BUDGET_CHARS env overrides still apply. The output is
+    deterministic per agent config, so the provider's prompt-cache prefix
+    (head_sha) stays stable across every turn and every call.
+    """
     persona = cfg.voice_personality or "friendly"
     lang = cfg.language or "hi"
     kb_budget, faq_budget, owner_budget = _effective_budgets(cfg)
+    rag_on = _rag_per_turn_enabled()
+    logger.info(
+        "📚 [KNOWLEDGE_BASE_INIT] Agent '%s' knowledge loaded: manual_text=%d chars, documents=%d, faq=%d items | Static budgets: KB=%d chars, FAQ=%d chars, Owner=%d chars | stable-prompt policy: %s",
+        cfg.name,
+        len(getattr(cfg.knowledge, "text", "") or ""),
+        len(getattr(cfg.knowledge, "documents", []) or []),
+        len(getattr(cfg.knowledge, "faq", []) or []),
+        kb_budget,
+        faq_budget,
+        owner_budget,
+        "KB/FAQ included in stable prefix for caching + RAG per-turn injects relevant chunks" if rag_on else "KB/FAQ included — RAG disabled for this call",
+    )
 
     lines = [
-        f"You are {cfg.name}, a {persona} voice receptionist.",
-        "Reply in the same language as the caller's latest message. If the caller speaks English, reply entirely in natural English; if Hindi or Hinglish, reply in Hindi or Hinglish. Do not switch languages without the caller asking.",
-        "SCRIPT RULE (critical for the voice engine): when the caller writes or speaks Hindi, write your ENTIRE answer in Devanagari script (देवनागरी) only — NEVER in Roman/Latin letters like 'Iske details nahi hain'. Roman-script Hindi sounds broken when spoken aloud. Phone numbers, digits and email addresses may stay as digits/Latin (Sarvam reads them correctly).",
-        "Keep replies to 1 or 2 short spoken sentences, preferably under 25 words. Start answering immediately. No analysis, markdown, lists, or emojis; never list more than three items or repeat the caller's full question.",
-        f"Preferred language: {lang}; use it when the caller's language is unclear.",
+        f"You are {cfg.name}, a {persona} voice receptionist on a live phone call.",
+        "Answer in the caller's language: English in -> English out; Hindi or Hinglish in -> Hindi in Devanagari script (देवनागरी) only — Roman-script Hindi sounds broken through TTS. Digits, phone numbers and emails stay as written. If the language is unclear, default to: " + lang + ".",
+        "Speak like a warm, efficient receptionist: 1-2 short spoken sentences, under 25 words, start answering immediately, no markdown, lists, emojis or preambles; never read back the caller's question, never repeat yourself, never greet or introduce yourself again (the greeting already played), never pitch services unprompted and never reveal being an AI.",
     ]
+    # Human rhythm + real latency win: a 1-3 word acknowledgment as its OWN
+    # first sentence reaches TTS at the LLM's first tokens (~1s answer).
+    # Env kill switch: VOICE_ACK_OPENERS=0.
+    if os.getenv("VOICE_ACK_OPENERS", "1") == "1":
+        lines.append(
+            "Open every answer with a very short acknowledgment as its own complete sentence, in the caller's language ('जी.' / 'हाँ जी.' / 'Sure.'), 1-3 words, varied naturally, never the same one twice in a row; then give the full answer."
+        )
     lines.append(
-        "Behave like a warm human receptionist. Never repeat yourself, never push "
-        "the same offer, never read out a list of services unprompted, and never "
-        "give a long preamble. Answer exactly what was asked, then stop. "
-        "ABSOLUTELY FORBIDDEN to add these after every answer: 'Aur kuch poochna hai?', "
-        "'Aur kuch jaanana chahenge?', 'Aapko aur kuch jaanana hai?', 'Kya aapko aur koi madad chahiye?', "
-        "'Aur kuch madad chahiye?', 'Kya aapko aur kuch chahiye?', 'Aur kuch?', "
-        "'Aur kuch janna chahenge?', and their Devanagari forms — 'क्या आपको और कुछ जानकारी चाहिए?', "
-        "'क्या आपको अभी कुछ और जानकारी चाहिए?', 'क्या मैं आपकी और मदद कर सकती हूँ?', "
-        "'क्या मैं आपकी किसी और तरह से मदद कर सकती हूँ?', 'और कुछ पूछना चाहेंगे?', 'और कुछ जानना चाहेंगे?' — "
-        "Only ask a follow-up when you are actively collecting missing required info "
-        "for a project enquiry (like phone, budget). If the caller says they have no more questions "
-        "(e.g., 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', "
-        "'नहीं और कोई मदद नहीं चाहिए', 'bas itna hi', 'that's all', 'no more questions'), "
-        "do NOT keep asking — treat it as closing and call end_call tool. "
-        "Never mention being an AI, a robot, or a bot."
+        "ACK/INCOMPLETE TURNS: pure acknowledgements and half-spoken fragments ('कि', 'और', 'एक minute') are answered deterministically before you are called; if one still reaches you, reply with at most one short warm line ('जी, बताइए।') — never facts, never guesses about what was meant. "
+        "That line is ONLY for turn-less fragments: NEVER use it to dodge a question, even a garbled or unclear one — for any question, answer from the provided business facts, or say plainly you don't have that detail and offer a follow-up. And never repeat an answer you already gave in this call."
+    )
+    lines.append(
+        "NEVER offer further help at the end of an answer: no 'Aur kuch poochna hai?', 'क्या मैं आपकी और मदद कर सकती हूँ?' or any variant — one answer, then stop and wait. Ask a follow-up only while actively collecting required enquiry details (name, phone, budget)."
     )
 
     extra = (cfg.knowledge.system_prompt or "").strip()
@@ -1326,6 +1726,12 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         lines.append("Instructions from the business owner:")
         lines.append(extra)
 
+    # Cache fix v3: static KB/FAQ are genuinely stable for same agent and
+    # increase the cacheable prefix to reliably >1024 real tokens. When RAG is
+    # on, per-turn RAG still injects the *relevant* chunks (27-105ms), but the
+    # static slices provide a large identical prefix for prompt caching.
+    # This restores historical cache-hit size (~2350 tokens) without artificial
+    # padding — natural business content only. RAG behavior unchanged.
     facts = _flatten_knowledge(cfg.knowledge)
     if facts:
         kept: list[str] = []
@@ -1344,8 +1750,8 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
         if truncated_any:
             logger.warning(
                 "⚠️ Knowledge base truncated to fit the LLM context budget "
-                f"({sum(len(f) for f in facts)} -> {used} chars; Groq's free tier is "
-                "8k TPM, and an oversized prompt is what causes 429s → silent dropped "
+                f"({sum(len(f) for f in facts)} -> {used} chars; an oversized prompt "
+                "is what causes rate-limit 429s → silent dropped "
                 f"turns). Raise VOICE_KB_BUDGET_CHARS only if you've upgraded the "
                 f"Groq tier or switched to a higher-limit provider (budget {kb_budget})."
             )
@@ -1396,20 +1802,115 @@ def build_instructions(cfg: AgentConfig, query_context: str = "") -> str:
             lines.extend(faq_lines)
 
     lines.append("")
-    lines.append("FINAL CRITICAL RULES - ALWAYS FOLLOW:")
-    lines.append("- After answering, STOP. Do NOT add 'Aur kuch jaanana chahenge?' / 'Aur kuch poochna hai?' / 'Kya aapko aur koi madad chahiye?' unless you are actively collecting required project info. One answer = stop speaking and wait for caller.")
-    lines.append("- If caller asks for contact number/email, use ONLY the numbers/emails given in 'Instructions from the business owner' above. Never say you don't have them if they are in the owner instructions. Primary phone is +91-8947027625, sales email sales@kriscent.in, info email info@kriscent.in. Provide them exactly when asked.")
-    lines.append("- If caller says 'mujhe kuch nahi puchna', 'koi sawaal nahi', 'नहीं और कोई सवाल नहीं है', 'नहीं और कोई मदद नहीं चाहिए', 'bas ho gaya', 'that's all', 'no more questions', 'ok thank you' as final, call end_call tool immediately — do not ask another follow-up.")
-    lines.append("- Keep every reply to 1-2 short sentences, under 25 words. No lists unless caller explicitly asks for list.")
-    lines.append("- ANTI-HALLUCINATION: Never invent financial data, balance, transactions, or office locations not in 'Business facts'. If user asks 'recent kaam' / 'recent work', explain Kriscent's recent projects from KB (IT services, AI agents, etc), NOT financial data. If info not in KB, say 'Mere paas iski exact jaankari nahi hai, main aapko Jaipur office se connect kara sakta hoon'.")
-    lines.append("- Be concise, warm, human. If caller says 'thank Kota' or 'accha laga' with thank, treat as closing — call end_call.")
+    lines.append(
+        "FACTS & HONESTY: ground every substantive answer ONLY in the owner instructions and any per-turn [RAG] business facts; when a retrieved fact directly answers the question, follow it exactly — numbers, prices and timings verbatim, never paraphrased. If nothing covers it, say plainly that you do not have that detail and offer to have the team follow up — never invent prices, offices, transactions or history. Give contact numbers or emails ONLY exactly as written in the owner instructions; if none are listed there, offer a callback instead."
+    )
 
+    _stable_chars = sum(len(x) + 1 for x in lines)
+    # ---- 📐 stable-prompt diagnostics: what the permanent head costs on
+    # EVERY request, measured at build time (the per-request [PROMPT] line in
+    # the worker shows the same numbers next to dynamic/RAG tokens).
+    logger.info(
+        "📐 [STABLE_PROMPT] chars=%d est_tokens=%d (4.0 chars/token) | sections: core+%sowner=%d kb_static=%s faq_static=%s | policy=%s",
+        _stable_chars,
+        int(_stable_chars / 4.0),
+        "ack-rhythm " if os.getenv("VOICE_ACK_OPENERS", "1") == "1" else "",
+        len(extra),
+        "on" if facts else "off",
+        "on" if faq else "off",
+        "cache-optimized: KB/FAQ in stable for >1024 tokens + RAG per-turn" if rag_on else "RAG disabled: static slices re-included",
+    )
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # v1 Agent (subclass) — static knowledge + cross-call memory + greeting
 # ---------------------------------------------------------------------------
+
+async def wait_until_caller_can_hear(session, timeout: float = 12.0) -> None:
+    """Wait until the caller is linked, then give the browser time to subscribe.
+
+    Opening speech that starts before the browser attaches its audio element is
+    generated and dropped. The call looks connected and stays silent.
+    """
+    room_io = getattr(session, "room_io", None)
+    if room_io is not None and hasattr(room_io, "wait_for_ready"):
+        try:
+            await asyncio.wait_for(room_io.wait_for_ready(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for the caller audio path — speaking anyway.")
+        except Exception as e:
+            logger.warning(f"wait_for_ready failed; speaking anyway: {e}")
+    # RoomIO "ready" is earlier than the browser attaching <audio>.
+    await asyncio.sleep(0.2)
+
+
+async def speak_opening_line(
+    session, text: str, *, timeout: float = 45.0, allow_interruptions: bool = False
+) -> None:
+    """Play one opening line and wait until playout finishes.
+
+    Interruptions stay off for this line only. The browser mic opens at the
+    same moment the agent starts, and that burst used to cancel the greeting
+    before any audio reached the caller.
+    """
+    text = (text or "").strip()
+    if not text:
+        logger.warning("Opening line is empty — nothing to speak")
+        return
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            # allow_interruptions: the greeting used to be hard-protected
+            # (False), which made EVERY interruption path skip it — library
+            # barge-in checks _current_speech.allow_interruptions and
+            # SpeechHandle.interrupt() raises while the handle is protected
+            # (voice/speech_handle.py:221, agent_activity.py user-speech
+            # gates). Result: talking over "Namaste…" changed nothing audible.
+            # Assistant mode now passes True; announcement one-way playback
+            # keeps False.
+            handle = session.say(text, allow_interruptions=allow_interruptions)
+            if handle is None:
+                return
+            waiter = getattr(handle, "wait_for_playout", None)
+            if callable(waiter):
+                await asyncio.wait_for(waiter(), timeout=timeout)
+            else:
+                await asyncio.wait_for(handle, timeout=timeout)
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "opening line attempt %s failed: %s: %r",
+                attempt, type(e).__name__, e,
+            )
+            if attempt == 1:
+                await asyncio.sleep(0.4)
+    if last_error is not None:
+        raise last_error
+
+
+def warm_agent_builder_schemas() -> None:
+    """Pre-warm Pydantic ChatMessage and ChatContext validation schemas off the event loop.
+
+    Pydantic v2 triggers a lazy model_rebuild() upon first ChatMessage instantiation.
+    On Windows systems, model_rebuild() inspects caller namespaces and imports annotations,
+    blocking the asyncio event loop for up to 7+ seconds if done inside an active call turn.
+    Calling this in prewarm() compiles the validators ahead of time.
+    """
+    try:
+        from livekit.agents.llm import chat_context
+        chat_context.ChatMessage.model_rebuild()
+        from livekit.agents import llm
+        warm_ctx = llm.ChatContext()
+        warm_ctx.add_message(role="system", content="warmup")
+        warm_ctx.add_message(role="user", content="warmup")
+        warm_ctx.add_message(role="assistant", content="warmup")
+        logger.info("🔥 Prewarm: llm.ChatContext / ChatMessage models compiled (0ms model_rebuild during call)")
+    except Exception as exc:
+        logger.debug("ChatContext schema prewarm note: %r", exc)
+
+
 def build_voice_agent(
     cfg: AgentConfig,
     *,
@@ -1417,6 +1918,7 @@ def build_voice_agent(
     prior_memory: str = "",
     lead_data: Optional[dict] = None,
     turn_timing_ref: Optional[dict] = None,
+    rag_prefetch: Optional[dict] = None,
 ) -> "Any":
     """Return a LiveKit v1 ``Agent`` instance wired for this config.
 
@@ -1459,22 +1961,7 @@ def build_voice_agent(
     # doesn't leave the caller in a silent, open call. Closing speech is now
     # deterministic: the tool itself speaks the fixed closing line.
     instructions += (
-        "\n\nCONVERSATION OPENING: The initial greeting has already been spoken by the application. "
-        "Never greet again, introduce yourself again, or say 'Namaste' in response to a "
-        "partial, interrupted, or unclear first user utterance. Acknowledge briefly and "
-        "ask what the caller needs.\n\nCALL LIFECYCLE: Keep the call open after every normal answer, pause, or contact-detail "
-        "collection. End the call only when the caller clearly and explicitly asks to "
-        "disconnect, hang up, cut the call, or says goodbye, bye, bye bye, ok bye, thank you, "
-        "that's all, no more help, or no more questions — this INCLUDES Hindi hang-up grants "
-        "such as 'फ़ोन रख दीजिए', 'आप phone रख सकते', 'call kaat dijiye', and direct "
-        "'I need nothing more' answers like 'मुझे कुछ भी नहीं चाहिए', 'मुझे कोई जानकारी नहीं चाहिए', "
-        "'kuch bhi nahi chahiye', 'call cut kar dijiye', 'और तो मुझे कुछ नहीं जानना' as a standalone final "
-        "utterance. Phrases such as 'that's all for this question' or 'okay' are NOT goodbye, "
-        "especially when followed by another question. "
-        "When the caller explicitly says goodbye, do NOT try to generate your own closing sentence — "
-        "just call the end_call tool once. The system will speak a fixed deterministic closing line "
-        f"'{_get_closing_for_cfg(cfg)}' and then hang up. Never call the tool before the closing is needed, "
-        "and never call it for an ambiguous phrase."
+        "\n\nCALL LIFECYCLE: keep the call open after every normal answer, pause or detail-collection turn. End the call ONLY on a clear, standalone goodbye or hang-up grant in any language ('bye', 'ok bye', 'thank you' as a closer, 'that\'s all', 'no more questions/help', 'फ़ोन रख दीजिए', 'कॉल काट दीजिए', 'मुझे कुछ और नहीं चाहिए/जानना'). 'ok', or 'that\'s all for this question' followed by another question, is NOT a goodbye. On a real goodbye do not compose a closing sentence yourself: call the end_call tool once — the system speaks the fixed closing line and hangs up. Never call end_call at any other time."
     )
 
     async def _end_call() -> str:
@@ -1489,6 +1976,7 @@ def build_voice_agent(
         ctx = get_job_context(required=False)
         if ctx is None:
             return "No job context; call not ended."
+        logger.info("[CALL_END_REQUESTED] source=agent reason=completed")
         # Avoid duplicate TTS: worker.py already spoke deterministic closing.
         # Only speak here as fallback if worker hasn't (check last closing timestamp).
         import time as _time
@@ -1518,6 +2006,14 @@ def build_voice_agent(
             await asyncio.sleep(0.4)
         # Physically cut the call: delete the LiveKit room so the caller/SIP
         # participant is disconnected (not left in a silent, open call).
+        agent_inst = agent_ref.get("instance")
+        if agent_inst is not None:
+            sess = getattr(agent_inst, "session", None)
+            if sess is not None:
+                try:
+                    sess.shutdown(drain=False)
+                except Exception:
+                    pass
         room = getattr(ctx.room, "name", None)
         if room:
             try:
@@ -1526,6 +2022,7 @@ def build_voice_agent(
             except Exception as e:
                 logger.warning(f"end_call: could not delete room {room}: {e}")
         ctx.shutdown()
+        logger.info("[CALL_ENDED] reason=completed")
         return "Call ended."
 
     # `name="end_call"` keeps the LLM-visible tool name in sync with the prompt
@@ -1539,6 +2036,7 @@ def build_voice_agent(
     # Cross-call memory becomes part of the initial conversation history, so it
     # influences every turn without being re-inserted.
     chat_ctx = llm.ChatContext()
+    _in_call_memory_lines: list[str] = []
     if lead_data:
         # For bulk-call campaigns, give the agent the lead's details (from the
         # uploaded file) so it can address them by name / reference their data.
@@ -1580,7 +2078,8 @@ def build_voice_agent(
         def __init__(self):
             self.cfg = cfg
             self.greeting = greeting
-            self._last_rag = ""  # per-turn RAG injection (see on_user_turn_completed)
+            self._opening_started = False
+            self._opening_done = False
             self._turn_timing_ref = turn_timing_ref  # For preventing duplicate REQUEST START while previous active
             # Store instance so _end_call tool can speak deterministic closing via session.
             agent_ref["instance"] = self
@@ -1597,22 +2096,183 @@ def build_voice_agent(
                 # here or the two can disagree.
             )
 
+        def llm_node(self, chat_ctx, tools, model_settings):
+            """Deterministic ack + incomplete-turn silence (see app/turn_rules.py).
+
+            Library contract (voice/generation.py `_llm_inference_task`): a
+            coroutine resolving to ``str`` IS the complete reply (fed straight to
+            TTS); one resolving to ``None`` yields no output at all. That is how
+            an acknowledgement gets answered with ZERO LLM calls (no REQUEST
+            START, no tokens, no billing entry to exclude) and how an incomplete
+            fragment stays silent until the caller finishes the thought. Every
+            other turn falls through to the default LLM path untouched.
+            """
+            tt = self._turn_timing_ref
+            if tt is not None:
+                ack = tt.get("ack_reply")
+                if ack is not None:
+                    tt.pop("ack_reply", None)
+                    logger.info(
+                        "✅ [ACK_FAST_PATH] text='%s' response='%s' (no LLM request)",
+                        str(ack.get("text", ""))[:60], str(ack.get("reply", ""))[:40],
+                    )
+
+                    async def _ack_reply():
+                        return str(ack.get("reply") or "जी।")
+
+                    return _ack_reply()
+                if tt.get("gov_turn_state") == "suppress":
+                    logger.info("⏸️ [LLM_REQUEST_SKIPPED] reason=incomplete_turn — awaiting caller continuation")
+
+                    async def _skip():
+                        return None
+
+                    return _skip()
+            return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+
+        async def tts_node(self, text, model_settings):
+            """Measure the FIRST assistant audio frame per speech (Task 3).
+
+            Deliberately NOT a TTS-object wrapper — an earlier experiment that
+            wrapped the TTS instance broke the greeting (see worker's
+            "TTS left unwrapped" note). Instead we override the agent's
+            tts_node hook, call the library default (which owns
+            synthesize/segmenting/aligned transcripts and works with ANY
+            provider behind it, including the FallbackAdapter), and wrap only
+            the frame generator. Zero added latency: it is a pass-through
+            async for. Stamps exactly the keys the existing turn-summary code
+            already understands (tts_request / first_tts_audio /
+            first_audio / last_speech_end_to_first_audio) so the 🗣️ TTS line
+            upgrades from "audio not measured" to REAL audio automatically.
+            """
+            tt = self._turn_timing_ref
+            _tts_entered = time.time()
+            _logger = logging.getLogger("voice-agent-saas-agent-builder")
+
+            async def _trace_text():
+                _first_text = True
+                async for _delta in text:
+                    if _first_text:
+                        _first_text = False
+                        _now = time.time()
+                        _ft = float(tt.get("first_token", 0) or 0) if tt is not None else 0
+                        _logger.info(
+                            "🔡 [TTS_TEXT_FIRST_DELTA] first_token_to_tts_node=%s tts_node_to_text=%dms chars=%d",
+                            (f"{(_now - _ft) * 1000:.0f}ms" if _ft and _now >= _ft else "na"),
+                            (_now - _tts_entered) * 1000,
+                            len(str(_delta)),
+                        )
+                    yield _delta
+
+            res = Agent.default.tts_node(self, _trace_text(), model_settings)
+            if asyncio.iscoroutine(res):
+                res = await res
+            if res is None or tt is None:
+                return res
+            tt["tts_request"] = _tts_entered
+
+            async def _probe():
+                _logger.info("🔌 [TTS_STREAM_START] first_token_to_stream_start=%s",
+                    (f"{(time.time() - float(tt.get('first_token', 0))) * 1000:.0f}ms"
+                     if float(tt.get("first_token", 0) or 0) else "na"))
+                _first = True
+                async for frame in res:
+                    if _first:
+                        _first = False
+                        if float(tt.get("first_tts_audio", 0) or 0) == 0.0:
+                            _now = time.time()
+                            tt["first_tts_audio"] = _now
+                            tt["first_audio"] = _now
+                            _se = float(tt.get("speech_end", 0) or 0)
+                            _sf = float(tt.get("stt_final_ts", 0) or 0)
+                            _tc = float(tt.get("turn_commit_ts", 0) or 0)
+                            _ft = float(tt.get("first_token", 0) or 0)
+                            _ttft = float(tt.get("ttft_ms", 0) or 0)
+                            def _ms(a, b):
+                                return f"{(b - a) * 1000:.0f}ms" if a and b and b >= a else "na"
+                            _synth_ms = int((_now - _ft) * 1000) if _ft else -1
+                            _s2fa = (tt["first_tts_audio"] - _se) * 1000 if _se else 0.0
+                            if _s2fa > 0:
+                                tt["last_speech_end_to_first_audio"] = _s2fa
+                            _logger.info(
+                                "🔊 [FIRST_ASSISTANT_AUDIO] t=%.3f (generation=%s)",
+                                _now, tt.get("gen", 0),
+                            )
+                            _logger.info(
+                                "⏱️ [LATENCY] stt_final_ms=%s turn_commit_ms=%s llm_ttft_ms=%s tts_first_audio_ms=%s speech_to_first_audio_ms=%s",
+                                _ms(_se, _sf) if _sf else "na",
+                                _ms(_sf if _sf else _se, _tc),
+                                f"{_ttft:.0f}ms" if _ttft else "na",
+                                f"{_synth_ms}ms" if _synth_ms >= 0 else "na",
+                                f"{_s2fa:.0f}ms" if _s2fa > 0 else "na",
+                            )
+                            try:
+                                _samples = tt.setdefault("latency_samples", [])
+                                if len(_samples) < 40:
+                                    _samples.append({
+                                        "speech_end_to_first_audio_ms": round(_s2fa) if _s2fa > 0 else None,
+                                        "ttft_ms": round(_ttft) if _ttft else None,
+                                        "tts_synth_ms": _synth_ms if _synth_ms >= 0 else None,
+                                        "turn_commit_ms": round((_tc - _sf) * 1000) if _tc and _sf else None,
+                                    })
+                            except Exception:
+                                pass
+                    yield frame
+
+            return _probe()
+
         async def on_enter(self) -> None:
-            if self.greeting:
-                # Wait until a participant is linked and audio output is ready
-                # before speaking, so outbound/SIP greetings aren't lost while
-                # the number is still ringing.
+            # Assistant mode: greet as soon as the caller can hear, then listen.
+            self._opening_started = True
+            try:
+                if not (self.greeting or "").strip():
+                    logger.info("[ASSISTANT_STARTED] Assistant has no greeting — listening immediately")
+                    return
+                logger.info("[ASSISTANT_STARTED] Assistant connected — waiting for caller audio path")
+                await wait_until_caller_can_hear(self.session)
+                logger.info("[ASSISTANT_STARTED] Speaking greeting: %s", self.greeting[:60])
+                _gtt = self._turn_timing_ref
+                if _gtt is not None:
+                    _gtt["greeting_active"] = True
+                logger.info("👋 [GREETING_STARTED] '%s' — interruptible: caller speech cancels playback", self.greeting[:60])
                 try:
-                    room_io = getattr(self.session, "room_io", None)
-                    if room_io is not None and hasattr(room_io, "wait_for_ready"):
-                        await asyncio.wait_for(room_io.wait_for_ready(), timeout=60)
-                except asyncio.TimeoutError:
-                    logger.warning("Timed out waiting for a participant to join — greeting anyway.")
-                except Exception as e:
-                    logger.warning(f"wait_for_ready failed; greeting anyway: {e}")
-                await self.session.say(self.greeting, allow_interruptions=True)
+                    await speak_opening_line(self.session, self.greeting, timeout=45, allow_interruptions=True)
+                finally:
+                    if _gtt is not None:
+                        _gtt["greeting_active"] = False
+                if _gtt is not None and _gtt.pop("greeting_interrupted", None):
+                    logger.info("🔇 Greeting ended via caller barge-in — only the played portion counts; caller's turn proceeds")
+                else:
+                    logger.info("[ASSISTANT_STARTED] Greeting finished — now listening for caller speech")
+            except Exception as e:
+                logger.warning(f"Greeting failed: {type(e).__name__}: {e!r}")
+            finally:
+                self._opening_done = True
+                if self._turn_timing_ref is not None:
+                    self._turn_timing_ref["greeting_active"] = False
 
         async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+            _tt = self._turn_timing_ref
+            _entered_ns = time.monotonic_ns()
+            if _tt is not None:
+                _tt["callback_enter_mono_ns"] = _entered_ns
+                logger.info(
+                    "[TURN_TRACE] stage=callback_enter monotonic_ns=%d call_id=%s turn_id=%s generation_id=%s",
+                    _entered_ns, _tt.get("call_id", "N/A"), _tt.get("turn_id", "N/A"), _tt.get("gen", "N/A"),
+                )
+            try:
+                await self._on_user_turn_completed_impl(turn_ctx, new_message)
+            finally:
+                _completed_ns = time.monotonic_ns()
+                if _tt is not None:
+                    _tt["callback_complete_mono_ns"] = _completed_ns
+                    logger.info(
+                        "[TURN_TRACE] stage=callback_complete monotonic_ns=%d call_id=%s turn_id=%s generation_id=%s callback_duration_ms=%.3f",
+                        _completed_ns, _tt.get("call_id", "N/A"), _tt.get("turn_id", "N/A"), _tt.get("gen", "N/A"),
+                        max(0, _completed_ns - _entered_ns) / 1_000_000,
+                    )
+
+        async def _on_user_turn_completed_impl(self, turn_ctx, new_message) -> None:
             """Hook that runs after the user finishes speaking — CRITICAL LATENCY PATH.
 
             LiveKit's ``AgentSession`` ``await``s this hook, so any blocking here
@@ -1622,7 +2282,9 @@ def build_voice_agent(
             - Explicit goodbye detection is fast (string ops, ~1ms)
             - Conversation trim is fast (list slice)
             - RAG is now async via to_thread to avoid blocking event loop (was sync, could be 100-300ms)
-            - When VOICE_PREEMPTIVE=1, RAG is skipped (static facts only) to preserve preemptive generation
+            - Turn governor (below): ack turns answer deterministically via the
+              agent's llm_node override (zero LLM), incomplete fragments are held
+              silently and merged into the next completed turn's RAG query
             - Added timing logs for STT_final->LLM_start to detect 3-7s outliers
             - FIX: Prevent duplicate/invalidated LLM requests - wait for previous LLM to complete before new REQUEST START
             - Exactly one REQUEST START per completed user turn, no 0/0 race
@@ -1637,6 +2299,26 @@ def build_voice_agent(
             # Turn serialization is LiveKit's job, not ours: a superseded request is
             # simply cancelled and reported as 0/0 tokens, which billing ignores.
             # So: log only, never wait.
+            try:
+                _turn_marker_text = _chat_msg_text(new_message).strip()
+                logger.info("🗣️ [USER_TURN_COMPLETED] callback entered for user turn: '%s'", _turn_marker_text[:80])
+                if self._turn_timing_ref is not None:
+                    _commit_ts = time.time()
+                    self._turn_timing_ref["turn_callback_enter_ts"] = _commit_ts
+                    _commit_mono = time.monotonic_ns()
+                    self._turn_timing_ref["callback_enter_mono_ns"] = _commit_mono
+                    self._turn_timing_ref["pipeline_stage"] = "user_turn_completed"
+                    _final_mono = int(self._turn_timing_ref.get("stt_final_mono_ns", 0) or 0)
+                    _final_ts = float(self._turn_timing_ref.get("stt_final_ts", 0.0) or 0.0)
+                    _final_age = _commit_ts - _final_ts
+                    _commit_ms = (
+                        f"{(_commit_mono - _final_mono) / 1_000_000:.0f}ms"
+                        if _final_mono > 0 and _commit_mono >= _final_mono
+                        else "N/A"
+                    )
+                    logger.info("⏱️ [TURN_TIMING] stt_final_to_callback_enter_ms=%s", _commit_ms)
+            except Exception:
+                pass
             try:
                 if self._turn_timing_ref and self._turn_timing_ref.get("llm_active", False):
                     prev_start = self._turn_timing_ref.get("request_start", 0)
@@ -1719,6 +2401,84 @@ def build_voice_agent(
                     )
             except Exception:
                 explicit_goodbye = False
+            # --- Turn governor (2026-09-24 spec) — runs BEFORE any LLM
+            # scheduling and decides three outcomes:
+            #   ack        -> llm_node answers with a canned line; NO LLM request,
+            #                 NO tokens, NO billing (00:31 log: 'Ok.' still cost a
+            #                 2865-token request whose 3-char answer was then
+            #                 mis-flagged into an apology).
+            #   incomplete -> llm_node produces NOTHING; the fragment is kept in
+            #                 pending_fragments and merged into the next complete
+            #                 turn (00:31 log: one thought split into 4 finals
+            #                 produced 3 invalidated 0/0 requests + 1 answered).
+            #   complete   -> normal trim+RAG+LLM path; if fragments are pending,
+            #                 RAG runs on the MERGED query.
+            # Closing intent always wins (explicit_goodbye computed above), so
+            # "thanks"/"बस इतना ही..." keep the existing deterministic closing.
+            try:
+                _gtext = user_text
+            except NameError:
+                _gtext = ""
+            _tt = self._turn_timing_ref
+            if _tt is not None:
+                # per-turn flags: drop anything left from a cancelled turn so a
+                # stale 'ack'/'suppress' can never hijack the next real question
+                _tt.pop("gov_turn_state", None)
+                _tt.pop("ack_reply", None)
+                _tt.pop("combined_query", None)
+                if _gtext and not explicit_goodbye:
+                    try:
+                        from .. import rag as _rag_rules
+                        _is_ack = _rag_rules.is_acknowledgement(_gtext)
+                        _is_inc = (not _is_ack) and _rag_rules.is_incomplete_turn(_gtext)
+                    except Exception:
+                        _is_ack = _is_inc = False
+                    _now_f = _time.time()
+                    _fb_before = len(list(_tt.get("pending_fragments") or []))
+                    if _is_ack:
+                        _tt["gov_turn_state"] = "ack"
+                        _tt["ack_reply"] = {"text": _gtext, "reply": _rag_rules.ack_reply(_gtext)}
+                        # an ACK means the caller moved past whatever they were
+                        # composing — held fragments can never "continue" into
+                        # this turn; clear so the NEXT turn starts clean.
+                        _freshA, _dropA = _frag_consume(_tt, _now_f)
+                        if _freshA or _dropA:
+                            logger.info("🧹 fragments cleared on ACK turn (kept=%d dropped_stale=%d) — deterministic answer owns the floor", len(_freshA), _dropA)
+                        logger.info("⏭️ [RAG_SKIPPED] acknowledgement turn: '%s' → deterministic reply, no LLM", _gtext[:40])
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='' fragment_buffer_before=%d fragment_buffer_after=0 merged=no path=ack", _gtext[:70], _fb_before)
+                        return
+                    if _is_inc:
+                        _pend = _frag_append_fresh(_tt, [_gtext], _now_f)
+                        _tt["gov_turn_state"] = "suppress"
+                        logger.info("⏸️ [INCOMPLETE_TURN] text='%s' waiting_for_continuation=true fragments=%d (TTL=%.0fs)", _gtext[:60], len(_pend), _FRAGMENT_TTL_S)
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='' fragment_buffer_before=%d fragment_buffer_after=%d merged=no path=hold", _gtext[:70], _fb_before, len(_pend))
+                        return
+                    # complete turn — strong-evidence continuation merge: a
+                    # previous question whose request was killed BEFORE any
+                    # output (worker-set overwritten_turn, generation-tagged)
+                    # joins the buffer as a fresh-in-time fragment.
+                    _ov = _tt.pop("overwritten_turn", None)
+                    _ov_used = False
+                    if isinstance(_ov, dict):
+                        _ovt = str(_ov.get("text") or "").strip()
+                        _ov_age = _now_f - float(_ov.get("ts") or 0.0)
+                        _ov_gen_ok = int(_ov.get("gen") or -1) == int(_tt.get("gen", 0) or 0)
+                        if _ovt and _ov_gen_ok and _ov_age <= _SUPERSEDED_MERGE_MAX_AGE_S and _ovt[:120] != _gtext[:120]:
+                            _old_p = list(_tt.get("pending_fragments") or [])
+                            _tt["pending_fragments"] = ([(_ovt, float(_ov.get("ts") or _now_f))] + _old_p)[-5:]
+                            _ov_used = True
+                            logger.info("🔗 [CONTINUATION_MERGE] caller's previous question was superseded %.1fs ago with zero output — treating '%s…' + '%s…' as ONE utterance", _ov_age, _ovt[:40], _gtext[:40])
+                    _kept, _dropped = _frag_consume(_tt, _now_f)
+                    if _dropped:
+                        logger.info("🧹 dropped %d stale fragment(s) (>%.0fs) — independent turn gets a clean query", _dropped, _FRAGMENT_TTL_S)
+                    if _kept:
+                        _combined = " ".join(_kept + [_gtext])
+                        _tt["gov_turn_state"] = "complete"
+                        _tt["combined_query"] = _combined
+                        logger.info("🧩 [COMPLETE_TURN] merged %d fragment(s)%s: '%s'", len(_kept) + 1, " (incl. superseded continuation)" if _ov_used else "", _combined[:90])
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='%s' fragment_buffer_before=%d fragment_buffer_after=0 merged=%s", _gtext[:70], _combined[:70], _fb_before, "yes+continuation" if _ov_used else "yes")
+                    else:
+                        logger.info("📥 [TURN_INPUT] raw_stt='%s' cleaned_turn='%s' fragment_buffer_before=%d fragment_buffer_after=0 merged=no", _gtext[:70], _gtext[:70], _fb_before)
             # Keep the rolling conversation bounded. Groq accounts the entire
             # prompt against TPM; an unbounded voice call eventually turns every
             # request into a 429 even with the 20b model. Preserve system facts
@@ -1752,13 +2512,81 @@ def build_voice_agent(
                     except Exception:
                         _history_limit = 8
                         _trim_threshold = 12
-                    if isinstance(items, list) and len(items) > _trim_threshold:
-                        system_items = [m for m in items if getattr(m, "role", "") == "system"]
+                    if isinstance(items, list):
+                        # Cache fix (applies ALWAYS, not just when trimming): keep ONLY the stable
+                        # behavioral instructions at the very beginning (id=lk.agent_task.instructions)
+                        # as the cacheable prefix. All other system messages (prior_memory, lead_data,
+                        # prior RAG if ever left) are dynamic per customer/lead/turn and must be AFTER
+                        # history so the stable prefix remains byte-identical across turns and across
+                        # customers (cross-customer cache sharing). This guarantees the provider-bound
+                        # prompt starts with the identical stable head.
+                        _stable_sys = []
+                        _other_sys = []
+                        for m in items:
+                            if getattr(m, "role", "") == "system":
+                                if getattr(m, "id", "") == "lk.agent_task.instructions":
+                                    _stable_sys.append(m)
+                                else:
+                                    _other_sys.append(m)
+                        # If no explicit instructions id found (older contexts), treat first system as stable
+                        if not _stable_sys:
+                            _all_sys = [m for m in items if getattr(m, "role", "") == "system"]
+                            if _all_sys:
+                                _stable_sys = [_all_sys[0]]
+                                _other_sys = _all_sys[1:]
                         dialogue_items = [m for m in items if getattr(m, "role", "") != "system"]
-                        kept_dialogue = dialogue_items[-_history_limit:]
-                        target_ctx.items = system_items + kept_dialogue
-                        logger.info("🧹 Trimmed conversation context to %s messages (voice latency: %s dialogue max, preserves name via prior_memory)", len(target_ctx.items), _history_limit)
+                        if len(items) > _trim_threshold:
+                            kept_dialogue = dialogue_items[-_history_limit:]
+                        else:
+                            kept_dialogue = dialogue_items
                         trimmed_count = len(dialogue_items) - len(kept_dialogue)
+                        if trimmed_count > 0:
+                            # Keep a bounded, verbatim window of this call's older
+                            # dialogue in the existing system-memory path. This
+                            # prevents context trimming from erasing caller facts
+                            # without RAG or entity-specific extraction.
+                            for _old_item in dialogue_items[:-_history_limit]:
+                                _old_role = getattr(_old_item, "role", "")
+                                _old_text = _chat_msg_text(_old_item).strip()
+                                if _old_role in ("user", "assistant") and _old_text:
+                                    _speaker = "Customer" if _old_role == "user" else "Agent"
+                                    _in_call_memory_lines.append(f"{_speaker}: {_old_text}")
+                            try:
+                                _memory_budget = int(os.getenv("VOICE_PRIOR_MEMORY_BUDGET_CHARS", "800"))
+                            except (TypeError, ValueError):
+                                _memory_budget = 800
+                            _memory_budget = max(1, _memory_budget)
+                            _memory_text = "\n".join(_in_call_memory_lines)[-_memory_budget:]
+                            _line_boundary = _memory_text.find("\n")
+                            if _line_boundary != -1 and _line_boundary < _memory_budget * 0.3:
+                                _memory_text = _memory_text[_line_boundary + 1:]
+                            _in_call_memory_lines[:] = [_memory_text] if _memory_text else []
+                            _memory_id = "voice.in_call_memory"
+                            _memory_message = next(
+                                (m for m in _other_sys if getattr(m, "id", "") == _memory_id),
+                                None,
+                            )
+                            _memory_content = (
+                                "Earlier turns from this call (verbatim context):\n" + _memory_text
+                            )
+                            if _memory_message is None:
+                                _memory_message = target_ctx.add_message(
+                                    role="system", content=_memory_content, id=_memory_id,
+                                )
+                                _other_sys.append(_memory_message)
+                            else:
+                                _memory_message.content = [_memory_content]
+                            logger.info(
+                                "🧠 [IN_CALL_MEMORY] archived_dialogue_items=%d retained_chars=%d",
+                                trimmed_count, len(_memory_text),
+                            )
+                        # Order: stable behavioral → history (dynamic) → other dynamic system (prior_memory, lead_data)
+                        # RAG for THIS turn is injected later with created_at just before final user, so it lands after history as well.
+                        # For cache: stable at beginning, identical across turns/customers; dynamic after.
+                        if len(items) > _trim_threshold or _other_sys:
+                            target_ctx.items = _stable_sys + kept_dialogue + _other_sys
+                        # else: no reordering needed (only stable present)
+                        logger.info("🧹 Trimmed conversation context to %s messages (dialogue max=%s, older turns retained in bounded in-call memory)", len(target_ctx.items), _history_limit)
                         if trimmed_count > 0:
                             logger.info(f"📝 Trimmed {trimmed_count} old dialogue items, kept last {_history_limit} for memory retention (reduces input tokens)")
                 except Exception as exc:
@@ -1793,32 +2621,238 @@ def build_voice_agent(
                     logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
                     return
                 from .. import rag  # local import: keep this module light
-                # Async RAG to avoid blocking event loop
+                from ..turn_rules import is_contextual_followup, build_contextual_retrieval_query
+                # If this turn completed a split thought, retrieve for the MERGED
+                # question (fragments + this final) instead of the bare tail —
+                # [COMPLETE_TURN] logged above shows the merge.
+                _cq = (self._turn_timing_ref or {}).get("combined_query")
+                if _cq:
+                    user_text = str(_cq)
+
+                # --- Conversational context for RAG (fix for pronoun follow-ups) ---
+                # Preserve actual user message for LLM (new_message unchanged).
+                # Only the INTERNAL retrieval query gets enriched with recent context.
+                original_user_query = user_text
+                retrieval_query = original_user_query
+                recent_user_ctx = ""
+                recent_assistant_ctx = ""
+                context_used = False
                 try:
-                    hits = await asyncio.to_thread(rag.build_context, cfg.knowledge, user_text, 2)
-                    hits = (hits or "").strip()
+                    _ctx_for_recent = _find_chat_ctx(turn_ctx)
+                    if _ctx_for_recent is not None:
+                        _items = getattr(_ctx_for_recent, "items", []) or []
+                        # Find last user before current (not ack/incomplete, not same text)
+                        for m in reversed(_items):
+                            if getattr(m, "role", "") == "user":
+                                _txt = _chat_msg_text(m).strip()
+                                if not _txt or _txt == original_user_query or len(_txt) < 4:
+                                    continue
+                                try:
+                                    from ..turn_rules import is_acknowledgement as _is_ack_r, is_incomplete_turn as _is_inc_r
+                                    if _is_ack_r(_txt) or _is_inc_r(_txt):
+                                        continue
+                                except Exception:
+                                    pass
+                                recent_user_ctx = _txt
+                                break
+                        if not recent_user_ctx:
+                            for m in reversed(_items):
+                                if getattr(m, "role", "") == "assistant":
+                                    _txt = _chat_msg_text(m).strip()
+                                    if _txt and len(_txt) > 10:
+                                        recent_assistant_ctx = _txt[:200]
+                                        break
                 except Exception:
-                    # Fallback sync if to_thread fails
-                    hits = (rag.build_context(cfg.knowledge, user_text, top_k=2) or "").strip()
-                _rag_elapsed = (_time.time() - _rag_t0) * 1000
-                if _rag_elapsed > 200:
-                    logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
+                    recent_user_ctx = ""
+                    recent_assistant_ctx = ""
+
+                try:
+                    if is_contextual_followup(original_user_query):
+                        _ctx_candidate = recent_user_ctx or recent_assistant_ctx
+                        if _ctx_candidate:
+                            _built = build_contextual_retrieval_query(
+                                original_user_query, recent_user_ctx, recent_assistant_ctx
+                            )
+                            if _built and _built != original_user_query:
+                                retrieval_query = _built
+                                context_used = True
+                except Exception:
+                    retrieval_query = original_user_query
+                    context_used = False
+
+                try:
+                    logger.info(
+                        "🔎 [RAG_CONTEXT_QUERY] user_query='%s' retrieval_query='%s' context_used=%s recent_len=%d",
+                        original_user_query[:80],
+                        retrieval_query[:120],
+                        "yes" if context_used else "no",
+                        len(recent_user_ctx or recent_assistant_ctx),
+                    )
+                except Exception:
+                    pass
+
+                logger.info(
+                    "🔎 [RAG_STARTED] query='%s' retrieval_query='%s' context_used=%s",
+                    original_user_query[:60],
+                    retrieval_query[:60],
+                    "yes" if context_used else "no",
+                )
+                # --- Fast path: the worker precomputes RAG from STT interim
+                # text (in parallel with endpointing), so by the time the turn
+                # completes the retrieval result for this exact text is usually
+                # already cached. This hook is AWAITED by the session before the
+                # LLM starts, so a cache hit removes ~30-100ms from EVERY turn.
+                hits = ""
+                _rag_src = "normal"
+                # P3 ROOT-CAUSE FIX: initialize EVERY retrieval-result field
+                # before either branch. Previously kb_used/faq_used & friends
+                # were assigned ONLY on the cache-MISS path; the shared log
+                # line after injection then raised UnboundLocalError on each
+                # prefetch-HIT turn (surfacing as the misleading
+                # "per-turn RAG injection skipped" warning — the context was in
+                # fact injected). Both branches now produce the same structure.
+                kb_used = False
+                kb_chars = 0
+                kb_hits = 0
+                faq_used = False
+                faq_chars = 0
+                faq_hits = 0
+                total_chars = 0
+                _prefetch_entry = None
+                if rag_prefetch is not None:
+                    try:
+                        # Prefetch cache is keyed by original normalized query (worker stores contextual result under original key)
+                        _prefetch_entry = rag_prefetch.get(rag.normalize_query(original_user_query))
+                        # Fallback: try retrieval_query key as well (in case worker stored under contextual key)
+                        if _prefetch_entry is None and retrieval_query != original_user_query:
+                            _prefetch_entry = rag_prefetch.get(rag.normalize_query(retrieval_query))
+                    except Exception:
+                        _prefetch_entry = None
+                # The worker caches the full detailed result; tolerate the old
+                # bare-string shape too so a worker/builder version skew cannot
+                # turn a hit into a crash.
+                if isinstance(_prefetch_entry, dict):
+                    hits = (_prefetch_entry.get("text") or "").strip()
+                elif isinstance(_prefetch_entry, str):
+                    hits = _prefetch_entry.strip()
                 else:
-                    logger.info(f"⏱️ TIMING RAG build_context: {_rag_elapsed:.0f}ms (hits {len(hits)} chars)")
-                if not hits or hits == self._last_rag:
-                    logger.info(f"⏱️ TIMING on_user_turn_completed (RAG no new hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
-                    return  # nothing new
+                    hits = ""
+                if hits:
+                    _rag_src = "prefetch"
+                    if isinstance(_prefetch_entry, dict):
+                        kb_used = bool(_prefetch_entry.get("kb_used", False))
+                        kb_chars = int(_prefetch_entry.get("kb_chars", 0) or 0)
+                        kb_hits = int(_prefetch_entry.get("kb_hits", 0) or 0)
+                        faq_used = bool(_prefetch_entry.get("faq_used", False))
+                        faq_chars = int(_prefetch_entry.get("faq_chars", 0) or 0)
+                        faq_hits = int(_prefetch_entry.get("faq_hits", 0) or 0)
+                        total_chars = int(_prefetch_entry.get("total_chars", len(hits)) or len(hits))
+                    else:  # bare text (older worker): source flags unknown
+                        kb_used = True
+                        kb_chars = total_chars = len(hits)
+                    _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                    logger.info(
+                        "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars | prefetch=true",
+                        retrieval_query[:60], _rag_elapsed, kb_used, kb_chars, kb_hits,
+                        faq_used, faq_chars, faq_hits, total_chars,
+                    )
+                    logger.info(
+                        "⚡ RAG PREFETCH HIT '%s' (%d chars) — computed during the STT interim, "
+                        "critical-path cost %.0fms",
+                        retrieval_query[:60], len(hits), _rag_elapsed,
+                    )
+                else:
+                    # Cache miss (final text diverged from every interim, or the
+                    # interim compute lost the race): compute now using contextual retrieval_query.
+                    # Actual LLM user message (new_message) remains unchanged.
+                    try:
+                        rag_res = await asyncio.to_thread(rag.build_context_detailed, cfg.knowledge, retrieval_query, 3)
+                    except Exception:
+                        # Fallback sync if to_thread fails
+                        rag_res = rag.build_context_detailed(cfg.knowledge, retrieval_query, top_k=3)
+                    _rag_elapsed = (_time.time() - _rag_t0) * 1000
+                    hits = (rag_res.get("text") or "").strip()
+                    kb_used = rag_res.get("kb_used", False)
+                    kb_chars = rag_res.get("kb_chars", 0)
+                    kb_hits = rag_res.get("kb_hits", 0)
+                    faq_used = rag_res.get("faq_used", False)
+                    faq_chars = rag_res.get("faq_chars", 0)
+                    faq_hits = rag_res.get("faq_hits", 0)
+                    total_chars = rag_res.get("total_chars", 0)
+
+                    # Authoritative user-facing retrieval log detailing KB and FAQ usage
+                    logger.info(
+                        "📚 [KNOWLEDGE_RETRIEVAL] query='%s' | latency=%.0fms | kb_used=%s (%d chars, %d hits) | faq_used=%s (%d chars, %d hits) | total=%d chars",
+                        retrieval_query[:60],
+                        _rag_elapsed,
+                        kb_used,
+                        kb_chars,
+                        kb_hits,
+                        faq_used,
+                        faq_chars,
+                        faq_hits,
+                        total_chars,
+                    )
+
+                    if _rag_elapsed > 200:
+                        logger.warning(f"🐢 Slow RAG: {_rag_elapsed:.0f}ms exceeds 100ms target")
+
+                logger.info(
+                    "🔎 [RAG_QUERY] query='%s' source=%s result_count=%d relevant_context_found=%s",
+                    retrieval_query[:70], _rag_src, int(kb_hits) + int(faq_hits), "yes" if hits else "no",
+                )
+                # NOTE: deliberately NO "same as last turn" dedupe here. This hook
+                # edits the per-turn copy of the chat context (temp_mutable_chat_ctx);
+                # the library discards it after generation, so the previous turn's
+                # injected facts are NOT in this turn's prompt. Skipping injection on
+                # "no new hits" (the old behavior) silently left repeat-question turns
+                # ungrounded (23:19 log: identical kb result -> "RAG no new hits" ->
+                # model answered from generic priors). Same text = same injection cost
+                # (~600 tokens); correctness wins.
+                _rag_kind = "retrieved"
                 target = _find_chat_ctx(turn_ctx)
+                _nstripped = _strip_trailing_ack_turns(target)
+                if _nstripped:
+                    logger.info("🧹 [ACK_STRIPPED] removed %d trailing acknowledgement assistant message(s) from this turn's generation context (per-turn copy only — session history untouched)", _nstripped)
+                if not hits:
+                    # ---- 0-hit turn: ONE cheap containment fallback over the
+                    # cached corpus (rag.fallback_context — BM25/ranking
+                    # untouched, runs in a thread so the loop stays free).
+                    # STT-mangled keywords ("Kriscent" heard as "sent") share
+                    # no exact token with any chunk, so main retrieval is
+                    # legitimately empty; containment still finds the chunk
+                    # containing the fragment, capped at ~560 chars. If the
+                    # fallback also finds nothing, the request proceeds
+                    # ungrounded — the prompt tells the model to say so
+                    # honestly instead of guessing.
+                    _fb_text = ""
+                    _fb_hits = 0
+                    try:
+                        _fb_text, _fb_hits = await asyncio.to_thread(
+                            rag.fallback_context, cfg.knowledge, retrieval_query
+                        )
+                    except Exception as _fb_exc:
+                        logger.debug("RAG fallback failed: %r", _fb_exc)
+                    if _fb_text:
+                        hits = _fb_text
+                        _rag_kind = "near-match"
+                        logger.info(
+                            "🕳️ [RAG_MISS] query='%s' fallback_attempted=yes fallback_hits=%d fallback_context_chars=%d",
+                            retrieval_query[:70], _fb_hits, len(_fb_text),
+                        )
+                    else:
+                        logger.info(
+                            "🕳️ [RAG_MISS] query='%s' fallback_attempted=yes fallback_hits=0 fallback_context_chars=0",
+                            retrieval_query[:70],
+                        )
+                        logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=no", retrieval_query[:70])
+                        logger.info(f"⏱️ TIMING on_user_turn_completed (no RAG hits): {(_time.time()-_rag_t0)*1000:.0f}ms")
+                        return  # nothing to inject, main retrieval AND fallback came up empty
                 if target is None:
                     logger.warning("⚠️ RAG: no chat_ctx found, skipping injection")
                     return
+                
                 # FIX ROOT CAUSE: When KB/FAQ RAG enabled, preemptive must be disabled BEFORE turn begins
-                # Verify runtime Session config, not just config variable
-                # Exactly one LLM REQUEST START per turn, no preemptive that can be invalidated by RAG mutation
-                # Previous bug: logged conflict but still allowed duplicate 0/0 failure
-                # New: Check if RAG enabled, if so preemptive should already be disabled at session level (worker.py fix)
-                # If preemptive_on env True but RAG enabled, session config has preemptive=False, so no invalidation should happen
-                # Log verification, not conflict
                 rag_enabled = True
                 try:
                     import os as _os_rag_check
@@ -1829,32 +2863,48 @@ def build_voice_agent(
                     rag_enabled = True
                 
                 if preemptive_on and rag_enabled:
-                    # This should NOT happen after worker.py fix - preemptive should be disabled when RAG enabled
-                    # If it does happen, it means session config still has preemptive enabled, which is bug
-                    # Log as warning that duplicate may occur, but we have disabled at session level so should be safe
-                    # Actually, after fix, preemptive_on env True but session preemptive=False, so no invalidation
-                    # So we log that RAG grounding needed but preemptive already disabled at session level, no invalidation
-                    logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {user_text[:60]})")
+                    logger.info(f"🔧 RAG+preemptive: KB grounding needed ({len(hits)} chars) but preemptive already disabled at session level (rag_enabled={rag_enabled}, env preemptive={preemptive_on}) - no invalidation, exactly one REQUEST START per turn (query: {retrieval_query[:60]})")
                 elif preemptive_on:
-                    logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {user_text[:60]})")
-                # Drop previous RAG message to avoid growth
-                try:
-                    items = getattr(target, "items", None)
-                    if isinstance(items, list):
-                        target.items = [m for m in items if _RAG_PREFIX not in _chat_msg_text(m)]
-                except Exception:
-                    pass
+                    logger.info(f"🔍 RAG+preemptive conflict: KB grounding needed ({len(hits)} chars) will invalidate preemptive for this turn — preserving correctness over latency (query: {retrieval_query[:60]})")
+                
+                if _rag_kind == "near-match":
+                    _header = (
+                        f"{_RAG_PREFIX} NEAR-MATCH business context (the exact question "
+                        "keywords were not found in the knowledge base; use ONLY statements "
+                        "this excerpt makes verbatim, do not stretch it to fit the question):"
+                    )
+                else:
+                    _header = (
+                        f"{_RAG_PREFIX} Relevant business facts for THIS specific question:"
+                    )
+                # 11:41 log defect #1 (ORDER, not presence — final_user=0c
+                # explained): agent_activity creates user_message BEFORE this
+                # hook, then inserts it into the generation ctx by
+                # created_at (_pipeline_reply_task_impl: chat_ctx.insert()).
+                # A plain add_message() stamps created_at=NOW — newer than the
+                # question — so [RAG] landed AFTER it: [..., USER question,
+                # [RAG] system]. The question was never the last message and
+                # the trailing system line read like new instructions. Anchor
+                # the block 1ms before the question instead: the library then
+                # slots the question right behind it — [..., [RAG] facts,
+                # USER question] — facts precede the question it grounds, and
+                # the question is last (stable prefix → dynamic RAG → user
+                # content, per the cache-prefix contract).
+                _inj_at = float(getattr(new_message, "created_at", 0.0) or 0.0) - 0.001
+                if _inj_at <= 0:
+                    _inj_at = _time.time() - 0.001
                 target.add_message(
                     role="system",
-                    content=(
-                        f"{_RAG_PREFIX} Relevant business facts for THIS specific "
-                        f"question:\n{hits}"
-                    ),
+                    content=f"{_header}\n{hits}",
+                    created_at=_inj_at,
                 )
-                self._last_rag = hits
-                logger.info(f"✅ RAG injected {len(hits)} chars for query: {user_text[:80]}")
+                logger.info(f"✅ [RAG_DONE] RAG injected {len(hits)} chars for query: {retrieval_query[:80]} (kb_used={kb_used}, faq_used={faq_used}) original='{original_user_query[:60]}'")
+                logger.info("🧠 [LLM_CONTEXT] user_query='%s' rag_context_present=yes (chars=%d, kind=%s)", retrieval_query[:70], len(hits), _rag_kind)
             except Exception as e:
-                logger.warning(f"⚠️ per-turn RAG injection skipped: {e}")
+                # RAG only *enriches* the turn context: a retrieval failure must
+                # never gate or delay the LLM reply (brief P4). Log loudly with
+                # the real exception, then fall through so LiveKit generates.
+                logger.warning(f"⚠️ per-turn RAG handling raised {type(e).__name__}: {e!r} — LLM reply still proceeds ungrounded for this turn")
                 logger.info(f"⏱️ TIMING on_user_turn_completed (RAG error, fallback): {(_time.time()-_rag_t0)*1000:.0f}ms")
 
     return _VoiceAgent()
@@ -1877,15 +2927,14 @@ def build_announce_agent(
     from livekit.agents import Agent
     from livekit.agents import llm
 
-    text = (announce_text or cfg.greeting or "").strip()
-    if not text:
-        raise ValueError(
-            "Announcement agent has no script. Set announce_text (or greeting) on the agent."
-        )
+    text = (announce_text or getattr(cfg, "announce_text", "") or cfg.greeting or f"Hello, this is {cfg.name} with an announcement.").strip()
+    end_after_announcement = bool(getattr(cfg, "end_after_announcement", False))
 
     class _AnnounceAgent(Agent):
         def __init__(self):
             self.cfg = cfg
+            self._opening_started = False
+            self._opening_done = False
             super().__init__(
                 # No LLM: a still/empty instruction set. Everything is hardcoded.
                 instructions="You are a one-way announcement. Do not use tools.",
@@ -1898,36 +2947,49 @@ def build_announce_agent(
             )
 
         async def on_enter(self) -> None:
-            # Wait for the participant/audio to be ready so the script isn't cut off.
+            self._opening_started = True
             try:
-                room_io = getattr(self.session, "room_io", None)
-                if room_io is not None and hasattr(room_io, "wait_for_ready"):
-                    await asyncio.wait_for(room_io.wait_for_ready(), timeout=60)
+                logger.info("[ANNOUNCEMENT_STARTED] Announcement connected — waiting for caller audio path")
+                await wait_until_caller_can_hear(self.session)
+                logger.info("[ANNOUNCEMENT_STARTED] Reading announcement script: %s", text[:60])
+                await speak_opening_line(self.session, text, timeout=120)
+                logger.info("[ANNOUNCEMENT_FINISHED] Announcement script playback completed")
             except Exception as e:
-                logger.warning(f"wait_for_ready failed; playing announcement anyway: {e}")
-            # Play the fixed script, then end the call gracefully. We delete the
-            # LiveKit room so the caller is physically disconnected (otherwise the
-            # browser/SIP participant would be left in a silent, open call), then
-            # shut the job down — which runs the worker's finalize_billing shutdown
-            # callback so the call is marked completed.
-            speech = self.session.say(text, allow_interruptions=False)
-            await speech
-            try:
-                from livekit.agents import get_job_context
-                ctx = get_job_context(required=False)
-                if ctx is not None:
-                    room = getattr(ctx.room, "name", None)
-                    if room:
-                        try:
-                            from ..telephony import end_active_room
-                            await end_active_room(room)
-                        except Exception as e:
-                            logger.warning(f"announcement: could not delete room {room}: {e}")
-                    ctx.shutdown()
-                else:
-                    self.session.shutdown(drain=True)
-                logger.info("📢 Announcement finished — closing call.")
-            except Exception as e:
-                logger.warning(f"could not close announcement session: {e}")
+                logger.warning(f"Announcement playback failed: {type(e).__name__}: {e!r}")
+            finally:
+                self._opening_done = True
+
+            if end_after_announcement:
+                logger.info("[CALL_END_REQUESTED] source=announcement reason=announcement_completed")
+                try:
+                    await asyncio.sleep(2.5)  # flush audio playout buffer to caller
+                    from livekit.agents import get_job_context
+                    ctx = get_job_context(required=False)
+                    try:
+                        self.session.shutdown(drain=True)
+                    except Exception:
+                        pass
+                    if ctx is not None:
+                        room = getattr(ctx.room, "name", None)
+                        if room:
+                            try:
+                                from ..telephony import end_active_room
+                                await end_active_room(room)
+                            except Exception as e:
+                                logger.warning(f"announcement: could not delete room {room}: {e}")
+                        ctx.shutdown()
+                    logger.info("[CALL_ENDED] reason=announcement_completed")
+                except Exception as e:
+                    logger.warning(f"could not close announcement session: {e}")
+            else:
+                logger.info("📢 Announcement finished — keeping call connected (end_after_announcement=False)")
 
     return _AnnounceAgent()
+
+
+# Pre-compile schemas when agent_builder is imported
+try:
+    warm_agent_builder_schemas()
+except Exception:
+    pass
+

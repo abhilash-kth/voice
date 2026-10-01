@@ -32,6 +32,10 @@ export default function Dashboard() {
   const [presetCallAgentId, setPresetCallAgentId] = useState("");
   const [notice, setNotice] = useState("");
   const [backendError, setBackendError] = useState("");
+  // P10: flips true on the first successful agents fetch and stays true.
+  // CallPanel disables Start until then — first-call success must not
+  // depend on a page refresh.
+  const [agentsReady, setAgentsReady] = useState(false);
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -53,6 +57,7 @@ export default function Dashboard() {
       setCatalog(c);
       setAgents(a.agents);
       setBackendError("");
+      setAgentsReady(true);
     } catch (e) {
       setBackendError(
         "Could not reach the backend at localhost:8000. Start it with: uvicorn app.main:app --port 8000",
@@ -293,6 +298,7 @@ export default function Dashboard() {
             onStarted={afterCall}
             presetAgentId={presetCallAgentId}
             onPresetConsumed={() => setPresetCallAgentId("")}
+            agentsReady={agentsReady}
           />
         )}
 
@@ -361,6 +367,15 @@ export default function Dashboard() {
                       {a.description || "—"}
                     </p>
                     <div className="flex flex-wrap gap-1.5 text-[11px] text-gray-400 mb-3">
+                      <span
+                        className={`rounded-full px-2.5 py-1 border ${
+                          a.agent_mode === "announcement"
+                            ? "bg-blue-500/10 text-blue-300 border-blue-500/20"
+                            : "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
+                        }`}
+                      >
+                        {a.agent_mode === "announcement" ? "announcement" : "assistant"}
+                      </span>
                       <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
                         LLM: {a.providers.llm.id.slice(0, 18)}
                       </span>
