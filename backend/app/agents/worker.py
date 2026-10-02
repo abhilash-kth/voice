@@ -3195,6 +3195,13 @@ async def _entrypoint_body(ctx, setup_complete):
                 reply_tracker["pending"] = None
         if reply_tracker["last_assistant_ts"] >= turn_ts or closing_requested["done"]:
             return  # closing turns must never receive a delayed fallback
+        if turn_timing.get("gov_turn_state") == "suppress":
+            # The turn governor intentionally returned no LLM output because
+            # this utterance is a fragment. Keep the floor open for the
+            # caller's continuation; the independent no-response watchdog
+            # still handles a caller who never resumes.
+            logger.info("silence fallback suppressed: incomplete turn is awaiting caller continuation")
+            return
         # REAL-stream markers (immediate) vs conversation_item_added (lags 5-15s
         # on reasoning-tool models like gpt-5-nano): _mark_reply only fires from
         # item_added, so a reply that already generated and STARTED PLAYING was
@@ -3202,15 +3209,18 @@ async def _entrypoint_body(ctx, setup_complete):
         # at +3.3s, 'Sorry, technical problem' followed at +15s). If this turn's
         # LLM request exists and any immediate marker is set, the reply is alive.
         try:
-            _rs = turn_timing.get("request_start", 0)
-            if _rs and _rs >= turn_ts - 2:
-                _m = max(
-                    turn_timing.get("first_token", 0), turn_timing.get("tts_request", 0),
-                    turn_timing.get("first_tts_audio", 0), turn_timing.get("first_audio", 0),
-                )
-                if _m >= _rs:
-                    logger.info("🛟 silence watchdog suppressed: reply already streaming/speaking per REAL stream markers (item_added lag)")
-                    return
+            _markers = {
+                "first_token": turn_timing.get("first_token", 0),
+                "tts_request": turn_timing.get("tts_request", 0),
+                "first_tts_audio": turn_timing.get("first_tts_audio", 0),
+                "first_audio": turn_timing.get("first_audio", 0),
+            }
+            # Request timestamps can be reset by state transitions while the
+            # reply is still streaming. These markers are reset per user turn.
+            _active = {k: float(v or 0) for k, v in _markers.items() if float(v or 0) >= turn_ts - 1.0}
+            if _active:
+                logger.info("silence fallback suppressed: reply progress belongs to this turn (%s); waiting for the response", ",".join(sorted(_active)))
+                return
         except Exception:
             pass
         # Barge-in-aware suppression (2026-09-24, "it should also listen"):

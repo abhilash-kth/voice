@@ -242,6 +242,14 @@ _WAIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A caller referring back to information they already gave is a complete
+# correction/answer, even when the sentence ends with a discourse particle
+# such as "ही". Holding these turns makes the agent appear not to listen.
+_COMPLETED_REFERENCE_RE = re.compile(
+    r"(?:बताया|बताई|बताए|कहा|बोला|बोली).{0,60}(?:पहले\s*ही|पहले)|"
+    r"(?:as\s+i\s+(?:already\s+)?(?:said|told)|i\s+(?:already\s+)?told\s+you)",
+    re.IGNORECASE,
+)
 # Conditionals that combine with a dangling मुझे/हमें into clear incompleteness.
 _CONDITION_WORDS = {"अगर", "यदि", "कि", "के", "लिए", "if", "whether"}
 _DANGLING_BENEFICIARY = {"मुझे", "हमें", "तुम्हें", "आपको", "want", "need"}
@@ -258,7 +266,9 @@ def is_incomplete_turn(text: str) -> bool:
         t = (text or "").strip()
         if not t:
             return False
-        if "?" in t or "？" in t:
+        if "?" in t or "\uFF1F" in t:
+            return False
+        if _COMPLETED_REFERENCE_RE.search(t):
             return False
         if t.endswith("।") or t.endswith("!"):
             return False

@@ -164,6 +164,7 @@ coverage/
 # =========================================================
 
 # Local LiveKit server binary
-# livekit-server.exebackend/google-key.json 
+livekit-server.exe
+# backend/google-key.json 
 # backend/google-key.json
 # backend/google-key.json
