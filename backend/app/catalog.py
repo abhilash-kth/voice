@@ -164,6 +164,43 @@ CATALOG: Dict[str, Any] = {
             "cost": {"per_1k_chars": 30.00},
             "options": {"voice": ["pNInz6obpgDQGcFmaJgB", "onwK4e9ZLuTAKqWW03F9"]},
         },
+        "cartesia_sonic3": {
+            "kind": "tts",
+            "display_name": "Cartesia Sonic 3 (ultra-low-latency, 40+ languages)",
+            "provider": "cartesia",
+            "model": "sonic-3",
+            "voice": "4459a9a5-69d6-4680-b970-e13dc51845b6",  # Indian female — gender default
+            "language": "hi",
+            "tier": "paid",
+            "requires_key": True,
+            "key_env": "CARTESIA_API_KEY",
+            "cost": {"per_1k_chars": 4.2},
+            "options": {
+                "model": ["sonic-3", "sonic-2", "sonic-turbo", "sonic"],
+                # Indian-accent voices from the operator's Cartesia account
+                # (play.cartesia.ai/voices). Sonic voices are multilingual: any
+                # voice below speaks every language in the `language` list.
+                "voice": [
+                    "4459a9a5-69d6-4680-b970-e13dc51845b6",  # female (Indian)
+                    "01fc5e31-71e9-40dc-a220-06dbd4b4ed7e",  # female (Indian)
+                    "32b0f12b-67c3-421d-8850-b46c019ced91",  # female (Indian)
+                    "cb9c954d-bcaa-43ed-82bf-aeb5e88a3cb5",  # male (Indian)
+                    "e6b71342-48f1-4c70-a13a-d197b176ff24",  # extra (Indian)
+                ],
+                # shown in the frontend dropdown next to the id
+                "voice_labels": {
+                    "4459a9a5-69d6-4680-b970-e13dc51845b6": "Female 1 (Indian)",
+                    "01fc5e31-71e9-40dc-a220-06dbd4b4ed7e": "Female 2 (Indian)",
+                    "32b0f12b-67c3-421d-8850-b46c019ced91": "Female 3 (Indian)",
+                    "cb9c954d-bcaa-43ed-82bf-aeb5e88a3cb5": "Male 1 (Indian)",
+                    "e6b71342-48f1-4c70-a13a-d197b176ff24": "Voice 5 (Indian)",
+                },
+                # Bare ISO-639-1 codes (Cartesia rejects full locales like hi-IN).
+                "language": ["hi", "en", "bn", "ta", "te", "kn", "ml", "gu", "mr", "pa", "or", "ur", "es", "fr", "de", "pt", "zh", "ja"],
+                "genders": ["female", "male", "neutral"],
+            },
+            "notes": "₹4.2/1k chars (~$50/1M). WebSocket streaming with sub-100ms first audio; Sonic 3 handles Hinglish code-mix. Gender picks the Indian voice (female→4459a9a5…, male→cb9c954d…); the agent language drives the spoken language. More Indian-accent voices: copy their id from play.cartesia.ai/voices into the voice list.",
+        },
         "openrouter_flux_tts": {
             "kind": "tts", "deprecated": True,
             "display_name": "OpenRouter Deepgram Flux TTS (FREE, English only)",

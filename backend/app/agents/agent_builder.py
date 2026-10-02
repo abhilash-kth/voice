@@ -31,6 +31,7 @@ from ..config import (
     OPENROUTER_API_KEY,
     GEMINI_API_KEY,
     SARVAM_API_KEY,
+    CARTESIA_API_KEY,
 )
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
@@ -1191,6 +1192,61 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
                 speaker=speaker,
                 api_key=api_key,
             )
+
+    if sel.id.startswith("cartesia"):
+        try:
+            from livekit.plugins.cartesia import TTS as CartesiaTTS
+        except ImportError as e:
+            raise RuntimeError(
+                f"Cartesia TTS needs livekit-plugins-cartesia ({e}). Run "
+                "`pip install livekit-plugins-cartesia>=1.7.1` in the worker venv and "
+                "set CARTESIA_API_KEY in backend/.env."
+            ) from e
+        api_key = overrides.get("api_key") or CARTESIA_API_KEY
+        if not api_key:
+            raise RuntimeError(
+                "Cartesia TTS needs CARTESIA_API_KEY (backend/.env) or an api_key in "
+                "the agent's tts config. Get one at https://play.cartesia.ai."
+            )
+        model = overrides.get("model", "sonic-3")
+        configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
+        # Cartesia takes bare ISO-639-1 codes ("hi", "en"), not BCP-47 locales, so
+        # strip the region from the shared locale map: "hi-IN"→"hi", "en-US"→"en",
+        # "multi"→"hi" (Sonic 3 is natively code-mixed, so Hinglish is fine).
+        target_language = overrides.get("language") or locale_for_language(configured_language).split("-")[0]
+        # Gender selects the voice unless one was chosen explicitly. Cartesia voice
+        # ids are account-specific UUIDs; the defaults below are the operator's
+        # Indian-accent voices (add more in backend/app/catalog.py options.voice).
+        # An explicit `voice` in the agent's tts config always wins.
+        gender = (getattr(cfg, "gender", "") or overrides.get("gender") or "female").lower()
+        _default_voices = {
+            "female": "4459a9a5-69d6-4680-b970-e13dc51845b6",
+            "male": "cb9c954d-bcaa-43ed-82bf-aeb5e88a3cb5",
+            "neutral": "4459a9a5-69d6-4680-b970-e13dc51845b6",
+        }
+        voice = overrides.get("voice") or _default_voices.get(gender, _default_voices["female"])
+        kwargs = dict(
+            model=model,
+            language=target_language,
+            voice=voice,
+            api_key=api_key,
+        )
+        if overrides.get("speed") is not None:
+            # sonic-3 accepts a float 0.6–2.0 or the preset words
+            speed = overrides["speed"]
+            kwargs["speed"] = speed if isinstance(speed, str) else float(speed)
+        if overrides.get("emotion"):
+            kwargs["emotion"] = overrides["emotion"]
+        logger.info(
+            f"🎙️ Cartesia TTS: model={model} voice={str(voice)[:8]}… "
+            f"language={target_language} gender={gender}"
+        )
+        try:
+            return CartesiaTTS(**kwargs)
+        except TypeError as e:
+            # Plugin version skew: retry with the minimal documented signature.
+            logger.warning(f"⚠️ Cartesia TTS rejected {sorted(kwargs)} ({e}); retrying minimal")
+            return CartesiaTTS(model=model, language=target_language, voice=voice, api_key=api_key)
 
     if sel.id.startswith("elevenlabs"):
         from livekit.plugins.elevenlabs import TTS

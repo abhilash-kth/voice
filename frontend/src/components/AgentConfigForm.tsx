@@ -98,6 +98,19 @@ interface LLMProvider {
 export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const kinds = ["llm", "stt", "tts", "telephony"] as const;
   const fallbackKinds = ["llm", "stt", "tts"] as const;
+  const optionKey = (kind: string, providerId: string, role: "primary" | "fallback" = "primary") =>
+    `${role}:${kind}:${providerId}`;
+  const initOptionVals = () => {
+    const values: Record<string, Record<string, string>> = {};
+    const providers = editing?.providers as any;
+    for (const kind of kinds) {
+      const primary = providers?.[kind];
+      if (primary?.id) values[optionKey(kind, primary.id)] = { ...(primary.config || {}) };
+      const fallback = providers?.[`${kind}_fallback`];
+      if (fallback?.id) values[optionKey(kind, fallback.id, "fallback")] = { ...(fallback.config || {}) };
+    }
+    return values;
+  };
   const [name, setName] = useState(editing?.name || "");
   const [greeting, setGreeting] = useState(editing?.greeting || "");
   const [fallbackResponse, setFallbackResponse] = useState(
@@ -277,7 +290,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     const p: any = editing?.providers || {};
     return !!(p.llm_fallback || p.stt_fallback || p.tts_fallback || p.llm_fallback_v2);
   });
-  const [optionVals, setOptionVals] = useState<Record<string, Record<string, string>>>({});
+  const [optionVals, setOptionVals] = useState<Record<string, Record<string, string>>>(initOptionVals);
   const [file, setFile] = useState<File | null>(null);
   const [savedDocuments, setSavedDocuments] = useState(editing?.knowledge?.documents || []);
   const hasText = knowledgeText.trim().length > 0;
@@ -294,9 +307,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const setFallbackPick = (kind: string, id: string) =>
     setFallbackPickedState((p) => ({ ...p, [kind]: id }));
 
-  const buildProviderEntry = (pid: string) => {
+  const buildProviderEntry = (kind: string, pid: string, role: "primary" | "fallback" = "primary") => {
     const p = providerByName[pid];
-    const opts = { ...(optionVals[pid] || {}) };
+    const opts = { ...(optionVals[optionKey(kind, pid, role)] || {}) };
     if (p?.model && !opts.model) opts.model = p.model as string;
     if (p?.voice && !opts.voice) opts.voice = p.voice as string;
     return { id: pid, config: opts };
@@ -447,12 +460,19 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     );
   };
 
-  const renderOptions = (pid: string) => {
+  const renderOptions = (kind: string, pid: string, role: "primary" | "fallback" = "primary") => {
     const p = providerByName[pid];
     if (!p?.options) return null;
+    // Non-array entries in options (e.g. cartesia's voice_labels map) are
+    // metadata for labelling, not selects — Object.entries would otherwise try
+    // to .map() a dict and crash the form.
+    const voiceLabels: Record<string, string> =
+      ((p as any).options as Record<string, unknown>)?.voice_labels as Record<string, string> || {};
     return Object.entries(p.options).map(([optName, optVals]) => {
-      if (!optVals || optVals.length === 0) return null;
-      const current = optionVals[pid]?.[optName] || optVals[0];
+      if (!Array.isArray(optVals) || optVals.length === 0) return null;
+      const key = optionKey(kind, pid, role);
+      const current = optionVals[key]?.[optName] || optVals[0];
+      const values = optVals.includes(current) ? optVals : [current, ...optVals];
       return (
         <label key={optName} className="flex flex-col gap-1 text-xs">
           <span className="text-gray-400 font-medium">{optName}</span>
@@ -462,17 +482,23 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             onChange={(e) =>
               setOptionVals((v) => ({
                 ...v,
-                [pid]: { ...(v[pid] || {}), [optName]: e.target.value },
+                [key]: { ...(v[key] || {}), [optName]: e.target.value },
               }))
             }
           >
-            {optVals.map((o) => (
-              <option key={o} value={o}>
-                {optName === "model" && (p as any).cost?.per_1k_in != null
-                  ? `${o} — ₹${(p as any).cost.per_1k_in}/1K in · ₹${(p as any).cost.per_1k_out}/1K out`
-                  : o}
-              </option>
-            ))}
+            {values.map((o) => {
+              let label = o;
+              if (optName === "model" && (p as any).cost?.per_1k_in != null) {
+                label = `${o} — ₹${(p as any).cost.per_1k_in}/1K in · ₹${(p as any).cost.per_1k_out}/1K out`;
+              } else if (optName === "voice" && voiceLabels[o]) {
+                label = `${voiceLabels[o]} (${o.slice(0, 8)}…)`;
+              }
+              return (
+                <option key={o} value={o}>
+                  {label}
+                </option>
+              );
+            })}
           </select>
         </label>
       );
@@ -544,11 +570,11 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       for (const kind of ["stt", "tts", "telephony"] as const) {
         const pid = picked[kind];
         if (!pid) continue;
-        cfg[kind] = buildProviderEntry(pid);
+        cfg[kind] = buildProviderEntry(kind, pid);
       }
       // For LLM legacy
       const pid = picked.llm;
-      if (pid) cfg.llm = buildProviderEntry(pid);
+      if (pid) cfg.llm = buildProviderEntry("llm", pid);
       if (fallbackEnabled) {
         for (const kind of fallbackKinds) {
           if (kind === "llm") continue; // handled separately
@@ -558,16 +584,16 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           const primaryId = picked[kind];
           if (fpid === primaryId) {
             const primaryCfg = cfg[kind]?.config || {};
-            const fallbackCfg = optionVals[fpid] || {};
+            const fallbackCfg = optionVals[optionKey(kind, fpid, "fallback")] || {};
             const sameModel = (primaryCfg.model || "") === (fallbackCfg.model || "") && Object.keys(fallbackCfg).length === 0;
             if (sameModel) continue;
           }
-          cfg[`${kind}_fallback`] = buildProviderEntry(fpid);
+          cfg[`${kind}_fallback`] = buildProviderEntry(kind, fpid, "fallback");
         }
         // LLM fallback legacy
         const fpid = fallbackPicked.llm;
         if (mode !== "announcement" && fpid && fpid !== picked.llm) {
-          cfg.llm_fallback = buildProviderEntry(fpid);
+          cfg.llm_fallback = buildProviderEntry("llm", fpid, "fallback");
         }
       }
       return cfg;
@@ -577,7 +603,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     for (const kind of ["stt", "tts", "telephony"] as const) {
       const pid = picked[kind];
       if (!pid) continue;
-      cfg[kind] = buildProviderEntry(pid);
+      cfg[kind] = buildProviderEntry(kind, pid);
     }
     if (fallbackEnabled) {
       // Announcement mode has no STT/LLM at runtime — only the voice (TTS) can fall back.
@@ -588,11 +614,11 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         const primaryId = picked[kind];
         if (fpid === primaryId) {
           const primaryCfg = cfg[kind]?.config || {};
-          const fallbackCfg = optionVals[fpid] || {};
+          const fallbackCfg = optionVals[optionKey(kind, fpid, "fallback")] || {};
           const sameModel = (primaryCfg.model || "") === (fallbackCfg.model || "") && Object.keys(fallbackCfg).length === 0;
           if (sameModel) continue;
         }
-        cfg[`${kind}_fallback`] = buildProviderEntry(fpid);
+        cfg[`${kind}_fallback`] = buildProviderEntry(kind, fpid, "fallback");
       }
     }
     return cfg;
@@ -1027,7 +1053,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   ))}
                 </select>
               </label>
-              {renderOptions(picked.llm)}
+              {renderOptions("llm", picked.llm)}
             </div>
           </div>
         )}
@@ -1053,7 +1079,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                   ))}
                 </select>
               </label>
-              {renderOptions(picked[kind])}
+              {renderOptions(kind, picked[kind])}
             </div>
             {providerByName[picked[kind]]?.notes && (
               <p className="mt-2 text-[11px] text-amber-300/90 leading-snug">{providerByName[picked[kind]]!.notes}</p>
@@ -1145,7 +1171,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                         ))}
                       </select>
                     </label>
-                    {renderOptions(fallbackPicked[kind])}
+                    {renderOptions(kind, fallbackPicked[kind], "fallback")}
                   </div>
                 </div>
               ))}

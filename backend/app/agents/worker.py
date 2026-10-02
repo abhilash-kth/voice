@@ -105,6 +105,15 @@ try:  # noqa: E402
     from livekit.plugins import sarvam as _sarvam_plugin  # noqa: F401
 except ImportError:  # package is optional (pip install livekit-plugins-sarvam)
     _sarvam_plugin = None
+# Same for Cartesia TTS: agent_builder's lazy
+#   "from livekit.plugins.cartesia import TTS"
+# would otherwise be the FIRST import of the module, running inside the job
+# thread and dying with "RuntimeError: Plugins must be registered on the main
+# thread" before the agent joins the room.
+try:  # noqa: E402
+    from livekit.plugins import cartesia as _cartesia_plugin  # noqa: F401
+except ImportError:  # package is optional (pip install livekit-plugins-cartesia)
+    _cartesia_plugin = None
 
 from app.config import setup_logging
 setup_logging()
