@@ -1,0 +1,998 @@
+"""
+FastAPI management + call-dispatch server for the Voice Agent SaaS platform.
+
+Storage is Prisma (Neon/Postgres, or SQLite for local). Run from backend/:
+
+    python -m prisma db push --schema schema.prisma
+    python -m prisma generate --schema schema.prisma
+    uvicorn app.main:app --port 8000 --reload
+
+Endpoints: auth, agents, knowledge, calls, wallet, billing.
+The LiveKit worker (app.agents.worker) reports cost/usage/transcripts here.
+"""
+from __future__ import annotations
+
+import os
+import time
+import asyncio
+import logging
+from typing import Optional
+from contextlib import asynccontextmanager
+
+logger = logging.getLogger("voice-agent-saas-api")
+
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+
+from .models import (
+    AgentCreate,
+    AgentUpdate,
+    Recharge,
+    RegisterBody,
+    LoginBody,
+)
+from . import auth
+from . import repo
+from .catalog import catalog_summary, get_provider, validate_llm_provider_model, get_llm_model, LLM_PROVIDERS, LLM_MODELS
+from .llm_catalog import validate_provider_model as validate_llm_v2, get_llm_model as get_llm_model_v2
+from . import telephony
+from . import billing as billing_mod
+from . import campaign as campaign_store
+from . import campaign_runner
+from . import leadfile
+from .db import init, shutdown, get_prisma
+from .config import WALLET_TOPUP_AMOUNT, LIVEKIT_URL, BILLING_INTERNAL_TOKEN, SERVER_COST_PER_MIN
+
+@asynccontextmanager
+async def lifespan(app):
+    await init()
+
+    # Import the voice runtime (livekit agents + plugins) on the main thread in
+    # the background so the first start_call's preflight is instant and so the
+    # plugin-registration-on-main-thread rule is satisfied before any worker
+    # thread touches the plugin modules.
+    async def _warm_runtime():
+        try:
+            from . import preflight as _preflight
+            await _preflight.warm_voice_runtime()
+        except Exception as e:
+            logger.warning(f"voice runtime warm failed: {e!r}")
+
+    warm_task = asyncio.create_task(_warm_runtime())
+
+    # Safety net: any "in-progress" call that never got finalized (worker crashed,
+    # room never closed, caller vanished) is auto-marked "failed". We use LiveKit's
+    # live rooms as the source of truth so a genuinely long, active call is never
+    # killed — only calls whose room has actually ended get cleaned up. Falls back
+    # to age-based cleanup if LiveKit is unreachable.
+    stale_minutes = int(os.getenv("STALE_CALL_MINUTES", "15"))
+    stale_poll = int(os.getenv("STALE_CALL_POLL_SECONDS", "60"))
+
+    async def _cleanup_loop():
+        while True:
+            try:
+                live = await telephony.list_live_active_rooms()
+                n = await repo.fail_stale_calls(stale_minutes, active_rooms=live)
+                if n:
+                    logger.warning(f"🧹 Marked {n} ended call(s) as failed.")
+            except Exception as e:
+                logger.warning(f"stale-call cleanup error: {e}")
+            await asyncio.sleep(stale_poll)
+
+    # Bulk-call campaign dispatcher: dials queued leads up to each campaign's
+    # concurrency, reconciling finished calls each tick.
+    campaign_tick = int(os.getenv("CAMPAIGN_TICK_SECONDS", "3"))
+
+    async def _campaign_loop():
+        while True:
+            try:
+                await campaign_runner.run_tick()
+            except Exception as e:
+                logger.warning(f"campaign dispatcher error: {e}")
+            await asyncio.sleep(campaign_tick)
+
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    campaign_task = asyncio.create_task(_campaign_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        campaign_task.cancel()
+        warm_task.cancel()
+        await shutdown()
+
+
+app = FastAPI(title="Voice Agent SaaS", version="0.3.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.exception("Unhandled server error: %s", exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/api/health")
+async def health():
+    db = get_prisma()
+    return {"ok": True, "service": "voice-agent-saas", "livekit_url": LIVEKIT_URL,
+            "db_connected": db.is_connected()}
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+@app.post("/api/auth/register", status_code=201)
+async def register(body: RegisterBody):
+    if not body.email or not body.password:
+        raise HTTPException(400, "Email and password required")
+    if await repo.get_user_by_email(body.email):
+        raise HTTPException(409, "Email already registered")
+    user = await repo.create_user(body.email, body.name, auth.hash_password(body.password))
+    token = auth.create_access_token(user["id"])
+    return {"token": token, "user": user}
+
+
+@app.post("/api/auth/login")
+async def login(body: LoginBody):
+    user = await repo.get_user_by_email(body.email)
+    if not user:
+        raise HTTPException(401, "Invalid credentials")
+    if not auth.verify_password(body.password, user.passwordHash):
+        raise HTTPException(401, "Invalid credentials")
+    user_dict = repo._user_dict(user)
+    token = auth.create_access_token(user.id)
+    return {"token": token, "user": user_dict}
+
+
+@app.get("/api/auth/me")
+async def me(user=Depends(auth.get_current_user)):
+    return repo._user_dict(user)
+
+
+# ---------------------------------------------------------------------------
+# Provider catalog (for the config UI) - V2 Provider → Multiple Models
+# ---------------------------------------------------------------------------
+@app.get("/api/catalog")
+async def get_catalog():
+    cat = catalog_summary()
+    # New V2 structure: providers with models
+    from .llm_catalog import catalog_summary_v2, LLM_PROVIDERS, LLM_MODELS
+    llm_v2 = catalog_summary_v2()
+    # Frontend expects JSON arrays; the v2 summary keys providers by id.
+    provs = llm_v2["providers"]
+    if not isinstance(provs, list):
+        provs = list(provs.values())
+    models = llm_v2["models"]
+    if not isinstance(models, list):
+        models = list(models.values())
+    return {
+        "catalog": cat,
+        "llm_catalog": llm_v2,  # New: provider → multiple models
+        "llm_providers": provs,
+        "llm_models": models,
+        # Every model incl. deprecated — a saved retired model still renders.
+        "llm_models_all": list(LLM_MODELS),
+        # Deprecated providers (openrouter) for legacy-agent display only.
+        "llm_legacy_providers": [p for p in LLM_PROVIDERS.values() if p.get("status") == "deprecated"],
+        "llm_by_provider": llm_v2["by_provider"],
+        "walletTopupAmounts": WALLET_TOPUP_AMOUNT,
+        "server_cost_per_min": SERVER_COST_PER_MIN,
+    }
+
+@app.get("/api/llm/providers")
+async def list_llm_providers():
+    from .llm_catalog import list_models_for_provider, list_providers, LLM_PROVIDERS
+    # Deprecated providers (openrouter) are excluded from the picker but returned
+    # under legacy_providers so an agent already using one still renders.
+    provs = list_providers()
+    return {
+        "providers": provs,
+        "legacy_providers": [p for p in LLM_PROVIDERS.values() if p.get("status") == "deprecated"],
+        "by_provider": {p["id"]: list_models_for_provider(p["id"]) for p in provs},
+    }
+
+@app.get("/api/llm/providers/{provider_id}/models")
+async def list_models_for_provider(provider_id: str):
+    from .llm_catalog import list_models_for_provider, get_llm_provider
+    prov = get_llm_provider(provider_id)
+    if not prov:
+        raise HTTPException(404, f"Unknown LLM provider '{provider_id}'")
+    models = list_models_for_provider(provider_id)
+    return {"provider": prov, "models": models}
+
+@app.get("/api/llm/models/{provider}/{model_id}")
+async def get_model_details(provider: str, model_id: str):
+    from .llm_catalog import get_llm_model, validate_provider_model
+    is_valid, msg = validate_provider_model(provider, model_id)
+    if not is_valid:
+        raise HTTPException(400, msg)
+    model = get_llm_model(provider, model_id)
+    if not model:
+        raise HTTPException(404, f"Model {model_id} not found for provider {provider}")
+    return {"model": model}
+
+@app.post("/api/llm/validate")
+async def validate_llm_selection(body: dict):
+    """Validate provider/model combination, return clear error if invalid, no silent substitution."""
+    provider = body.get("provider", "")
+    model_id = body.get("model_id", body.get("model", ""))
+    if not provider or not model_id:
+        raise HTTPException(400, "Both provider and model_id required")
+    from .llm_catalog import validate_provider_model, get_llm_model
+    is_valid, msg = validate_provider_model(provider, model_id)
+    if not is_valid:
+        raise HTTPException(400, msg)
+    model = get_llm_model(provider, model_id)
+    return {"valid": True, "provider": provider, "model": model, "message": msg}
+
+
+# ---------------------------------------------------------------------------
+# Agents CRUD (per-user)
+# ---------------------------------------------------------------------------
+@app.get("/api/agents")
+async def list_agents(user=Depends(auth.get_current_user)):
+    agents = await repo.list_agents(user.id)
+    for a in agents:
+        calls = await repo.list_calls(user.id, agent_id=a["id"])
+        a["call_count"] = len([c for c in calls if c["status"] in ("completed", "in-progress")])
+        a["total_billed"] = round(
+            sum(float(c["cost"].get("client_price_inr", 0) or 0) for c in calls if c["status"] == "completed"), 2,
+        )
+        a["active_calls"] = await repo.count_active_calls(a["id"])
+    return {"agents": agents}
+
+
+@app.get("/api/agents/{agent_id}")
+async def get_agent(agent_id: str, user=Depends(auth.get_current_user)):
+    rec = await repo.get_agent(agent_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Agent not found")
+    return rec
+
+
+@app.post("/api/agents", status_code=201)
+async def create_agent(body: AgentCreate, user=Depends(auth.get_current_user)):
+    # Validate LLM with new V2 catalog - no silent substitution, clear error
+    try:
+        if body.providers.llm_v2:
+            prov = body.providers.llm_v2.provider
+            model = body.providers.llm_v2.model_id
+            is_valid, msg = validate_llm_v2(prov, model)
+            if not is_valid:
+                raise HTTPException(400, f"Primary LLM invalid: {msg}")
+        else:
+            # Old style: resolve provider/model and validate
+            prov, model_id, _ = body.providers.llm.resolve_llm_provider_model()
+            if prov and model_id:
+                is_valid, msg = validate_llm_v2(prov, model_id)
+                if not is_valid:
+                    raise HTTPException(400, f"Primary LLM invalid: {msg}. Selected id={body.providers.llm.id} config={body.providers.llm.config}. Do NOT silently replace.")
+            else:
+                # Fallback to old get_provider check for backward compat
+                if not get_provider("llm", body.providers.llm.id):
+                    raise HTTPException(400, f"Unknown LLM provider {body.providers.llm.id}")
+        
+        if body.providers.llm_fallback_v2:
+            prov = body.providers.llm_fallback_v2.provider
+            model = body.providers.llm_fallback_v2.model_id
+            is_valid, msg = validate_llm_v2(prov, model)
+            if not is_valid:
+                raise HTTPException(400, f"Fallback LLM invalid: {msg}")
+        elif body.providers.llm_fallback:
+            prov, model_id, _ = body.providers.llm_fallback.resolve_llm_provider_model()
+            if prov and model_id:
+                is_valid, msg = validate_llm_v2(prov, model_id)
+                if not is_valid:
+                    raise HTTPException(400, f"Fallback LLM invalid: {msg}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"LLM validation error: {e}")
+    
+    for kind, sel in (("stt", body.providers.stt),
+                      ("tts", body.providers.tts), ("telephony", body.providers.telephony)):
+        if sel and not get_provider(kind, sel.id):
+            raise HTTPException(400, f"Unknown provider {sel.id} for {kind}")
+    return await repo.create_agent(user.id, body.model_dump())
+
+
+@app.put("/api/agents/{agent_id}")
+async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_current_user)):
+    patch = body.model_dump(exclude_none=True)
+    rec = await repo.update_agent(agent_id, user.id, patch)
+    if not rec:
+        raise HTTPException(404, "Agent not found")
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception:
+        pass
+    return rec
+
+
+@app.delete("/api/agents/{agent_id}", status_code=204)
+async def delete_agent(agent_id: str, user=Depends(auth.get_current_user)):
+    if not await repo.delete_agent(agent_id, user.id):
+        raise HTTPException(404, "Agent not found")
+
+
+# ---------------------------------------------------------------------------
+# Knowledge base
+# ---------------------------------------------------------------------------
+@app.put("/api/agents/{agent_id}/knowledge")
+async def set_knowledge(agent_id: str, body: dict, user=Depends(auth.get_current_user)):
+    rec = await repo.set_agent_knowledge(agent_id, user.id, body)
+    if not rec:
+        raise HTTPException(404, "Agent not found")
+    return rec
+
+
+@app.post("/api/agents/{agent_id}/knowledge")
+async def add_knowledge(
+    agent_id: str,
+    text: Optional[str] = Form(None),
+    faq: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    user=Depends(auth.get_current_user),
+):
+    if not await repo.get_agent(agent_id, user.id):
+        raise HTTPException(404, "Agent not found")
+
+    if file is not None and text and text.strip():
+        raise HTTPException(400, "Choose either a knowledge file or pasted text, not both")
+
+    if file is not None:
+        doc_name = file.filename or "uploaded-doc"
+        raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(413, "Knowledge file must be 10 MB or smaller")
+        content = _parse_file(doc_name, raw)
+        if len(content) > 2_000_000:
+            raise HTTPException(413, "Extracted knowledge content is too large")
+        # File upload is a replacement operation: never accumulate stale files.
+        await repo.set_agent_knowledge(agent_id, user.id, {"text": "", "documents": [{"name": doc_name, "content": content}]})
+        return {"ok": True, "replaced": "document"}
+
+    if text:
+        await repo.set_agent_knowledge(agent_id, user.id, {"text": text})
+        return {"ok": True, "appended": "text"}
+
+    if faq:
+        import json as _json
+        try:
+            items = _json.loads(faq)
+        except Exception:
+            raise HTTPException(400, "faq must be a JSON array of {q,a}")
+        await repo.set_agent_knowledge(agent_id, user.id, {"faq": items})
+        return {"ok": True, "appended": "faq", "count": len(items)}
+
+    raise HTTPException(400, "Provide text, faq, or a file")
+
+
+def _parse_file(name: str, raw: bytes) -> str:
+    lower = name.lower()
+    try:
+        if lower.endswith(".txt") or lower.endswith(".md"):
+            return raw.decode("utf-8", errors="ignore")
+        if lower.endswith(".csv"):
+            import io, csv
+            lines = [" ".join(row) for row in csv.reader(io.StringIO(raw.decode("utf-8", errors="ignore")))]
+            return "\n".join(lines)
+        if lower.endswith(".pdf"):
+            try:
+                import io
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(raw))
+                return "\n".join((page.extract_text() or "") for page in reader.pages)
+            except Exception as e:
+                raise HTTPException(400, f"PDF parsing requires the 'pypdf' package: {e}")
+        if lower.endswith(".json"):
+            import json as _json
+            return _json.dumps(_json.loads(raw.decode("utf-8", errors="ignore")), ensure_ascii=False)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse {name}: {e}")
+    raise HTTPException(400, "Unsupported file type. Use .txt, .md, .csv, .json or .pdf")
+
+
+# ---------------------------------------------------------------------------
+# Start a call (browser or SIP)
+# ---------------------------------------------------------------------------
+_AGENT_JOIN_VERIFY_SECONDS = float(os.getenv("DISPATCH_VERIFY_SECONDS", "18"))
+
+
+async def _agent_join_watchdog(call_id: str, room: str, user_id: str,
+                               agent_id: str, mode: str, phone: str) -> None:
+    """Heal, then fail loudly, when the LiveKit dispatch never produces an agent.
+
+    Room creation + agent dispatch succeeding only means the server ACCEPTED the
+    dispatch — a worker still has to be OFFERED the job and join. Self-hosted
+    LiveKit drops a dispatch when no worker is registered for the agent name at
+    that moment (worker still booting, re-registering after a network blip, or
+    stuck draining a previous call), and older servers do not retry it. So:
+
+      1. ~8s with no agent in the room  → create the dispatch explicitly ONCE
+         ([DISPATCH_RETRY]) — by then a freshly (re)started worker is registered,
+         so this alone heals the classic "first click after worker restart".
+      2. Still no agent after DISPATCH_VERIFY_SECONDS → mark the call `failed`
+         with the real reason in `usage.error`. The UI polls the call row every
+         ~2s while waiting, so the caller sees it far earlier than the old
+         silent 30s timeout.
+
+    One-shot by design: repeated re-dispatch against a genuinely dead worker
+    changes nothing, so this is remediation, not a retry loop.
+    """
+    try:
+        await asyncio.sleep(3.0)  # dispatch head start; the agent normally joins in 2-8s
+        deadline = time.monotonic() + max(8.0, _AGENT_JOIN_VERIFY_SECONDS)
+        retry_at = time.monotonic() + 5.0  # ~8s after the call was placed
+        retried = False
+        while time.monotonic() < deadline:
+            try:
+                row = await repo.get_call(call_id, user_id)
+            except Exception:
+                return
+            if not row or row.get("status") not in ("planned", "in-progress"):
+                return  # already completed/failed — user ended it or the worker did
+            joined = await telephony.room_agent_joined(room)
+            if joined is True:
+                logger.info("[AGENT_JOIN_VERIFIED] room=%s call=%s", room, call_id)
+                return
+            if not retried and time.monotonic() >= retry_at:
+                retried = True
+                meta = telephony._metadata(agent_id, mode, phone or "", call_id, user_id)
+                dispatch_id = await telephony.create_agent_dispatch(room, meta)
+                logger.warning(
+                    "[DISPATCH_RETRY] room=%s call=%s: no agent after ~8s, one-shot "
+                    "explicit dispatch %s (worker now registered?)",
+                    room, call_id, dispatch_id or "FAILED",
+                )
+                if dispatch_id:
+                    deadline += 8.0  # graceful slack for the re-dispatch to land
+            await asyncio.sleep(2.0)
+
+        # Final re-check before failing (the agent may have joined during the
+        # last sleep and flipped the row already).
+        try:
+            row = await repo.get_call(call_id, user_id)
+        except Exception:
+            return
+        if not row or row.get("status") not in ("planned", "in-progress"):
+            return
+        reason = (
+            f"the agent did not join the room within {int(max(8.0, _AGENT_JOIN_VERIFY_SECONDS))} seconds — "
+            "the agent worker is not picking up the dispatch. Make sure exactly ONE agent worker is running "
+            "(python -m app.agents.worker), that no old worker window is still open, and that the worker is "
+            "connected to the LiveKit server; then try again."
+        )
+        logger.error("[AGENT_JOIN_TIMEOUT] room=%s call=%s: %s", room, call_id, reason)
+        try:
+            await repo.update_call(call_id, {
+                "status": "failed",
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                "usage": {"error": reason},
+            })
+        except Exception as e:
+            logger.warning("could not mark call %s failed after agent-join timeout: %r", call_id, e)
+    except Exception as e:
+        logger.debug("agent-join watchdog stopped early for call %s: %r", call_id, e)
+
+
+@app.post("/api/calls")
+async def start_call(body: dict, user=Depends(auth.get_current_user)):
+    agent_id = body.get("agent_id")
+    mode = body.get("mode", "browser")
+    phone = body.get("phone") or ""
+    sip_trunk_id = body.get("sip_trunk_id")
+
+    rec = await repo.get_agent(agent_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Agent not found")
+    if not rec["enabled"]:
+        raise HTTPException(400, "This agent is disabled")
+
+    # PREFLIGHT: run the worker's exact config→runtime path BEFORE creating the
+    # room. A saved agent whose config no longer builds (model removed from the
+    # catalog, missing API key, unknown provider) used to crash the worker job
+    # after the room existed — the caller sat in a silent room forever with no
+    # error anywhere. Now the call fails here, immediately, with the real
+    # reason the UI can show.
+    from . import preflight as _preflight
+    cfg_err = await _preflight.preflight_agent_config(rec)
+    if cfg_err:
+        logger.error(
+            "[CALL_BLOCKED] agent_id=%s name=%s: config would crash the worker: %s",
+            agent_id, rec.get("name"), cfg_err,
+        )
+        raise HTTPException(
+            400,
+            f"Agent '{rec.get('name', agent_id)}' is not ready to take calls: {cfg_err}. "
+            "Open the agent, re-save its LLM/STT/TTS selection (and check the API keys in backend/.env), then retry.",
+        )
+
+    logger.info("[CALL_START] agent_id=%s mode=%s user_id=%s", agent_id, mode, user.id)
+    logger.info("[AGENT_SELECTED] agent_id=%s name=%s mode=%s", agent_id, rec.get("name"), rec.get("agent_mode", "assistant"))
+
+    # Concurrency = calls that are ACTUALLY live right now (LiveKit rooms with real
+    # participants), NOT rows stuck in "in-progress". Falls back to the DB count if
+    # LiveKit is unreachable. Stuck calls are cleared automatically by the sweeper.
+    if mode == "browser":
+        try:
+            existing_calls = await repo.list_calls(user.id, limit=20)
+            for prev in existing_calls:
+                if prev.get("mode") == "browser" and prev.get("status") in ("planned", "in-progress"):
+                    prev_room = prev.get("room")
+                    if prev_room:
+                        try:
+                            await telephony.end_active_room(prev_room)
+                        except Exception:
+                            pass
+                    await repo.update_call(prev["id"], {
+                        "status": "completed",
+                        "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+                    })
+        except Exception as e:
+            logger.warning("Error auto-cleaning prior browser calls: %s", e)
+
+    live_rooms = await telephony.list_live_active_rooms()
+    active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
+    if active >= rec["max_concurrency"]:
+        if mode == "browser":
+            logger.info("Browser mode: overriding concurrency limit for agent %s on manual user start", agent_id)
+        else:
+            raise HTTPException(
+                409,
+                f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
+                "Wait a few seconds for a call to end, or raise the 'Max concurrent calls' limit.",
+            )
+
+    wallet = await repo.get_wallet(user.id)
+    if wallet["balance"] <= 0:
+        raise HTTPException(402, "Wallet balance is ₹0. Recharge to place a call.")
+
+    if mode == "sip" and not phone:
+        raise HTTPException(400, "SIP mode requires a phone number")
+
+    # Cache the active agent config locally so worker can load in 0ms without DB delay
+    try:
+        from .config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{agent_id}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception as e:
+        logger.warning("Could not cache agent config to data dir: %s", e)
+
+    call = await repo.create_call({
+        "user_id": user.id,
+        "agent_id": agent_id,
+        "mode": mode,
+        "phone": phone or None,
+        "status": "planned",
+    })
+
+    try:
+        if mode == "sip":
+            result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
+        else:
+            result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
+    except ModuleNotFoundError:
+        raise HTTPException(503, "livekit not installed on the backend. Run `pip install -r requirements.txt` to enable calls.")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except TimeoutError as e:
+        # LiveKit itself did not answer. Mark the call failed so the UI and the
+        # Calls tab show the truth instead of a stale "planned" row.
+        try:
+            await repo.update_call(call["id"], {
+                "status": "failed",
+                "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+            })
+        except Exception:
+            pass
+        raise HTTPException(503, f"LiveKit server did not respond: {e}. Check that the LiveKit server is running and reachable, then retry.")
+    except Exception as e:
+        raise HTTPException(400, f"Call setup failed: {e}")
+
+    await repo.update_call(call["id"], {"room": result["room"]})
+    result["call_id"] = call["id"]
+
+    # The room + dispatch are now accepted by LiveKit, but "accepted" is not
+    # "a worker actually joined". Watch it in the background so a dead/absent
+    # worker turns into a precise call failure (visible in the UI within ~2s
+    # via the waiting poll) instead of 30s of silence in an empty room.
+    try:
+        asyncio.create_task(
+            _agent_join_watchdog(call["id"], result["room"], user.id, agent_id, mode, phone)
+        )
+    except Exception as e:
+        logger.debug("agent-join watchdog not scheduled: %r", e)
+
+    return result
+
+
+@app.get("/api/calls")
+async def list_calls(agent_id: Optional[str] = None, user=Depends(auth.get_current_user)):
+    return {"calls": await repo.list_calls(user.id, agent_id=agent_id)}
+
+
+@app.get("/api/calls/{call_id}")
+async def get_call(call_id: str, user=Depends(auth.get_current_user)):
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    return rec
+
+
+@app.post("/api/calls/{call_id}/end")
+async def end_call(call_id: str, user=Depends(auth.get_current_user)):
+    logger.info("[CALL_END_REQUESTED] source=user call_id=%s user_id=%s", call_id, user.id)
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    room = rec.get("room")
+    if room:
+        try:
+            await telephony.end_active_room(room)
+        except Exception as e:
+            logger.warning(f"Could not close room before ending call {call_id}: {e}")
+    if rec.get("status") in ("planned", "in-progress"):
+        await repo.update_call(call_id, {
+            "status": "completed",
+            "ended_at": time.strftime("%Y-%m-%d %H:%M"),
+        })
+    logger.info("[CALL_ENDED] call_id=%s reason=user_ended", call_id)
+    return {"ok": True, "call_id": call_id}
+
+
+@app.delete("/api/calls/{call_id}", status_code=204)
+async def delete_call(call_id: str, user=Depends(auth.get_current_user)):
+    rec = await repo.get_call(call_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Call not found")
+    # If the selected row is still live, close its room before deleting the row.
+    if rec.get("status") in ("planned", "in-progress") and rec.get("room"):
+        try:
+            await telephony.end_active_room(rec["room"])
+        except Exception as e:
+            logger.warning(f"Could not close room before deleting call {call_id}: {e}")
+    if not await repo.delete_call(call_id, user.id):
+        raise HTTPException(404, "Call not found")
+
+
+# ---------------------------------------------------------------------------
+# Bulk-call campaigns (upload leads -> dial up to concurrency)
+# ---------------------------------------------------------------------------
+@app.post("/api/campaigns", status_code=201)
+async def create_campaign(
+    name: str = Form(...),
+    agent_id: str = Form(...),
+    concurrency: int = Form(1),
+    sip_trunk_id: Optional[str] = Form(None),
+    phone_column: Optional[str] = Form(None),
+    autostart: str = Form("true"),
+    file: UploadFile = File(...),
+    user=Depends(auth.get_current_user),
+):
+    rec = await repo.get_agent(agent_id, user.id)
+    if not rec:
+        raise HTTPException(404, "Agent not found")
+    if not rec["enabled"]:
+        raise HTTPException(400, "This agent is disabled")
+
+    raw = await file.read()
+    try:
+        parsed = leadfile.parse_lead_file(file.filename or "leads.csv", raw, phone_column=phone_column)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    if parsed["count"] == 0:
+        raise HTTPException(400, "No valid lead rows found (each row needs a phone number).")
+
+    created = campaign_store.create(
+        user_id=user.id,
+        agent_id=agent_id,
+        name=name or "Untitled campaign",
+        concurrency=concurrency,
+        sip_trunk_id=sip_trunk_id or "",
+        lead_rows=parsed["rows"],
+        phone_column=parsed["phone_column"],
+    )
+    if autostart.lower() == "true":
+        campaign_store.set_status(user.id, created["id"], "running")
+        created["status"] = "running"
+    return {**created, "phone_column": parsed["phone_column"],
+            "dropped": parsed["dropped"], "mode": "sip"}
+
+
+@app.get("/api/campaigns")
+async def list_campaigns(user=Depends(auth.get_current_user)):
+    return {"campaigns": campaign_store.list_campaigns(user.id)}
+
+
+@app.get("/api/campaigns/{campaign_id}")
+async def get_campaign(campaign_id: str, user=Depends(auth.get_current_user)):
+    c = campaign_store.get(user.id, campaign_id)
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    return c
+
+
+@app.post("/api/campaigns/{campaign_id}/start")
+async def start_campaign(campaign_id: str, user=Depends(auth.get_current_user)):
+    c = campaign_store.get(user.id, campaign_id)
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    wallet = await repo.get_wallet(user.id)
+    if (wallet.get("balance") or 0) <= 0:
+        raise HTTPException(402, "Wallet balance is ₹0. Recharge to run a campaign.")
+    # Preflight the agent: a config that crashes the worker would fail EVERY
+    # dial in this campaign and still bill the failed minutes.
+    from . import preflight as _pf
+    agent_rec = await repo.get_agent(c["agent_id"], user.id)
+    if agent_rec:
+        err = await _pf.preflight_agent_config(agent_rec)
+        if err:
+            raise HTTPException(
+                400,
+                f"Campaign agent '{agent_rec.get('name')}' is not ready: {err}. Fix the agent config and retry.",
+            )
+    c = campaign_store.set_status(user.id, campaign_id, "running")
+    return c
+
+
+@app.post("/api/campaigns/{campaign_id}/pause")
+async def pause_campaign(campaign_id: str, user=Depends(auth.get_current_user)):
+    c = campaign_store.get(user.id, campaign_id)
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    c = campaign_store.set_status(user.id, campaign_id, "paused")
+    return c
+
+
+@app.delete("/api/campaigns/{campaign_id}", status_code=204)
+async def delete_campaign(campaign_id: str, user=Depends(auth.get_current_user)):
+    if not campaign_store.get(user.id, campaign_id):
+        raise HTTPException(404, "Campaign not found")
+    # Pause first so the dispatcher stops touching it, then drop it.
+    campaign_store.set_status(user.id, campaign_id, "paused")
+    campaign_store.delete(user.id, campaign_id)
+
+
+# ---------------------------------------------------------------------------
+# Billing (posted by the worker)
+# ---------------------------------------------------------------------------
+@app.post("/api/billing/log")
+async def billing_log(payload: dict, x_internal_token: Optional[str] = Header(None)):
+    if BILLING_INTERNAL_TOKEN and x_internal_token != BILLING_INTERNAL_TOKEN:
+        raise HTTPException(401, "Invalid internal token")
+
+    status = (payload.get("status") or "completed").lower()
+    # Support both old (id) and new (callId, call_id) formats
+    call_id = payload.get("callId") or payload.get("call_id") or payload.get("id")
+    user_id_from_payload = payload.get("userId") or payload.get("user_id") or ""
+    rec = None
+    if call_id:
+        rec = await get_call_for_billing(call_id, user_id_from_payload)
+    if not rec:
+        # Fix 404: worker may be using different DB or call not yet created in backend DB
+        # Create call record from payload if not found, to allow billing to succeed
+        # Trace exact call ID being sent
+        logger.warning(f"Billing log: call record not found for id={call_id} user_id={user_id_from_payload} payload keys={list(payload.keys())} - attempting to create from payload (fixes 404)")
+        try:
+            # Extract user_id, agent_id from payload or use defaults
+            create_user_id = user_id_from_payload or payload.get("userId") or payload.get("user_id") or "unknown"
+            create_agent_id = payload.get("agentId") or payload.get("agent_id") or "unknown"
+            # Try to create call record with same ID
+            from .db import get_prisma
+            db = get_prisma()
+            # Check if we can create with specific ID - Prisma allows specifying ID if not auto-generated? 
+            # Use repo.create_call with data that will generate new ID, then update? Instead, create directly via prisma
+            try:
+                # Try direct prisma create with given ID
+                created = await db.call.create(data={
+                    "id": call_id,
+                    "userId": create_user_id,
+                    "agentId": create_agent_id,
+                    "mode": payload.get("mode", "browser"),
+                    "room": payload.get("room", ""),
+                    "phone": payload.get("phone"),
+                    "status": "planned",
+                    "startedAt": payload.get("started_at", ""),
+                    "transcripts": "[]",
+                })
+                from . import repo as _repo
+                rec = _repo._call_dict(created)
+                logger.info(f"Billing log: created missing call record id={call_id} user_id={create_user_id} agent_id={create_agent_id} (fixes 404 for {call_id})")
+            except Exception as e_create:
+                # If create with ID fails (e.g., ID format), try repo.create_call and then update with our ID logic
+                logger.warning(f"Billing log: direct create with ID failed {e_create}, trying fallback create")
+                try:
+                    fallback = await db.call.create(data={
+                        "userId": create_user_id,
+                        "agentId": create_agent_id,
+                        "mode": payload.get("mode", "browser"),
+                        "room": payload.get("room", ""),
+                        "phone": payload.get("phone"),
+                        "status": "planned",
+                        "startedAt": payload.get("started_at", ""),
+                        "transcripts": "[]",
+                    })
+                    from . import repo as _repo
+                    rec = _repo._call_dict(fallback)
+                    # Use fallback ID for billing, but log original
+                    logger.info(f"Billing log: created fallback call record id={rec['id']} original requested {call_id} (DB mismatch, using fallback)")
+                    # Update call_id to fallback for rest of flow
+                    call_id = rec["id"]
+                except Exception as e_fallback:
+                    logger.error(f"Billing log: failed to create call record for {call_id}: {e_fallback}")
+                    raise HTTPException(404, f"Call record not found and could not create: {call_id}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Billing log: unexpected error creating call {call_id}: {e}")
+            raise HTTPException(404, f"Call record not found: {call_id}")
+
+    # Idempotency: if we already have a spend transaction for this call, don't double-charge.
+    # But still ensure the call record is up-to-date.
+    already_charged = False
+    try:
+        already_charged = await repo.has_spend_for_call(rec["user_id"], call_id)
+    except Exception:
+        already_charged = False
+
+    if rec.get("status") == "completed" and already_charged:
+        return {"ok": True, "call_id": call_id, "already_processed": True}
+
+    # Parse new format (costs dict, usage dict) and old format (flat fields)
+    costs = payload.get("costs") or {}
+    usage = payload.get("usage") or {}
+    # New format: usage contains sttSeconds, ttsChars, llmInputTokens etc, costs contains client_price_inr etc
+    # Old format: flat fields costToUserNumber, providerCost, etc
+    duration = payload.get("duration") or payload.get("durationSeconds") or rec.get("duration_seconds", 0)
+    transcripts = payload.get("transcripts") or rec.get("transcripts", [])
+    recording_url = payload.get("recordingUrl") or payload.get("recording_url") or rec.get("recording_url")
+
+    # Build usage dict for storage
+    if usage:
+        # New format from worker.py _post_billing
+        usage_to_store = {
+            "stt_seconds": usage.get("sttSeconds", 0) or payload.get("sttSeconds", 0),
+            "tts_chars": usage.get("ttsChars", 0) or payload.get("ttsChars", 0),
+            "llm_input_tokens": usage.get("llmInputTokens", 0) or usage.get("llmInputTokensAuthoritative", 0) or usage.get("totalInputTokens", 0) or payload.get("llmInputTokens", 0),
+            "llm_output_tokens": usage.get("llmOutputTokens", 0) or usage.get("llmOutputTokensAuthoritative", 0) or usage.get("totalOutputTokens", 0) or payload.get("llmOutputTokens", 0),
+            "llm_cached_tokens": usage.get("llmCachedTokens", 0) or usage.get("totalCachedTokens", 0),
+            "user_speech_seconds": usage.get("sttSeconds", 0) or payload.get("sttSeconds", 0),
+            "successful_requests": usage.get("successfulRequests", 0),
+            "failed_requests": usage.get("failedRequests", 0),
+        }
+    else:
+        usage_to_store = {
+            "stt_seconds": payload.get("sttSeconds", 0),
+            "tts_chars": payload.get("ttsChars", 0),
+            "llm_input_tokens": payload.get("llmInputTokens", 0),
+            "llm_output_tokens": payload.get("llmOutputTokens", 0),
+            "user_speech_seconds": payload.get("sttSeconds", 0),
+        }
+
+    # Build cost dict
+    if costs:
+        cost_to_store = costs
+    else:
+        cost_to_store = {
+            "client_price_inr": payload.get("costToUserNumber", 0),
+            "total_cost_inr": payload.get("providerCost", 0),
+            "your_profit_inr": payload.get("profit", 0),
+            "is_profit": payload.get("isProfit", True),
+            "stt_cost_inr": payload.get("sttCost", 0),
+            "llm_cost_inr": payload.get("llmCost", 0),
+            "tts_cost_inr": payload.get("ttsCost", 0),
+            "server_cost_inr": payload.get("serverCost", 0),
+            "your_cost_per_min": payload.get("costPerMin", 0),
+            "client_bill_per_min": payload.get("billPerMin", 0),
+            "duration_mins": payload.get("durationMins", 0),
+        }
+
+    await repo.update_call(call_id, {
+        "status": status,
+        "room": payload.get("room", rec.get("room", "")),
+        "ended_at": payload.get("date", "") or payload.get("ended_at", ""),
+        "duration_seconds": duration,
+        "transcripts": transcripts,
+        "recording_url": recording_url,
+        "usage": usage_to_store,
+        "cost": cost_to_store,
+    })
+
+    # Settle the wallet for completed calls — deduct once per call, idempotent via repo.deduct.
+    if status == "completed" and not already_charged:
+        # New format: costs dict has client_price_inr, old: costToUserNumber
+        charge = float(costs.get("client_price_inr", 0) or payload.get("costToUserNumber", 0) or 0)
+        if charge > 0:
+            try:
+                await repo.deduct(rec["user_id"], charge, note=f"Call {call_id}")
+                logger.info(f"💸 Deducted ₹{charge} for call {call_id} — remaining balance will update (billing_posted via backend)")
+            except Exception as de:
+                logger.warning(f"Could not deduct wallet for call {call_id}: {de}")
+
+    return {"ok": True, "call_id": call_id, "billing_posted": True}
+
+
+async def get_call_for_billing(call_id: str, user_id: str):
+    # Find the call without user scoping (worker may pass user_id). Fall back to
+    # unscoped lookup when user_id is empty.
+    if user_id:
+        rec = await repo.get_call(call_id, user_id)
+        if rec:
+            return rec
+    return await get_call_unscoped(call_id)
+
+
+async def get_call_unscoped(call_id: str):
+    from .db import get_prisma
+    from . import repo as _repo
+    c = await get_prisma().call.find_unique(where={"id": call_id})
+    return _repo._call_dict(c) if c else None
+
+
+@app.get("/api/billing/usage")
+async def billing_usage(agent_id: Optional[str] = None, user=Depends(auth.get_current_user)):
+    return await repo.get_usage(user.id, agent_id=agent_id)
+
+
+# ---------------------------------------------------------------------------
+# Wallet
+# ---------------------------------------------------------------------------
+@app.get("/api/wallet")
+async def get_wallet(user=Depends(auth.get_current_user)):
+    return await repo.get_wallet(user.id)
+
+
+@app.post("/api/wallet/recharge")
+async def recharge(body: Recharge, user=Depends(auth.get_current_user)):
+    if body.add_amount <= 0:
+        raise HTTPException(400, "Recharge amount must be positive")
+    return await repo.recharge(user.id, body.add_amount)
+
+
+# ---------------------------------------------------------------------------
+# Cost preview
+# ---------------------------------------------------------------------------
+@app.post("/api/cost-preview")
+async def cost_preview(body: dict):
+    return billing_mod.calculate_call_cost(
+        duration_seconds=int(body.get("duration_seconds", 60)),
+        stt_seconds=float(body.get("stt_seconds", 30)),
+        llm_input_tokens=int(body.get("llm_input_tokens", 500)),
+        llm_output_tokens=int(body.get("llm_output_tokens", 800)),
+        tts_chars=int(body.get("tts_chars", 800)),
+        llm_provider_id=body.get("llm_provider_id", "groq_llama_3_3_70b"),
+        stt_provider_id=body.get("stt_provider_id", "deepgram_nova2"),
+        tts_provider_id=body.get("tts_provider_id", "google_wavenet_hi"),
+        client_rate_per_min=float(body.get("client_rate_per_min", 2.50)),
+    )
+
+
+def run():
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+
+
+if __name__ == "__main__":
+    run()
