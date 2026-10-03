@@ -189,6 +189,16 @@ export default function Dashboard() {
                 <div className="text-[11px] text-gray-500">Auto-deduct per call</div>
               </div>
 
+              {user.role === "SUPER_ADMIN" && (
+                <a
+                  href={process.env.NEXT_PUBLIC_ADMIN_URL || "http://localhost:3002"}
+                  className="text-xs text-amber-300 hover:text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/40 rounded-lg px-3 py-2 transition-colors"
+                  title="Open the Super Admin console"
+                >
+                  Admin
+                </a>
+              )}
+
               <button
                 onClick={() => {
                   clearToken();

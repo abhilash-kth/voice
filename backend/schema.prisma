@@ -40,6 +40,10 @@ model User {
   name          String        @default("")
   passwordHash  String
   walletBalance Float         @default(0)
+  // "USER" (default, self-service customer) | "SUPER_ADMIN" (platform operator)
+  role          String        @default("USER")
+  // A disabled user cannot authenticate or use any API (set by a SUPER_ADMIN).
+  disabled      Boolean       @default(false)
   createdAt     String        @default("")
 
   agents        Agent[]
@@ -61,6 +65,9 @@ model Agent {
   gender            String  @default("female")
   voicePersonality  String  @default("friendly")
   clientRatePerMin  Float   @default(2.5)
+  // Normalized user-side voice speed (range from BillingConfig; per-provider
+  // mapping in services/tts_speed.py). 1.0 = provider default.
+  voiceSpeed        Float   @default(1.0)
   memoryEnabled     Boolean @default(true)
   recordingEnabled  Boolean @default(true)
   maxConcurrency    Int     @default(1)
@@ -119,4 +126,146 @@ model Transaction {
   ts     String @default("")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================================================
+// Dynamic application configuration (SUPER_ADMIN managed)
+//
+// These tables let the Super Admin panel control providers, models, pricing
+// and billing at runtime. Seeded from the code catalogs (app/catalog.py +
+// app/llm_catalog.py) on first boot, so existing agents keep resolving the
+// exact same ids. JSON blobs stay `String` for SQLite/Postgres portability
+// (same convention as the tables above).
+// ==========================================================================
+
+// --------------------------------------------------------------------------
+// Providers (llm | stt | tts | telephony)
+// --------------------------------------------------------------------------
+model Provider {
+  id           String  @id @default(cuid())
+  kind         String  // "llm" | "stt" | "tts" | "telephony"
+  slug         String  // "openai" | "groq" | "google" | "sarvam" | "deepgram" | ...
+  displayName  String
+  // backend plugin adapter: "openai" | "google" | "sarvam" | "deepgram" | "cartesia" | "openrouter" | ""
+  providerType String  @default("")
+  baseUrl      String  @default("")
+  // env var that supplies the key when no ProviderCredential row exists
+  keyEnv       String  @default("")
+  tier         String  @default("paid")      // free | paid
+  requiresKey  Boolean @default(true)
+  enabled      Boolean @default(true)
+  status       String  @default("active")    // active | deprecated
+  notes        String  @default("")
+  sortOrder    Int     @default(0)
+  createdAt    String  @default("")
+  updatedAt    String  @default("")
+
+  // NOTE: don't name this relation "models" — prisma-client-py code-gen breaks
+  // when a field shadows its generated `models` module import.
+  catalogModels CatalogModel[]
+  credentials   ProviderCredential[]
+
+  @@unique([kind, slug])
+  @@index([kind, enabled])
+}
+
+// --------------------------------------------------------------------------
+// Catalog models — one row per selectable model/variant.
+//
+// `catalogId` is the id the frontend + saved Agent provider selections use
+// (e.g. LLM provider-level "openai"/"groq", STT "deepgram_nova2",
+// TTS "google_wavenet_hi"). `modelId` is the provider-side model name
+// (e.g. "gpt-4.1-mini", "nova-3", "sonic-3"). For LLM one row exists per
+// (providerSlug, modelId); for STT/TTS one row per catalogId.
+// --------------------------------------------------------------------------
+model CatalogModel {
+  id              String   @id @default(cuid())
+  kind            String   // "llm" | "stt" | "tts" | "telephony"
+  providerId      String
+  providerSlug    String
+  catalogId       String   // selection id used by agents
+  modelId         String   @default("") // provider-side model name ("" for whole-provider rows)
+  displayName     String
+  enabled         Boolean  @default(true)
+  status          String   @default("active")     // active | deprecated
+  tier            String   @default("paid")
+  // --- customer-facing pricing (set by SUPER_ADMIN, NOT provider rates) ---
+  customerPricePerMin Float @default(0)           // ₹/min shown to customers (0 = derived)
+  priceCurrency       String @default("INR")
+  // --- internal cost inputs used by the existing billing engine ---
+  inputPricePer1M       Float @default(0)         // LLM $/1M input tokens
+  cachedInputPricePer1M Float @default(0)         // LLM $/1M cached input tokens
+  outputPricePer1M      Float @default(0)         // LLM $/1M output tokens
+  costPerMin            Float @default(0)         // STT ₹/min, telephony ₹/min
+  costPer1kChars        Float @default(0)         // TTS ₹/1k chars
+  // Serialized JSON: languages[], voices[], voice_labels{}, genders[],
+  // capabilities[], context_window, max_output_tokens, reasoning_*,
+  // expected_speed, free_tier, options{}, notes, ...
+  meta      String @default("{}")
+  sortOrder Int    @default(0)
+  createdAt String @default("")
+  updatedAt String @default("")
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([kind, catalogId, providerSlug, modelId])
+  @@index([kind, enabled])
+  @@index([providerId])
+}
+
+// --------------------------------------------------------------------------
+// Provider credentials (encrypted at rest, SUPER_ADMIN managed)
+// --------------------------------------------------------------------------
+model ProviderCredential {
+  id           String  @id @default(cuid())
+  providerId   String
+  providerSlug String
+  kind         String  @default("")   // llm | stt | tts | telephony ("" = shared)
+  label        String  @default("")   // human label, e.g. "production key"
+  // Fernet ciphertext (base64). NEVER decrypted client-side; masked in the UI.
+  encValue     String
+  maskedValue  String  @default("")   // e.g. "••••••••ABCD"
+  status       String  @default("active") // active | disabled | rotated
+  createdAt    String  @default("")
+  updatedAt    String  @default("")
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([providerSlug, status])
+}
+
+// --------------------------------------------------------------------------
+// Billing configuration (single-row "global" record)
+// --------------------------------------------------------------------------
+model BillingConfig {
+  id                     String @id @default("global")
+  serverCostPerMin       Float  @default(0.05)
+  minClientPrice         Float  @default(1.0)
+  profitMarginPercent    Float  @default(50)
+  // Serialized JSON array of wallet top-up amounts, e.g. [100, 250, 500, 1000]
+  walletTopupAmounts     String @default("[100, 250, 500, 1000]")
+  // Normalized user voice-speed range (see services/tts_speed.py)
+  voiceSpeedMin          Float  @default(0.6)
+  voiceSpeedMax          Float  @default(1.6)
+  voiceSpeedDefault      Float  @default(1.0)
+  updatedAt              String @default("")
+}
+
+// --------------------------------------------------------------------------
+// Super Admin audit log — every privileged mutation is recorded.
+// --------------------------------------------------------------------------
+model AdminAuditLog {
+  id         String @id @default(cuid())
+  adminId    String
+  adminEmail String @default("")
+  action     String // login | provider_created | model_updated | price_changed | api_key_rotated | user_disabled | billing_config_changed | ...
+  targetType String @default("") // provider | model | credential | user | billing | auth
+  targetId   String @default("")
+  // Serialized JSON with safe detail (no secrets)
+  detail    String @default("{}")
+  createdAt String @default("")
+
+  @@index([createdAt])
+  @@index([adminId])
 }

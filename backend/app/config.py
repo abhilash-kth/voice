@@ -57,6 +57,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # pick the model that `openrouter` providers use by default.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
+# Dynamic-catalog providers (Super Admin can also store these in ProviderCredential).
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY", "")
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS", os.path.join(str(BASE_DIR), "google-key.json")
 )

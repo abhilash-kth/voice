@@ -18,15 +18,59 @@ from .config import SERVER_COST_PER_MIN, PROFIT_MARGIN_PERCENT, MIN_CLIENT_PRICE
 
 logger = logging.getLogger("voice-agent-saas-billing")
 
+
+def _billing_consts() -> Dict[str, float]:
+    """server_cost_per_min / profit margin / min client price.
+
+    Reads the Super Admin's BillingConfig (DB snapshot) when available and
+    falls back to .env defaults — the sync billing path never touches the DB.
+    """
+    try:
+        from .services import config_store
+        b = config_store.get_billing()
+        return {
+            "server_cost_per_min": b["server_cost_per_min"],
+            "min_client_price": b["min_client_price"],
+            "profit_margin_percent": b["profit_margin_percent"],
+        }
+    except Exception:
+        return {
+            "server_cost_per_min": SERVER_COST_PER_MIN,
+            "min_client_price": MIN_CLIENT_PRICE,
+            "profit_margin_percent": PROFIT_MARGIN_PERCENT,
+        }
+
+
 def _get_cost(kind: str, provider_id: str) -> Dict[str, Any]:
+    # DB snapshot override first (admin-edited provider costs), then code catalog.
+    try:
+        from .services import config_store
+        prov = config_store.get_provider(kind, provider_id)
+        if prov and prov.get("cost"):
+            return prov["cost"]
+    except Exception:
+        pass
     prov = catalog.get_provider(kind, provider_id) or {}
     return prov.get("cost", {})
 
 def _get_llm_cost_v2(provider: str, model_id: str, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> Dict[str, float]:
-    """Calculate LLM cost using V2 catalog pricing metadata."""
+    """Calculate LLM cost using V2 catalog pricing metadata (DB-overridable)."""
     try:
         from .llm_catalog import get_llm_model, calculate_llm_cost
         model = get_llm_model(provider, model_id)
+        # Super Admin's per-model price overrides (DB snapshot) take precedence.
+        if model:
+            try:
+                from .services import config_store
+                ov = config_store.get_llm_meta(provider, model_id)
+                if ov:
+                    if ov.get("input_price_per_1m") and ov["input_price_per_1m"] != model.get("input_price_per_1m"):
+                        model = dict(model)
+                        model["input_price_per_1m"] = float(ov["input_price_per_1m"])
+                        model["cached_input_price_per_1m"] = float(ov.get("cached_input_price_per_1m") or model.get("cached_input_price_per_1m") or 0)
+                        model["output_price_per_1m"] = float(ov.get("output_price_per_1m") or model.get("output_price_per_1m") or 0)
+            except Exception:
+                pass
         if model:
             costs = calculate_llm_cost(model, input_tokens, cached_input_tokens, output_tokens)
             # Convert USD to INR? Catalog pricing is in USD per 1M tokens.
@@ -138,12 +182,13 @@ def calculate_call_cost(
 
     stt_cost_inr = stt_mins * stt_cost.get("per_min", 0.22)
     tts_cost_inr = (tts_chars / 1000.0) * tts_cost.get("per_1k_chars", 1.33)
-    server_cost_inr = duration_mins * SERVER_COST_PER_MIN
+    consts = _billing_consts()
+    server_cost_inr = duration_mins * consts["server_cost_per_min"]
 
     total_cost_inr = stt_cost_inr + llm_cost_inr + tts_cost_inr + server_cost_inr
 
-    margin = 1.0 + (PROFIT_MARGIN_PERCENT / 100.0)
-    client_price_inr = max(total_cost_inr * margin, MIN_CLIENT_PRICE)
+    margin = 1.0 + (consts["profit_margin_percent"] / 100.0)
+    client_price_inr = max(total_cost_inr * margin, consts["min_client_price"])
     profit_inr = client_price_inr - total_cost_inr
 
     result = {
@@ -161,7 +206,7 @@ def calculate_call_cost(
         "client_bill_per_min": round(client_price_inr / duration_mins, 2),
         "profit_per_min": round(profit_inr / duration_mins, 2),
         "rate_per_min": round(client_price_inr / duration_mins, 2),
-        "profit_margin_percent": PROFIT_MARGIN_PERCENT,
+        "profit_margin_percent": consts["profit_margin_percent"],
         # New V2 fields
         "llm_provider": llm_provider or llm_provider_id,
         "llm_model": llm_model_id or llm_provider_id,

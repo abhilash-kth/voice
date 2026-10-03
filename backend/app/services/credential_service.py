@@ -1,0 +1,166 @@
+"""Provider credential service — the ONLY module that sees raw provider keys.
+
+* Every write encrypts via services/crypto before touching the DB.
+* Every read-for-UI returns only the masked value; the plaintext NEVER leaves
+  this module in an API payload.
+* Rotation = create a new active credential + mark the old one ``rotated``;
+  decryption of new calls uses the new key immediately (snapshot refresh).
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Dict, List, Optional
+
+from ..db import get_prisma
+from .. import repo
+from . import crypto
+
+logger = logging.getLogger("voice-agent-saas-credentials")
+
+_MASK_RE = re.compile(r"(^[\s\*•]+|(?<=.{4})[A-Za-z0-9+/=]+$)")
+
+
+def mask_secret(value: str) -> str:
+    """Strategy from product spec: `************ABCD` (last 4 chars visible)."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    tail = value[-4:]
+    return f"************{tail}"
+
+
+def _row_public(c) -> Dict[str, Any]:
+    """Safe public shape — no ciphertext, no plaintext."""
+    return {
+        "id": c.id,
+        "provider_id": c.providerId,
+        "provider_slug": c.providerSlug,
+        "kind": c.kind or "",
+        "label": c.label or "",
+        "masked_value": c.maskedValue or "",
+        "status": c.status,
+        "created_at": c.createdAt or "",
+        "updated_at": c.updatedAt or "",
+    }
+
+
+async def list_credentials(provider_id: Optional[str] = None, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    db = get_prisma()
+    where: Dict[str, Any] = {}
+    if provider_id:
+        where["providerId"] = provider_id
+    if kind is not None:
+        where["kind"] = kind
+    rows = await db.providercredential.find_many(where=where, order={"createdAt": "desc"})
+    return [_row_public(c) for c in rows]
+
+
+async def get_credential(cid: str) -> Optional[Dict[str, Any]]:
+    db = get_prisma()
+    c = await db.providercredential.find_unique(where={"id": cid})
+    return _row_public(c) if c else None
+
+
+async def create_credential(*, provider_id: str, value: str, label: str = "",
+                            admin: Optional[dict] = None) -> Dict[str, Any]:
+    db = get_prisma()
+    p = await db.provider.find_unique(where={"id": provider_id})
+    if not p:
+        raise LookupError("provider not found")
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("API key value required")
+    enc, masked = crypto.encrypt_secret(value)
+    from .config_store import _now_fallback
+    now = _now_fallback()
+    c = await db.providercredential.create(data={
+        "providerId": p.id, "providerSlug": p.slug, "kind": p.kind,
+        "label": (label or "").strip(), "encValue": enc,
+        "maskedValue": masked, "createdAt": now, "updatedAt": now,
+    })
+    await _audit(admin, "api_key_created", "credential", c.id,
+                 {"provider": p.slug, "kind": p.kind, "masked": masked, "label": label})
+    _invalidate()
+    logger.info(f"🔑 credential created for {p.kind}:{p.slug} ({masked})")
+    return _row_public(c)
+
+
+async def update_credential(cid: str, *, value: Optional[str] = None,
+                            label: Optional[str] = None,
+                            admin: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    db = get_prisma()
+    c = await db.providercredential.find_unique(where={"id": cid})
+    if not c:
+        return None
+    data: Dict[str, Any] = {}
+    if label is not None:
+        data["label"] = label.strip()
+    if value:
+        enc, masked = crypto.encrypt_secret(value.strip())
+        data["encValue"] = enc
+        data["maskedValue"] = masked
+    if not data:
+        return _row_public(c)
+    from .config_store import _now_fallback
+    data["updatedAt"] = _now_fallback()
+    c = await db.providercredential.update(where={"id": cid}, data=data)
+    await _audit(admin, "api_key_updated", "credential", cid,
+                 {"provider": c.providerSlug, "rotated_in_place": bool(value)})
+    _invalidate()
+    return _row_public(c)
+
+
+async def set_status(cid: str, status: str, *, admin: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    db = get_prisma()
+    c = await db.providercredential.find_unique(where={"id": cid})
+    if not c:
+        return None
+    from .config_store import _now_fallback
+    c = await db.providercredential.update(
+        where={"id": cid}, data={"status": status, "updatedAt": _now_fallback()}
+    )
+    await _audit(admin, f"api_key_{status}", "credential", cid, {"provider": c.providerSlug})
+    _invalidate()
+    return _row_public(c)
+
+
+async def rotate_credential(cid: str, *, new_value: str, label: str = "",
+                            admin: Optional[dict] = None) -> Dict[str, Any]:
+    """Create replacement active credential; old one is marked ``rotated``."""
+    db = get_prisma()
+    old = await db.providercredential.find_unique(where={"id": cid})
+    if not old:
+        raise LookupError("credential not found")
+    created = await create_credential(
+        provider_id=old.providerId, value=new_value,
+        label=label or f"rotated from {old.label or old.id}",
+        admin=admin,
+    )
+    from .config_store import _now_fallback
+    await db.providercredential.update(
+        where={"id": cid}, data={"status": "rotated", "updatedAt": _now_fallback()}
+    )
+    await _audit(admin, "api_key_rotated", "credential", cid,
+                 {"provider": old.providerSlug, "new_id": created["id"]})
+    _invalidate()
+    return created
+
+
+async def _audit(admin: Optional[dict], action: str, target_type: str, target_id: str, detail: dict) -> None:
+    try:
+        from . import admin_service
+
+        await admin_service.audit(admin or {}, action, target_type=target_type,
+                                  target_id=target_id, detail=detail)
+    except Exception as e:
+        logger.warning(f"audit write failed for {action}: {e!r}")
+
+
+def _invalidate() -> None:
+    try:
+        from . import config_store
+
+        config_store.invalidate()
+    except Exception:
+        pass

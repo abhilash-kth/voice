@@ -71,10 +71,8 @@ interface LLMModel {
   status: string;
   capabilities: string[];
   notes: string;
-  // Added with the provider overhaul — optional so older payloads still parse.
-  supports_temperature?: boolean;
-  default_temperature?: number | null;
-  temperature_range?: [number, number] | null;
+  // Temperature was removed platform-wide — every model runs on the provider's
+  // own default sampling. (Never re-expose this knob to users.)
   supports_reasoning_effort?: boolean;
   reasoning_effort_options?: string[];
   voice_recommended?: boolean;
@@ -129,10 +127,12 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [language, setLanguage] = useState(editing?.language || "hi");
   // Spoken-voice gender: picks the Google Chirp 3 speaker / Sarvam Bulbul speaker.
   const [gender, setGender] = useState(editing?.gender || "female");
-  // Sampling controls, sent per selected model (only when the model supports them).
-  const [temperature, setTemperature] = useState<number>(() => {
-    const saved = (editing?.providers as any)?.llm?.config?.temperature;
-    return typeof saved === "number" ? saved : 0.7;
+  // Normalized voice speed (1.0 = normal), clamped to the admin-configured
+  // bounds from the catalog. Mapped per-TTS-provider only when supported.
+  const vsCfg = (catalog as any).voice_speed || { min: 0.6, max: 1.6, default: 1.0 };
+  const [voiceSpeed, setVoiceSpeed] = useState<number>(() => {
+    const saved = (editing as any)?.voice_speed;
+    return typeof saved === "number" ? saved : (vsCfg.default ?? 1.0);
   });
   const [reasoningEffort, setReasoningEffort] = useState<string>(
     () => (editing?.providers as any)?.llm?.config?.reasoning_effort || "low"
@@ -371,7 +371,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
           <span>• Max out {meta.max_output_tokens.toLocaleString()}</span>
           <span>• Speed {meta.expected_speed}</span>
           <span>• Reasoning {meta.reasoning_supported ? meta.reasoning_default : "no"}</span>
-          <span>• Temperature {meta.supports_temperature === false ? "fixed (reasoning model)" : "adjustable"}</span>
           {meta.cost_per_1k_output != null && (
             <span>• ${meta.cost_per_1k_output}/1K out tokens</span>
           )}
@@ -390,8 +389,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     );
   };
 
-  // Follow the selected model: reasoning models have their own effort default and
-  // reject a custom temperature, so keep the UI honest about what will be sent.
+  // Follow the selected model: reasoning models have their own effort default.
   useEffect(() => {
     const meta = getModelMeta(primaryLlmProvider, primaryLlmModel);
     if (!meta) return;
@@ -400,41 +398,16 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     }
   }, [primaryLlmProvider, primaryLlmModel]);
 
-  // Temperature / reasoning controls, shown only when the selected model accepts
-  // them. Reasoning models (gpt-5 family, o-series) have no temperature knob.
+  // Reasoning controls, shown only when the selected model accepts them.
+  // (LLM temperature is intentionally NOT a user-facing control: every model
+  // runs with the provider's own default sampling.)
   const renderTuning = (provider: string, modelId: string) => {
     const meta = getModelMeta(provider, modelId);
     if (!meta) return null;
-    const supportsTemp = meta.supports_temperature !== false;
     const supportsReasoning = !!(meta.reasoning_supported || meta.supports_reasoning_effort);
-    if (!supportsTemp && !supportsReasoning) return null;
+    if (!supportsReasoning) return null;
     return (
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
-        {supportsTemp ? (
-          <label className="flex flex-col gap-1 text-xs">
-            <span className="text-gray-400 font-medium">
-              Temperature <span className="text-blue-300">{temperature.toFixed(2)}</span>
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={temperature}
-              onChange={(e) => setTemperature(Number(e.target.value))}
-              className="w-full accent-blue-500"
-            />
-            <span className="text-[10px] text-gray-500">
-              0.3 = tight script adherence, 0.7 = natural variation, 1.0 = most creative.
-              {meta.default_temperature != null ? ` Model default ${meta.default_temperature}.` : ""}
-            </span>
-          </label>
-        ) : (
-          <div className="text-[11px] text-gray-500 self-end">
-            Temperature is not adjustable on this reasoning model — the provider fixes
-            sampling. Use reasoning effort instead.
-          </div>
-        )}
         {supportsReasoning && (
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-gray-400 font-medium">Reasoning effort</span>
@@ -510,10 +483,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     // V2 LLM handling
     if (isV2) {
       const primaryMeta = getModelMeta(primaryLlmProvider, primaryLlmModel);
-      // Reasoning models (gpt-5 family, o-series) reject a custom temperature, so
-      // omit it rather than send a value the API would refuse or ignore.
+      // Only reasoning effort is user-tunable; temperature rides provider defaults.
       const tuning: any = {};
-      if (primaryMeta?.supports_temperature !== false) tuning.temperature = temperature;
       if (primaryMeta?.reasoning_supported || primaryMeta?.supports_reasoning_effort) {
         tuning.reasoning_effort = reasoningEffort;
       }
@@ -542,7 +513,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         // Do not treat Groq 120B as OpenAI - keep separate
         if (!(primaryLlmProvider === fallbackLlmProvider && primaryLlmModel === fallbackLlmModel)) {
           const fbTuning: any = {};
-          if (fallbackMeta?.supports_temperature !== false) fbTuning.temperature = temperature;
           if (fallbackMeta?.reasoning_supported || fallbackMeta?.supports_reasoning_effort) {
             fbTuning.reasoning_effort = reasoningEffort;
           }
@@ -666,6 +636,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         memory_enabled: mode === "announcement" ? false : memoryEnabled,
         recording_enabled: mode === "announcement" ? false : recordingEnabled,
         max_concurrency: Math.max(1, Number(maxConcurrency) || 1),
+        voice_speed: voiceSpeed,
         providers: buildConfig(),
         enabled: true,
       };
@@ -869,6 +840,24 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 </select>
                 <p className="mt-1 text-[10px] text-gray-500">
                   {GENDER_VOICE_HINT[gender] || GENDER_VOICE_HINT.female}
+                </p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400 font-medium">
+                  Voice speed <span className="text-blue-300">{voiceSpeed.toFixed(2)}×</span>
+                </label>
+                <input
+                  type="range"
+                  min={vsCfg.min}
+                  max={vsCfg.max}
+                  step={0.05}
+                  value={voiceSpeed}
+                  onChange={(e) => setVoiceSpeed(Number(e.target.value))}
+                  className="w-full mt-2 accent-blue-500"
+                />
+                <p className="mt-1 text-[10px] text-gray-500">
+                  1.00 is the natural pace. Only applied when the chosen TTS provider supports speed
+                  control (range {vsCfg.min}× – {vsCfg.max}× set by the admin).
                 </p>
               </div>
             </>

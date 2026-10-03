@@ -95,6 +95,9 @@ backend/prisma_client/
 # Backup files
 backend/schema.prisma.bak
 
+# Derived from schema.prisma on demand by scripts/db-setup.sh (DB_PROVIDER=sqlite)
+backend/schema.sqlite.prisma
+
 
 # =========================================================
 # Logs

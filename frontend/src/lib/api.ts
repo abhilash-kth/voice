@@ -62,6 +62,8 @@ export interface Catalog {
   };
   walletTopupAmounts: number[];
   server_cost_per_min?: number;
+  // Super-Admin-configured bounds for the voice_speed slider.
+  voice_speed?: { min: number; max: number; default: number };
   llm_providers?: { id: string; display_name: string; base_url: string; tier: string }[];
   llm_models?: {
     provider: string;
@@ -95,6 +97,8 @@ export interface Agent {
   language: string;
   // female | male | neutral — selects the spoken voice (Chirp 3 / Bulbul speaker)
   gender: string;
+  // Normalized 0.6–1.6 (admin range); mapped per-TTS-provider where supported.
+  voice_speed: number;
   voice_personality: string;
   no_response_timeout_seconds?: number;
   no_response_message?: string;
@@ -129,6 +133,9 @@ export interface User {
   id: string;
   email: string;
   name: string;
+  // "USER" | "SUPER_ADMIN" — SUPER_ADMIN users also get the /super-admin panel link.
+  role?: string;
+  disabled?: boolean;
   wallet_balance: number;
   created_at: string;
 }
