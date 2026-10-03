@@ -50,6 +50,10 @@ class RegisterBody(BaseModel):
     email: str
     password: str
     name: str = ""
+    # Optional. "SUPER_ADMIN" is honored ONLY for the one-time bootstrap
+    # (while zero super admins exist); afterwards the route refuses it.
+    # Any other value -> 400. Unknown extra keys are ignored by Pydantic.
+    role: str = "USER"
 
 
 class LoginBody(BaseModel):

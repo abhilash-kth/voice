@@ -43,6 +43,33 @@ async def test_login_disabled_user_rejected(live_client):
     assert login.status_code == 403
 
 
+class TestRegisterRoleBootstrap:
+    async def test_first_super_admin_registration_allowed(self, live_client):
+        # clean_db wiped all users -> zero SUPER_ADMINs -> bootstrap door open.
+        r = await live_client.post("/api/auth/register", json={
+            "email": "first-admin@test.dev", "password": "pw123456",
+            "name": "Boss", "role": "SUPER_ADMIN"})
+        assert r.status_code == 201, r.text
+        assert r.json()["user"]["role"] == "SUPER_ADMIN"
+        # token gives immediate admin access
+        from app import admin  # noqa  (guard import path exists)
+        me = await live_client.get("/api/auth/me", headers=_auth(r.json()["token"]))
+        assert me.json()["role"] == "SUPER_ADMIN"
+
+    async def test_second_super_admin_registration_refused(self, live_client):
+        first = await live_client.post("/api/auth/register", json={
+            "email": "first@test.dev", "password": "pw123456", "role": "SUPER_ADMIN"})
+        assert first.status_code == 201
+        second = await live_client.post("/api/auth/register", json={
+            "email": "second@test.dev", "password": "pw123456", "role": "SUPER_ADMIN"})
+        assert second.status_code == 403, second.text
+
+    async def test_invalid_role_value_rejected(self, live_client):
+        r = await live_client.post("/api/auth/register", json={
+            "email": "odd@test.dev", "password": "pw123456", "role": "ROOT"})
+        assert r.status_code == 400, r.text
+
+
 class TestCatalog:
     async def test_catalog_shape_and_temperature_free(self, live_client):
         r = await live_client.get("/api/catalog")
