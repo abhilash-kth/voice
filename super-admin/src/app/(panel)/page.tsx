@@ -14,6 +14,16 @@ function Stat({ label, value, sub, accent }: { label: string; value: string | nu
   );
 }
 
+// snapshot_ts arrives as Unix epoch seconds (float). Format to HH:MM:SS.
+function fmtEpoch(ts?: number): string {
+  if (!ts || !Number.isFinite(ts)) return "—";
+  try {
+    return new Date(ts * 1000).toLocaleTimeString("en-GB", { hour12: false });
+  } catch {
+    return "—";
+  }
+}
+
 export default function OverviewPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [health, setHealth] = useState<AdminHealth | null>(null);
@@ -74,7 +84,7 @@ export default function OverviewPage() {
             <Stat
               label="Config snapshot"
               value={health?.snapshot_source === "db" ? "DB ✓" : health?.snapshot_source ?? "—"}
-              sub={`as of ${health?.snapshot_ts?.slice(11, 19) || "—"}${health?.snapshot_error ? " ⚠ " + health.snapshot_error : ""}`}
+              sub={`as of ${fmtEpoch(health?.snapshot_ts)}${health?.snapshot_error ? " ⚠ " + health.snapshot_error : ""}`}
               accent={health?.snapshot_source === "db" ? "text-emerald-300" : "text-amber-300"}
             />
             <Stat label="Backend" value={health?.ok ? "Online ✓" : "Offline"} sub="FastAPI / Prisma" accent={health?.ok ? "text-emerald-300" : "text-red-300"} />

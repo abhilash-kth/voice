@@ -90,13 +90,13 @@ export interface Stats {
 export interface AdminHealth {
   ok: boolean;
   snapshot_source: string;
-  snapshot_ts: string;
+  snapshot_ts: number;   // Unix epoch SECONDS (from time.time()), not a string
   snapshot_error?: string | null;
 }
 export const adminStats = () => req<Stats>("/api/admin/stats");
 export const adminHealth = () => req<AdminHealth>("/api/admin/health");
 export const reloadConfig = () =>
-  req<{ ok: boolean; source: string; ts: string }>("/api/admin/config/reload", { method: "POST" });
+  req<{ ok: boolean; source: string; ts: number }>("/api/admin/config/reload", { method: "POST" });
 export const reseedConfig = () =>
   req<{ ok: boolean; source: string }>("/api/admin/config/reseed", { method: "POST" });
 
