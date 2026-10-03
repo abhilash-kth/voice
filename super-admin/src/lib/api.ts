@@ -101,13 +101,7 @@ export const reseedConfig = () =>
   req<{ ok: boolean; source: string }>("/api/admin/config/reseed", { method: "POST" });
 
 // ------ users ----------------------------------------------------------------
-export const listUsers = (params: {
-  page?: number;
-  page_size?: number;
-  q?: string;
-  role?: string;
-  disabled?: boolean;
-}) => {
+export const listUsers = (params: { page?: number; page_size?: number; q?: string; role?: string; disabled?: boolean }) => {
   const qs = new URLSearchParams();
   if (params.page) qs.set("page", String(params.page));
   if (params.page_size) qs.set("page_size", String(params.page_size));
@@ -277,20 +271,15 @@ export const listUsage = () => req<{ items: UsageRow[] }>("/api/admin/usage");
 
 export interface AuditLog {
   id: string;
-  ts: string;
+  admin_id: string;
   admin_email: string;
   action: string;
   target_type: string;
   target_id: string;
   detail: Record<string, unknown>;
+  created_at: string;   // ISO string (backend field name is created_at, not ts)
 }
-export const listAuditLogs = (params: {
-  page?: number;
-  page_size?: number;
-  action?: string;
-  target_type?: string;
-  q?: string;
-}) => {
+export const listAuditLogs = (params: { page?: number; page_size?: number; action?: string; target_type?: string; q?: string }) => {
   const qs = new URLSearchParams();
   if (params.page) qs.set("page", String(params.page));
   if (params.page_size) qs.set("page_size", String(params.page_size));
