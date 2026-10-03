@@ -289,10 +289,19 @@ npm run dev
 Auth endpoints return `{ token, user }`; call them with header
 `Authorization: Bearer <token>`.
 
+> **First Super Admin (one-time bootstrap):** the public `/api/auth/register`
+> can NEVER create admins (a `role` field in its body is ignored). To create
+> the FIRST super admin, set `SUPER_ADMIN_SETUP_KEY` in `backend/.env`,
+> restart the API, then POST `/api/setup/super-admin` with header
+> `X-Setup-Key: <that key>` — it only works while zero super admins exist,
+> then closes forever. Later admins are promoted from Super Admin → Users
+> (audited). Recommended: blank the key out of `.env` once you're set up.
+
 | Method         | Path                            | Body                                                    | Notes                                                                                                 |
 | -------------- | ------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| POST           | `/api/auth/register`            | `{email,password,name}`                                 | create account → `{token,user}`                                                                       |
+| POST           | `/api/auth/register`            | `{email,password,name}`                                 | create account → `{token,user}` (always `USER` role)                                                  |
 | POST           | `/api/auth/login`               | `{email,password}`                                      | → `{token,user}`                                                                                      |
+| POST           | `/api/setup/super-admin`        | `{email,password,name}` + header `X-Setup-Key`          | **one-time** first Super Admin (see bootstrap note below; hidden from `/docs`)                        |
 | GET            | `/api/auth/me`                  | —                                                       | current user                                                                                          |
 | GET            | `/api/catalog`                  | —                                                       | provider list + top-up amounts                                                                        |
 | GET            | `/api/agents`                   | —                                                       | your agents + call stats + `active_calls`                                                             |

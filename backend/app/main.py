@@ -32,7 +32,8 @@ from .db import init, shutdown
 from .admin import routes as admin_routes
 from .services import config_store
 from .routes import (auth_routes, catalog_routes, agents_routes,
-                     calls_routes, campaigns_routes, billing_routes)
+                     calls_routes, campaigns_routes, billing_routes,
+                     setup_routes)
 
 logger = logging.getLogger("voice-agent-saas-api")
 
@@ -111,6 +112,7 @@ async def lifespan(app):
 
 app = FastAPI(title="Voice Agent SaaS", version="0.4.0", lifespan=lifespan)
 app.include_router(admin_routes.router)
+app.include_router(setup_routes.router)   # hidden from /docs, key-protected
 app.include_router(auth_routes.router)
 app.include_router(catalog_routes.router)
 app.include_router(agents_routes.router)

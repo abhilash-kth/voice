@@ -47,13 +47,12 @@ class Wallet(BaseModel):
 # Auth
 # ---------------------------------------------------------------------------
 class RegisterBody(BaseModel):
+    # Used by the PUBLIC /api/auth/register (always creates USER) and by the
+    # key-protected one-time /api/setup/super-admin. Deliberately NO role
+    # field: callers can never pick their own role.
     email: str
     password: str
     name: str = ""
-    # Optional. "SUPER_ADMIN" is honored ONLY for the one-time bootstrap
-    # (while zero super admins exist); afterwards the route refuses it.
-    # Any other value -> 400. Unknown extra keys are ignored by Pydantic.
-    role: str = "USER"
 
 
 class LoginBody(BaseModel):

@@ -8,8 +8,9 @@ from ..db import get_prisma
 
 async def create_user(email: str, name: str, password_hash: str, role: str = "USER") -> dict:
     """Create a user. `role` is USER by default; SUPER_ADMIN is only ever
-    passed by the one-time bootstrap in routes/auth_routes.register — all
-    later promotions go through the audited admin service."""
+    passed by the key-protected one-time bootstrap in
+    routes/setup_routes.py — all later promotions go through the audited
+    admin service (set_user_role)."""
     db = get_prisma()
     u = await db.user.create(
         data={"email": email.lower(), "name": name, "passwordHash": password_hash, "role": role}
