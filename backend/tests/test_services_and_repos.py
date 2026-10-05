@@ -140,6 +140,19 @@ class TestCredentials:
         await config_store.refresh_if_stale(force=True)
         assert config_store.get_api_key("stt", "deepgram") is None
 
+    async def test_reveal_returns_plaintext_and_is_audited(self, seeded):
+        provs = await admin_service.list_providers(kind="stt")
+        dg = next(p for p in provs if p["slug"] == "deepgram")
+        cred = await credential_service.create_credential(
+            provider_id=dg["id"], value="dg-reveal-me-9999", admin={"id": "a", "email": "a@t"})
+        assert await credential_service.reveal_credential(
+            cred["id"], admin={"id": "a", "email": "a@t"}) == "dg-reveal-me-9999"
+        assert await credential_service.reveal_credential("no-such-id") is None
+        logs = await admin_service.list_audit_logs(action="api_key_revealed")
+        entries = [i for i in logs["items"] if i["target_id"] == cred["id"]]
+        assert entries, "reveal must be audited"
+        assert "dg-reveal-me-9999" not in str(entries[0]["detail"])
+
 
 class TestUsersAndAudit:
     async def test_role_guard_refuses_demote_last_admin(self, seeded):

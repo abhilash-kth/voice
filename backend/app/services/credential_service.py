@@ -1,8 +1,9 @@
 """Provider credential service — the ONLY module that sees raw provider keys.
 
 * Every write encrypts via services/crypto before touching the DB.
-* Every read-for-UI returns only the masked value; the plaintext NEVER leaves
-  this module in an API payload.
+* Every read-for-UI returns only the masked value. The single exception is
+  ``reveal_credential`` — an audited, SUPER_ADMIN-only endpoint that returns
+  the plaintext to the panel (the key's owner). The value is NEVER logged.
 * Rotation = create a new active credential + mark the old one ``rotated``;
   decryption of new calls uses the new key immediately (snapshot refresh).
 """
@@ -60,6 +61,29 @@ async def get_credential(cid: str) -> Optional[Dict[str, Any]]:
     db = get_prisma()
     c = await db.providercredential.find_unique(where={"id": cid})
     return _row_public(c) if c else None
+
+
+async def reveal_credential(cid: str, *, admin: Optional[dict] = None) -> Optional[str]:
+    """Return the PLAINTEXT key for the super-admin panel (audited).
+
+    Never log the returned value. Decryption failures surface the exception
+    TYPE only — the ciphertext/plaintext must never land in a log line.
+    """
+    db = get_prisma()
+    c = await db.providercredential.find_unique(where={"id": cid})
+    if not c:
+        return None
+    try:
+        value = crypto.decrypt_secret(c.encValue)
+    except Exception as e:
+        logger.error(
+            f"🔑 credential {cid} ({c.providerSlug}) could not be decrypted: {type(e).__name__}"
+        )
+        raise
+    await _audit(admin, "api_key_revealed", "credential", cid,
+                 {"provider": c.providerSlug, "masked": c.maskedValue})
+    logger.info(f"🔑 credential revealed to super admin for {c.kind}:{c.providerSlug} ({c.maskedValue})")
+    return value
 
 
 async def create_credential(*, provider_id: str, value: str, label: str = "",

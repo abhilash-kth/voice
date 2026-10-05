@@ -21,8 +21,10 @@ Design
 
       python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-* Decryption happens ONLY server-side (API responses always carry
-  ``masked_value``; the plaintext never leaves the backend).
+* Decryption happens ONLY server-side: at call time (agent builder/preflight)
+  and for the audited SUPER_ADMIN-only credentials ``reveal`` endpoint, which
+  is the sole API path that returns plaintext. Every other API response
+  carries only ``masked_value``.
 """
 from __future__ import annotations
 

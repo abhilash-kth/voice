@@ -3,7 +3,8 @@
 Every endpoint requires `role == SUPER_ADMIN` (see admin.deps.get_super_admin)
 and every mutation writes an AdminAuditLog entry via the service layer.
 Secrets are write-only: API-key endpoints accept plaintext but only ever
-return the masked value.
+return the masked value — the single audited exception is the credentials
+``reveal`` endpoint (see admin/credential_routes.py, mounted below).
 """
 from __future__ import annotations
 
@@ -11,8 +12,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..services import admin_service, credential_service, catalog_service, config_store
-from . import deps, schemas
+from ..services import admin_service, catalog_service, config_store
+from . import credential_routes, deps, schemas
 
 router = APIRouter(
     prefix="/api/admin",
@@ -21,6 +22,10 @@ router = APIRouter(
 )
 
 ADMIN = Depends(deps.get_super_admin)
+
+# Mounts `/api/admin/credentials*` (incl. the audited /reveal endpoint).
+# Parent prefix + dependencies apply to the included routes as well.
+router.include_router(credential_routes.router)
 
 
 def _err(e: Exception) -> HTTPException:
@@ -195,51 +200,8 @@ async def delete_model(model_id: str, admin=ADMIN):
 
 
 # ---------------------------------------------------------------------------
-# Provider credentials (secrets write-only)
+# Provider credentials — moved to admin/credential_routes.py (mounted below).
 # ---------------------------------------------------------------------------
-@router.get("/credentials")
-async def list_credentials(admin=ADMIN, provider_id: Optional[str] = None,
-                           kind: Optional[str] = None):
-    return {"items": await credential_service.list_credentials(provider_id=provider_id, kind=kind)}
-
-
-@router.post("/credentials", status_code=201)
-async def create_credential(body: schemas.CredentialCreateBody, admin=ADMIN):
-    try:
-        return await credential_service.create_credential(
-            provider_id=body.provider_id, value=body.value, label=body.label, admin=admin)
-    except Exception as e:
-        raise _err(e)
-
-
-@router.put("/credentials/{credential_id}")
-async def update_credential(credential_id: str, body: schemas.CredentialUpdateBody, admin=ADMIN):
-    try:
-        out = await credential_service.update_credential(
-            credential_id, value=body.value, label=body.label, admin=admin)
-    except Exception as e:
-        raise _err(e)
-    if not out:
-        raise HTTPException(404, "Credential not found")
-    return out
-
-
-@router.put("/credentials/{credential_id}/status")
-async def credential_status(credential_id: str, body: schemas.CredentialStatusBody, admin=ADMIN):
-    out = await credential_service.set_status(credential_id, body.status, admin=admin)
-    if not out:
-        raise HTTPException(404, "Credential not found")
-    return out
-
-
-@router.post("/credentials/{credential_id}/rotate", status_code=201)
-async def credential_rotate(credential_id: str, body: schemas.CredentialRotateBody, admin=ADMIN):
-    try:
-        return await credential_service.rotate_credential(
-            credential_id, new_value=body.new_value, label=body.label, admin=admin)
-    except Exception as e:
-        raise _err(e)
-
 
 # ---------------------------------------------------------------------------
 # Billing configuration

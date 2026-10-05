@@ -234,6 +234,9 @@ export const rotateCredential = (id: string, new_value: string, label?: string) 
     method: "POST",
     body: JSON.stringify({ new_value, label: label ?? "" }),
   });
+// Audited: returns the plaintext key ONCE for display in the panel only.
+export const revealCredential = (id: string) =>
+  req<{ value: string }>(`/api/admin/credentials/${id}/reveal`, { method: "POST" });
 
 // ------ billing ----------------------------------------------------------------
 export interface BillingConfig {

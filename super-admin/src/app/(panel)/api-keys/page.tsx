@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import PageHeader, { StateBox, useBusy } from "@/components/PageHeader";
 import CredentialFormModal from "@/components/CredentialFormModal";
 import {
-  listCredentials, setCredentialStatus, listProviders,
+  listCredentials, setCredentialStatus, listProviders, revealCredential,
   type Credential, type Provider,
 } from "@/lib/api";
 import { fmtDateTime } from "@/lib/format";
@@ -22,7 +22,32 @@ export default function ApiKeysPage() {
   const [error, setError] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [rotating, setRotating] = useState<Credential | null>(null);
+  const [revealed, setRevealed] = useState<Record<string, string>>({});
   const { busy, msg, err, run } = useBusy();
+
+  const hideKey = (id: string) =>
+    setRevealed((m) => {
+      const n = { ...m };
+      delete n[id];
+      return n;
+    });
+
+  const toggleReveal = async (c: Credential) => {
+    if (revealed[c.id]) {
+      hideKey(c.id);
+      return;
+    }
+    const r = await run(
+      () => revealCredential(c.id),
+      "Key revealed — shown only in this panel, recorded in the audit log"
+    );
+    if (r) setRevealed((m) => ({ ...m, [c.id]: r.value }));
+  };
+
+  const copyKey = (id: string) => {
+    const v = revealed[id];
+    if (v && typeof navigator !== "undefined") navigator.clipboard?.writeText(v).catch(() => {});
+  };
 
   const load = useCallback(() => {
     setLoading(true);
@@ -48,7 +73,10 @@ export default function ApiKeysPage() {
 
   return (
     <>
-      <PageHeader title="API Keys" subtitle="Provider credentials — encrypted at rest, write-only, always shown masked">
+      <PageHeader
+        title="API Keys"
+        subtitle="Provider credentials — encrypted at rest and used for calls before env-var keys. Revealing a key is audited; values never appear in logs."
+      >
         <button className="btn text-xs" onClick={() => setShowCreate(true)}>＋ Add key</button>
       </PageHeader>
 
@@ -98,16 +126,33 @@ export default function ApiKeysPage() {
                     <span className="text-[11px] text-gray-500 ml-1.5">[{c.kind.toUpperCase()}]</span>
                   </td>
                   <td className="text-gray-300">{c.label || <span className="text-gray-600">—</span>}</td>
-                  <td className="font-mono text-xs text-gray-400">{c.masked_value}</td>
+                  <td className="font-mono text-xs text-gray-400 max-w-[260px]">
+                    {revealed[c.id] ? (
+                      <span className="text-emerald-300 break-all">{revealed[c.id]}</span>
+                    ) : (
+                      c.masked_value
+                    )}
+                  </td>
                   <td>
                     <span className={STATUS_PILL[c.status] || "pill pill-gray"}>● {c.status}</span>
                   </td>
                   <td className="text-gray-500 text-xs">{fmtDateTime(c.updated_at)}</td>
                   <td>
                     <div className="flex gap-1.5">
-                      <button className="btn-secondary text-xs px-2.5 py-1" onClick={() => setRotating(c)}>Rotate</button>
+                      <button
+                        className="btn-secondary text-xs px-2.5 py-1"
+                        disabled={busy}
+                        title={revealed[c.id] ? "Hide the plaintext key" : "Reveal the plaintext key (audited)"}
+                        onClick={() => toggleReveal(c)}
+                      >
+                        {revealed[c.id] ? "Hide" : "👁 Reveal"}
+                      </button>
+                      {revealed[c.id] && (
+                        <button className="btn-secondary text-xs px-2.5 py-1" onClick={() => copyKey(c.id)}>Copy</button>
+                      )}
+                      <button className="btn-secondary text-xs px-2.5 py-1" onClick={() => { hideKey(c.id); setRotating(c); }}>Rotate</button>
                       {c.status === "active" ? (
-                        <button className="btn-danger text-xs px-2.5 py-1" disabled={busy} onClick={() => setStatus(c, "disabled")}>
+                        <button className="btn-danger text-xs px-2.5 py-1" disabled={busy} onClick={() => { hideKey(c.id); setStatus(c, "disabled"); }}>
                           Disable
                         </button>
                       ) : c.status === "disabled" ? (
@@ -123,7 +168,9 @@ export default function ApiKeysPage() {
           </table>
         </div>
         <p className="text-[10px] text-gray-600 mt-2">
-          Plaintext keys are never stored readable and never leave the server in any response. Rotated keys are kept (masked) for audit.
+          Keys are stored encrypted (Fernet) and used for calls in place of env-var keys. Reveal decrypts for this
+          panel only, is written to the audit log, and the value is never logged server-side. Rotated keys are kept
+          (masked) for audit.
         </p>
       </StateBox>
 

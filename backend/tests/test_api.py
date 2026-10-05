@@ -201,6 +201,37 @@ class TestAdminFlows:
         listed = (await live_client.get("/api/admin/credentials", headers=_auth(token))).json()
         assert SECRET not in str(listed)
 
+    async def test_credential_reveal_admin_only(self, live_client, super_admin):
+        """The audited reveal endpoint is the ONLY path that returns plaintext,
+        and only to a SUPER_ADMIN. The value must never be logged or listed."""
+        token, _ = super_admin
+        provs = (await live_client.get("/api/admin/providers?kind=stt", headers=_auth(token))).json()["items"]
+        dg = next(p for p in provs if p["slug"] == "deepgram")
+        SECRET = "dg-reveal-secret-7777"
+        r = await live_client.post("/api/admin/credentials", headers=_auth(token),
+                                   json={"provider_id": dg["id"], "value": SECRET, "label": "reveal-me"})
+        assert r.status_code == 201, r.text
+        cid = r.json()["id"]
+        # anonymous → rejected
+        r = await live_client.post(f"/api/admin/credentials/{cid}/reveal")
+        assert r.status_code in (401, 403)
+        # normal user → rejected
+        r = await live_client.post("/api/auth/register", json={
+            "email": "not-admin@test.dev", "password": "pw123456", "name": "No Admin"})
+        user_token = r.json()["token"]
+        r = await live_client.post(f"/api/admin/credentials/{cid}/reveal", headers=_auth(user_token))
+        assert r.status_code in (401, 403)
+        # super admin → exact plaintext, audited, and listed views still masked
+        r = await live_client.post(f"/api/admin/credentials/{cid}/reveal", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["value"] == SECRET
+        listed = (await live_client.get("/api/admin/credentials", headers=_auth(token))).json()
+        assert SECRET not in str(listed)
+        logs = await live_client.get("/api/admin/audit-logs?action=api_key_revealed", headers=_auth(token))
+        entries = [i for i in logs.json()["items"] if i["target_id"] == cid]
+        assert entries, "reveal must write an api_key_revealed audit entry"
+        assert SECRET not in str(entries[0]["detail"])
+
     async def test_audit_log_records_actions(self, live_client, super_admin):
         token, _ = super_admin
         # perform an admin mutation and verify it landed in the audit log
