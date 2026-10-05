@@ -360,7 +360,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # [HTTP_CHUNK] even when attempts interleave.
     import uuid as _uuid_mod
     import httpx as _httpx
-    from . import http_timing as _http_timing
+    from .. import http_timing as _http_timing
     _http_inst = {"n": 0}
 
     async def _on_http_send(_request):
