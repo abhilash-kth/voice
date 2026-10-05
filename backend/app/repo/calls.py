@@ -66,7 +66,9 @@ async def create_call(data: dict):
             "room": data.get("room", ""),
             "phone": data.get("phone"),
             "status": data.get("status", "planned"),
-            "startedAt": data.get("started_at", ""),
+            # Always stamp creation time: the stale-call sweeper ages rows by
+            # startedAt — an empty timestamp made stuck rows immortal (age 0).
+            "startedAt": data.get("started_at") or datetime.now().strftime("%Y-%m-%d %H:%M"),
             "transcripts": _dump(data.get("transcripts", [])),
         }
     )
@@ -131,11 +133,15 @@ async def count_live_calls(agent_id: str, active_rooms: Optional[set]) -> int:
 
 
 def _call_age_minutes(c) -> float:
+    """Age in minutes. A missing/unparseable startedAt means a legacy stuck row
+    (created before the timestamp was stamped) — report +inf so the sweeper can
+    clear it instead of freezing it at age 0 forever. Live-room liveness is
+    still checked first, so a genuinely live call is never failed by this."""
     try:
         started = datetime.strptime(c.startedAt, "%Y-%m-%d %H:%M")
     except Exception:
-        return 0.0
-    return (datetime.now() - started).total_seconds() / 60.0
+        return float("inf")
+    return max((datetime.now() - started).total_seconds() / 60.0, 0.0)
 
 
 async def fail_stale_calls(stale_minutes: int = 15, active_rooms: Optional[set] = None,

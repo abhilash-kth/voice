@@ -1,9 +1,12 @@
 """DB-backed service + repository tests (SQLite via Prisma)."""
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from app import repo, auth
+from app.db import get_prisma
 from app.services import admin_service, catalog_service, config_store, credential_service
 from app import billing
 
@@ -152,6 +155,54 @@ class TestCredentials:
         entries = [i for i in logs["items"] if i["target_id"] == cred["id"]]
         assert entries, "reveal must be audited"
         assert "dg-reveal-me-9999" not in str(entries[0]["detail"])
+
+
+class TestCallLifecycle:
+    """startedAt stamping + the stale-call sweeper (bug: rows with startedAt=''
+    aged 0 forever, so stuck 'in-progress' calls were immortal)."""
+
+    async def test_create_call_stamps_started_at(self, seeded):
+        u = await repo.create_user("lc1@t.dev", "LC1", auth.hash_password("pw"))
+        a = await repo.create_agent(u["id"], {"name": "A1"})
+        c = await repo.create_call({"user_id": u["id"], "agent_id": a["id"], "room": "r1"})
+        assert c["started_at"], "startedAt must be auto-stamped so the sweeper can age rows"
+        # and the stamp must parse with the sweeper's format
+        datetime.strptime(c["started_at"], "%Y-%m-%d %H:%M")
+
+    async def test_sweeper_fails_legacy_stuck_rows_but_never_live_ones(self, seeded):
+        u = await repo.create_user("lc2@t.dev", "LC2", auth.hash_password("pw"))
+        a = await repo.create_agent(u["id"], {"name": "A2"})
+        db = get_prisma()
+        # Legacy-style row exactly as old code produced it: in-progress, no timestamp.
+        await db.call.create(data={
+            "userId": u["id"], "agentId": a["id"], "mode": "browser",
+            "room": "dead-room", "status": "in-progress", "startedAt": "", "transcripts": "[]"})
+        # Genuinely live call (fresh timestamp, room still live in LiveKit).
+        await repo.create_call({"user_id": u["id"], "agent_id": a["id"], "room": "live-room",
+                                "status": "in-progress"})
+        # Freshly dispatched agent still joining (in-progress but brand new,
+        # room not yet live) — the grace window must protect it.
+        await repo.create_call({"user_id": u["id"], "agent_id": a["id"], "room": "fresh-room",
+                                "status": "in-progress"})
+
+        n = await repo.fail_stale_calls(15, active_rooms={"live-room"})
+        assert n == 1
+        by_room = {r["room"]: r["status"] for r in await repo.list_calls(u["id"], a["id"])}
+        assert by_room["dead-room"] == "failed"
+        assert by_room["live-room"] == "in-progress"   # live room → never touched
+        assert by_room["fresh-room"] == "in-progress"  # grace window
+
+    async def test_sweeper_age_fallback_when_livekit_down(self, seeded):
+        u = await repo.create_user("lc3@t.dev", "LC3", auth.hash_password("pw"))
+        a = await repo.create_agent(u["id"], {"name": "A3"})
+        db = get_prisma()
+        await db.call.create(data={
+            "userId": u["id"], "agentId": a["id"], "mode": "browser",
+            "room": "ghost", "status": "in-progress", "startedAt": "", "transcripts": "[]"})
+        n = await repo.fail_stale_calls(15, active_rooms=None)  # LiveKit unreachable
+        assert n == 1
+        by_room = {r["room"]: r["status"] for r in await repo.list_calls(u["id"], a["id"])}
+        assert by_room["ghost"] == "failed"
 
 
 class TestUsersAndAudit:
