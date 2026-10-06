@@ -1,0 +1,35 @@
+{
+  "name": "saas-landing",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "latest",
+    "class-variance-authority": "latest",
+    "clsx": "latest",
+    "framer-motion": "latest",
+    "lucide-react": "latest",
+    "next": "16.3.8",
+    "react": "latest",
+    "react-dom": "latest",
+    "tailwind-merge": "latest"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "eslint": "latest",
+    "eslint-config-next": "16.3.8",
+    "postcss": "latest",
+    "tailwindcss": "4.3.3",
+    "tw-animate-css": "latest",
+    "typescript": "latest"
+  }
+}
