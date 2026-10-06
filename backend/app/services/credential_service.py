@@ -87,7 +87,8 @@ async def reveal_credential(cid: str, *, admin: Optional[dict] = None) -> Option
 
 
 async def create_credential(*, provider_id: str, value: str, label: str = "",
-                            admin: Optional[dict] = None) -> Dict[str, Any]:
+                            admin: Optional[dict] = None,
+                            _replace_id: Optional[str] = None) -> Dict[str, Any]:
     db = get_prisma()
     p = await db.provider.find_unique(where={"id": provider_id})
     if not p:
@@ -95,18 +96,32 @@ async def create_credential(*, provider_id: str, value: str, label: str = "",
     value = (value or "").strip()
     if not value:
         raise ValueError("API key value required")
+    # One ACTIVE key per provider SLUG, across all kinds — the same key serves
+    # every service of the provider (sarvam STT+LLM, openai LLM+TTS, …).
+    # Rotation of another active row for the same slug is allowed via _replace_id.
+    dupes = await db.providercredential.find_many(
+        where={"providerSlug": p.slug, "status": "active"}
+    )
+    dupe = next((c for c in dupes if c.id != _replace_id), None)
+    if dupe is not None:
+        raise ValueError(
+            f"A key for '{p.slug}' already exists (…{(dupe.maskedValue or '')[-4:]}). "
+            "Rotate it instead — one key per provider is enforced."
+        )
     enc, masked = crypto.encrypt_secret(value)
     from .config_store import _now_fallback
     now = _now_fallback()
+    # Stored as SHARED (kind ""): resolution prefers a kind-specific row for its
+    # own kind and otherwise uses this shared key (see config_merge.get_api_key).
     c = await db.providercredential.create(data={
-        "providerId": p.id, "providerSlug": p.slug, "kind": p.kind,
+        "providerId": p.id, "providerSlug": p.slug, "kind": "",
         "label": (label or "").strip(), "encValue": enc,
         "maskedValue": masked, "createdAt": now, "updatedAt": now,
     })
     await _audit(admin, "api_key_created", "credential", c.id,
-                 {"provider": p.slug, "kind": p.kind, "masked": masked, "label": label})
+                 {"provider": p.slug, "kind": "shared", "masked": masked, "label": label})
     _invalidate()
-    logger.info(f"🔑 credential created for {p.kind}:{p.slug} ({masked})")
+    logger.info(f"🔑 credential created for {p.kind}:{p.slug} [shared] ({masked})")
     return _row_public(c)
 
 
@@ -159,7 +174,7 @@ async def rotate_credential(cid: str, *, new_value: str, label: str = "",
     created = await create_credential(
         provider_id=old.providerId, value=new_value,
         label=label or f"rotated from {old.label or old.id}",
-        admin=admin,
+        admin=admin, _replace_id=cid,
     )
     from .config_store import _now_fallback
     await db.providercredential.update(
@@ -169,6 +184,22 @@ async def rotate_credential(cid: str, *, new_value: str, label: str = "",
                  {"provider": old.providerSlug, "new_id": created["id"]})
     _invalidate()
     return created
+
+
+async def delete_credential(cid: str, *, admin: Optional[dict] = None) -> bool:
+    """Delete a credential row entirely. Deleting the ACTIVE key for a provider
+    makes calls fall back to the provider's env-var key (if set)."""
+    db = get_prisma()
+    c = await db.providercredential.find_unique(where={"id": cid})
+    if not c:
+        return False
+    await db.providercredential.delete(where={"id": cid})
+    await _audit(admin, "api_key_deleted", "credential", cid,
+                 {"provider": c.providerSlug, "kind": c.kind or "shared",
+                  "masked": c.maskedValue, "was_status": c.status})
+    _invalidate()
+    logger.info(f"🔑 credential DELETED for {c.kind}:{c.providerSlug} ({c.maskedValue})")
+    return True
 
 
 async def _audit(admin: Optional[dict], action: str, target_type: str, target_id: str, detail: dict) -> None:

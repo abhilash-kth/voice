@@ -2146,6 +2146,10 @@ async def _entrypoint_body(ctx, setup_complete):
                 stt_provider_id=cfg.providers.stt.id,
                 tts_provider_id=cfg.providers.tts.id,
                 client_rate_per_min=cfg.client_rate_per_min,
+                # Super-Admin pricing layers: per-mode flat rate (announcement/
+                # assistant) + concurrency tier & misc fees (billing_rates.py).
+                agent_mode=agent_mode,
+                max_concurrency=int(getattr(cfg, "max_concurrency", 1) or 1),
             )
             if memory_enabled:
                 memory.save(customer_key, usage["transcripts"])

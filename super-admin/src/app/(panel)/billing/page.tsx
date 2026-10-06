@@ -1,7 +1,8 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import PageHeader, { StateBox, useBusy } from "@/components/PageHeader";
-import { getBilling, updateBilling, type BillingConfig } from "@/lib/api";
+import { ModePricingCard, type ModePricingState } from "@/components/ModePricingCard";
+import { getBilling, updateBilling, type BillingConfig } from "@/lib/billing";
 import { fmtINR, toNum } from "@/lib/format";
 
 export default function BillingPage() {
@@ -17,6 +18,9 @@ export default function BillingPage() {
   const [vsMin, setVsMin] = useState("");
   const [vsMax, setVsMax] = useState("");
   const [vsDefault, setVsDefault] = useState("");
+  const [modePricing, setModePricing] = useState<ModePricingState>({
+    announcement: "0", assistant: "0", misc: "0", tiers: [],
+  });
 
   const hydrate = (c: BillingConfig) => {
     setServerCost(String(c.server_cost_per_min));
@@ -26,6 +30,14 @@ export default function BillingPage() {
     setVsMin(String(c.voice_speed_min));
     setVsMax(String(c.voice_speed_max));
     setVsDefault(String(c.voice_speed_default));
+    setModePricing({
+      announcement: String(c.announcement_price_per_min ?? 0),
+      assistant: String(c.assistant_price_per_min ?? 0),
+      misc: String(c.misc_fee_per_min ?? 0),
+      tiers: (c.concurrency_addons || []).map((t) => ({
+        up_to: String(t.up_to), addon: String(t.addon_per_min),
+      })),
+    });
   };
 
   const load = useCallback(() => {
@@ -63,6 +75,12 @@ export default function BillingPage() {
       voice_speed_min: toNum(vsMin),
       voice_speed_max: toNum(vsMax),
       voice_speed_default: toNum(vsDefault),
+      announcement_price_per_min: toNum(modePricing.announcement),
+      assistant_price_per_min: toNum(modePricing.assistant),
+      misc_fee_per_min: toNum(modePricing.misc),
+      concurrency_addons: modePricing.tiers
+        .map((t) => ({ up_to: Math.trunc(toNum(t.up_to)), addon_per_min: toNum(t.addon) }))
+        .filter((t) => t.up_to > 0),
     };
     run(async () => {
       const out = await updateBilling(patch);
@@ -115,6 +133,8 @@ export default function BillingPage() {
           </div>
 
           <div className="space-y-4">
+            <ModePricingCard value={modePricing} onChange={setModePricing} />
+
             <div className="card p-5 space-y-4">
               <h2 className="text-sm font-bold">Wallet top-ups</h2>
               <Field label="Amounts offered in the dashboard (₹, comma-separated)" hint="Customers pick one of these when recharging.">

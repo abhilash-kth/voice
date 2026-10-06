@@ -43,6 +43,16 @@ export default function ModelFormModal({
     for (const f of PRICE_FIELDS[model.kind] || []) out[f.key] = String(model[f.key] ?? 0);
     return out;
   });
+  // Per-TTS-model voice-speed bounds for the customer slider (stored in meta).
+  // Empty = use the global Billing config range.
+  const meta = (edit ? (model.meta || {}) : {}) as Record<string, unknown>;
+  const sMeta = (k: string) => {
+    const v = edit && model.kind === "tts" ? meta[k] : undefined;
+    return v === null || v === undefined ? "" : String(v);
+  };
+  const [speedMin, setSpeedMin] = useState(sMeta("speed_min"));
+  const [speedMax, setSpeedMax] = useState(sMeta("speed_max"));
+  const [speedDefault, setSpeedDefault] = useState(sMeta("speed_default"));
   const { busy, err, run } = useBusy();
 
   useEffect(() => {
@@ -57,6 +67,16 @@ export default function ModelFormModal({
     };
     for (const f of PRICE_FIELDS[kind] || []) {
       (patch as Record<string, unknown>)[f.key] = toNum(prices[f.key] ?? "0");
+    }
+    if (kind === "tts") {
+      // Empty field = no per-model bound (falls back to the global Billing range).
+      // null REMOVES a previously set bound (server merges meta keys).
+      const mk = (s: string) => (s.trim() === "" ? null : toNum(s));
+      patch.meta = {
+        speed_min: mk(speedMin),
+        speed_max: mk(speedMax),
+        speed_default: mk(speedDefault),
+      } as Record<string, unknown>;
     }
     run(async () => {
       if (edit) {
@@ -147,6 +167,32 @@ export default function ModelFormModal({
             />
           </label>
         ))}
+
+        {kind === "tts" && (
+          <div className="rounded-xl border border-gray-800 p-3 space-y-2">
+            <span className="text-xs text-gray-300 font-semibold">
+              Voice-speed range for THIS model (customer slider)
+            </span>
+            <p className="text-[10px] text-gray-600">
+              Different voices support different speeds. Leave empty to use the global
+              Billing-config range. Overrides min/max/default shown to customers who pick this model.
+            </p>
+            <div className="grid grid-cols-3 gap-3">
+              <label className="block">
+                <span className="text-xs text-gray-400 font-medium">Min ×</span>
+                <input className="input mt-1" type="number" step="0.05" min="0.1" value={speedMin} onChange={(e) => setSpeedMin(e.target.value)} placeholder="—" />
+              </label>
+              <label className="block">
+                <span className="text-xs text-gray-400 font-medium">Max ×</span>
+                <input className="input mt-1" type="number" step="0.05" min="0.1" value={speedMax} onChange={(e) => setSpeedMax(e.target.value)} placeholder="—" />
+              </label>
+              <label className="block">
+                <span className="text-xs text-gray-400 font-medium">Default ×</span>
+                <input className="input mt-1" type="number" step="0.05" min="0.1" value={speedDefault} onChange={(e) => setSpeedDefault(e.target.value)} placeholder="—" />
+              </label>
+            </div>
+          </div>
+        )}
 
         <p className="text-[10px] text-gray-600">
           New models are created DISABLED — flip them on from the table after verifying prices.

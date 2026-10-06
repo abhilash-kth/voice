@@ -249,6 +249,15 @@ model BillingConfig {
   voiceSpeedMin          Float  @default(0.6)
   voiceSpeedMax          Float  @default(1.6)
   voiceSpeedDefault      Float  @default(1.0)
+  // Per-mode customer pricing. 0 = legacy behaviour (infra cost × margin).
+  // >0 = flat customer price billed per minute for that agent mode.
+  announcementPricePerMin Float @default(0)
+  assistantPricePerMin    Float @default(0)
+  // Miscellaneous per-minute fee added on top of every billed call.
+  miscFeePerMin          Float  @default(0)
+  // Concurrency surcharges, JSON array of {"up_to": int, "addon_per_min": float},
+  // ascending. First tier with up_to >= agent's max_concurrency applies.
+  concurrencyAddons      String @default("[]")
   updatedAt              String @default("")
 }
 

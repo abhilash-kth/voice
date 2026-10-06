@@ -320,4 +320,22 @@ export const addKnowledge = async (
   return res.json();
 };
 
+// ------ call cost preview (mode + models + concurrency pricing) -----------
+export interface CostPreview {
+  client_price_inr: number;
+  client_rate_per_min: number;
+  duration_mins: number;
+  total_cost_inr: number;
+  applied_flat_rate_per_min: number;
+  concurrency_addon_per_min: number;
+  misc_fee_per_min: number;
+  [k: string]: unknown;
+}
+export const costPreview = (body: {
+  duration_seconds?: number; stt_seconds?: number;
+  llm_input_tokens?: number; llm_output_tokens?: number; tts_chars?: number;
+  llm_provider_id?: string; stt_provider_id?: string; tts_provider_id?: string;
+  agent_mode?: string; max_concurrency?: number;
+}) => req<CostPreview>("/api/cost-preview", { method: "POST", body: JSON.stringify(body) });
+
 export { BASE };

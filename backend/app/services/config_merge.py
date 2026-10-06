@@ -24,20 +24,7 @@ logger = logging.getLogger("voice-agent-saas-config-store")
 # ---------------------------------------------------------------------------
 
 
-def get_billing() -> Dict[str, Any]:
-    """Billing config with code/env fallbacks for every key."""
-    from .. import config as _cfg
-
-    b = dict(get_snapshot().billing or {})
-    return {
-        "server_cost_per_min": float(b.get("serverCostPerMin") if b.get("serverCostPerMin") is not None else _cfg.SERVER_COST_PER_MIN),
-        "min_client_price": float(b.get("minClientPrice") if b.get("minClientPrice") is not None else _cfg.MIN_CLIENT_PRICE),
-        "profit_margin_percent": float(b.get("profitMarginPercent") if b.get("profitMarginPercent") is not None else _cfg.PROFIT_MARGIN_PERCENT),
-        "wallet_topup_amounts": list(b.get("wallet_topup_amounts") or _cfg.WALLET_TOPUP_AMOUNT),
-        "voice_speed_min": float(b.get("voiceSpeedMin") if b.get("voiceSpeedMin") is not None else 0.6),
-        "voice_speed_max": float(b.get("voiceSpeedMax") if b.get("voiceSpeedMax") is not None else 1.6),
-        "voice_speed_default": float(b.get("voiceSpeedDefault") if b.get("voiceSpeedDefault") is not None else 1.0),
-    }
+from .config_billing import get_billing  # re-export (split to its own module)
 
 
 def get_providers_of(kind: str) -> List[Dict[str, Any]]:
@@ -108,6 +95,13 @@ def get_providers_of(kind: str) -> List[Dict[str, Any]]:
             opts = (mrow.get("_meta") or {}).get("options")
             if opts:
                 entry["options"] = opts
+            _meta = mrow.get("_meta") or {}
+            for sk in ("speed_min", "speed_max", "speed_default"):
+                if _meta.get(sk) is not None:
+                    try:
+                        entry[sk] = float(_meta[sk])
+                    except (TypeError, ValueError):
+                        pass
             if mrow.get("customerPricePerMin"):
                 entry["customer_price_per_min"] = mrow["customerPricePerMin"]
             entry["enabled"] = bool(mrow.get("enabled", True)) and bool(prov_row.get("enabled", True))
@@ -152,6 +146,14 @@ def _apply_model_row(entry: Dict[str, Any], mrow: Dict[str, Any]) -> Dict[str, A
     options = dict(meta.get("options") or out.get("options") or {})
     if options:
         out["options"] = options
+    # Per-model TTS voice-speed range (Super Admin set on the Models page) →
+    # the customer slider uses these bounds instead of the global Billing ones.
+    for sk in ("speed_min", "speed_max", "speed_default"):
+        if meta.get(sk) is not None:
+            try:
+                out[sk] = float(meta[sk])
+            except (TypeError, ValueError):
+                pass
     if mrow.get("customerPricePerMin"):
         out["customer_price_per_min"] = float(mrow["customerPricePerMin"])
         out["price_currency"] = mrow.get("priceCurrency") or "INR"
@@ -265,11 +267,18 @@ def list_llm_models() -> List[Dict[str, Any]]:
 def get_api_key(kind: str, slug: str) -> Optional[str]:
     """Decrypted provider API key from the ACTIVE credential row, or None.
 
-    Blocking-callers never see this: decryption is memoised per snapshot ts to
-    keep the hot path cheap (keys change only via admin mutations which bump
-    the snapshot)."""
+    One key per provider: the panel stores SHARED credentials (kind "") so a
+    single Sarvam/OpenAI/… key serves that provider's LLM/STT/TTS alike.
+    Kind-specific rows are still honoured first (they win over the shared one
+    for their own kind). Blocking-callers never see this: decryption is
+    memoised per snapshot ts to keep the hot path cheap (keys change only via
+    admin mutations which bump the snapshot)."""
     snap = get_snapshot()
-    creds = (snap.credentials.get(f"{kind}:{slug}") or snap.credentials.get(f":{slug}") or [])
+    # Combine BOTH lists: kind-specific first (higher precedence), then shared.
+    # (Using `or` here was wrong: a kind-specific list holding only disabled
+    # rows would shadow an ACTIVE shared credential.)
+    creds = (snap.credentials.get(f"{kind}:{slug}") or []) + \
+            (snap.credentials.get(f":{slug}") or [])
     for c in creds:
         if c.get("status") != "active":
             continue

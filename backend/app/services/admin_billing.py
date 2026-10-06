@@ -14,6 +14,34 @@ logger = logging.getLogger("voice-agent-saas-admin")
 # ---------------------------------------------------------------------------
 # Billing config
 # ---------------------------------------------------------------------------
+def _validate_concurrency_addons(raw: Any) -> List[Dict[str, float]]:
+    """Concurrency surcharge tiers: list of {"up_to": int, "addon_per_min": float},
+    ascending, max 20 tiers. up_to must be a positive int; addon >= 0."""
+    if not isinstance(raw, list):
+        raise ValueError("concurrency_addons must be a list of {up_to, addon_per_min}")
+    if len(raw) > 20:
+        raise ValueError("concurrency_addons: at most 20 tiers")
+    out: List[Dict[str, float]] = []
+    prev = 0
+    for i, t in enumerate(raw):
+        if not isinstance(t, dict):
+            raise ValueError(f"concurrency_addons[{i}] must be an object")
+        try:
+            up_to = int(t.get("up_to"))
+            addon = float(t.get("addon_per_min"))
+        except (TypeError, ValueError):
+            raise ValueError(f"concurrency_addons[{i}]: up_to must be an integer and addon_per_min a number") from None
+        if up_to < 1 or up_to > 10000:
+            raise ValueError(f"concurrency_addons[{i}]: up_to must be between 1 and 10000")
+        if addon < 0 or addon > 10000:
+            raise ValueError(f"concurrency_addons[{i}]: addon_per_min must be between 0 and 10000")
+        if up_to <= prev:
+            raise ValueError("concurrency_addons must be sorted ascending by up_to (no duplicates)")
+        prev = up_to
+        out.append({"up_to": up_to, "addon_per_min": addon})
+    return out
+
+
 async def get_billing() -> Dict[str, Any]:
     db = get_prisma()
     b = await db.billingconfig.find_unique(where={"id": "global"})
@@ -32,6 +60,12 @@ async def get_billing() -> Dict[str, Any]:
         topups = json.loads(b.walletTopupAmounts or "[]")
     except Exception:
         topups = []
+    try:
+        tiers = json.loads(getattr(b, "concurrencyAddons", "[]") or "[]")
+        if not isinstance(tiers, list):
+            tiers = []
+    except Exception:
+        tiers = []
     return {
         "id": b.id,
         "server_cost_per_min": float(b.serverCostPerMin),
@@ -41,6 +75,10 @@ async def get_billing() -> Dict[str, Any]:
         "voice_speed_min": float(b.voiceSpeedMin),
         "voice_speed_max": float(b.voiceSpeedMax),
         "voice_speed_default": float(b.voiceSpeedDefault),
+        "announcement_price_per_min": float(getattr(b, "announcementPricePerMin", 0) or 0),
+        "assistant_price_per_min": float(getattr(b, "assistantPricePerMin", 0) or 0),
+        "misc_fee_per_min": float(getattr(b, "miscFeePerMin", 0) or 0),
+        "concurrency_addons": tiers,
         "updated_at": b.updatedAt or "",
     }
 
@@ -80,6 +118,15 @@ async def update_billing(patch: Dict[str, Any], *, admin: Dict[str, Any]) -> Dic
         data["voiceSpeedMax"] = v
     if (v := _flt("voice_speed_default", 0.25, 4.0, "voice_speed_default")) is not None:
         data["voiceSpeedDefault"] = v
+    if (v := _flt("announcement_price_per_min", 0, 10000, "announcement_price_per_min")) is not None:
+        data["announcementPricePerMin"] = v
+    if (v := _flt("assistant_price_per_min", 0, 10000, "assistant_price_per_min")) is not None:
+        data["assistantPricePerMin"] = v
+    if (v := _flt("misc_fee_per_min", 0, 10000, "misc_fee_per_min")) is not None:
+        data["miscFeePerMin"] = v
+    if patch.get("concurrency_addons") is not None:
+        tiers = _validate_concurrency_addons(patch["concurrency_addons"])
+        data["concurrencyAddons"] = json.dumps(tiers)
     if data:
         lo = data.get("voiceSpeedMin", cur["voice_speed_min"])
         hi = data.get("voiceSpeedMax", cur["voice_speed_max"])

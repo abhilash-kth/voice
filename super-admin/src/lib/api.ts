@@ -16,7 +16,7 @@ export function clearToken() {
   if (typeof window !== "undefined") localStorage.removeItem(TOKEN_KEY);
 }
 
-async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   const res = await fetch(`${BASE}${path}`, {
     ...options,
@@ -237,21 +237,9 @@ export const rotateCredential = (id: string, new_value: string, label?: string) 
 // Audited: returns the plaintext key ONCE for display in the panel only.
 export const revealCredential = (id: string) =>
   req<{ value: string }>(`/api/admin/credentials/${id}/reveal`, { method: "POST" });
-
-// ------ billing ----------------------------------------------------------------
-export interface BillingConfig {
-  server_cost_per_min: number;
-  min_client_price: number;
-  profit_margin_percent: number;
-  wallet_topup_amounts: number[];
-  voice_speed_min: number;
-  voice_speed_max: number;
-  voice_speed_default: number;
-  [k: string]: unknown;
-}
-export const getBilling = () => req<BillingConfig>("/api/admin/billing");
-export const updateBilling = (patch: Partial<BillingConfig>) =>
-  req<BillingConfig>("/api/admin/billing", { method: "PUT", body: JSON.stringify(patch) });
+export const deleteCredential = (id: string) =>
+  req<void>(`/api/admin/credentials/${id}`, { method: "DELETE" });
+// Billing types/helpers moved to lib/billing.ts (file-size budget).
 
 // ------ usage + audit ------------------------------------------------------------
 export interface UsageRow {

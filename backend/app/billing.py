@@ -14,31 +14,9 @@ from typing import Any, Dict, Optional
 import logging
 
 from . import catalog
-from .config import SERVER_COST_PER_MIN, PROFIT_MARGIN_PERCENT, MIN_CLIENT_PRICE
+from .billing_rates import billing_consts as _billing_consts  # re-export (tests + compat)
 
 logger = logging.getLogger("voice-agent-saas-billing")
-
-
-def _billing_consts() -> Dict[str, float]:
-    """server_cost_per_min / profit margin / min client price.
-
-    Reads the Super Admin's BillingConfig (DB snapshot) when available and
-    falls back to .env defaults — the sync billing path never touches the DB.
-    """
-    try:
-        from .services import config_store
-        b = config_store.get_billing()
-        return {
-            "server_cost_per_min": b["server_cost_per_min"],
-            "min_client_price": b["min_client_price"],
-            "profit_margin_percent": b["profit_margin_percent"],
-        }
-    except Exception:
-        return {
-            "server_cost_per_min": SERVER_COST_PER_MIN,
-            "min_client_price": MIN_CLIENT_PRICE,
-            "profit_margin_percent": PROFIT_MARGIN_PERCENT,
-        }
 
 
 def _get_cost(kind: str, provider_id: str) -> Dict[str, Any]:
@@ -126,6 +104,10 @@ def calculate_call_cost(
     stt_provider_id: str = "deepgram_nova2",
     tts_provider_id: str = "google_wavenet_hi",
     client_rate_per_min: float = 2.50,
+    # Customer-price composition layers (see billing_rates.py). Defaults keep
+    # the legacy cost×margin behaviour exactly.
+    agent_mode: str = "assistant",
+    max_concurrency: int = 1,
     # New V2 fields
     llm_provider: Optional[str] = None,
     llm_model_id: Optional[str] = None,
@@ -187,8 +169,14 @@ def calculate_call_cost(
 
     total_cost_inr = stt_cost_inr + llm_cost_inr + tts_cost_inr + server_cost_inr
 
-    margin = 1.0 + (consts["profit_margin_percent"] / 100.0)
-    client_price_inr = max(total_cost_inr * margin, consts["min_client_price"])
+    # Customer price = per-mode flat rate OR cost×margin, + concurrency tier
+    # & misc fees, floored at min client price (billing_rates.customer_price).
+    from . import billing_rates
+    price_parts = billing_rates.customer_price(
+        total_cost_inr=total_cost_inr, duration_mins=duration_mins,
+        agent_mode=agent_mode, max_concurrency=max_concurrency, consts=consts,
+    )
+    client_price_inr = price_parts["client_price_inr"]
     profit_inr = client_price_inr - total_cost_inr
 
     result = {
@@ -207,6 +195,10 @@ def calculate_call_cost(
         "profit_per_min": round(profit_inr / duration_mins, 2),
         "rate_per_min": round(client_price_inr / duration_mins, 2),
         "profit_margin_percent": consts["profit_margin_percent"],
+        # Customer-price composition breakdown (mode / concurrency / misc)
+        "agent_mode": agent_mode or "assistant",
+        "max_concurrency": max_concurrency,
+        **price_parts,
         # New V2 fields
         "llm_provider": llm_provider or llm_provider_id,
         "llm_model": llm_model_id or llm_provider_id,

@@ -71,6 +71,11 @@ async def build_snapshot_from_db() -> Optional[ConfigSnapshot]:
             "voiceSpeedMax": billing_row.voiceSpeedMax,
             "voiceSpeedDefault": billing_row.voiceSpeedDefault,
             "wallet_topup_amounts": json.loads(billing_row.walletTopupAmounts or "[]"),
+            # Per-mode pricing + surcharges (billing_rates.customer_price)
+            "announcementPricePerMin": getattr(billing_row, "announcementPricePerMin", 0) or 0,
+            "assistantPricePerMin": getattr(billing_row, "assistantPricePerMin", 0) or 0,
+            "miscFeePerMin": getattr(billing_row, "miscFeePerMin", 0) or 0,
+            "concurrencyAddons": getattr(billing_row, "concurrencyAddons", "[]") or "[]",
         }
 
     return ConfigSnapshot(

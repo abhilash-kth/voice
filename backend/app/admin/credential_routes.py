@@ -76,6 +76,13 @@ async def credential_rotate(credential_id: str, body: schemas.CredentialRotateBo
         raise _err(e)
 
 
+@router.delete("/credentials/{credential_id}", status_code=204)
+async def credential_delete(credential_id: str, admin=ADMIN):
+    ok = await credential_service.delete_credential(credential_id, admin=admin)
+    if not ok:
+        raise HTTPException(404, "Credential not found")
+
+
 @router.post("/credentials/{credential_id}/reveal")
 async def credential_reveal(credential_id: str, admin=ADMIN):
     """Return the plaintext key to the super-admin panel.

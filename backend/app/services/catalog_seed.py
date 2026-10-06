@@ -226,22 +226,27 @@ async def seed_credentials_from_env() -> int:
     db = get_prisma()
     created = 0
     providers = await db.provider.find_many()
+    done_slugs: set = set()
     for p in providers:
+        if p.slug in done_slugs:
+            continue  # one shared credential per provider slug, not per kind row
         key_env = p.keyEnv or ""
         value = os.getenv(key_env, "").strip() if key_env else ""
         if not value:
             continue
         existing = await db.providercredential.find_first(
-            where={"providerSlug": p.slug, "kind": p.kind, "status": "active"}
+            where={"providerSlug": p.slug, "status": "active"}
         )
         if existing:
+            done_slugs.add(p.slug)
             continue
         enc, masked = crypto.encrypt_secret(value)
         await db.providercredential.create(data={
-            "providerId": p.id, "providerSlug": p.slug, "kind": p.kind,
+            "providerId": p.id, "providerSlug": p.slug, "kind": "",
             "label": f"seeded from {key_env}", "encValue": enc, "maskedValue": masked,
             "createdAt": _now(), "updatedAt": _now(),
         })
+        done_slugs.add(p.slug)
         created += 1
     if created:
         logger.info(f"🔑 Seeded {created} provider credential(s) from env vars.")

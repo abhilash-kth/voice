@@ -38,6 +38,35 @@ DEFAULT_RANGE = (0.6, 1.6)
 DEFAULT_VALUE = 1.0
 
 
+def model_speed_range(catalog_id: str) -> Optional[Tuple[float, float, float]]:
+    """Per-TTS-model speed bounds ``(min, max, default)`` from the CatalogModel
+    meta, as set by the Super Admin in the Models page (``speed_min`` /
+    ``speed_max`` / ``speed_default``). Returns None when the model has no
+    custom range — the caller should use the global BillingConfig range then.
+    """
+    if not catalog_id:
+        return None
+    try:
+        from .config_core import get_snapshot
+
+        snap = get_snapshot()
+        for m in (snap.models.get("tts") or []):
+            if (m.get("catalogId") or "") != catalog_id:
+                continue
+            meta = m.get("_meta") or {}
+            if meta.get("speed_min") is None and meta.get("speed_max") is None:
+                return None
+            lo = float(meta.get("speed_min") if meta.get("speed_min") is not None else DEFAULT_RANGE[0])
+            hi = float(meta.get("speed_max") if meta.get("speed_max") is not None else DEFAULT_RANGE[1])
+            dflt = float(meta.get("speed_default") if meta.get("speed_default") is not None else DEFAULT_VALUE)
+            if lo > hi:
+                lo, hi = hi, lo
+            return lo, hi, min(max(dflt, lo), hi)
+    except Exception:
+        pass
+    return None
+
+
 def normalize_user_speed(value: Optional[float], min_v: float, max_v: float, default: float) -> float:
     """Clamp the user-side value to the admin-configured range; None -> default."""
     try:

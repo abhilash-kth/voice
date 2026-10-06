@@ -143,6 +143,46 @@ class TestCredentials:
         await config_store.refresh_if_stale(force=True)
         assert config_store.get_api_key("stt", "deepgram") is None
 
+    async def test_one_shared_key_serves_every_kind_of_the_provider(self, seeded):
+        """A key stored for a provider is shared (kind ""): the same OpenAI key
+        serves openai-LLM and openai-TTS alike (config_merge.get_api_key)."""
+        provs = await admin_service.list_providers(kind="tts")
+        ot = next(p for p in provs if p["slug"] == "openai")
+        cred = await credential_service.create_credential(
+            provider_id=ot["id"], value="sk-shared-openai-42", admin={"id": "a", "email": "a@t"})
+        assert cred["kind"] == "", "panel keys are stored as shared (kind '')"
+        await config_store.refresh_if_stale(force=True)
+        assert config_store.get_api_key("tts", "openai") == "sk-shared-openai-42"
+        assert config_store.get_api_key("llm", "openai") == "sk-shared-openai-42"
+
+    async def test_duplicate_active_key_rejected_but_rotation_allowed(self, seeded):
+        provs = await admin_service.list_providers(kind="stt")
+        dg = next(p for p in provs if p["slug"] == "deepgram")
+        first = await credential_service.create_credential(
+            provider_id=dg["id"], value="dg-one", admin={"id": "a", "email": "a@t"})
+        with pytest.raises(ValueError, match="one key per provider"):
+            await credential_service.create_credential(
+                provider_id=dg["id"], value="dg-two", admin={"id": "a", "email": "a@t"})
+        # Rotation is the intended replace path and must still work.
+        new = await credential_service.rotate_credential(
+            first["id"], new_value="dg-two", admin={"id": "a", "email": "a@t"})
+        await config_store.refresh_if_stale(force=True)
+        assert config_store.get_api_key("stt", "deepgram") == "dg-two"
+        assert (await credential_service.get_credential(first["id"]))["status"] == "rotated"
+
+    async def test_delete_credential_removes_key_and_audits(self, seeded):
+        provs = await admin_service.list_providers(kind="stt")
+        dg = next(p for p in provs if p["slug"] == "deepgram")
+        cred = await credential_service.create_credential(
+            provider_id=dg["id"], value="dg-delete-me", admin={"id": "a", "email": "a@t"})
+        assert await credential_service.delete_credential(
+            cred["id"], admin={"id": "a", "email": "a@t"}) is True
+        assert await credential_service.delete_credential(cred["id"]) is False
+        await config_store.refresh_if_stale(force=True)
+        assert config_store.get_api_key("stt", "deepgram") is None
+        logs = await admin_service.list_audit_logs(action="api_key_deleted")
+        assert any(i["target_id"] == cred["id"] for i in logs["items"])
+
     async def test_reveal_returns_plaintext_and_is_audited(self, seeded):
         provs = await admin_service.list_providers(kind="stt")
         dg = next(p for p in provs if p["slug"] == "deepgram")
