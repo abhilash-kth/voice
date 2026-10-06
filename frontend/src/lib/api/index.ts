@@ -327,8 +327,10 @@ export interface CostPreview {
   duration_mins: number;
   total_cost_inr: number;
   applied_flat_rate_per_min: number;
+  models_rate_per_min: number;
   concurrency_addon_per_min: number;
   misc_fee_per_min: number;
+  floor_applied?: boolean;
   [k: string]: unknown;
 }
 export const costPreview = (body: {

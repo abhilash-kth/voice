@@ -4,9 +4,12 @@ import { costPreview, type CostPreview } from "@/lib/api";
 
 /**
  * Live estimate of what THIS agent configuration bills per minute:
- *   mode rate (announcement/assistant) or model costs × margin
+ *   the flat mode rate (if the Super Admin set one) or your selected
+ *   LLM+STT+TTS models' ₹/min rate card
  *   + concurrency surcharge (agent's Max concurrent)
  *   + miscellaneous fee — all set by the Super Admin.
+ * If you've configured fallback models, only the primaries are priced here;
+ * a fallback leg is billed at its own rate only when it actually serves a call.
  * Refreshes (debounced) whenever the mode/models/concurrency change.
  */
 export default function CostEstimate({
@@ -57,14 +60,19 @@ export default function CostEstimate({
   const parts: string[] = [];
   if (Number(preview.applied_flat_rate_per_min) > 0) {
     parts.push(`${mode === "announcement" ? "announcement" : "assistant"} rate ₹${Number(preview.applied_flat_rate_per_min).toFixed(2)}/min`);
+  } else if (Number(preview.models_rate_per_min) > 0) {
+    parts.push(`selected models ₹${Number(preview.models_rate_per_min).toFixed(2)}/min`);
   } else {
-    parts.push("models cost + margin");
+    parts.push("standard rate");
   }
   if (Number(preview.concurrency_addon_per_min) > 0) {
     parts.push(`concurrency +₹${Number(preview.concurrency_addon_per_min).toFixed(2)}/min`);
   }
   if (Number(preview.misc_fee_per_min) > 0) {
     parts.push(`misc +₹${Number(preview.misc_fee_per_min).toFixed(2)}/min`);
+  }
+  if (preview.floor_applied && Number(preview.models_rate_per_min) > 0) {
+    parts.push("minimum rate applied");
   }
 
   return (

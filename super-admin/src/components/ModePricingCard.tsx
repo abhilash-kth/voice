@@ -4,8 +4,8 @@
 // Values are string states owned by the billing page (kept small & controlled).
 
 export interface ModePricingState {
-  announcement: string;  // ₹/min, "0" = cost×margin
-  assistant: string;     // ₹/min, "0" = cost×margin
+  announcement: string;  // ₹/min flat rate; "0" = use per-model prices
+  assistant: string;     // ₹/min flat rate; "0" = use per-model prices
   misc: string;          // ₹/min added to every billed call
   tiers: { up_to: string; addon: string }[];  // concurrency surcharges
 }
@@ -23,24 +23,26 @@ export function ModePricingCard({
 
   return (
     <div className="card p-5 space-y-4">
-      <h2 className="text-sm font-bold">Call pricing — mode, concurrency &amp; misc</h2>
+      <h2 className="text-sm font-bold">Customer rate card — flat overrides, surcharges &amp; misc</h2>
+      <p className="text-xs text-gray-500 leading-relaxed">
+        What the customer pays per minute = <b className="text-gray-300">model prices</b> (set per LLM/STT/TTS
+        on the Models page) + <b className="text-gray-300">concurrency surcharge</b> + <b className="text-gray-300">misc fee</b>.
+        A flat mode rate below <b className="text-gray-300">replaces the model prices</b> for that mode (never the surcharges).
+      </p>
       <div className="grid grid-cols-3 gap-3">
-        <Field label="Announcement ₹ / min" hint="Flat customer rate for announcement-mode calls.">
+        <Field label="Announcement flat ₹ / min" hint="Replaces model prices for announcement-mode calls. 0 = use model prices.">
           <input className="input" type="number" step="0.01" min="0" value={value.announcement}
                  onChange={(e) => set({ announcement: e.target.value })} />
         </Field>
-        <Field label="Assistant ₹ / min" hint="Flat customer rate for assistant-mode calls.">
+        <Field label="Assistant flat ₹ / min" hint="Replaces model prices for assistant-mode calls. 0 = use model prices.">
           <input className="input" type="number" step="0.01" min="0" value={value.assistant}
                  onChange={(e) => set({ assistant: e.target.value })} />
         </Field>
-        <Field label="Misc fee ₹ / min" hint="Miscellaneous charge added to every billed call.">
+        <Field label="Misc fee ₹ / min" hint="Always added on top of everything for every billed call.">
           <input className="input" type="number" step="0.01" min="0" value={value.misc}
                  onChange={(e) => set({ misc: e.target.value })} />
         </Field>
       </div>
-      <p className="text-[10px] text-gray-600">
-        A mode rate of 0 means &ldquo;automatic&rdquo;: the legacy infra-cost × profit-margin pricing stays in effect for that mode.
-      </p>
 
       <div>
         <div className="flex items-center justify-between">

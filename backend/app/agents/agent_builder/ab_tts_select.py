@@ -58,22 +58,11 @@ def _tts_adapter_for_pair(pair) -> str:
 
 
 def _normalized_voice_speed(cfg: AgentConfig) -> Optional[float]:
-    """User voice_speed normalized to the Super Admin's configured range; None
-    means 'untouched' (no provider param is sent). A Super-Admin-set range on
-    the selected TTS **model** (Models page meta) wins over the global
-    BillingConfig range — different voices genuinely support different speeds.
+    """Speed control is TTS-internal: no user/admin-facing speed is sent to
+    providers (None = untouched → provider default). The config column and the
+    tts_speed helpers are kept for possible future internal use but are never
+    injected into provider calls.
     """
-    raw = getattr(cfg, "voice_speed", None)
-    try:
-        from ...services import config_store as _cs, tts_speed
-        tts_sel = getattr(getattr(cfg, "providers", None), "tts", None)
-        cat_id = getattr(tts_sel, "id", "") if tts_sel else ""
-        model_range = tts_speed.model_speed_range(cat_id)
-        if model_range:
-            return tts_speed.normalize_user_speed(raw, *model_range)
-        b = _cs.get_billing()
-        return tts_speed.normalize_user_speed(raw, b["voice_speed_min"], b["voice_speed_max"], b["voice_speed_default"])
-    except Exception:
-        return raw
+    return None
 
 

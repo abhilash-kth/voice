@@ -15,9 +15,6 @@ export default function BillingPage() {
   const [minPrice, setMinPrice] = useState("");
   const [margin, setMargin] = useState("");
   const [topups, setTopups] = useState("");
-  const [vsMin, setVsMin] = useState("");
-  const [vsMax, setVsMax] = useState("");
-  const [vsDefault, setVsDefault] = useState("");
   const [modePricing, setModePricing] = useState<ModePricingState>({
     announcement: "0", assistant: "0", misc: "0", tiers: [],
   });
@@ -27,9 +24,6 @@ export default function BillingPage() {
     setMinPrice(String(c.min_client_price));
     setMargin(String(c.profit_margin_percent));
     setTopups((c.wallet_topup_amounts || []).join(", "));
-    setVsMin(String(c.voice_speed_min));
-    setVsMax(String(c.voice_speed_max));
-    setVsDefault(String(c.voice_speed_default));
     setModePricing({
       announcement: String(c.announcement_price_per_min ?? 0),
       assistant: String(c.assistant_price_per_min ?? 0),
@@ -54,8 +48,8 @@ export default function BillingPage() {
 
   useEffect(load, [load]);
 
-  // Live preview: what a customer pays per minute for a model whose provider
-  // cost equals serverCost — mirrors app/services/tts_speed + billing logic.
+  // Never-loss safety floor preview: even if a call's rate card prices low,
+  // the customer pays at least this per minute.
   const cost = toNum(serverCost);
   const marginPct = toNum(margin);
   const withMargin = cost * (1 + marginPct / 100);
@@ -72,9 +66,6 @@ export default function BillingPage() {
       min_client_price: floor,
       profit_margin_percent: marginPct,
       wallet_topup_amounts: amounts,
-      voice_speed_min: toNum(vsMin),
-      voice_speed_max: toNum(vsMax),
-      voice_speed_default: toNum(vsDefault),
       announcement_price_per_min: toNum(modePricing.announcement),
       assistant_price_per_min: toNum(modePricing.assistant),
       misc_fee_per_min: toNum(modePricing.misc),
@@ -88,13 +79,11 @@ export default function BillingPage() {
     }, "Billing config saved ✓ (customers see it after a config reload)");
   };
 
-  const valid = cost >= 0 && floor >= 0 && marginPct >= 0 &&
-    toNum(vsMin) > 0 && toNum(vsMax) >= toNum(vsMin) &&
-    toNum(vsDefault) >= toNum(vsMin) && toNum(vsDefault) <= toNum(vsMax);
+  const valid = cost >= 0 && floor >= 0 && marginPct >= 0;
 
   return (
     <>
-      <PageHeader title="Billing config" subtitle="Platform pricing — applied dynamically, no redeploy needed">
+      <PageHeader title="Billing config" subtitle="Platform pricing formula — applied dynamically, no redeploy needed">
         <button className="btn-secondary text-xs" onClick={load} disabled={loading}>↻ Reset</button>
         <button className="btn text-xs" disabled={busy || !valid || !cfg} onClick={save}>
           {busy ? "Saving…" : "💾 Save changes"}
@@ -110,25 +99,32 @@ export default function BillingPage() {
       <StateBox loading={loading} error={error}>
         <div className="grid lg:grid-cols-2 gap-4">
           <div className="card p-5 space-y-4">
-            <h2 className="text-sm font-bold">Pricing</h2>
+            <h2 className="text-sm font-bold">Safety floor (never a loss)</h2>
+            <p className="text-xs text-gray-500 leading-relaxed">
+              Customer ₹/min normally comes from the <b className="text-gray-300">rate card</b> — the
+              per-model prices you set on the Models page (LLM + STT + TTS of the agent), or the flat
+              per-mode price on the right — plus the concurrency surcharge and misc fee. If that total is
+              ever <b className="text-gray-300">below your real cost</b>, the customer is automatically
+              billed the floor instead. You never lose money on a call.
+            </p>
 
             <Field label="Your cost ₹ / min (infra: telephony + compute)" hint="Server-side cost baseline. Not shown to users.">
               <input className="input" type="number" step="0.01" min="0" value={serverCost} onChange={(e) => setServerCost(e.target.value)} />
             </Field>
 
-            <Field label="Profit margin %" hint="Added on top of your cost to compute customer prices.">
+            <Field label="Guaranteed margin %" hint="Floor = your cost × (1 + margin). Customers never pay less than this markup on real cost.">
               <input className="input" type="number" step="1" min="0" value={margin} onChange={(e) => setMargin(e.target.value)} />
             </Field>
 
-            <Field label="Minimum customer price ₹ / min" hint="Floor — customers never pay less than this per minute.">
+            <Field label="Absolute minimum ₹ / min" hint="Second floor — customers never pay less than this per minute, whatever the math says.">
               <input className="input" type="number" step="0.01" min="0" value={minPrice} onChange={(e) => setMinPrice(e.target.value)} />
             </Field>
 
             <div className="rounded-xl bg-gray-800/50 border border-gray-800 p-3 text-xs text-gray-400">
-              <span className="font-semibold text-gray-300">Live preview:</span> a model costing you{" "}
-              {fmtINR(cost)}/min bills customers at{" "}
+              <span className="font-semibold text-gray-300">Floor preview:</span> worst case, customers pay{" "}
               <span className="font-bold text-emerald-300">{fmtINR(effective)}/min</span>
-              {floor > withMargin ? " (floor price applied)" : " (cost + margin)"}.
+              {floor > withMargin ? " (absolute minimum)" : " (cost + guaranteed margin)"} — rate-card
+              prices above this are charged as-is.
             </div>
           </div>
 
@@ -147,24 +143,6 @@ export default function BillingPage() {
               </div>
             </div>
 
-            <div className="card p-5 space-y-4">
-              <h2 className="text-sm font-bold">Voice speed (TTS)</h2>
-              <div className="grid grid-cols-3 gap-3">
-                <Field label="Min">
-                  <input className="input" type="number" step="0.1" min="0.1" value={vsMin} onChange={(e) => setVsMin(e.target.value)} />
-                </Field>
-                <Field label="Max">
-                  <input className="input" type="number" step="0.1" min="0.1" value={vsMax} onChange={(e) => setVsMax(e.target.value)} />
-                </Field>
-                <Field label="Default">
-                  <input className="input" type="number" step="0.1" min="0.1" value={vsDefault} onChange={(e) => setVsDefault(e.target.value)} />
-                </Field>
-              </div>
-              {!valid && vsMin && vsMax && (
-                <p className="text-[10px] text-red-300">Speeds must satisfy: 0 &lt; min ≤ default ≤ max.</p>
-              )}
-              <p className="text-[10px] text-gray-600">Range enforced in the customer agent config; default pre-selects the slider.</p>
-            </div>
           </div>
         </div>
       </StateBox>

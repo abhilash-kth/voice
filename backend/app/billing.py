@@ -169,12 +169,17 @@ def calculate_call_cost(
 
     total_cost_inr = stt_cost_inr + llm_cost_inr + tts_cost_inr + server_cost_inr
 
-    # Customer price = per-mode flat rate OR cost×margin, + concurrency tier
-    # & misc fees, floored at min client price (billing_rates.customer_price).
+    # Customer price = rate card (per-mode flat rate, else the call's selected
+    # models' customer ₹/min) + concurrency tier + misc fee, floored at
+    # max(infra cost × margin, min client price) — never a loss.
     from . import billing_rates
+    models_rate = billing_rates.selected_models_rate_per_min(
+        llm_provider=v2_provider or "", llm_model_id=v2_model or "",
+        stt_id=stt_provider_id or "", tts_id=tts_provider_id or "")
     price_parts = billing_rates.customer_price(
         total_cost_inr=total_cost_inr, duration_mins=duration_mins,
-        agent_mode=agent_mode, max_concurrency=max_concurrency, consts=consts,
+        agent_mode=agent_mode, max_concurrency=max_concurrency,
+        models_rate_per_min=models_rate, consts=consts,
     )
     client_price_inr = price_parts["client_price_inr"]
     profit_inr = client_price_inr - total_cost_inr

@@ -42,15 +42,24 @@ async def stats_overview() -> Dict[str, Any]:
 
 
 async def usage_rows() -> List[Dict[str, Any]]:
-    """Per-call usage+cost rows for the analytics page (most recent 500)."""
+    """Per-call usage+cost rows for the analytics page (most recent 500).
+
+    Rows carry the customer's name/email so the panel reads as people, not
+    raw ids."""
     db = get_prisma()
     calls = await db.call.find_many(order={"startedAt": "desc"}, take=500)
+    uids = list({c.userId for c in calls if c.userId})
+    users = await db.user.find_many(where={"id": {"in": uids}}) if uids else []
+    uname = {u.id: (u.name or "") for u in users}
+    uemail = {u.id: (u.email or "") for u in users}
     out: List[Dict[str, Any]] = []
     for c in calls:
         usage = _load(c.usage)
         cost = _load(c.cost)
         out.append({
-            "id": c.id, "user_id": c.userId, "agent_id": c.agentId,
+            "id": c.id, "user_id": c.userId,
+            "user_name": uname.get(c.userId, ""), "user_email": uemail.get(c.userId, ""),
+            "agent_id": c.agentId,
             "mode": c.mode, "status": c.status, "started_at": c.startedAt or "",
             "duration_seconds": c.durationSeconds or 0,
             "stt_seconds": usage.get("stt_seconds", 0),

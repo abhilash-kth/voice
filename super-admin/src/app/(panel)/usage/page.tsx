@@ -4,6 +4,11 @@ import PageHeader, { StateBox } from "@/components/PageHeader";
 import { listUsage, type UsageRow } from "@/lib/api";
 import { fmtDateTime, fmtDuration, fmtINR, shortId } from "@/lib/format";
 
+function userDisplay(r: UsageRow): string {
+  if (r.user_name) return r.user_email ? `${r.user_name} (${r.user_email})` : r.user_name;
+  return r.user_email || shortId(r.user_id);
+}
+
 export default function UsagePage() {
   const [items, setItems] = useState<UsageRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -67,7 +72,10 @@ export default function UsagePage() {
               {items.map((r) => (
                 <tr key={r.id}>
                   <td className="text-gray-400 text-xs whitespace-nowrap">{fmtDateTime(r.started_at)}</td>
-                  <td className="font-mono text-xs text-gray-400">{shortId(r.user_id)}</td>
+                  <td>
+                    <div className="text-gray-200 text-sm">{userDisplay(r)}</div>
+                    <div className="font-mono text-xs text-gray-500">{shortId(r.user_id)}</div>
+                  </td>
                   <td className="font-mono text-xs text-gray-400">{shortId(r.agent_id)}</td>
                   <td><span className="pill pill-gray">{r.mode || "voice"}</span></td>
                   <td className="text-gray-300 text-xs">{fmtDuration(r.duration_seconds)}</td>

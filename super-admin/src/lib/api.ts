@@ -245,6 +245,8 @@ export const deleteCredential = (id: string) =>
 export interface UsageRow {
   id: string;
   user_id: string;
+  user_name?: string;
+  user_email?: string;
   agent_id: string;
   mode: string;
   status: string;

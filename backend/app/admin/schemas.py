@@ -142,3 +142,8 @@ class BillingUpdateBody(BaseModel):
     voice_speed_min: Optional[float] = None
     voice_speed_max: Optional[float] = None
     voice_speed_default: Optional[float] = None
+    # Per-mode flat customer pricing + surcharges (see app/billing_rates.py)
+    announcement_price_per_min: Optional[float] = None
+    assistant_price_per_min: Optional[float] = None
+    misc_fee_per_min: Optional[float] = None
+    concurrency_addons: Optional[List[Dict[str, Any]]] = None

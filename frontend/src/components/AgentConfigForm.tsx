@@ -128,14 +128,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [language, setLanguage] = useState(editing?.language || "hi");
   // Spoken-voice gender: picks the Google Chirp 3 speaker / Sarvam Bulbul speaker.
   const [gender, setGender] = useState(editing?.gender || "female");
-  // Normalized voice speed (1.0 = normal), clamped to admin-configured
-  // bounds. Global defaults come from the catalog; the selected TTS model's
-  // per-model range (Super Admin → Models page) overrides them in vsCfg below.
-  const vsGlobalCfg = (catalog as any).voice_speed || { min: 0.6, max: 1.6, default: 1.0 };
-  const [voiceSpeed, setVoiceSpeed] = useState<number>(() => {
-    const saved = (editing as any)?.voice_speed;
-    return typeof saved === "number" ? saved : (vsGlobalCfg.default ?? 1.0);
-  });
   const [reasoningEffort, setReasoningEffort] = useState<string>(
     () => (editing?.providers as any)?.llm?.config?.reasoning_effort || "low"
   );
@@ -289,22 +281,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     };
   });
 
-  // Voice-speed slider bounds: the selected TTS model's own range (when the
-  // Super Admin configured one on the Models page) wins; else global Billing.
-  const vsCfg = (() => {
-    const ttsEntry: any = ((catalog as any).catalog?.tts || []).find((p: any) => p.id === picked.tts);
-    if (ttsEntry && typeof ttsEntry.speed_min === "number" && typeof ttsEntry.speed_max === "number") {
-      return {
-        min: ttsEntry.speed_min,
-        max: ttsEntry.speed_max,
-        default: typeof ttsEntry.speed_default === "number" ? ttsEntry.speed_default : vsGlobalCfg.default,
-      };
-    }
-    return vsGlobalCfg;
-  })();
-  useEffect(() => {
-    setVoiceSpeed((v) => Math.min(Math.max(v, vsCfg.min), vsCfg.max));
-  }, [vsCfg.min, vsCfg.max]);
   const [fallbackEnabled, setFallbackEnabled] = useState<boolean>(() => {
     const p: any = editing?.providers || {};
     return !!(p.llm_fallback || p.stt_fallback || p.tts_fallback || p.llm_fallback_v2);
@@ -655,7 +631,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         memory_enabled: mode === "announcement" ? false : memoryEnabled,
         recording_enabled: mode === "announcement" ? false : recordingEnabled,
         max_concurrency: Math.max(1, Number(maxConcurrency) || 1),
-        voice_speed: voiceSpeed,
         providers: buildConfig(),
         enabled: true,
       };
@@ -859,24 +834,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                 </select>
                 <p className="mt-1 text-[10px] text-gray-500">
                   {GENDER_VOICE_HINT[gender] || GENDER_VOICE_HINT.female}
-                </p>
-              </div>
-              <div>
-                <label className="text-xs text-gray-400 font-medium">
-                  Voice speed <span className="text-blue-300">{voiceSpeed.toFixed(2)}×</span>
-                </label>
-                <input
-                  type="range"
-                  min={vsCfg.min}
-                  max={vsCfg.max}
-                  step={0.05}
-                  value={voiceSpeed}
-                  onChange={(e) => setVoiceSpeed(Number(e.target.value))}
-                  className="w-full mt-2 accent-blue-500"
-                />
-                <p className="mt-1 text-[10px] text-gray-500">
-                  1.00 is the natural pace. Only applied when the chosen TTS provider supports speed
-                  control (range {vsCfg.min}× – {vsCfg.max}× — set by the admin, per-model when configured).
                 </p>
               </div>
             </>
