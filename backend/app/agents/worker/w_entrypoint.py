@@ -20,9 +20,11 @@ from .w_billing_reporter import _billing_report, _post_billing
 from .w_gcp import threading
 from .w_imports import AgentConfig, calculate_call_cost, db_init, leadfile, memory, repo
 from .w_runtime import DEFAULT_FALLBACK_RESPONSE, DETERMINISTIC_CLOSING_MESSAGE, DETERMINISTIC_CLOSING_MESSAGE_EN, FALLBACK_REPLY, LLM_FALLBACK_DELAY, WORKER_AGENT_NAME, _FAIL_THRESHOLD_SECONDS, _get_deterministic_closing, _item_is_tool_related, _mark_call_failed, _msg_text, clean_reply_text
+from . import w_runtime as _wr
+from . import w_ssl as _ws
 from .w_session_announce import build_announcement_session, start_egress
 from .w_session_assistant import build_assistant_session
-from .w_ssl import _prewarm_ssl_context, _ssl_context_cache
+from .w_ssl import _prewarm_ssl_context
 
 async def entrypoint(ctx):
     """LiveKit job entrypoint — the worker's failure contract.
@@ -147,16 +149,19 @@ async def _entrypoint_body(ctx, setup_complete):
     # --- Latency fix: DB init was 2.33s per job + 1.13s lookup + 8.62s None->listening
     # Previous log: job request 10.184 -> DB init 2.33s (12.845) -> lookup 1.13s (13.978) -> provider build 4.37s (18.350) -> listening 8.62s (23.648)
     # Total 13.5s before user hears greeting. Fix: cache DB init per process, parallel provider build.
-    global _DB_INIT_DONE, _AGENT_CACHE
+    global _AGENT_CACHE
     # Ensure SSL cache ready before DB init. If the import-time prewarm thread
     # hasn't finished, build it in a thread — NOT here: doing it on the loop is
     # the very >1s ssl.create_default_context stall we're avoiding, and it would
     # land right before the greeting plays.
+    # NOTE: cross-module flags (_DB_INIT_DONE in w_runtime, _ssl_context_cache
+    # in w_ssl) are read/written via module attribute — a plain `import` of the
+    # NAME would bind a stale copy and `global` here would create a divergent
+    # module-local variable (the bug that crashed every job with NameError).
     try:
-        global _ssl_context_cache
-        if _ssl_context_cache is None:
+        if _ws._ssl_context_cache is None:
             await asyncio.wait_for(asyncio.to_thread(_prewarm_ssl_context), timeout=4)
-            if _ssl_context_cache is None:
+            if _ws._ssl_context_cache is None:
                 logger.warning("⚠️ SSL context still not cached before DB init — first connect may block the loop")
             else:
                 logger.info("🔧 SSL context ready before DB init (built off-loop)")
@@ -194,12 +199,11 @@ async def _entrypoint_body(ctx, setup_complete):
 
     if rec is not None:
         # Warm DB connection in background so billing/cleanup at end of call is instant
-        if not _DB_INIT_DONE:
+        if not _wr._DB_INIT_DONE:
             async def _bg_db_init():
-                global _DB_INIT_DONE
                 try:
                     await asyncio.wait_for(db_init(), timeout=10)
-                    _DB_INIT_DONE = True
+                    _wr._DB_INIT_DONE = True
                     logger.info("⏱️ Background DB init completed ready for billing")
                 except Exception as exc:
                     logger.warning("Background DB init failed: %r", exc)
@@ -207,7 +211,7 @@ async def _entrypoint_body(ctx, setup_complete):
     else:
         db_t0 = time.time()
         db_just_initialized = False
-        if not _DB_INIT_DONE:
+        if not _wr._DB_INIT_DONE:
             try:
                 try:
                     def _ensure_prisma_engine_binary() -> bool:
@@ -226,7 +230,7 @@ async def _entrypoint_body(ctx, setup_complete):
                 except Exception:
                     pass
                 await asyncio.wait_for(db_init(), timeout=8)
-                _DB_INIT_DONE = True
+                _wr._DB_INIT_DONE = True
                 db_just_initialized = True
                 logger.info(f"⏱️ DB init {time.time()-db_t0:.2f}s on agent loop (first time, cached for next calls)")
             except Exception as exc:
@@ -236,7 +240,7 @@ async def _entrypoint_body(ctx, setup_complete):
                 await asyncio.wait_for(db_init(), timeout=5)
                 logger.info("⏱️ DB init rechecked on this event loop")
             except Exception as exc:
-                _DB_INIT_DONE = False
+                _wr._DB_INIT_DONE = False
                 logger.warning("database re-init failed (%.2fs): %r", time.time() - db_t0, exc)
 
         if agent_id and user_id:
@@ -281,13 +285,26 @@ async def _entrypoint_body(ctx, setup_complete):
     else:
         cfg = AgentConfig(**rec)
 
+    # --- Panel-set API keys / models -----------------------------------------
+    # The sync pipeline reads provider keys from config_store's in-process
+    # snapshot, which in a fresh job process is the code-default fallback
+    # (NO panel credentials → silent .env key fallback). Force-load the DB
+    # snapshot now so a key the Super Admin set in the panel is used by THIS
+    # call — panel first, .env only as fallback (ab_config_access).
+    try:
+        from app.services import config_store as _cs
+        await asyncio.wait_for(_cs.refresh_if_stale(force=True), timeout=8)
+        logger.info("⏱️ Config snapshot loaded — panel API keys/models active for this call")
+    except Exception as _e:
+        logger.warning("Config snapshot refresh failed (falling back to env keys): %r", _e)
+
     logger.info(f"📞 agent={cfg.name} mode={mode} phone={phone} call={call_id}")
 
     # Ensure the call record status is tracked in-progress asynchronously without blocking audio
     call_record = {"id": call_id or f"call_{uuid.uuid4().hex[:8]}", "user_id": user_id}
     async def _mark_call_in_progress():
         try:
-            if not _DB_INIT_DONE:
+            if not _wr._DB_INIT_DONE:
                 await asyncio.wait_for(db_init(), timeout=10)
             if call_id and user_id:
                 await repo.update_call(call_id, {"status": "in-progress", "room": getattr(ctx.room, "name", "")})
