@@ -2214,7 +2214,16 @@ async def _entrypoint_body(ctx, setup_complete):
             except Exception:
                 pass
 
-            # Fallback local update (ensures call is marked completed even if backend unreachable)
+            # Fallback local update (ensures call is marked completed even if backend unreachable).
+            # Make sure this job loop's DB client is connected first — the whole
+            # fallback exists for when the API server is down and direct-DB is
+            # the only way money + call state still land.
+            if not _wr._DB_INIT_DONE:
+                try:
+                    await asyncio.wait_for(db_init(), timeout=8)
+                    _wr._DB_INIT_DONE = True
+                except Exception as _dbe:
+                    logger.warning(f"DB init for fallback billing failed: {_dbe!r}")
             try:
                 await repo.update_call(call_record["id"], {
                     "status": status,

@@ -40,35 +40,64 @@ async def recharge(user_id: str, amount: float) -> dict:
 
 
 async def deduct(user_id: str, amount: float, note: str = "") -> dict:
+    """Idempotent wallet deduction WITHOUT interactive transactions.
+
+    The generated client's ``db.tx()`` raises ``ClientNotConnectedError`` on
+    the per-event-loop clients used by LiveKit job processes (plain queries
+    work on the same connected client — interactive tx does not), which used
+    to drop the entire direct-deduct fallback when the API server was
+    unreachable. Instead: idempotency pre-check → optimistic compare-and-set
+    on the balance → ledger row, with best-effort balance compensation if
+    the ledger write fails. The CAS predicate makes concurrent deducts
+    single-winner, matching the old tx semantics.
+    """
     db = get_prisma()
-    # Idempotency: if a spend transaction for this exact call already exists, skip
-    if note:
-        try:
-            existing = await db.transaction.find_first(
-                where={"userId": user_id, "kind": "spend", "note": note}
-            )
-            if existing:
-                return await get_wallet(user_id)
-        except Exception:
-            pass
-    # Atomic: balance update + ledger row succeed or fail together, and the
-    # idempotency re-check inside the tx closes the double-deduct race.
-    async with db.tx(timeout=8000) as tx:
-        u = await tx.user.find_unique(where={"id": user_id})
+    if amount <= 0:
+        return await get_wallet(user_id)
+    for _attempt in range(2):
+        # Idempotency first thing EVERY attempt: if a ledger row for this exact
+        # note already exists, another deduct (API settle / worker fallback)
+        # already charged this call — return without charging again.
+        if note:
+            try:
+                existing = await db.transaction.find_first(
+                    where={"userId": user_id, "kind": "spend", "note": note}
+                )
+                if existing:
+                    return await get_wallet(user_id)
+            except Exception:
+                pass
+        u = await db.user.find_unique(where={"id": user_id})
         if not u:
             raise ValueError("user not found")
-        if note:
-            existing = await tx.transaction.find_first(
-                where={"userId": user_id, "kind": "spend", "note": note}
-            )
-            if existing:
-                return await get_wallet(user_id)
-        new_balance = round(max((u.walletBalance or 0) - amount, 0.0), 2)
-        await tx.user.update(where={"id": user_id}, data={"walletBalance": new_balance})
-        await tx.transaction.create(
-            data={"userId": user_id, "kind": "spend", "amount": -amount, "note": note, "ts": _ts()}
+        old_balance = u.walletBalance or 0
+        new_balance = round(max(old_balance - amount, 0.0), 2)
+        # Compare-and-set: only the deduct that matches the exact balance it
+        # read gets to move the balance; a concurrent change loses and retries
+        # (the retry re-checks the ledger first, closing the double charge).
+        res = await db.user.update_many(
+            where={"id": user_id, "walletBalance": old_balance},
+            data={"walletBalance": new_balance},
         )
-    return await get_wallet(user_id)
+        if getattr(res, "count", 0) == 0:
+            continue
+        try:
+            await db.transaction.create(
+                data={"userId": user_id, "kind": "spend", "amount": -amount, "note": note, "ts": _ts()}
+            )
+        except Exception:
+            # Keep money and ledger in step: restore the balance, then fail
+            # loudly so the caller can retry rather than double-charging.
+            try:
+                await db.user.update_many(
+                    where={"id": user_id, "walletBalance": new_balance},
+                    data={"walletBalance": old_balance},
+                )
+            except Exception:
+                pass
+            raise
+        return await get_wallet(user_id)
+    raise RuntimeError("wallet deduct failed: balance changed concurrently (retry)")
 
 
 async def has_spend_for_call(user_id: str, call_id: str) -> bool:
