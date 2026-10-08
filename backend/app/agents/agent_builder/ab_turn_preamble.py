@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import time
-import time as _time
 
 from .ab_prompt import _chat_msg_text
 

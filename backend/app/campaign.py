@@ -12,9 +12,7 @@ import uuid
 import threading
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Optional
-
 from .config import DATA_DIR
 
 _FILE = DATA_DIR / "campaigns.json"

@@ -4,7 +4,6 @@ Extracted 1:1 from `llm_timing_factory.py`.
 """
 from __future__ import annotations
 
-import hashlib as _hl
 import logging
 import time as _time
 import traceback

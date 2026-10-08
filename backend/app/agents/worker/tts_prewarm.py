@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import asyncio
 import logging
-import hashlib as _hl
 from typing import Any, Iterator, Optional
 
 logger = logging.getLogger("voice-agent-saas-worker")

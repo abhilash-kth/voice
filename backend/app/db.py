@@ -30,7 +30,9 @@ if BACKEND_DIR not in os.sys.path:
 # been run; a clear error is raised otherwise.
 try:
     from prisma_client import Prisma
-    from prisma_client.errors import PrismaError  # noqa: F401  (re-export)
+    from prisma_client.errors import(
+    PrismaError  # noqa: F401   re-export,
+)
 except ImportError as e:  # pragma: no cover - surface a friendly message
     raise ImportError(
         "Prisma client not generated. From backend/ run:\n"

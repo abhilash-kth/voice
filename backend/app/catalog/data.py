@@ -5,7 +5,7 @@ Extracted from catalog.py. LLM entries are populated separately by
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 
 # Legacy STT/TTS/Telephony catalog (code-level reference data)

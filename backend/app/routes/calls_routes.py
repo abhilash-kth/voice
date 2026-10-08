@@ -15,7 +15,6 @@ from fastapi import APIRouter, HTTPException, Depends
 from .. import auth
 from .. import repo
 from .. import telephony
-from .. import campaign_runner
 from ..config import LIVEKIT_URL
 from .calls_watchdog import agent_join_watchdog
 

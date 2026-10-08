@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from .. import catalog as code_catalog
 from .. import llm_catalog as code_llm
-from .config_core import ConfigSnapshot, get_snapshot
+from .config_core import get_snapshot
 
 logger = logging.getLogger("voice-agent-saas-config-store")
 
@@ -24,7 +24,9 @@ logger = logging.getLogger("voice-agent-saas-config-store")
 # ---------------------------------------------------------------------------
 
 
-from .config_billing import get_billing  # re-export (split to its own module)
+from .config_billing import(
+    get_billing  # re-export  split to its own module,
+)
 
 
 def get_providers_of(kind: str) -> List[Dict[str, Any]]:

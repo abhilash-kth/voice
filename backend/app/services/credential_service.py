@@ -14,7 +14,6 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ..db import get_prisma
-from .. import repo
 from . import crypto
 
 logger = logging.getLogger("voice-agent-saas-credentials")

@@ -9,9 +9,9 @@ from __future__ import annotations
 import logging
 import re
 from collections import OrderedDict
-from typing import Any, List
+from typing import List
 
-from ..models import KnowledgeBase, KnowledgeItem
+from ..models import KnowledgeBase
 
 
 _logger = logging.getLogger("voice-agent-saas")

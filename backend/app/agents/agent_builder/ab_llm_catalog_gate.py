@@ -12,7 +12,7 @@ logger = logging.getLogger("voice-agent-saas-agent-builder")
 
 def gate_and_enrich_model(overrides, raw_id, provider, model_id, base_url, provider_type, key_env):
     try:
-        from ...llm_catalog import get_llm_model, validate_provider_model, get_llm_provider
+        from ...llm_catalog import get_llm_model, validate_provider_model
         # If model_id empty, try to get default from catalog or env
         if not model_id:
             import os as _os

@@ -14,7 +14,6 @@ from ..models import Recharge
 from .. import auth
 from .. import repo
 from .. import billing as billing_mod
-from ..db import get_prisma
 from ..config import BILLING_INTERNAL_TOKEN
 
 import logging

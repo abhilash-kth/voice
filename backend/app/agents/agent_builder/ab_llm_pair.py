@@ -7,7 +7,7 @@ logger = logging.getLogger("voice-agent-saas-agent-builder")
 
 
 # cross-module imports (auto-generated)
-from .ab_config_access import _provider_api_key, _provider_base_url
+from .ab_config_access import _provider_api_key
 from .ab_llm_catalog_gate import gate_and_enrich_model
 from .ab_llm_reasoning import resolve_reasoning_budget
 from .ab_llm_instantiate_chain import instantiate_llm_from_kwargs
@@ -20,9 +20,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     Logs LLM PROVIDER CONFIG with provider, model, base_url exactly as selected.
     Fixes OpenAI 404 by validating exact model and capturing actual API error.
     """
-    from livekit.plugins.openai import LLM
     from openai import AsyncOpenAI
-
     sel = pair
     overrides = sel.config or {}
     raw_id = sel.id

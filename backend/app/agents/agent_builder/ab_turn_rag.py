@@ -34,7 +34,7 @@ async def apply_per_turn_rag(self, turn_ctx, new_message, cfg, rag_prefetch,
             logger.info(f"⏱️ TIMING on_user_turn_completed (empty text): {(_time.time()-_rag_t0)*1000:.0f}ms")
             return
         from ... import rag  # local import: keep this module light
-        from ...turn_rules import is_contextual_followup, build_contextual_retrieval_query
+        from ...turn_rules import is_contextual_followup
         # If this turn completed a split thought, retrieve for the MERGED
         # question (fragments + this final) instead of the bare tail —
         # [COMPLETE_TURN] logged above shows the merge.

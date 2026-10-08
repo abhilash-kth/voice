@@ -6,12 +6,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .. import catalog as code_catalog
 from .. import llm_catalog as code_llm
 from ..db import get_prisma
-from .config_store import ConfigSnapshot
 from .catalog_public import _now  # shared timestamp helper (lives with the public renderers)
 from .catalog_seeds_data import EXTRA_PROVIDER_SEEDS
 
@@ -222,7 +221,6 @@ async def seed_credentials_from_env() -> int:
     if os.getenv("SEED_PROVIDER_API_KEYS_FROM_ENV", "").lower() != "true":
         return 0
     from . import crypto, credential_service
-
     db = get_prisma()
     created = 0
     providers = await db.provider.find_many()

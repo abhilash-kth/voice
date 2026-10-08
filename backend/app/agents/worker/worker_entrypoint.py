@@ -4,9 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
-import hashlib as _hl
 from typing import Any
-
 logger = logging.getLogger("voice-agent-saas-worker")
 
 
@@ -35,7 +33,9 @@ from .session_announcer import build_announcement_session, start_egress
 from .assistant_mode_setup import build_assistant_session
 from .ssl_cert_patch import _prewarm_ssl_context
 
-from .call_dispatch import entrypoint  # noqa: F401  (public API: imported via package __init__)
+from .call_dispatch import(
+    entrypoint  # noqa: F401   public API: imported via package __init__,
+)
 
 
 
@@ -43,11 +43,7 @@ from .call_dispatch import entrypoint  # noqa: F401  (public API: imported via p
 async def _entrypoint_body(ctx, setup_complete):
     from livekit.agents import AgentSession
     from app.agents.agent_builder import (
-        build_vad,
-        build_stt,
-        build_llm,
-        build_tts,
-        build_voice_agent,
+        build_vad, build_stt, build_llm, build_tts, build_voice_agent,
         build_announce_agent,
     )
 

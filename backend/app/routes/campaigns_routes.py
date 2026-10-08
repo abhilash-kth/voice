@@ -11,7 +11,6 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from .. import auth
 from .. import repo
 from .. import campaign as campaign_store
-from .. import campaign_runner
 from .. import leadfile
 
 logger = logging.getLogger("voice-agent-saas-api")

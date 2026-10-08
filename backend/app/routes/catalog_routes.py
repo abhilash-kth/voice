@@ -10,8 +10,8 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from ..catalog import catalog_summary, get_provider, validate_llm_provider_model, get_llm_model
-from ..llm_catalog import validate_provider_model as validate_llm_v2, get_llm_model as get_llm_model_v2
+from ..catalog import catalog_summary, get_provider, validate_llm_provider_model
+from ..llm_catalog import validate_provider_model as validate_llm_v2
 from ..services import config_store
 
 logger = logging.getLogger("voice-agent-saas-api")

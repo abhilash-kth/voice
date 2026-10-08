@@ -15,7 +15,7 @@ one file per provider, to keep every source file small and reviewable.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from .models import LLM_MODELS
 

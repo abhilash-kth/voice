@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import os
+import re
+import sys
+import asyncio
 import logging
+import time
+import uuid
+import json
+import traceback
 import hashlib as _hl
-from typing import Any
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger("voice-agent-saas-worker")
 
 
 # cross-module imports (auto-generated)
-from .gcp_credentials import warm_google_credentials
+from .w_gcp_creds import warm_google_credentials
 from .dep_imports import setup_logging, silero
 from .runtime_env import _VAD_CACHE_LOCK
 

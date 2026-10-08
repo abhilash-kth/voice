@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 from ...models import AgentConfig
-from ...config import (
-    GROQ_API_KEY,
-)
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
 

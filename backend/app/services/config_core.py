@@ -16,9 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .. import catalog as code_catalog
 from .. import llm_catalog as code_llm
-
 logger = logging.getLogger("voice-agent-saas-config-store")
 
 _REFRESH_TTL = float(os.getenv("ADMIN_CONFIG_TTL_SECONDS", "60"))

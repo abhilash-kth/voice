@@ -14,7 +14,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 
-from .db import get_prisma
 from . import repo
 
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")

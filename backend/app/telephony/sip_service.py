@@ -6,10 +6,8 @@ from __future__ import annotations
 
 
 import uuid
-import logging
 from datetime import timedelta
 from typing import Any, Optional
-
 from ..config import (
     LIVEKIT_URL,
     LIVEKIT_API_KEY,

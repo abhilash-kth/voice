@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import OrderedDict
 from typing import Any, List
-
 from ..models import KnowledgeBase, KnowledgeItem
 
 
