@@ -2,7 +2,7 @@
 scheduled (authorized / never-scheduled / started / speech gates) and the
 speech_created hook that remembers pending reply handles.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule).
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule).
 """
 from __future__ import annotations
 
@@ -117,9 +117,6 @@ def build_reply_stall_probe(session, agent_mode, state_tracker, call_closed,
         except Exception:
             stall_probe["task"] = None
 
-    # Late-bound wiring for transcription handler (see transcription_pipeline.py)
-    late["schedule_no_response"] = _schedule_no_response
-    late["arm_stall_probe"] = _arm_stall_probe
     def _on_speech_created(ev) -> None:
         try:
             handle = getattr(ev, "speech_handle", None)

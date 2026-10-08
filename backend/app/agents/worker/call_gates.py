@@ -1,14 +1,14 @@
 """Pre-call gates: monthly subscription check that blocks the call with a
 user-facing failure reason before any audio runs.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule); the inline
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule); the inline
 `return` on a blocked call is communicated as `True` ("aborted") instead.
 """
 from __future__ import annotations
 
 import logging
 
-from .w_runtime import _mark_call_failed
+from .runtime_env import _mark_call_failed
 
 logger = logging.getLogger("voice-agent-saas-worker")
 

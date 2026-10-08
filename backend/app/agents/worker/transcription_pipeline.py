@@ -1,6 +1,6 @@
 """User-input transcription pipeline: barge-in cancellation + RAG prefetch.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Contains:
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Contains:
   * `_precompute_rag` — retrieval runs on each STT interim so the awaited
     on_user_turn_completed hook becomes a dict lookup (~0ms).
   * `_on_transcription` — immediate barge-in cancellation on the first

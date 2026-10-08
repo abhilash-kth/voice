@@ -1,13 +1,12 @@
 """Turn-detection latency metric logging (EOU → turn decision).
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Recovers
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Recovers
 final-to-turn-decision time from LiveKit EOUMetrics and correlates event-
 loop blockage samples over the decision window. Observability only.
 """
 from __future__ import annotations
 
 import logging
-import time
 
 logger = logging.getLogger("voice-agent-saas-worker")
 

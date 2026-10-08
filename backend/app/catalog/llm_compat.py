@@ -6,7 +6,7 @@ a single ``model`` field) from the V2 provider/model metadata in
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 from ..llm_catalog import (

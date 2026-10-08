@@ -1,5 +1,5 @@
 """Stream-error reporting (rate-limit diagnostics) and finalization metrics
-for the LLM timing stream wrapper. Extracted 1:1 from `w_llm_timing.py`.
+for the LLM timing stream wrapper. Extracted 1:1 from `llm_timing_factory.py`.
 """
 from __future__ import annotations
 

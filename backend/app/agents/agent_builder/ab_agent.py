@@ -77,7 +77,7 @@ def build_voice_agent(
     # (writes) and the end_call tool (final memory save). Same semantics as the
     # original builder-scope list.
     _in_call_memory_lines = []
-    _end_call = build_end_call_tool(
+    end_call_tool, chat_ctx = build_end_call_tool(
         cfg, lead_data, llm, agent_ref, closing_state, prior_memory, _in_call_memory_lines)
 
     class _VoiceAgent(Agent):

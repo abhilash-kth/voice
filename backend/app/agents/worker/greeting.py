@@ -1,10 +1,10 @@
 """Greeting selection + lead-template rendering for the call's opening hello.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule).
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule).
 """
 from __future__ import annotations
 
-from .w_imports import leadfile
+from .dep_imports import leadfile
 
 
 def select_greeting(cfg, lead_data) -> str:

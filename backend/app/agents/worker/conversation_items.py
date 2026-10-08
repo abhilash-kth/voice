@@ -1,7 +1,7 @@
 """conversation_item_added hook: reply/fallback tracking, closing detection,
 token/conversation accounting, watchdog resets on agent activity.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Behaviour
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Behaviour
 identical to the previous inline `on_item_added`.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import logging
 import time
 
 from .user_turn_items import process_user_turn_item
-from .w_runtime import (
+from .runtime_env import (
     DETERMINISTIC_CLOSING_MESSAGE, DETERMINISTIC_CLOSING_MESSAGE_EN,
     FALLBACK_REPLY, _item_is_tool_related, _msg_text, clean_reply_text,
 )

@@ -1,7 +1,6 @@
 """Super Admin user management (roles, disable, wallet adjustments, detail).\n\nExtracted from the old monolithic admin_service — behavior unchanged.\n"""
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Dict, List, Optional
 

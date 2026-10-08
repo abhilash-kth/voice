@@ -127,4 +127,4 @@ def build_end_call_tool(cfg, lead_data, llm, agent_ref, closing_state,
         if len(prior_memory) != len(_pm_truncated):
             logger.info(f"🔧 Prior memory truncated {len(prior_memory)} -> {len(_pm_truncated)} chars (budget {_pm_budget}) to reduce 3500-3700 tokens")
 
-    return _end_call
+    return end_call_tool, chat_ctx

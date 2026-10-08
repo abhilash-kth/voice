@@ -16,7 +16,6 @@ logger = logging.getLogger("voice-agent-saas-worker")
 def build_contextual_retrieval(turn_ctx, original_user_query):
     """Harvest recent conversational context and build the internal
     retrieval query (the caller-facing user message stays unchanged)."""
-    original_user_query = user_text
     retrieval_query = original_user_query
     recent_user_ctx = ""
     recent_assistant_ctx = ""

@@ -55,8 +55,6 @@ def prepare_turn(self, new_message, closing_state):
             self._turn_timing_ref["callback_enter_mono_ns"] = _commit_mono
             self._turn_timing_ref["pipeline_stage"] = "user_turn_completed"
             _final_mono = int(self._turn_timing_ref.get("stt_final_mono_ns", 0) or 0)
-            _final_ts = float(self._turn_timing_ref.get("stt_final_ts", 0.0) or 0.0)
-            _final_age = _commit_ts - _final_ts
             _commit_ms = (
                 f"{(_commit_mono - _final_mono) / 1_000_000:.0f}ms"
                 if _final_mono > 0 and _commit_mono >= _final_mono

@@ -1,7 +1,7 @@
 """Call finalization: cost computation, billing report/POST, local call
 update, wallet fallback deduction (deduped via has_spend_for_call).
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Runs as the
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Runs as the
 LiveKit shutdown callback; identical behaviour to the previous inline
 finalize_billing.
 """
@@ -11,10 +11,10 @@ import asyncio
 import logging
 import time
 
-from . import w_runtime as _wr
-from .w_billing_reporter import _billing_report, _post_billing
-from .w_imports import calculate_call_cost, db_init, memory, repo
-from .w_runtime import _FAIL_THRESHOLD_SECONDS
+from . import runtime_env as _wr
+from .billing_turn_report import _billing_report, _post_billing
+from .dep_imports import calculate_call_cost, db_init, memory, repo
+from .runtime_env import _FAIL_THRESHOLD_SECONDS
 
 logger = logging.getLogger("voice-agent-saas-worker")
 

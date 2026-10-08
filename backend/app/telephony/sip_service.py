@@ -5,7 +5,6 @@ Extracted from telephony.py - behavior unchanged.
 from __future__ import annotations
 
 
-import asyncio
 import uuid
 import logging
 from datetime import timedelta

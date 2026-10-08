@@ -1,5 +1,5 @@
 """TimingStreamWrapper: TTFT / usage / chargefinalisation instrumentation
-around a single LLM stream. Extracted 1:1 from `w_llm_timing.py`.
+around a single LLM stream. Extracted 1:1 from `llm_timing_factory.py`.
 """
 from __future__ import annotations
 

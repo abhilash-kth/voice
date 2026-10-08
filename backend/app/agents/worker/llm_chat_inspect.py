@@ -1,6 +1,6 @@
 """ChatContext inspection for request-level LLM timing: message head
 fingerprints (head_sha), token estimates + cache metadata. Extracted 1:1
-from `w_llm_timing.py` (`LLMTimingWrapper.chat`).
+from `llm_timing_factory.py` (`LLMTimingWrapper.chat`).
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ _logger = logging.getLogger("voice-agent-saas-worker")
 
 
 def _inspect_chat_ctx(self, args, kwargs):
+    _gen = int(self._timing.get("gen", 0))
     _req_inflight = False
     _token_estimate_ns = _fingerprint_ns = _cache_metadata_ns = 0
     _cc = kwargs.get("chat_ctx")

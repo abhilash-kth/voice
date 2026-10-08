@@ -1,5 +1,5 @@
 """Probe-helper predicates + probe/chat-context-manager wrappers for the
-LLM timing instrumentation. Extracted verbatim from `w_llm_timing.py`
+LLM timing instrumentation. Extracted verbatim from `llm_timing_factory.py`
 (<=300-line rule).
 """
 from __future__ import annotations
@@ -36,6 +36,7 @@ def _is_recovery_probe() -> bool:
 
 
 def _rate_limit_fields(exc):
+    import re as _re_own
     """(is_429, limit, used, requested, retry_after_ms) — ONLY numbers the
     provider actually sent (headers / error body), never invented.
     'unknown' marks what the provider did not report."""

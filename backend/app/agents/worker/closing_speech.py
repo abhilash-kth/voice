@@ -1,6 +1,6 @@
 """Deterministic closing speech + LLM-silence fallback.
 
-Extracted verbatim from `w_entrypoint.py` via call_closing.py (<=300-line
+Extracted verbatim from `worker_entrypoint.py` via call_closing.py (<=300-line
 rule). Speaks the fixed goodbye, squelches pending fallback says, and arms
 the LLM-silence watchdog. Cross-calls to the no-response watchdog are
 late-wired exactly as they were in the original shared closure.
@@ -13,7 +13,7 @@ import time
 
 
 logger = logging.getLogger("voice-agent-saas-worker")
-from .w_runtime import DEFAULT_FALLBACK_RESPONSE, LLM_FALLBACK_DELAY, _get_deterministic_closing
+from .runtime_env import DEFAULT_FALLBACK_RESPONSE, LLM_FALLBACK_DELAY, _get_deterministic_closing
 
 
 def build_closing_speech(ctx, session, cfg, agent_mode, turn_timing, usage,

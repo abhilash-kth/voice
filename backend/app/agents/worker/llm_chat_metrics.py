@@ -1,6 +1,6 @@
 """Request-level LLM timing metrics: the outer `chat()` of `LLMTimingWrapper`
 (chat-context extraction, stable-head fingerprinting, span classification).
-Extracted 1:1 from `w_llm_timing.py`.
+Extracted 1:1 from `llm_timing_factory.py`.
 """
 from __future__ import annotations
 

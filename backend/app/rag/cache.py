@@ -7,7 +7,6 @@ from __future__ import annotations
 
 
 import logging
-import os
 import re
 from collections import OrderedDict
 from typing import Any, List

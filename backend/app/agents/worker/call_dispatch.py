@@ -1,16 +1,19 @@
 """Worker entrypoint: job-dispatch logging, 90s setup watchdog, failure
 framing (end room + shutdown + re-raise) around `_entrypoint_body`.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). The body
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). The body
 function is imported lazily inside `entrypoint` to avoid a circular import
-(w_entrypoint re-exports this entrypoint for __main__ / package __init__).
+(worker_entrypoint re-exports this entrypoint for __main__ / package __init__).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import traceback
+
+from .runtime_env import WORKER_AGENT_NAME, _mark_call_failed
 
 logger = logging.getLogger("voice-agent-saas-worker")
 
@@ -78,7 +81,7 @@ async def entrypoint(ctx):
 
     watchdog_task = asyncio.create_task(_setup_watchdog())
     try:
-        from .w_entrypoint import _entrypoint_body
+        from .worker_entrypoint import _entrypoint_body
         await _entrypoint_body(ctx, setup_complete)
     except Exception as e:
         # Avoid synchronous traceback.format_exc() on event loop (tokenize.open block)

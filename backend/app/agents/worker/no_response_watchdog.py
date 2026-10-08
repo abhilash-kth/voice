@@ -1,7 +1,7 @@
 """No-response watchdog: if the caller stays silent past the configured
 timeout, speaks the no-response message deterministically and hangs up.
 
-Extracted verbatim from `w_entrypoint.py` via call_closing.py (<=300-line
+Extracted verbatim from `worker_entrypoint.py` via call_closing.py (<=300-line
 rule). Cross-calls (pending-reply cancel) are late-wired as before.
 """
 from __future__ import annotations

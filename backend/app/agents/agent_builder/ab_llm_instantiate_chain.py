@@ -6,9 +6,10 @@ Extracted 1:1 from `agent_builder/ab_llm_pair.py` (<=300-line rule).
 from __future__ import annotations
 
 import logging
-import time
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
+
+from .ab_llm_instantiate import _instantiate_llm
 
 
 def instantiate_llm_from_kwargs(provider, provider_type, model_id, base_url, api_key, key_env, raw_id, llm_kwargs, _cache_cap, _cap, reasoning, use_responses_api):

@@ -3,7 +3,6 @@ from here; importing the package (which this does transitively) performs
 all top-level prewarm/bootstrap in the original order."""
 import os
 import sys
-import time
 
 from . import (
     WORKER_AGENT_NAME,

@@ -5,7 +5,6 @@ Extracted 1:1 from `agent_builder/ab_llm_pair.py` (<=300-line rule).
 from __future__ import annotations
 
 import logging
-import time
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
 

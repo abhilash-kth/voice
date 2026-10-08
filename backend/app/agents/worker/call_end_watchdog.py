@@ -2,7 +2,7 @@
 (any disconnect reason), so LiveKit shutdown callbacks (finalize_billing)
 always run. Contains greeting/no-response speech-end bookkeeping.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule).
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule).
 """
 from __future__ import annotations
 
@@ -215,4 +215,4 @@ def build_call_end_watchdog(ctx, session, cfg, agent_mode, agent_id, greeting,
         logger.debug("duplicate agent check: %r", e)
 
     opening_backup = asyncio.create_task(_backup_opening_line())
-    return watch_call_end
+    return watch_call_end, opening_backup

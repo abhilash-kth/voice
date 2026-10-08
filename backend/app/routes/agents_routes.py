@@ -3,6 +3,10 @@ Extracted from the old monolithic main.py — behavior unchanged.
 """
 from __future__ import annotations
 
+import json
+
+from ..services import config_store
+
 import logging
 from typing import Optional
 

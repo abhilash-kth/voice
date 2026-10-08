@@ -2,7 +2,7 @@
 DB init (process-cached), cached-record short-circuit, 2-attempt lookup,
 demo fallback, and the "agent not found → mark call failed → shutdown" path.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule); only the
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule); only the
 control-flow tail is adapted to return values (identical behaviour).
 """
 from __future__ import annotations
@@ -11,8 +11,8 @@ import asyncio
 import logging
 import time
 
-from .w_imports import AgentConfig, db_init, repo
-from . import w_runtime as _wr
+from .dep_imports import AgentConfig, db_init, repo
+from . import runtime_env as _wr
 
 logger = logging.getLogger("voice-agent-saas-worker")
 

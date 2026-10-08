@@ -1,6 +1,6 @@
 """Closing / no-response / silence-fallback pipeline for a call.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Contains the
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Contains the
 deterministic closing speak + booking, the LLM-silence fallback watchdog,
 the no-response (caller stayed quiet) watchdog, and room/session close
 handlers. Behaviour is identical to the previous inline implementation.
@@ -15,7 +15,7 @@ logger = logging.getLogger("voice-agent-saas-worker")
 
 from .closing_speech import build_closing_speech
 from .no_response_watchdog import build_no_response_watchdog
-from .w_runtime import DEFAULT_FALLBACK_RESPONSE, LLM_FALLBACK_DELAY, _get_deterministic_closing
+from .runtime_env import DEFAULT_FALLBACK_RESPONSE, LLM_FALLBACK_DELAY, _get_deterministic_closing
 
 
 def build_closing_pipeline(ctx, session, cfg, agent_mode, turn_timing,
@@ -111,8 +111,6 @@ def build_closing_pipeline(ctx, session, cfg, agent_mode, turn_timing,
     _schedule_deterministic_closing = speech["schedule_closing"]
     _cancel_pending = speech["cancel_pending"]
     _mark_reply = speech["mark_reply"]
-    _spawn_say = speech["spawn_say"]
-    _silence_fallback = speech["silence_fallback"]
     _schedule_silence_fallback = speech["schedule_silence_fallback"]
 
     noresp = build_no_response_watchdog(
@@ -120,7 +118,6 @@ def build_closing_pipeline(ctx, session, cfg, agent_mode, turn_timing,
         call_closed, call_finished, closing_in_progress, closing_requested,
         agent_holder, reply_tracker, late)
     _cancel_no_response = noresp["cancel"]
-    _no_response_timeout_handler = noresp["handler"]
     _schedule_no_response = noresp["schedule"]
     late["cancel_pending"] = _cancel_pending
     late["cancel_no_response"] = _cancel_no_response

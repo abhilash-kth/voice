@@ -1,7 +1,7 @@
 """agent_state_changed hook: turn-timing bookkeeping and reply-stall /
 empty-turn race handling driven by listening/thinking/speaking transitions.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Identical
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Identical
 behaviour to the previous inline `_on_state`.
 """
 from __future__ import annotations

@@ -33,7 +33,7 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     provider, model_id, base_url, api_key, key_env, provider_type = resolve_pair_credentials(sel, overrides, raw_id)
 
     # Import new catalog for validation and metadata
-    model_id, model_meta = gate_and_enrich_model(overrides, raw_id, provider, model_id, base_url, provider_type)
+    model_id, model_meta = gate_and_enrich_model(overrides, raw_id, provider, model_id, base_url, provider_type, key_env)
 
     low, meta, reasoning, _cap_override, _reasoning_mdl, _cap = resolve_reasoning_budget(provider, model_id, overrides)
 

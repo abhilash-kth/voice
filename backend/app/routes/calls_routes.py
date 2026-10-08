@@ -5,6 +5,7 @@ watchdog lives in calls_watchdog.py (300-line file budget).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Optional

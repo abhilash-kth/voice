@@ -1,6 +1,6 @@
 """Event-loop stall diagnostics for the active call.
 
-Extracted verbatim from `w_entrypoint.py` (<=300-line rule). Read-only
+Extracted verbatim from `worker_entrypoint.py` (<=300-line rule). Read-only
 observability: measures event-loop drift during active calls, dumps
 blocked-callback stacks, and can wrap slow sync callbacks.
 """

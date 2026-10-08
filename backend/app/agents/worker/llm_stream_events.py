@@ -1,5 +1,5 @@
 """First-token instrumentation + per-chunk usage extraction for the LLM
-timing stream wrapper. Extracted 1:1 from `w_llm_timing.py` (__aiter__).
+timing stream wrapper. Extracted 1:1 from `llm_timing_factory.py` (__aiter__).
 """
 from __future__ import annotations
 
