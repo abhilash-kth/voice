@@ -53,3 +53,20 @@ def _prewarm_ssl_context():
 _threading_prewarm.Thread(target=_prewarm_ssl_context, daemon=True).start()
 
 # Patch LiveKit http_context and httpx to use cached SSL context - fixes 314ms and 1359ms blocks
+
+
+async def ensure_ssl_before_db_init() -> None:
+    """Ensure the SSL context cache exists before DB init. If the import-time
+    prewarm thread has not finished, build it off-loop in a thread (never on the
+    loop — that is the >1s ssl.create_default_context stall right before the
+    greeting). Extracted verbatim from `_entrypoint_body`."""
+    try:
+        if _ssl_context_cache is None:
+            await asyncio.wait_for(asyncio.to_thread(_prewarm_ssl_context), timeout=4)
+            if _ssl_context_cache is None:
+                logger.warning("⚠️ SSL context still not cached before DB init — first connect may block the loop")
+            else:
+                logger.info("🔧 SSL context ready before DB init (built off-loop)")
+    except Exception as _e:
+        logger.debug(f"SSL ensure failed: {_e!r}")
+
