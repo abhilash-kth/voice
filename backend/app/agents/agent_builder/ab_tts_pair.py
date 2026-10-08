@@ -10,7 +10,7 @@ logger = logging.getLogger("voice-agent-saas-agent-builder")
 
 
 # cross-module imports (auto-generated)
-from .ab_config_access import _provider_api_key, _provider_base_url
+from .ab_config_access import _provider_api_key, _provider_base_url, _key_miss_reason
 from .ab_tts_select import _normalized_voice_speed, _tts_adapter_for_pair
 from .ab_voices import _resolve_tts_voice, locale_for_language
 
@@ -44,7 +44,7 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         if not api_key:
             raise RuntimeError(
                 f"TTS provider '{sel.id}' needs an API key — set it in the Super Admin panel "
-                f"(Providers → '{slug or sel.id}' → Credentials). Provider keys are NOT read from .env."
+                f"(Providers → '{slug or sel.id}' → Credentials). Provider keys are NOT read from .env." + _key_miss_reason()
             )
         base_url = overrides.get("base_url") or _provider_base_url("tts", slug or sel.id) or None
         kwargs: dict = dict(model=model, voice=voice, api_key=api_key)
@@ -96,7 +96,7 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         if not api_key:
             raise RuntimeError(
                 "Sarvam TTS needs an API key — set it in the Super Admin panel "
-                "(Providers → 'sarvam' → Credentials). Provider keys are NOT read from .env."
+                "(Providers → 'sarvam' → Credentials). Provider keys are NOT read from .env." + _key_miss_reason()
             )
         configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
         target_language = overrides.get("language") or locale_for_language(configured_language)
@@ -161,7 +161,7 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         if not api_key:
             raise RuntimeError(
                 "Cartesia TTS needs an API key — set it in the Super Admin panel "
-                "(Providers → 'cartesia' → Credentials). Provider keys are NOT read from .env."
+                "(Providers → 'cartesia' → Credentials). Provider keys are NOT read from .env." + _key_miss_reason()
             )
         model = overrides.get("model", "sonic-3")
         configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
@@ -214,7 +214,7 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         if not _el_key:
             raise RuntimeError(
                 "ElevenLabs TTS needs an API key — set it in the Super Admin panel "
-                "(Providers → 'elevenlabs' → Credentials). Provider keys are NOT read from .env."
+                "(Providers → 'elevenlabs' → Credentials). Provider keys are NOT read from .env." + _key_miss_reason()
             )
         kwargs["api_key"] = _el_key
         return TTS(**kwargs)
@@ -234,7 +234,7 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         if not api_key:
             raise RuntimeError(
                 "OpenRouter TTS needs an API key — set it in the Super Admin panel "
-                "(Providers → 'openrouter' → Credentials). Provider keys are NOT read from .env."
+                "(Providers → 'openrouter' → Credentials). Provider keys are NOT read from .env." + _key_miss_reason()
             )
         default_voices = {
             "deepgram/flux-tts:free": "flux-bree-en",

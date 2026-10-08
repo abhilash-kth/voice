@@ -111,7 +111,15 @@ async def refresh_if_stale(force: bool = False) -> ConfigSnapshot:
                 _STALE = False
                 snap = new_snap
         except Exception as e:
-            logger.warning(f"config snapshot refresh failed (keeping last good): {e!r}")
+            # Stuck on the code-fallback snapshot means EMPTY credentials —
+            # panel API keys silently can't resolve. That is no longer a mere
+            # warning: provider keys come ONLY from the panel now.
+            if get_snapshot().source != "db":
+                logger.error(
+                    f"⛔ config snapshot refresh failed and NO DB snapshot exists "
+                    f"(source=code): {e!r} — Super-Admin API keys will NOT resolve")
+            else:
+                logger.warning(f"config snapshot refresh failed (keeping last good): {e!r}")
     return snap
 
 

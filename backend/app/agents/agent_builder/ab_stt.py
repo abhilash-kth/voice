@@ -11,7 +11,7 @@ logger = logging.getLogger("voice-agent-saas-agent-builder")
 
 
 # cross-module imports (auto-generated)
-from .ab_config_access import _provider_api_key
+from .ab_config_access import _provider_api_key, _key_miss_reason
 from .ab_voices import locale_for_language
 
 def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
@@ -31,6 +31,7 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
             raise RuntimeError(
                 "Sarvam STT needs an API key — set it in the Super Admin panel "
                 "(Providers → 'sarvam' → Credentials). Provider keys are NOT read from .env."
+                + _key_miss_reason()
             )
         lang = overrides.get("language") or locale_for_language(getattr(cfg, "language", "hi"))
         model = overrides.get("model", "saaras:v3")
@@ -61,6 +62,7 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
         raise RuntimeError(
             "Deepgram STT needs an API key — set it in the Super Admin panel "
             "(Providers → 'deepgram' → Credentials). Provider keys are NOT read from .env."
+            + _key_miss_reason()
         )
     keywords = overrides.get("keywords") or [
         ("Kriscent", 10.0),

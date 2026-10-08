@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 
-from .ab_config_access import _provider_api_key, _provider_base_url
+from .ab_config_access import _provider_api_key, _provider_base_url, _key_miss_reason
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
 
@@ -110,6 +110,6 @@ def resolve_pair_credentials(sel, overrides, raw_id):
         raise RuntimeError(
             f"No API key for LLM provider '{provider}' (id={raw_id}). Set it in the Super Admin "
             f"panel (Providers → '{key_slug}' → Credentials) — provider keys are NOT read from .env. "
-            f"Provider={provider}, model={model_id}, base_url={base_url or 'https://api.openai.com/v1'}"
+            f"Provider={provider}, model={model_id}, base_url={base_url or 'https://api.openai.com/v1'}" + _key_miss_reason()
         )
     return provider, model_id, base_url, api_key, key_slug, provider_type
