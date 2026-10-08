@@ -296,7 +296,5 @@ def get_api_key(kind: str, slug: str) -> Optional[str]:
             return None
     return None
 
-
 def provider_base_url(kind: str, slug: str) -> str:
-    p = get_provider(kind, slug)
-    return (p or {}).get("base_url") or ""
+    return (get_provider(kind, slug) or {}).get("base_url") or ""
