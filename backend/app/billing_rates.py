@@ -1,25 +1,28 @@
 """Customer-price composition (split from billing.py; ≤300-line rule).
 
-Industry model — a transparent rate card with a never-loss floor:
+Per-minute rate card — the customer pays, per call:
 
-  Customer ₹/min = (per-mode flat rate, else Σ customer_price_per_min of the
-                    call's selected LLM+STT+TTS models — the Super Admin's
-                    rate card on the Models page)
-                   + concurrency surcharge (agent's Max-concurrent tier)
-                   + miscellaneous fee
-  Final price    = max(rate_card × minutes, infra_cost × (1+margin),
-                       min_client_price)   ← gross margin can never go
-                       negative and the floor always applies.
+  ₹/min = Σ customer_price_per_min of the call's selected LLM + STT + TTS
+          models (Super-Admin per-model prices on the Models page)
+        + server_cost_per_min (platform infra component, also admin-set)
+  floored at the per-mode minimum (assistant_min / announcement_min ₹/min),
+  then per-call at max(infra_cost × (1+margin), min_client_price) so a call
+  can NEVER bill below cost.
 
-All knobs are Super-Admin-controlled via BillingConfig (0/[] = off → legacy).
+Concurrency is NOT billed per minute here: extra concurrent lines are a
+monthly subscription item (services/subscription_service.py), as is the
+telephony rent and the per-agent-count platform fee.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from .config import SERVER_COST_PER_MIN, PROFIT_MARGIN_PERCENT, MIN_CLIENT_PRICE
 
 
+# ---------------------------------------------------------------------------
+# Snapshot-backed constants (DB wins, env/code are fallbacks)
+# ---------------------------------------------------------------------------
 def billing_consts() -> Dict[str, Any]:
     """All BillingConfig numbers with DB snapshot precedence + .env fallback.
 
@@ -30,46 +33,26 @@ def billing_consts() -> Dict[str, Any]:
         "server_cost_per_min": SERVER_COST_PER_MIN,
         "min_client_price": MIN_CLIENT_PRICE,
         "profit_margin_percent": PROFIT_MARGIN_PERCENT,
-        "announcement_price_per_min": 0.0,
-        "assistant_price_per_min": 0.0,
-        "misc_fee_per_min": 0.0,
-        "concurrency_addons": [],
+        "assistant_min_per_min": MIN_CLIENT_PRICE,
+        "announcement_min_per_min": MIN_CLIENT_PRICE,
+        "concurrency_line_price_per_month": 0.0,
+        "telephony_rent_per_month": 0.0,
     }
     try:
         from .services import config_store
 
         b = config_store.get_billing()
-        for k in ("server_cost_per_min", "min_client_price", "profit_margin_percent",
-                  "announcement_price_per_min", "assistant_price_per_min", "misc_fee_per_min"):
+        for k in out:
             if b.get(k) is not None:
                 out[k] = float(b[k])
-        tiers = b.get("concurrency_addons")
-        if isinstance(tiers, list):
-            out["concurrency_addons"] = tiers
     except Exception:
         pass
     return out
 
 
-def concurrency_addon_for(tiers: List[Dict[str, Any]], max_concurrency: int) -> float:
-    """₹/min surcharge for an agent whose Max-concurrent is `max_concurrency`.
-
-    Tiers are ascending by `up_to`; the first tier with up_to >= value applies.
-    A value above every tier uses the LAST tier (by design — never free).
-    """
-    try:
-        mc = max(int(max_concurrency), 1)
-    except (TypeError, ValueError):
-        mc = 1
-    best = None
-    for t in sorted((t for t in tiers or [] if isinstance(t, dict)),
-                    key=lambda t: t.get("up_to", 0)):
-        best = t
-        if mc <= int(t.get("up_to", 0) or 0):
-            return float(t.get("addon_per_min", 0) or 0)
-    return float(best.get("addon_per_min", 0) or 0) if best else 0.0
-
-
+# ---------------------------------------------------------------------------
+# The call's selected models' rate card (₹/min)
+# ---------------------------------------------------------------------------
 def _snapshot_model_price(kind: str, key: str, model_id: str = "") -> float:
     """Super-Admin rate card: a model's customer_price_per_min from the DB
     snapshot (0 when unset / snapshot unavailable). key = catalogId for
@@ -102,22 +85,20 @@ def selected_models_rate_per_min(*, llm_provider: str = "", llm_model_id: str = 
 
 
 def customer_price(*, total_cost_inr: float, duration_mins: float,
-                   agent_mode: str = "assistant", max_concurrency: int = 1,
-                   models_rate_per_min: float = 0.0,
-                   consts: Dict[str, Any] | None = None) -> Dict[str, Any]:
+                   agent_mode: str = "assistant", models_rate_per_min: float = 0.0,
+                   consts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Compose the final customer price for one call. Returns the price plus a
-    transparent breakdown (each layer visible in the usage/cost record)."""
+    transparent breakdown (each component visible in the usage/cost record)."""
     c = consts or billing_consts()
-    flat = (c["announcement_price_per_min"] if (agent_mode or "assistant") == "announcement"
-            else c["assistant_price_per_min"])
-    applied_flat = flat if flat and flat > 0 else 0.0
-    rate_card = (applied_flat if applied_flat else float(models_rate_per_min or 0.0))
-    addon_per_min = concurrency_addon_for(c["concurrency_addons"], max_concurrency)
-    misc_per_min = float(c["misc_fee_per_min"])
-    rate_card += addon_per_min + misc_per_min
-    price = rate_card * duration_mins
+    models_rate = float(models_rate_per_min or 0.0)
+    server_per_min = float(c["server_cost_per_min"])
+    rate_card = models_rate + server_per_min
+    mode_min = (c["announcement_min_per_min"] if (agent_mode or "assistant") == "announcement"
+                else c["assistant_min_per_min"])
+    applied_rate = max(rate_card, float(mode_min))
+    price = applied_rate * duration_mins
     # Never-loss floor: customer pays at least infra cost × (1+margin), and at
-    # least the configured minimum per call.
+    # least the configured absolute minimum per call.
     floor_price = max(total_cost_inr * (1.0 + (c["profit_margin_percent"] / 100.0)),
                       c["min_client_price"])
     floor_applied = price < floor_price
@@ -125,11 +106,10 @@ def customer_price(*, total_cost_inr: float, duration_mins: float,
         price = floor_price
     return {
         "client_price_inr": round(price, 2),
+        "models_rate_per_min": round(models_rate, 4),
+        "server_per_min": round(server_per_min, 4),
         "rate_card_per_min": round(rate_card, 4),
-        "models_rate_per_min": round(float(models_rate_per_min or 0.0), 4),
-        "applied_flat_rate_per_min": round(applied_flat, 4),
-        "concurrency_addon_per_min": round(addon_per_min, 4),
-        "misc_fee_per_min": round(misc_per_min, 4),
-        "addon_fees_inr": round((addon_per_min + misc_per_min) * duration_mins, 4),
+        "mode_min_per_min": round(float(mode_min), 4),
+        "applied_rate_per_min": round(applied_rate, 4),
         "floor_applied": bool(floor_applied),
     }

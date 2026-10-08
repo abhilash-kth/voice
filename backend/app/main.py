@@ -33,7 +33,7 @@ from .admin import routes as admin_routes
 from .services import config_store
 from .routes import (auth_routes, catalog_routes, agents_routes,
                      calls_routes, campaigns_routes, billing_routes,
-                     setup_routes)
+                     setup_routes, subscription_routes)
 
 logger = logging.getLogger("voice-agent-saas-api")
 
@@ -101,11 +101,27 @@ async def lifespan(app):
 
     cleanup_task = asyncio.create_task(_cleanup_loop())
     campaign_task = asyncio.create_task(_campaign_loop())
+
+    # Monthly subscription renewals: sweep every hour (past-due grace and
+    # deactivation are date-based, so hourly resolution is plenty).
+    sub_poll = int(os.getenv("SUBSCRIPTION_SWEEP_SECONDS", "3600"))
+
+    async def _subscription_loop():
+        from .services import subscription_service
+        while True:
+            try:
+                await subscription_service.renew_due()
+            except Exception as e:
+                logger.warning(f"subscription renewal sweep error: {e}")
+            await asyncio.sleep(sub_poll)
+
+    subscription_task = asyncio.create_task(_subscription_loop())
     try:
         yield
     finally:
         cleanup_task.cancel()
         campaign_task.cancel()
+        subscription_task.cancel()
         warm_task.cancel()
         await shutdown()
 
@@ -119,6 +135,7 @@ app.include_router(agents_routes.router)
 app.include_router(calls_routes.router)
 app.include_router(campaigns_routes.router)
 app.include_router(billing_routes.router)
+app.include_router(subscription_routes.router)
 
 app.add_middleware(
     CORSMiddleware,

@@ -90,12 +90,29 @@ async def create_agent(body: AgentCreate, user=Depends(auth.get_current_user)):
         # (Saved agents that already use one keep running — see voice pipeline.)
         if prov.get("enabled") is False:
             raise HTTPException(400, f"Provider {sel.id} is disabled by the administrator for {kind}")
+    # Monthly-plan entitlements: active subscription + agent-slot headroom,
+    # and the agent's max concurrency must fit the purchased lines.
+    from ..services import subscription_service
+    try:
+        current = len(await repo.list_agents(user.id))
+        await subscription_service.ensure_agent_creation_allowed(user.id, current)
+        await subscription_service.ensure_concurrency_allowed(
+            user.id, int(getattr(body, "max_concurrency", 1) or 1))
+    except subscription_service.SubscriptionError as e:
+        raise HTTPException(402, str(e)) from None
     return await repo.create_agent(user.id, body.model_dump())
 
 
 @router.put("/api/agents/{agent_id}")
 async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_current_user)):
     patch = body.model_dump(exclude_none=True)
+    if patch.get("max_concurrency") is not None:
+        from ..services import subscription_service
+        try:
+            await subscription_service.ensure_concurrency_allowed(
+                user.id, int(patch["max_concurrency"] or 1))
+        except subscription_service.SubscriptionError as e:
+            raise HTTPException(402, str(e)) from None
     rec = await repo.update_agent(agent_id, user.id, patch)
     if not rec:
         raise HTTPException(404, "Agent not found")
@@ -133,8 +150,23 @@ async def add_knowledge(
     file: Optional[UploadFile] = File(None),
     user=Depends(auth.get_current_user),
 ):
-    if not await repo.get_agent(agent_id, user.id):
+    agent_rec = await repo.get_agent(agent_id, user.id)
+    if not agent_rec:
         raise HTTPException(404, "Agent not found")
+
+    # Entitlement limits (free base + purchased KB packs), enforced per agent.
+    from ..services import subscription_service
+    lim = await subscription_service.kb_limits(user.id)
+
+    def _kb_over(total_chars: int = 0, faq_count: int = 0) -> None:
+        if total_chars > lim["kb_char_limit"]:
+            raise HTTPException(402, (
+                f"Knowledge base limit exceeded ({total_chars}/{lim['kb_char_limit']} chars). "
+                "Buy a KB pack on the Billing page for a bigger allowance."))
+        if faq_count > lim["kb_faq_limit"]:
+            raise HTTPException(402, (
+                f"FAQ limit exceeded ({faq_count}/{lim['kb_faq_limit']}). "
+                "Buy a KB pack on the Billing page for more FAQs."))
 
     if file is not None and text and text.strip():
         raise HTTPException(400, "Choose either a knowledge file or pasted text, not both")
@@ -147,13 +179,17 @@ async def add_knowledge(
         content = _parse_file(doc_name, raw)
         if len(content) > 2_000_000:
             raise HTTPException(413, "Extracted knowledge content is too large")
-        # File upload is a replacement operation: never accumulate stale files.
+        # File upload REPLACES the document source — the new total is just it.
+        _kb_over(total_chars=len(content))
         await repo.set_agent_knowledge(agent_id, user.id, {"text": "", "documents": [{"name": doc_name, "content": content}]})
-        return {"ok": True, "replaced": "document"}
+        return {"ok": True, "replaced": "document", "kb_char_limit": lim["kb_char_limit"]}
 
     if text:
+        # Pasted text replaces the whole knowledge source (repo clears
+        # documents when text is set), so the new total is just the text.
+        _kb_over(total_chars=len(text))
         await repo.set_agent_knowledge(agent_id, user.id, {"text": text})
-        return {"ok": True, "appended": "text"}
+        return {"ok": True, "appended": "text", "kb_char_limit": lim["kb_char_limit"]}
 
     if faq:
         import json as _json
@@ -161,8 +197,9 @@ async def add_knowledge(
             items = _json.loads(faq)
         except Exception:
             raise HTTPException(400, "faq must be a JSON array of {q,a}")
+        _kb_over(faq_count=len(items))
         await repo.set_agent_knowledge(agent_id, user.id, {"faq": items})
-        return {"ok": True, "appended": "faq", "count": len(items)}
+        return {"ok": True, "appended": "faq", "count": len(items), "kb_faq_limit": lim["kb_faq_limit"]}
 
     raise HTTPException(400, "Provide text, faq, or a file")
 

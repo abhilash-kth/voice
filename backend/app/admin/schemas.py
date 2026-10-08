@@ -147,3 +147,28 @@ class BillingUpdateBody(BaseModel):
     assistant_price_per_min: Optional[float] = None
     misc_fee_per_min: Optional[float] = None
     concurrency_addons: Optional[List[Dict[str, Any]]] = None
+    # Monthly subscription economics + per-mode rate-card minimums
+    concurrency_line_price_per_month: Optional[float] = None
+    telephony_rent_per_month: Optional[float] = None
+    assistant_min_per_min: Optional[float] = None
+    announcement_min_per_min: Optional[float] = None
+
+
+class PlanBody(BaseModel):
+    kind: str
+    label: str = Field(..., max_length=120)
+    units: int = 0
+    faqs: int = 0
+    price_per_month: float = Field(0, ge=0, le=10_000_000)
+    enabled: bool = True
+    sort_order: int = 0
+
+
+class PlanUpdateBody(BaseModel):
+    kind: Optional[str] = None
+    label: Optional[str] = None
+    units: Optional[int] = None
+    faqs: Optional[int] = None
+    price_per_month: Optional[float] = Field(None, ge=0, le=10_000_000)
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = None

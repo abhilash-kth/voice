@@ -298,6 +298,27 @@ async def _entrypoint_body(ctx, setup_complete):
     except Exception as _e:
         logger.warning("Config snapshot refresh failed (falling back to env keys): %r", _e)
 
+    # --- Monthly-plan gate ---------------------------------------------------
+    # No active subscription (or past_due) → no calls. The call row is marked
+    # failed with a user-facing reason; the call is never billed.
+    try:
+        from app.services import subscription_service as _subs
+        _gate_reason = await _subs.call_gate(user_id) if user_id else None
+    except Exception as _ge:
+        _gate_reason = None
+        logger.debug(f"subscription gate check failed (allowing call): {_ge!r}")
+    if _gate_reason:
+        logger.warning("[CALL_BLOCKED] room=%s user=%s reason=%s", getattr(ctx.room, "name", ""), user_id, _gate_reason)
+        try:
+            await _mark_call_failed(call_id, _gate_reason)
+        except Exception:
+            pass
+        try:
+            ctx.shutdown()
+        except Exception:
+            pass
+        return
+
     logger.info(f"📞 agent={cfg.name} mode={mode} phone={phone} call={call_id}")
 
     # Ensure the call record status is tracked in-progress asynchronously without blocking audio

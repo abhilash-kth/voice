@@ -258,7 +258,57 @@ model BillingConfig {
   // Concurrency surcharges, JSON array of {"up_to": int, "addon_per_min": float},
   // ascending. First tier with up_to >= agent's max_concurrency applies.
   concurrencyAddons      String @default("[]")
+  // --- Monthly subscription economics (see services/subscription_service.py) ---
+  // Price per EXTRA concurrency line per month (first line is free), ₹/month.
+  concurrencyLinePricePerMonth Float @default(0)
+  // Monthly rent for the telephony/number access, ₹/month.
+  telephonyRentPerMonth        Float @default(0)
+  // Per-mode minimum customer rate, ₹/min (rate card floors).
+  assistantMinPerMin           Float @default(1.0)
+  announcementMinPerMin        Float @default(1.0)
   updatedAt              String @default("")
+}
+
+// --------------------------------------------------------------------------
+// Monthly subscription: one row per user, snapshots their entitled plan.
+// Prices are taken from BillingConfig/PlanTier AT PURCHASE time (Super-Admin
+// price changes only affect future purchases/renewals).
+// --------------------------------------------------------------------------
+model Subscription {
+  id               String  @id @default(cuid())
+  userId           String  @unique
+  agentLimit       Int     @default(0)   // 0 = no platform plan purchased
+  concurrencyLines Int     @default(1)   // 1 line free
+  telephonyRented  Boolean @default(false)
+  kbCharLimit      Int     @default(0)   // extra chars on top of the free base
+  kbFaqLimit       Int     @default(0)   // extra FAQs on top of the free base
+  monthlyTotal     Float   @default(0)
+  status           String  @default("inactive") // active | past_due | inactive
+  startedAt        String  @default("")
+  renewsAt         String  @default("")
+  lastChargedAt    String  @default("")
+  pastDueSince     String  @default("")
+  createdAt        String  @default("")
+  updatedAt        String  @default("")
+
+  @@index([status, renewsAt])
+}
+
+// Super-Admin-managed purchasable plan rows.
+// kind="capacity": units = number of agents the plan allows.
+// kind="kb_pack": units = extra KB characters, faqs = extra FAQ entries allowed.
+model PlanTier {
+  id            String  @id @default(cuid())
+  kind          String  // capacity | kb_pack
+  label         String
+  units         Int
+  faqs          Int     @default(0)
+  pricePerMonth Float
+  enabled       Boolean @default(true)
+  sortOrder     Int     @default(0)
+  createdAt     String  @default("")
+
+  @@index([kind, sortOrder])
 }
 
 // --------------------------------------------------------------------------

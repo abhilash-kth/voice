@@ -79,6 +79,11 @@ async def get_billing() -> Dict[str, Any]:
         "assistant_price_per_min": float(getattr(b, "assistantPricePerMin", 0) or 0),
         "misc_fee_per_min": float(getattr(b, "miscFeePerMin", 0) or 0),
         "concurrency_addons": tiers,
+        # Monthly subscription economics + per-mode rate-card minimums.
+        "concurrency_line_price_per_month": float(getattr(b, "concurrencyLinePricePerMonth", 0) or 0),
+        "telephony_rent_per_month": float(getattr(b, "telephonyRentPerMonth", 0) or 0),
+        "assistant_min_per_min": float(getattr(b, "assistantMinPerMin", 1.0) or 1.0),
+        "announcement_min_per_min": float(getattr(b, "announcementMinPerMin", 1.0) or 1.0),
         "updated_at": b.updatedAt or "",
     }
 
@@ -124,6 +129,14 @@ async def update_billing(patch: Dict[str, Any], *, admin: Dict[str, Any]) -> Dic
         data["assistantPricePerMin"] = v
     if (v := _flt("misc_fee_per_min", 0, 10000, "misc_fee_per_min")) is not None:
         data["miscFeePerMin"] = v
+    if (v := _flt("concurrency_line_price_per_month", 0, 10_000_000, "concurrency_line_price_per_month")) is not None:
+        data["concurrencyLinePricePerMonth"] = v
+    if (v := _flt("telephony_rent_per_month", 0, 10_000_000, "telephony_rent_per_month")) is not None:
+        data["telephonyRentPerMonth"] = v
+    if (v := _flt("assistant_min_per_min", 0, 10000, "assistant_min_per_min")) is not None:
+        data["assistantMinPerMin"] = v
+    if (v := _flt("announcement_min_per_min", 0, 10000, "announcement_min_per_min")) is not None:
+        data["announcementMinPerMin"] = v
     if patch.get("concurrency_addons") is not None:
         tiers = _validate_concurrency_addons(patch["concurrency_addons"])
         data["concurrencyAddons"] = json.dumps(tiers)
