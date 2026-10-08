@@ -1,17 +1,27 @@
 "use client";
 
 // Backend base URL (FastAPI on :8000). Override with NEXT_PUBLIC_BACKEND_URL.
-const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:9000";
 
 // Session security: the JWT lives in an httpOnly, SameSite=Lax cookie that
 // JavaScript can never read — the panel stores NOTHING in localStorage.
-export function setToken(_t?: string) { /* cookie session — nothing to store */ }
-export function getToken(): string | null { return null; }
+export function setToken(_t?: string) {
+  /* cookie session — nothing to store */
+}
+export function getToken(): string | null {
+  return null;
+}
 export function clearToken() {
-  fetch(`${BASE}/api/auth/logout`, { method: "POST", credentials: "include" }).catch(() => {});
+  fetch(`${BASE}/api/auth/logout`, {
+    method: "POST",
+    credentials: "include",
+  }).catch(() => {});
 }
 
-export async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function req<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...options,
     credentials: "include",
@@ -28,13 +38,19 @@ export async function req<T>(path: string, options: RequestInit = {}): Promise<T
     } catch {
       /* ignore */
     }
-    const err = Object.assign(new Error(detail || `Request failed (${res.status})`), {
-      status: res.status,
-    });
+    const err = Object.assign(
+      new Error(detail || `Request failed (${res.status})`),
+      {
+        status: res.status,
+      },
+    );
     // Session expired or no longer authorized → bounce to login.
     if (res.status === 401 || res.status === 403) {
       clearToken();
-      if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
+      if (
+        typeof window !== "undefined" &&
+        !window.location.pathname.startsWith("/login")
+      ) {
         window.location.href = "/login";
       }
     }
@@ -84,24 +100,35 @@ export interface Stats {
 export interface AdminHealth {
   ok: boolean;
   snapshot_source: string;
-  snapshot_ts: number;   // Unix epoch SECONDS (from time.time()), not a string
+  snapshot_ts: number; // Unix epoch SECONDS (from time.time()), not a string
   snapshot_error?: string | null;
 }
 export const adminStats = () => req<Stats>("/api/admin/stats");
 export const adminHealth = () => req<AdminHealth>("/api/admin/health");
 export const reloadConfig = () =>
-  req<{ ok: boolean; source: string; ts: number }>("/api/admin/config/reload", { method: "POST" });
+  req<{ ok: boolean; source: string; ts: number }>("/api/admin/config/reload", {
+    method: "POST",
+  });
 export const reseedConfig = () =>
-  req<{ ok: boolean; source: string }>("/api/admin/config/reseed", { method: "POST" });
+  req<{ ok: boolean; source: string }>("/api/admin/config/reseed", {
+    method: "POST",
+  });
 
 // ------ users ----------------------------------------------------------------
-export const listUsers = (params: { page?: number; page_size?: number; q?: string; role?: string; disabled?: boolean }) => {
+export const listUsers = (params: {
+  page?: number;
+  page_size?: number;
+  q?: string;
+  role?: string;
+  disabled?: boolean;
+}) => {
   const qs = new URLSearchParams();
   if (params.page) qs.set("page", String(params.page));
   if (params.page_size) qs.set("page_size", String(params.page_size));
   if (params.q) qs.set("q", params.q);
   if (params.role) qs.set("role", params.role);
-  if (params.disabled !== undefined) qs.set("disabled", String(params.disabled));
+  if (params.disabled !== undefined)
+    qs.set("disabled", String(params.disabled));
   return req<Paged<ApiUser>>(`/api/admin/users?${qs.toString()}`);
 };
 
@@ -109,7 +136,11 @@ export interface UserDetail {
   user: ApiUser;
   agents: Record<string, unknown>[];
   calls: Record<string, unknown>[];
-  wallet: { balance: number; currency: string; transactions: Record<string, unknown>[] };
+  wallet: {
+    balance: number;
+    currency: string;
+    transactions: Record<string, unknown>[];
+  };
   usage: {
     walletBalance: number;
     totalCallsCount: number;
@@ -122,11 +153,18 @@ export interface UserDetail {
     recentCalls: Record<string, unknown>[];
   };
 }
-export const getUserDetail = (id: string) => req<UserDetail>(`/api/admin/users/${id}`);
+export const getUserDetail = (id: string) =>
+  req<UserDetail>(`/api/admin/users/${id}`);
 export const setUserRole = (id: string, role: "USER" | "SUPER_ADMIN") =>
-  req<ApiUser>(`/api/admin/users/${id}/role`, { method: "PUT", body: JSON.stringify({ role }) });
+  req<ApiUser>(`/api/admin/users/${id}/role`, {
+    method: "PUT",
+    body: JSON.stringify({ role }),
+  });
 export const setUserDisabled = (id: string, disabled: boolean) =>
-  req<ApiUser>(`/api/admin/users/${id}/disabled`, { method: "PUT", body: JSON.stringify({ disabled }) });
+  req<ApiUser>(`/api/admin/users/${id}/disabled`, {
+    method: "PUT",
+    body: JSON.stringify({ disabled }),
+  });
 export const adjustWallet = (id: string, amount: number, note: string) =>
   req<UserDetail["wallet"]>(`/api/admin/users/${id}/wallet`, {
     method: "POST",
@@ -152,13 +190,25 @@ export interface Provider {
   updated_at: string;
 }
 export const listProviders = (kind?: string) =>
-  req<{ items: Provider[] }>(`/api/admin/providers${kind ? `?kind=${kind}` : ""}`);
-export const createProvider = (body: Partial<Provider> & { kind: string; slug: string }) =>
-  req<Provider>("/api/admin/providers", { method: "POST", body: JSON.stringify(body) });
+  req<{ items: Provider[] }>(
+    `/api/admin/providers${kind ? `?kind=${kind}` : ""}`,
+  );
+export const createProvider = (
+  body: Partial<Provider> & { kind: string; slug: string },
+) =>
+  req<Provider>("/api/admin/providers", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 export const updateProvider = (id: string, patch: Partial<Provider>) =>
-  req<Provider>(`/api/admin/providers/${id}`, { method: "PUT", body: JSON.stringify(patch) });
+  req<Provider>(`/api/admin/providers/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
 export const deleteProvider = (id: string, cascade = false) =>
-  req<void>(`/api/admin/providers/${id}?cascade=${cascade}`, { method: "DELETE" });
+  req<void>(`/api/admin/providers/${id}?cascade=${cascade}`, {
+    method: "DELETE",
+  });
 
 // ------ catalog models --------------------------------------------------------
 export interface CatalogModel {
@@ -184,7 +234,12 @@ export interface CatalogModel {
   created_at: string;
   updated_at: string;
 }
-export const listModels = (params: { kind?: string; provider_id?: string; page?: number; page_size?: number }) => {
+export const listModels = (params: {
+  kind?: string;
+  provider_id?: string;
+  page?: number;
+  page_size?: number;
+}) => {
   const qs = new URLSearchParams();
   if (params.kind) qs.set("kind", params.kind);
   if (params.provider_id) qs.set("provider_id", params.provider_id);
@@ -192,10 +247,22 @@ export const listModels = (params: { kind?: string; provider_id?: string; page?:
   if (params.page_size) qs.set("page_size", String(params.page_size));
   return req<Paged<CatalogModel>>(`/api/admin/models?${qs.toString()}`);
 };
-export const createModel = (body: Partial<CatalogModel> & { kind: string; provider_id: string; catalog_id: string }) =>
-  req<CatalogModel>("/api/admin/models", { method: "POST", body: JSON.stringify(body) });
+export const createModel = (
+  body: Partial<CatalogModel> & {
+    kind: string;
+    provider_id: string;
+    catalog_id: string;
+  },
+) =>
+  req<CatalogModel>("/api/admin/models", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 export const updateModel = (id: string, patch: Partial<CatalogModel>) =>
-  req<CatalogModel>(`/api/admin/models/${id}`, { method: "PUT", body: JSON.stringify(patch) });
+  req<CatalogModel>(`/api/admin/models/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
 export const deleteModel = (id: string) =>
   req<void>(`/api/admin/models/${id}`, { method: "DELETE" });
 
@@ -211,26 +278,55 @@ export interface Credential {
   created_at: string;
   updated_at: string;
 }
-export const listCredentials = (params: { provider_id?: string; kind?: string } = {}) => {
+export const listCredentials = (
+  params: { provider_id?: string; kind?: string } = {},
+) => {
   const qs = new URLSearchParams();
   if (params.provider_id) qs.set("provider_id", params.provider_id);
   if (params.kind) qs.set("kind", params.kind);
-  return req<{ items: Credential[] }>(`/api/admin/credentials${qs.toString() ? `?${qs}` : ""}`);
+  return req<{ items: Credential[] }>(
+    `/api/admin/credentials${qs.toString() ? `?${qs}` : ""}`,
+  );
 };
-export const createCredential = (body: { provider_id: string; value: string; label?: string }) =>
-  req<Credential>("/api/admin/credentials", { method: "POST", body: JSON.stringify(body) });
-export const updateCredential = (id: string, patch: { value?: string; label?: string }) =>
-  req<Credential>(`/api/admin/credentials/${id}`, { method: "PUT", body: JSON.stringify(patch) });
-export const setCredentialStatus = (id: string, status: "active" | "disabled" | "rotated") =>
-  req<Credential>(`/api/admin/credentials/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) });
-export const rotateCredential = (id: string, new_value: string, label?: string) =>
+export const createCredential = (body: {
+  provider_id: string;
+  value: string;
+  label?: string;
+}) =>
+  req<Credential>("/api/admin/credentials", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateCredential = (
+  id: string,
+  patch: { value?: string; label?: string },
+) =>
+  req<Credential>(`/api/admin/credentials/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+export const setCredentialStatus = (
+  id: string,
+  status: "active" | "disabled" | "rotated",
+) =>
+  req<Credential>(`/api/admin/credentials/${id}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+export const rotateCredential = (
+  id: string,
+  new_value: string,
+  label?: string,
+) =>
   req<Credential>(`/api/admin/credentials/${id}/rotate`, {
     method: "POST",
     body: JSON.stringify({ new_value, label: label ?? "" }),
   });
 // Audited: returns the plaintext key ONCE for display in the panel only.
 export const revealCredential = (id: string) =>
-  req<{ value: string }>(`/api/admin/credentials/${id}/reveal`, { method: "POST" });
+  req<{ value: string }>(`/api/admin/credentials/${id}/reveal`, {
+    method: "POST",
+  });
 export const deleteCredential = (id: string) =>
   req<void>(`/api/admin/credentials/${id}`, { method: "DELETE" });
 // Billing types/helpers moved to lib/billing.ts (file-size budget).
@@ -264,9 +360,15 @@ export interface AuditLog {
   target_type: string;
   target_id: string;
   detail: Record<string, unknown>;
-  created_at: string;   // ISO string (backend field name is created_at, not ts)
+  created_at: string; // ISO string (backend field name is created_at, not ts)
 }
-export const listAuditLogs = (params: { page?: number; page_size?: number; action?: string; target_type?: string; q?: string }) => {
+export const listAuditLogs = (params: {
+  page?: number;
+  page_size?: number;
+  action?: string;
+  target_type?: string;
+  q?: string;
+}) => {
   const qs = new URLSearchParams();
   if (params.page) qs.set("page", String(params.page));
   if (params.page_size) qs.set("page_size", String(params.page_size));
