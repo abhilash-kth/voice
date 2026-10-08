@@ -19,6 +19,18 @@ from .runtime_env import _FAIL_THRESHOLD_SECONDS
 logger = logging.getLogger("voice-agent-saas-worker")
 
 
+def _min_bill_seconds_for(agent_mode: str) -> int:
+    """Super-Admin minimum billed seconds for this call's mode (0 = off)."""
+    try:
+        from ...billing_rates import billing_consts
+        c = billing_consts()
+        key = ("announcement_min_bill_seconds" if (agent_mode or "") == "announcement"
+               else "assistant_min_bill_seconds")
+        return int(c.get(key) or 0)
+    except Exception:
+        return 0
+
+
 def register_finalize_billing(ctx, cfg, agent_mode, agent_id, user_id, mode,
                               phone, customer_key, call_start, call_record,
                               recording_url, turn_timing, usage, memory_enabled):
@@ -138,7 +150,7 @@ def register_finalize_billing(ctx, cfg, agent_mode, agent_id, user_id, mode,
                     logger.debug(f"call metric summaries skipped: {_le!r}")
                 
                 if ttft == 0 and gen_time == 0:
-                    logger.warning(f"⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")
+                    logger.warning("⚠️ FINAL BILLING TTFT/gen_time still 0 after checking last metrics - using 0, but actual measurements were logged during call")
                 
                 logger.info(f"💰 FINAL BILLING LLM provider={llm_provider} model={llm_model} input={llm_input} cached={llm_cached} output={llm_output} TTFT={ttft:.0f}ms gen_time={gen_time:.0f}ms successful={successful_count} failed={failed_count} total_cost=${total_llm_cost:.6f} (aggregated authoritative)")
             except Exception as e:
@@ -174,6 +186,11 @@ def register_finalize_billing(ctx, cfg, agent_mode, agent_id, user_id, mode,
                 # assistant) + concurrency tier & misc fees (billing_rates.py).
                 agent_mode=agent_mode,
                 max_concurrency=int(getattr(cfg, "max_concurrency", 1) or 1),
+                # Enterprise minimum billed duration (Super Admin → Billing):
+                # a call shorter than this bills at the minimum; costs stay
+                # actual-usage. Per-mode knob, read from the same snapshot the
+                # rate card uses so the log matches the panel exactly.
+                min_bill_seconds=_min_bill_seconds_for(agent_mode),
             )
             if memory_enabled:
                 memory.save(customer_key, usage["transcripts"])

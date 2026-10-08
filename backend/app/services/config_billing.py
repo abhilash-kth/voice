@@ -33,6 +33,8 @@ def get_billing() -> Dict[str, Any]:
         "telephony_rent_per_month": float(b.get("telephonyRentPerMonth") or 0),
         "assistant_min_per_min": float(b.get("assistantMinPerMin") or 1.0),
         "announcement_min_per_min": float(b.get("announcementMinPerMin") or 1.0),
+        "assistant_min_bill_seconds": int(b.get("assistantMinBillSeconds") or 0),
+        "announcement_min_bill_seconds": int(b.get("announcementMinBillSeconds") or 0),
     }
     try:
         tiers = json.loads(b.get("concurrencyAddons") or "[]")

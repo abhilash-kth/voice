@@ -76,6 +76,16 @@ async def build_snapshot_from_db() -> Optional[ConfigSnapshot]:
             "assistantPricePerMin": getattr(billing_row, "assistantPricePerMin", 0) or 0,
             "miscFeePerMin": getattr(billing_row, "miscFeePerMin", 0) or 0,
             "concurrencyAddons": getattr(billing_row, "concurrencyAddons", "[]") or "[]",
+            # Per-mode rate-card minimums + monthly economics + enterprise
+            # minimum billed duration — every BillingConfig knob the super
+            # admin sets must reach the worker's snapshot (was silently
+            # falling back to code defaults for these keys).
+            "assistantMinPerMin": getattr(billing_row, "assistantMinPerMin", 1.0) or 1.0,
+            "announcementMinPerMin": getattr(billing_row, "announcementMinPerMin", 1.0) or 1.0,
+            "concurrencyLinePricePerMonth": getattr(billing_row, "concurrencyLinePricePerMonth", 0) or 0,
+            "telephonyRentPerMonth": getattr(billing_row, "telephonyRentPerMonth", 0) or 0,
+            "assistantMinBillSeconds": int(getattr(billing_row, "assistantMinBillSeconds", 0) or 0),
+            "announcementMinBillSeconds": int(getattr(billing_row, "announcementMinBillSeconds", 0) or 0),
         }
 
     return ConfigSnapshot(
@@ -128,7 +138,6 @@ def build_user_catalog() -> Dict[str, Any]:
     """
     from . import config_store
 
-    snap = config_store.get_snapshot()
     billing = config_store.get_billing()
 
     # Legacy catalog kinds (stt/tts/telephony): enabled-filtered provider lists

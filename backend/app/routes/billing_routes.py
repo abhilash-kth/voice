@@ -228,6 +228,13 @@ async def recharge(body: Recharge, user=Depends(auth.get_current_user)):
 # ---------------------------------------------------------------------------
 @router.post("/api/cost-preview")
 async def cost_preview(body: dict):
+    agent_mode = str(body.get("agent_mode", "assistant"))
+    # Preview must match the final bill exactly — include the Super-Admin
+    # per-mode minimum billed duration.
+    consts = billing_mod._billing_consts() if hasattr(billing_mod, "_billing_consts") else {}
+    min_bill = int(consts.get(
+        "announcement_min_bill_seconds" if agent_mode == "announcement"
+        else "assistant_min_bill_seconds", 0) or 0)
     return billing_mod.calculate_call_cost(
         duration_seconds=int(body.get("duration_seconds", 60)),
         stt_seconds=float(body.get("stt_seconds", 30)),
@@ -239,7 +246,8 @@ async def cost_preview(body: dict):
         tts_provider_id=body.get("tts_provider_id", "google_wavenet_hi"),
         telephony_provider_id=body.get("telephony_provider_id", ""),
         client_rate_per_min=float(body.get("client_rate_per_min", 2.50)),
-        agent_mode=str(body.get("agent_mode", "assistant")),
+        agent_mode=agent_mode,
         max_concurrency=int(body.get("max_concurrency", 1) or 1),
+        min_bill_seconds=min_bill,
     )
 

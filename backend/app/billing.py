@@ -109,6 +109,9 @@ def calculate_call_cost(
     # the legacy cost×margin behaviour exactly.
     agent_mode: str = "assistant",
     max_concurrency: int = 1,
+    # Enterprise minimum BILLED duration (seconds; 0 = bill actual time). Costs
+    # stay actual-usage; only the customer charge floors the CALL duration.
+    min_bill_seconds: int = 0,
     # New V2 fields
     llm_provider: Optional[str] = None,
     llm_model_id: Optional[str] = None,
@@ -123,6 +126,11 @@ def calculate_call_cost(
     """
     duration_mins = max(duration_seconds / 60.0, 0.01)
     stt_mins = max(stt_seconds / 60.0, 0.0)
+    # Minimum billed duration: customer pays at least min_bill_seconds. The
+    # invoice uses billed_mins; infra costs keep the actual call length.
+    billed_seconds = max(int(duration_seconds or 0), int(min_bill_seconds or 0))
+    billed_mins = max(billed_seconds / 60.0, 0.01)
+    min_bill_applied = billed_seconds > int(duration_seconds or 0)
 
     # Try V2 pricing first if provider/model provided - provider from llm_provider or llm_provider_id
     llm_cost_inr = 0
@@ -185,29 +193,40 @@ def calculate_call_cost(
         stt_id=stt_provider_id or "", tts_id=tts_provider_id or "",
         telephony_id=telephony_provider_id or "", agent_mode=agent_mode)
     price_parts = billing_rates.customer_price(
-        total_cost_inr=total_cost_inr, duration_mins=duration_mins,
+        total_cost_inr=total_cost_inr, duration_mins=billed_mins,
         agent_mode=agent_mode, models_rate_per_min=models_rate, consts=consts,
     )
     client_price_inr = price_parts["client_price_inr"]
     profit_inr = client_price_inr - total_cost_inr
 
     result = {
+        "actual_seconds": int(duration_seconds or 0),
+        "billed_seconds": billed_seconds,
+        "min_bill_seconds": int(min_bill_seconds or 0),
+        "min_bill_applied": bool(min_bill_applied),
+        "billed_mins": round(billed_mins, 2),
+        "telephony_provider_id": telephony_provider_id or "",
+        "stt_provider_id": stt_provider_id or "",
+        "tts_provider_id": tts_provider_id or "",
         "stt_cost_inr": round(stt_cost_inr, 4),
         "llm_cost_inr": round(llm_cost_inr, 4),
         "tts_cost_inr": round(tts_cost_inr, 4),
         "telephony_cost_inr": round(telephony_cost_inr, 4),
         "server_cost_inr": round(server_cost_inr, 4),
         "total_cost_inr": round(total_cost_inr, 2),
-        "client_rate_per_min": round(client_price_inr / duration_mins, 2),
+        "client_rate_per_min": round(client_price_inr / billed_mins, 2),
         "client_price_inr": round(client_price_inr, 2),
         "your_profit_inr": round(profit_inr, 2),
         "is_profit": profit_inr >= 0,
         "duration_mins": round(duration_mins, 2),
         "your_cost_per_min": round(total_cost_inr / duration_mins, 2),
-        "client_bill_per_min": round(client_price_inr / duration_mins, 2),
+        "client_bill_per_min": round(client_price_inr / billed_mins, 2),
         "profit_per_min": round(profit_inr / duration_mins, 2),
         "rate_per_min": round(client_price_inr / duration_mins, 2),
         "profit_margin_percent": consts["profit_margin_percent"],
+        # Super-Admin-set absolute per-call floor (shown in the billing log so
+        # the report reads exactly the configured numbers).
+        "min_client_price": consts["min_client_price"],
         # Customer-price composition breakdown (mode / concurrency / misc)
         "agent_mode": agent_mode or "assistant",
         "max_concurrency": max_concurrency,

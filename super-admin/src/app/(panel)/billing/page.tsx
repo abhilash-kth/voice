@@ -22,6 +22,8 @@ export default function BillingPage() {
   const [margin, setMargin] = useState("");
   const [assistMin, setAssistMin] = useState("");
   const [announceMin, setAnnounceMin] = useState("");
+  const [assistMinSecs, setAssistMinSecs] = useState("");
+  const [announceMinSecs, setAnnounceMinSecs] = useState("");
   const [topups, setTopups] = useState("");
 
   const hydrate = (c: BillingConfig) => {
@@ -30,6 +32,8 @@ export default function BillingPage() {
     setMargin(String(c.profit_margin_percent));
     setAssistMin(String(c.assistant_min_per_min ?? c.min_client_price ?? 1));
     setAnnounceMin(String(c.announcement_min_per_min ?? c.min_client_price ?? 1));
+    setAssistMinSecs(String(c.assistant_min_bill_seconds ?? 0));
+    setAnnounceMinSecs(String(c.announcement_min_bill_seconds ?? 0));
     setTopups((c.wallet_topup_amounts || []).join(", "));
   };
 
@@ -49,6 +53,8 @@ export default function BillingPage() {
   const floor = toNum(minPrice);
   const aMin = toNum(assistMin);
   const nMin = toNum(announceMin);
+  const aMinSecs = Math.max(0, Math.floor(toNum(assistMinSecs)));
+  const nMinSecs = Math.max(0, Math.floor(toNum(announceMinSecs)));
   const neverLoss = Math.max(cost * (1 + marginPct / 100), floor);
 
   const save = () => {
@@ -60,6 +66,8 @@ export default function BillingPage() {
         profit_margin_percent: marginPct,
         assistant_min_per_min: aMin,
         announcement_min_per_min: nMin,
+        assistant_min_bill_seconds: aMinSecs,
+        announcement_min_bill_seconds: nMinSecs,
         wallet_topup_amounts: amounts,
       });
       setCfg(out);
@@ -67,7 +75,7 @@ export default function BillingPage() {
   };
 
   const valid = cost >= 0 && floor >= 0 && marginPct >= 0 && aMin >= 0 && nMin >= 0
-    && amountsValid(topups);
+    && aMinSecs >= 0 && nMinSecs >= 0 && amountsValid(topups);
 
   return (
     <>
@@ -86,6 +94,7 @@ export default function BillingPage() {
 
       <StateBox loading={loading} error={error}>
         <div className="grid lg:grid-cols-2 gap-4">
+          <div className="space-y-4">
           <div className="card p-5 space-y-4">
             <h2 className="text-sm font-bold">Customer ₹/min — rate card</h2>
             <p className="text-xs text-gray-500 leading-relaxed">
@@ -107,6 +116,27 @@ export default function BillingPage() {
                 <input className="input" type="number" step="0.01" min="0" value={announceMin} onChange={(e) => setAnnounceMin(e.target.value)} />
               </Field>
             </div>
+          </div>
+
+          <div className="card p-5 space-y-4">
+            <h2 className="text-sm font-bold">Minimum billed duration (seconds)</h2>
+            <p className="text-xs text-gray-500 leading-relaxed">
+              Enterprise billing: a call shorter than the minimum still bills the full minimum
+              (e.g. <b className="text-gray-300">30</b> → a 9s call bills as 30s at the applied rate).
+              Infra costs always use the <b className="text-gray-300">actual</b> duration — only the
+              customer charge is floored. <b className="text-gray-300">0 = bill actual duration.</b>{" "}
+              Bills compose as <b className="text-gray-300">TTS + Telephony + Server</b> for announcements
+              and <b className="text-gray-300">STT + LLM + TTS + Telephony + Server</b> for assistants.
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Assistant minimum seconds" hint="0 = off. Short assistant calls bill this many seconds.">
+                <input className="input" type="number" step="1" min="0" value={assistMinSecs} onChange={(e) => setAssistMinSecs(e.target.value)} />
+              </Field>
+              <Field label="Announcement minimum seconds" hint="0 = off. Short announcement calls bill this many seconds.">
+                <input className="input" type="number" step="1" min="0" value={announceMinSecs} onChange={(e) => setAnnounceMinSecs(e.target.value)} />
+              </Field>
+            </div>
+          </div>
           </div>
 
           <div className="space-y-4">

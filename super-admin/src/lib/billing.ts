@@ -22,6 +22,10 @@ export interface BillingConfig {
   // Per-mode minimum customer ₹/min on the rate card.
   assistant_min_per_min: number;
   announcement_min_per_min: number;
+  // Enterprise minimum BILLED duration per mode (seconds; 0 = bill actual
+  // duration). A shorter call still bills this many seconds.
+  assistant_min_bill_seconds: number;
+  announcement_min_bill_seconds: number;
   updated_at?: string;
   [k: string]: unknown;
 }

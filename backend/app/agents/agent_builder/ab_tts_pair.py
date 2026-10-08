@@ -4,15 +4,7 @@ import logging
 from typing import Any
 
 from ...models import AgentConfig
-from ...config import(
-    OPENAI_API_KEY,
-    GOOGLE_APPLICATION_CREDENTIALS,
-    OPENROUTER_API_KEY,
-    SARVAM_API_KEY,
-    CARTESIA_API_KEY,
-    FISH_AUDIO_API_KEY,
-    MINIMAX_API_KEY,
-)
+from ...config import GOOGLE_APPLICATION_CREDENTIALS
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
 
@@ -48,12 +40,11 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
             raise RuntimeError(
                 f"TTS provider '{sel.id}' needs a voice (set `voice` in the agent's tts config)."
             )
-        key_map = {"fish": FISH_AUDIO_API_KEY, "minimax": MINIMAX_API_KEY, "openai": OPENAI_API_KEY}
-        env_default = key_map.get((slug or ""), OPENAI_API_KEY)
-        api_key = overrides.get("api_key") or _provider_api_key("tts", slug or sel.id, env_default)
+        api_key = overrides.get("api_key") or _provider_api_key("tts", slug or sel.id)
         if not api_key:
             raise RuntimeError(
-                f"TTS provider '{sel.id}' needs an API key (Super Admin panel or the provider's env var)."
+                f"TTS provider '{sel.id}' needs an API key — set it in the Super Admin panel "
+                f"(Providers → '{slug or sel.id}' → Credentials). Provider keys are NOT read from .env."
             )
         base_url = overrides.get("base_url") or _provider_base_url("tts", slug or sel.id) or None
         kwargs: dict = dict(model=model, voice=voice, api_key=api_key)
@@ -99,13 +90,13 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         except ImportError as e:
             raise RuntimeError(
                 f"Sarvam TTS needs livekit-plugins-sarvam ({e}). Run "
-                "`pip install livekit-plugins-sarvam>=1.4.1` in the worker venv and "
-                "set SARVAM_API_KEY in backend/.env."
+                "`pip install livekit-plugins-sarvam>=1.4.1` in the worker venv."
             ) from e
-        api_key = overrides.get("api_key") or _provider_api_key("tts", "sarvam", SARVAM_API_KEY)
+        api_key = overrides.get("api_key") or _provider_api_key("tts", "sarvam")
         if not api_key:
             raise RuntimeError(
-                "Sarvam TTS needs a Sarvam API key (Super Admin panel or SARVAM_API_KEY env)."
+                "Sarvam TTS needs an API key — set it in the Super Admin panel "
+                "(Providers → 'sarvam' → Credentials). Provider keys are NOT read from .env."
             )
         configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
         target_language = overrides.get("language") or locale_for_language(configured_language)
@@ -164,13 +155,13 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
         except ImportError as e:
             raise RuntimeError(
                 f"Cartesia TTS needs livekit-plugins-cartesia ({e}). Run "
-                "`pip install livekit-plugins-cartesia>=1.7.1` in the worker venv and "
-                "set CARTESIA_API_KEY in backend/.env."
+                "`pip install livekit-plugins-cartesia>=1.7.1` in the worker venv."
             ) from e
-        api_key = overrides.get("api_key") or _provider_api_key("tts", "cartesia", CARTESIA_API_KEY)
+        api_key = overrides.get("api_key") or _provider_api_key("tts", "cartesia")
         if not api_key:
             raise RuntimeError(
-                "Cartesia TTS needs a Cartesia API key (Super Admin panel or CARTESIA_API_KEY env)."
+                "Cartesia TTS needs an API key — set it in the Super Admin panel "
+                "(Providers → 'cartesia' → Credentials). Provider keys are NOT read from .env."
             )
         model = overrides.get("model", "sonic-3")
         configured_language = (getattr(cfg, "language", "hi") or "hi").lower()
@@ -213,16 +204,19 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
             return CartesiaTTS(model=model, language=target_language, voice=voice, api_key=api_key)
 
     if sel.id.startswith("elevenlabs"):
-        from ...config import ELEVENLABS_API_KEY as _EL_ENV
         from livekit.plugins.elevenlabs import TTS
         kwargs = dict(
             voice_id=overrides.get("voice", "pNInz6obpgDQGcFmaJgB"),
             model=overrides.get("model", "eleven_multilingual_v2"),
             language=overrides.get("language", "en" if (getattr(cfg, "language", "hi") or "hi").lower().startswith("en") else "hi"),
         )
-        _el_key = overrides.get("api_key") or _provider_api_key("tts", "elevenlabs", _EL_ENV)
-        if _el_key:
-            kwargs["api_key"] = _el_key
+        _el_key = overrides.get("api_key") or _provider_api_key("tts", "elevenlabs")
+        if not _el_key:
+            raise RuntimeError(
+                "ElevenLabs TTS needs an API key — set it in the Super Admin panel "
+                "(Providers → 'elevenlabs' → Credentials). Provider keys are NOT read from .env."
+            )
+        kwargs["api_key"] = _el_key
         return TTS(**kwargs)
 
     if sel.id.startswith("openrouter"):
@@ -236,10 +230,11 @@ def _build_tts_from_pair(pair, cfg: AgentConfig) -> Any:
             or cat.get("model")
             or "deepgram/flux-tts:free"
         )
-        api_key = overrides.get("api_key") or _provider_api_key("tts", "openrouter", OPENROUTER_API_KEY)
+        api_key = overrides.get("api_key") or _provider_api_key("tts", "openrouter")
         if not api_key:
             raise RuntimeError(
-                "OpenRouter TTS needs an OpenRouter API key (Super Admin panel or OPENROUTER_API_KEY env)."
+                "OpenRouter TTS needs an API key — set it in the Super Admin panel "
+                "(Providers → 'openrouter' → Credentials). Provider keys are NOT read from .env."
             )
         default_voices = {
             "deepgram/flux-tts:free": "flux-bree-en",

@@ -21,7 +21,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .config import SERVER_COST_PER_MIN, PROFIT_MARGIN_PERCENT, MIN_CLIENT_PRICE
+from .config import (SERVER_COST_PER_MIN, PROFIT_MARGIN_PERCENT, MIN_CLIENT_PRICE,
+                    ASSISTANT_MIN_BILL_SECONDS, ANNOUNCEMENT_MIN_BILL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +35,8 @@ def billing_consts() -> Dict[str, Any]:
     refreshed on every admin mutation.
     """
     out: Dict[str, Any] = {
+        "assistant_min_bill_seconds": ASSISTANT_MIN_BILL_SECONDS,
+        "announcement_min_bill_seconds": ANNOUNCEMENT_MIN_BILL_SECONDS,
         "server_cost_per_min": SERVER_COST_PER_MIN,
         "min_client_price": MIN_CLIENT_PRICE,
         "profit_margin_percent": PROFIT_MARGIN_PERCENT,

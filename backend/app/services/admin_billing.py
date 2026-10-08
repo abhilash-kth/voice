@@ -84,6 +84,9 @@ async def get_billing() -> Dict[str, Any]:
         "telephony_rent_per_month": float(getattr(b, "telephonyRentPerMonth", 0) or 0),
         "assistant_min_per_min": float(getattr(b, "assistantMinPerMin", 1.0) or 1.0),
         "announcement_min_per_min": float(getattr(b, "announcementMinPerMin", 1.0) or 1.0),
+        # Enterprise minimum billed duration per mode (seconds; 0 = off).
+        "assistant_min_bill_seconds": int(getattr(b, "assistantMinBillSeconds", 0) or 0),
+        "announcement_min_bill_seconds": int(getattr(b, "announcementMinBillSeconds", 0) or 0),
         "updated_at": b.updatedAt or "",
     }
 
@@ -137,6 +140,10 @@ async def update_billing(patch: Dict[str, Any], *, admin: Dict[str, Any]) -> Dic
         data["assistantMinPerMin"] = v
     if (v := _flt("announcement_min_per_min", 0, 10000, "announcement_min_per_min")) is not None:
         data["announcementMinPerMin"] = v
+    if (v := _flt("assistant_min_bill_seconds", 0, 86400, "assistant_min_bill_seconds")) is not None:
+        data["assistantMinBillSeconds"] = int(v)
+    if (v := _flt("announcement_min_bill_seconds", 0, 86400, "announcement_min_bill_seconds")) is not None:
+        data["announcementMinBillSeconds"] = int(v)
     if patch.get("concurrency_addons") is not None:
         tiers = _validate_concurrency_addons(patch["concurrency_addons"])
         data["concurrencyAddons"] = json.dumps(tiers)

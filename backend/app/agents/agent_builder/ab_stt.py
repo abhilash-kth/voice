@@ -5,11 +5,7 @@ import os
 from typing import Any
 
 from ...models import AgentConfig
-from ...config import(
-    DEEPGRAM_API_KEY,
-    GOOGLE_APPLICATION_CREDENTIALS,
-    SARVAM_API_KEY,
-)
+from ...config import GOOGLE_APPLICATION_CREDENTIALS
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
 
@@ -30,9 +26,12 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
                 f"Sarvam STT needs livekit-plugins-sarvam ({e}). Run "
                 "`pip install livekit-plugins-sarvam>=1.4.1` in the worker venv."
             ) from e
-        api_key = overrides.get("api_key") or _provider_api_key("stt", "sarvam", SARVAM_API_KEY)
+        api_key = overrides.get("api_key") or _provider_api_key("stt", "sarvam")
         if not api_key:
-            raise RuntimeError("Sarvam STT needs a Sarvam API key (Super Admin panel or SARVAM_API_KEY env).")
+            raise RuntimeError(
+                "Sarvam STT needs an API key — set it in the Super Admin panel "
+                "(Providers → 'sarvam' → Credentials). Provider keys are NOT read from .env."
+            )
         lang = overrides.get("language") or locale_for_language(getattr(cfg, "language", "hi"))
         model = overrides.get("model", "saaras:v3")
         kwargs = dict(model=model, target_language_code=lang, api_key=api_key)
@@ -57,6 +56,12 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
         )
 
     from livekit.plugins.deepgram import STT
+    dg_api_key = overrides.get("api_key") or _provider_api_key("stt", "deepgram")
+    if not dg_api_key:
+        raise RuntimeError(
+            "Deepgram STT needs an API key — set it in the Super Admin panel "
+            "(Providers → 'deepgram' → Credentials). Provider keys are NOT read from .env."
+        )
     keywords = overrides.get("keywords") or [
         ("Kriscent", 10.0),
         ("Kota", 6.0),
@@ -81,7 +86,7 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
         vad_events=bool(overrides.get("vad_events", True)),
         no_delay=bool(overrides.get("no_delay", True)),
         filler_words=bool(overrides.get("filler_words", True)),
-        api_key=overrides.get("api_key") or _provider_api_key("stt", "deepgram", DEEPGRAM_API_KEY) or None,
+        api_key=dg_api_key,
     )
     # Deepgram API compatibility:
     # - Nova-3 models require Keyterm Prompting (list of strings via 'keyterm' parameter)
@@ -165,7 +170,7 @@ def _build_stt_from_pair(pair, cfg: AgentConfig) -> Any:
             except TypeError:
                 continue
         # If all optional fail, use basic config (preserves per-agent base config)
-        logger.warning(f"Deepgram STT using basic config (base params only)")
+        logger.warning("Deepgram STT using basic config (base params only)")
         return STT(**stt_kwargs)
 
 

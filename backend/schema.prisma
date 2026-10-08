@@ -264,6 +264,11 @@ model BillingConfig {
   // Monthly rent for the telephony/number access, ₹/month.
   telephonyRentPerMonth        Float @default(0)
   // Per-mode minimum customer rate, ₹/min (rate card floors).
+  // --- Enterprise minimum-billed-duration per mode (seconds; 0 = off). A call
+  // shorter than this is billed as if it lasted the minimum. Costs are still
+  // computed from ACTUAL usage; only the customer charge uses the floor. ---
+  assistantMinBillSeconds    Int @default(0)
+  announcementMinBillSeconds Int @default(0)
   assistantMinPerMin           Float @default(1.0)
   announcementMinPerMin        Float @default(1.0)
   updatedAt              String @default("")

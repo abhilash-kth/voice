@@ -8,37 +8,78 @@ logger = logging.getLogger("voice-agent-saas-worker")
 from .dep_imports import BILLING_INTERNAL_TOKEN, aiohttp
 from .runtime_env import BILLING_BACKEND_URL
 
-def _billing_report(costs, usage, duration, turn_timing_ref=None) -> str:
-    # FIX: Use aggregated authoritative values for all billing displays, not word-count estimates
-    # Authoritative is 69,461 input / 572 output, not 139in/361out from usage word count
-    # Make every billing display use same aggregated authoritative values
+
+def _display_tokens(usage, turn_timing_ref):
+    """Aggregated authoritative token counts (fall back to usage estimates)."""
     try:
         if turn_timing_ref:
-            display_input = turn_timing_ref.get("aggregated_input", usage['llm_input_tokens'])
-            display_output = turn_timing_ref.get("aggregated_output", usage['llm_output_tokens'])
-            successful = turn_timing_ref.get("successful_requests", 0)
-            failed = turn_timing_ref.get("failed_requests", 0)
-        else:
-            # Fallback to usage if no turn_timing_ref, but try to get authoritative from usage if it has been updated
-            display_input = usage.get('llm_input_tokens_authoritative', usage['llm_input_tokens'])
-            display_output = usage.get('llm_output_tokens_authoritative', usage['llm_output_tokens'])
-            successful = usage.get('successful_requests', 0)
-            failed = usage.get('failed_requests', 0)
+            return (turn_timing_ref.get("aggregated_input", usage["llm_input_tokens"]),
+                    turn_timing_ref.get("aggregated_output", usage["llm_output_tokens"]),
+                    turn_timing_ref.get("successful_requests", 0),
+                    turn_timing_ref.get("failed_requests", 0))
+        return (usage.get("llm_input_tokens_authoritative", usage["llm_input_tokens"]),
+                usage.get("llm_output_tokens_authoritative", usage["llm_output_tokens"]),
+                usage.get("successful_requests", 0),
+                usage.get("failed_requests", 0))
     except Exception:
-        display_input = usage['llm_input_tokens']
-        display_output = usage['llm_output_tokens']
-        successful = 0
-        failed = 0
-    
+        return usage["llm_input_tokens"], usage["llm_output_tokens"], 0, 0
+
+
+def _billing_report(costs, usage, duration, turn_timing_ref=None) -> str:
+    """The end-of-call BILLING block. Every number shown is exactly what the
+    Super Admin configured: the rate card composition (per-model ₹/min set on
+    the Models page + server ₹/min), the per-mode minimum rate, the never-loss
+    floor, and the per-mode minimum billed duration.
+
+    Chargeable legs are mode-aware:
+      • assistant    → STT + LLM + TTS + Telephony + Server
+      • announcement → TTS + Telephony + Server  (fixed script: no STT/LLM)
+    """
+    mode = costs.get("agent_mode") or "assistant"
+    is_announce = mode == "announcement"
+    # Infra cost legs (provider-side spend, actual usage)
+    tele_id = costs.get("telephony_provider_id") or ""
+    tele_label = tele_id if tele_id and tele_id != "browser" else "none (browser)"
+    legs = []
+    if not is_announce:
+        d_in, d_out, ok, failed = _display_tokens(usage, turn_timing_ref)
+        legs.append(f"👂 STT       {round(usage['user_speech_seconds'], 1)}s -> ₹{costs['stt_cost_inr']}")
+        legs.append(f"🧠 LLM       {d_in}in/{d_out}out ({ok} ok, {failed} failed) -> ₹{costs['llm_cost_inr']}")
+    legs.append(f"🗣️ TTS       {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}")
+    legs.append(f"📞 Telephony {tele_label} -> ₹{costs.get('telephony_cost_inr', 0)}")
+    legs.append(f"🖥️ Server    -> ₹{costs['server_cost_inr']}")
+
+    # Customer rate composition — exactly the super-admin-set numbers.
+    margin = costs.get("profit_margin_percent", 0)
+    min_call = costs.get("min_client_price", 0)
+    floor_val = max(costs["total_cost_inr"] * (1 + margin / 100.0), float(min_call or 0))
+    floor_txt = (f"APPLIED ✅ (price raised to ₹{round(floor_val, 2)})"
+                 if costs.get("floor_applied") else "not needed")
+
+    # Minimum billed duration (enterprise): customer pays at least min seconds.
+    billed_s = costs.get("billed_seconds", duration)
+    if costs.get("min_bill_applied"):
+        dur_head = f"duration={duration}s actual / {billed_s}s billed"
+        bill_note = (f" — {billed_s}s billed (Super-Admin min {costs.get('min_bill_seconds', 0)}s; "
+                     f"actual {duration}s)")
+    else:
+        dur_head = f"duration={duration}s ({costs['duration_mins']} min)"
+        bill_note = ""
+
     return (
         "\n" + "=" * 64 + "\n"
-        f"📊 BILLING  duration={duration}s ({costs['duration_mins']} min)\n"
-        f"👂 STT {round(usage['user_speech_seconds'],1)}s -> ₹{costs['stt_cost_inr']}\n"
-        f"🧠 LLM {display_input}in/{display_output}out (authoritative aggregated {successful} successful, {failed} failed) -> ₹{costs['llm_cost_inr']}\n"
-        f"🗣️ TTS {usage['tts_chars']} chars -> ₹{costs['tts_cost_inr']}\n"
-        f"🖥️ Server -> ₹{costs['server_cost_inr']}\n"
+        f"📊 BILLING  mode={mode} {dur_head}\n"
+        + "\n".join(legs) + "\n"
         f"💸 YOUR COST ₹{costs['total_cost_inr']} (₹{costs['your_cost_per_min']}/min)\n"
-        f"💳 CUSTOMER BILL ₹{costs['client_price_inr']} (₹{costs['client_bill_per_min']}/min)\n"
+        f"🏷️ RATE CARD models ₹{costs.get('models_rate_per_min', 0)}/min"
+        f" + server ₹{costs.get('server_per_min', 0)}/min"
+        f" = ₹{costs.get('rate_card_per_min', 0)}/min"
+        f" | {mode}-min ₹{costs.get('mode_min_per_min', 0)}/min"
+        f" → applied ₹{costs.get('applied_rate_per_min', 0)}/min\n"
+        f"🧱 FLOOR max(cost×(1+{margin}%), ₹{min_call}/call) = ₹{round(floor_val, 2)} → {floor_txt}\n"
+        f"💳 CUSTOMER BILL ₹{costs['client_price_inr']}"
+        f" = ₹{costs.get('applied_rate_per_min', costs.get('client_bill_per_min', 0))}/min"
+        f" × {costs.get('billed_mins', costs['duration_mins'])} min{bill_note}\n"
         f"🤑 PROFIT ₹{costs['your_profit_inr']} [{'PROFIT ✅' if costs['is_profit'] else 'LOSS ⚠️'}]\n"
         + "=" * 64
     )
@@ -110,5 +151,3 @@ async def _post_billing(call_id, user_id, agent_id, mode, phone, duration, costs
     except Exception as e:
         logger.warning(f"⚠️ Billing POST failed for call {call_id} to {BILLING_BACKEND_URL}: {e!r} — will fallback to direct DB deduct", exc_info=True)
         return False
-
-
