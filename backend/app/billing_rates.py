@@ -91,7 +91,8 @@ def selected_models_rate_per_min(*, llm_provider: str = "", llm_model_id: str = 
     """
     total = 0.0
     if agent_mode == "announcement":
-        if telephony_id:
+        # "browser" is free with no carrier — never priced.
+        if telephony_id and telephony_id != "browser":
             total += _snapshot_model_price("telephony", telephony_id)
     else:
         if llm_provider:

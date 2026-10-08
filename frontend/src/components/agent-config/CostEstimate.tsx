@@ -6,7 +6,8 @@ import { costPreview, type CostPreview } from "@/lib/api";
  * Live estimate of what THIS agent configuration bills per minute:
  *   your selected LLM+STT+TTS models' ₹/min prices (set per model by the
  *   Super Admin) + the platform server cost ₹/min, floored at the mode
- *   minimum. Concurrency, telephony and the agent plan itself are monthly
+ *   minimum; in announcement mode the models leg is TTS + telephony ₹/min.
+ *   Concurrency and the agent plan itself are monthly
  *   subscription items (Billing page), not per-minute.
  * If you've configured fallback models, only the primaries are priced here;
  * a fallback leg is billed at its own rate only when it actually serves a call.
