@@ -18,7 +18,6 @@ from .config_core import get_snapshot
 
 logger = logging.getLogger("voice-agent-saas-config-store")
 
-
 # ---------------------------------------------------------------------------
 # Sync getters used by pipeline/billing — always safe, always fast
 # ---------------------------------------------------------------------------
