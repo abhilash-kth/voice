@@ -16,7 +16,7 @@ logger = logging.getLogger("voice-agent-saas-worker")
 
 
 # cross-module imports (auto-generated)
-from .w_gcp_creds import warm_google_credentials
+from .gcp_credentials import warm_google_credentials
 from .dep_imports import setup_logging, silero
 from .runtime_env import _VAD_CACHE_LOCK
 

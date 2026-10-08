@@ -7,10 +7,10 @@ logger = logging.getLogger("voice-agent-saas-agent-builder")
 
 
 # cross-module imports (auto-generated)
-from .ab_config_access import _provider_api_key
 from .ab_llm_catalog_gate import gate_and_enrich_model
 from .ab_llm_reasoning import resolve_reasoning_budget
 from .ab_llm_instantiate_chain import instantiate_llm_from_kwargs
+from .ab_llm_client_probe import build_instrumented_http_client
 from .ab_llm_instantiate import _instantiate_llm
 
 def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
@@ -20,7 +20,6 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     Logs LLM PROVIDER CONFIG with provider, model, base_url exactly as selected.
     Fixes OpenAI 404 by validating exact model and capturing actual API error.
     """
-    from openai import AsyncOpenAI
     sel = pair
     overrides = sel.config or {}
     raw_id = sel.id
@@ -68,7 +67,6 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
     # instance): with B/C above it is a correlation counter, not a retry
     # claim. Rid joins this line to [HTTP_RESPONSE_HEADERS] and
     # [HTTP_CHUNK] even when attempts interleave.
-    from .ab_llm_client_probe import build_instrumented_http_client
     client = build_instrumented_http_client(api_key, base_url, provider, model_id, _native_google)
     llm_kwargs = {
         "model": model_id,  # EXACT model as selected, no rewriting
@@ -183,7 +181,6 @@ def _build_llm_from_pair(pair, cfg_language: str = "hi") -> Any:
             f"Do not silently rewrite model. Fix root cause."
         )
         raise
-
 
 
 

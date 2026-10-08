@@ -4,7 +4,6 @@ import os
 import asyncio
 import logging
 import time
-from typing import Any
 logger = logging.getLogger("voice-agent-saas-worker")
 
 

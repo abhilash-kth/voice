@@ -4,14 +4,11 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any
 logger = logging.getLogger("voice-agent-saas-worker")
 
 
 # cross-module imports (auto-generated)
-from .billing_turn_report import _billing_report, _post_billing
-from .gcp_env import threading
-from .dep_imports import AgentConfig, calculate_call_cost, db_init, leadfile, memory, repo
+from .dep_imports import leadfile, memory
 from .loop_diagnostics import build_loop_diagnostics
 from .turn_metrics_log import attach_turn_metrics, new_turn_timing
 from .user_turn_items import new_call_bookkeeping
@@ -26,12 +23,8 @@ from .agent_fetch import fetch_agent_record, mark_call_in_progress, parse_job_me
 from .call_gates import subscription_call_gate
 from .greeting import select_greeting
 from .ssl_cert_patch import ensure_ssl_before_db_init
-from .runtime_env import DEFAULT_FALLBACK_RESPONSE, DETERMINISTIC_CLOSING_MESSAGE, DETERMINISTIC_CLOSING_MESSAGE_EN, FALLBACK_REPLY, LLM_FALLBACK_DELAY, WORKER_AGENT_NAME, _FAIL_THRESHOLD_SECONDS, _get_deterministic_closing, _item_is_tool_related, _mark_call_failed, _msg_text, clean_reply_text
-from . import runtime_env as _wr
-from . import ssl_cert_patch as _ws
 from .session_announcer import build_announcement_session, start_egress
 from .assistant_mode_setup import build_assistant_session
-from .ssl_cert_patch import _prewarm_ssl_context
 
 from .call_dispatch import(
     entrypoint  # noqa: F401   public API: imported via package __init__,
@@ -41,11 +34,7 @@ from .call_dispatch import(
 
 
 async def _entrypoint_body(ctx, setup_complete):
-    from livekit.agents import AgentSession
-    from app.agents.agent_builder import (
-        build_vad, build_stt, build_llm, build_tts, build_voice_agent,
-        build_announce_agent,
-    )
+    from app.agents.agent_builder import build_voice_agent, build_announce_agent
 
     call_start = time.time()
 

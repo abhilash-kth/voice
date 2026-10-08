@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import logging
 import time
-from typing import Any, Optional
+from typing import Optional
 logger = logging.getLogger("voice-agent-saas-worker")
 
 

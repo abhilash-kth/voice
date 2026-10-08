@@ -9,6 +9,7 @@ import time as _time
 import traceback
 
 from .llm_chat_cm import TimingChatCM, _is_recovery_probe
+from .llm_chat_inspect import _inspect_chat_ctx
 
 _logger = logging.getLogger("voice-agent-saas-worker")
 
@@ -93,7 +94,6 @@ def timed_chat_outer(self, *args, **kwargs):
         if _cc is None and args:
             _cc = args[0]
         if _cc is not None:
-            from .llm_chat_inspect import _inspect_chat_ctx
             _token_estimate_ns, _fingerprint_ns, _cache_metadata_ns, _req_inflight = _inspect_chat_ctx(self, args, kwargs)
     except Exception as _pe:
         # never silent again: one visible line per call is cheap and this

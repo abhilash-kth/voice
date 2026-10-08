@@ -1,3 +1,6 @@
+## import-hub note: every name below is consumed by sibling worker modules via
+## `from .dep_imports import ...` (pyflakes cannot trace that; do not "clean" it).
+
 from __future__ import annotations
 
 import os

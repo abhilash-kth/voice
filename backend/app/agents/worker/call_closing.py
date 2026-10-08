@@ -15,7 +15,6 @@ logger = logging.getLogger("voice-agent-saas-worker")
 
 from .closing_speech import build_closing_speech
 from .no_response_watchdog import build_no_response_watchdog
-from .runtime_env import DEFAULT_FALLBACK_RESPONSE, LLM_FALLBACK_DELAY
 
 
 def build_closing_pipeline(ctx, session, cfg, agent_mode, turn_timing,

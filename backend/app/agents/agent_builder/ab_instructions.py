@@ -4,9 +4,6 @@ import logging
 import os
 
 from ...models import AgentConfig, KnowledgeBase
-from ...config import (
-    GROQ_API_KEY
-)
 
 logger = logging.getLogger("voice-agent-saas-agent-builder")
 

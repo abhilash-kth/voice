@@ -11,7 +11,7 @@ management layer can boot even when the livekit packages aren't installed in
 that particular interpreter (e.g. a lightweight CI or a machine that only runs
 the API).
 """
-from __future__ import annotations
+from __future__ import annotations  # noqa: F401
 
 from .ab_config_access import (  # noqa: F401
     _provider_api_key,
