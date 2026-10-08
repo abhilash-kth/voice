@@ -4,8 +4,10 @@ Per-minute rate card — the customer pays, per call:
 
   ₹/min = Σ customer_price_per_min of the call's selected models
           (Super-Admin per-model prices on the Models page):
-            • assistant mode   → LLM + STT + TTS
-            • announcement mode → TTS only (fixed script: LLM/STT never run)
+            • assistant mode    → LLM + STT + TTS
+            • announcement mode → TTS + telephony (fixed script: LLM/STT
+              never run; announcements are phone blasts so the telephony
+              leg is part of the price — + server below)
         + server_cost_per_min (platform infra component, also admin-set)
   floored at the per-mode minimum (assistant_min / announcement_min ₹/min),
   then per-call at max(infra_cost × (1+margin), min_client_price) so a call
@@ -75,15 +77,23 @@ def _snapshot_model_price(kind: str, key: str, model_id: str = "") -> float:
 
 def selected_models_rate_per_min(*, llm_provider: str = "", llm_model_id: str = "",
                                  stt_id: str = "", tts_id: str = "",
+                                 telephony_id: str = "",
                                  agent_mode: str = "assistant") -> float:
     """Rate card total (₹/min) for the call's selected models.
 
-    Announcement calls only speak a fixed script — the LLM and STT legs never
-    run, so they are NEVER priced: the announcement rate card is the TTS
-    model's price (+server), nothing else.
+    Mode decides which legs are chargeable:
+      • assistant    → LLM + STT + TTS (+ server, added by the caller)
+      • announcement → TTS + telephony (announcements always go out over the
+        phone network, so the selected telephony model's ₹/min is part of the
+        announcement price; LLM/STT legs never run, so they are never priced)
+    A browser call has no telephony model selected → telephony_id is empty →
+    no telephony leg is priced (rate falls to TTS + server only).
     """
     total = 0.0
-    if agent_mode != "announcement":
+    if agent_mode == "announcement":
+        if telephony_id:
+            total += _snapshot_model_price("telephony", telephony_id)
+    else:
         if llm_provider:
             total += _snapshot_model_price("llm", llm_provider, llm_model_id)
         if stt_id:

@@ -271,6 +271,7 @@ export const costPreview = (body: {
   duration_seconds?: number; stt_seconds?: number;
   llm_input_tokens?: number; llm_output_tokens?: number; tts_chars?: number;
   llm_provider_id?: string; stt_provider_id?: string; tts_provider_id?: string;
+  telephony_provider_id?: string;
   agent_mode?: string; max_concurrency?: number;
 }) => req<CostPreview>("/api/cost-preview", { method: "POST", body: JSON.stringify(body) });
 

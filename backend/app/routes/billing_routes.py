@@ -240,6 +240,7 @@ async def cost_preview(body: dict):
         llm_provider_id=body.get("llm_provider_id", "groq_llama_3_3_70b"),
         stt_provider_id=body.get("stt_provider_id", "deepgram_nova2"),
         tts_provider_id=body.get("tts_provider_id", "google_wavenet_hi"),
+        telephony_provider_id=body.get("telephony_provider_id", ""),
         client_rate_per_min=float(body.get("client_rate_per_min", 2.50)),
         agent_mode=str(body.get("agent_mode", "assistant")),
         max_concurrency=int(body.get("max_concurrency", 1) or 1),

@@ -10,18 +10,20 @@ import { fmtINR } from "@/lib/format";
  * card composition (per model, from the Models page), the server component,
  * the per-mode minimum floor and the final ₹ for that call.
  *
- * Announcement mode plays a fixed script: only TTS runs, so only the TTS
- * price (+server) can bill — the LLM/STT selectors hide automatically.
+ * Announcement mode plays a fixed script over the phone network: the
+ * announcement price = TTS + telephony + server (LLM/STT never run, so only
+ * the TTS and telephony selectors show).
  */
 export default function RateCalculator() {
-  const [models, setModels] = useState<{ llm: CatalogModel[]; stt: CatalogModel[]; tts: CatalogModel[] }>({
-    llm: [], stt: [], tts: [],
-  });
+  const [models, setModels] = useState<{
+    llm: CatalogModel[]; stt: CatalogModel[]; tts: CatalogModel[]; telephony: CatalogModel[];
+  }>({ llm: [], stt: [], tts: [], telephony: [] });
   const [mode, setMode] = useState<"assistant" | "announcement">("assistant");
   const [duration, setDuration] = useState(60);
   const [llmId, setLlmId] = useState("");
   const [sttId, setSttId] = useState("");
   const [ttsId, setTtsId] = useState("");
+  const [teleId, setTeleId] = useState("");
   const [out, setOut] = useState<RatePreview | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -32,14 +34,15 @@ export default function RateCalculator() {
       listModels({ kind: "llm", page_size: 200 }),
       listModels({ kind: "stt", page_size: 200 }),
       listModels({ kind: "tts", page_size: 200 }),
-    ]).then(([l, s, t]) => {
+      listModels({ kind: "telephony", page_size: 200 }),
+    ]).then(([l, s, t, p]) => {
       const live = (xs: CatalogModel[]) => xs.filter((m) => m.enabled && m.status === "live");
       const pick = (xs: CatalogModel[]) => (live(xs)[0]?.catalog_id || "");
-      const loaded = { llm: live(l.items), stt: live(s.items), tts: live(t.items) };
-      setModels(loaded);
+      setModels({ llm: live(l.items), stt: live(s.items), tts: live(t.items), telephony: live(p.items) });
       setLlmId(pick(l.items));
       setSttId(pick(s.items));
       setTtsId(pick(t.items));
+      setTeleId(pick(p.items));
     }).catch((e) => setErr(e.message));
   }, []);
 
@@ -52,6 +55,7 @@ export default function RateCalculator() {
         agent_mode: mode, duration_seconds: Math.max(1, duration),
         llm_provider_id: llmId || undefined, stt_provider_id: sttId || undefined,
         tts_provider_id: ttsId || undefined,
+        telephony_provider_id: mode === "announcement" ? (teleId || undefined) : undefined,
       });
       if (seq.current === my) setOut(res);
     } catch (e) {
@@ -59,7 +63,7 @@ export default function RateCalculator() {
     } finally {
       if (seq.current === my) setBusy(false);
     }
-  }, [mode, duration, llmId, sttId, ttsId]);
+  }, [mode, duration, llmId, sttId, ttsId, teleId]);
 
   useEffect(() => {
     const t = setTimeout(compute, 250);   // debounce rapid edits
@@ -100,13 +104,16 @@ export default function RateCalculator() {
             <Sel label="STT (listens)" list={models.stt} value={sttId} onChange={setSttId} />
           </>
         ) : (
-          <div className="sm:col-span-2 rounded-xl bg-gray-800/50 border border-gray-800 p-3 text-xs text-gray-400 flex items-center">
-            Announcements play a fixed script — <b className="text-gray-200 mx-1">only TTS runs</b>, so
-            only the TTS price + server cost can bill.
+          <div className="sm:col-span-2 lg:col-span-1 rounded-xl bg-gray-800/50 border border-gray-800 p-3 text-xs text-gray-400 flex items-center">
+            Announcements play a fixed script over the phone — price ={" "}
+            <b className="text-gray-200 mx-1">TTS + telephony + server</b> (LLM/STT never run).
           </div>
         )}
         <Sel label={mode === "announcement" ? "TTS (speaks the script)" : "TTS (speaks)"}
              list={models.tts} value={ttsId} onChange={setTtsId} />
+        {mode === "announcement" && (
+          <Sel label="Telephony (phone network)" list={models.telephony} value={teleId} onChange={setTeleId} />
+        )}
       </div>
 
       {err && <div className="text-xs text-red-300">{err}</div>}
@@ -118,6 +125,9 @@ export default function RateCalculator() {
                 <Part label={priceOf(models.llm, llmId)?.display_name || "LLM"} value={priceOf(models.llm, llmId)?.customer_price_per_min ?? 0} />
                 <Part label={priceOf(models.stt, sttId)?.display_name || "STT"} value={priceOf(models.stt, sttId)?.customer_price_per_min ?? 0} />
               </>
+            )}
+            {mode === "announcement" && (
+              <Part label={priceOf(models.telephony, teleId)?.display_name || "telephony"} value={priceOf(models.telephony, teleId)?.customer_price_per_min ?? 0} />
             )}
             <Part label={priceOf(models.tts, ttsId)?.display_name || "TTS"} value={priceOf(models.tts, ttsId)?.customer_price_per_min ?? 0} />
             <Part label="+ server" value={out.server_per_min} />

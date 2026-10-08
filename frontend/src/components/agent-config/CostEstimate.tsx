@@ -17,12 +17,14 @@ export default function CostEstimate({
   llmId,
   sttId,
   ttsId,
+  teleId = "",
   maxConcurrency,
 }: {
   mode: string;
   llmId: string;
   sttId: string;
   ttsId: string;
+  teleId?: string;
   maxConcurrency: number;
 }) {
   const [preview, setPreview] = useState<CostPreview | null>(null);
@@ -38,6 +40,7 @@ export default function CostEstimate({
         llm_provider_id: llmId,
         stt_provider_id: sttId,
         tts_provider_id: ttsId,
+        telephony_provider_id: mode === "announcement" && teleId !== "browser" ? teleId : undefined,
       })
         .then((p) => {
           setPreview(p);
@@ -48,7 +51,7 @@ export default function CostEstimate({
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [mode, llmId, sttId, ttsId, maxConcurrency]);
+  }, [mode, llmId, sttId, ttsId, teleId, maxConcurrency]);
 
   if (failed) {
     return <p className="text-[10px] text-gray-600">Cost estimate unavailable right now.</p>;

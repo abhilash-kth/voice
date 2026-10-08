@@ -2183,6 +2183,10 @@ async def _entrypoint_body(ctx, setup_complete):
                 llm_generation_time_ms=gen_time,
                 stt_provider_id=cfg.providers.stt.id,
                 tts_provider_id=cfg.providers.tts.id,
+                # Announcement rate card = TTS + telephony (+server). Browser
+                # calls select no telephony model → empty → no telephony leg.
+                telephony_provider_id=(cfg.providers.telephony.id
+                                       if getattr(cfg.providers, "telephony", None) else ""),
                 client_rate_per_min=cfg.client_rate_per_min,
                 # Super-Admin pricing layers: per-mode flat rate (announcement/
                 # assistant) + concurrency tier & misc fees (billing_rates.py).

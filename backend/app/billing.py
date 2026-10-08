@@ -103,6 +103,7 @@ def calculate_call_cost(
     llm_provider_id: str = "groq_llama_3_3_70b",
     stt_provider_id: str = "deepgram_nova2",
     tts_provider_id: str = "google_wavenet_hi",
+    telephony_provider_id: str = "",
     client_rate_per_min: float = 2.50,
     # Customer-price composition layers (see billing_rates.py). Defaults keep
     # the legacy cost×margin behaviour exactly.
@@ -164,20 +165,25 @@ def calculate_call_cost(
 
     stt_cost_inr = stt_mins * stt_cost.get("per_min", 0.22)
     tts_cost_inr = (tts_chars / 1000.0) * tts_cost.get("per_1k_chars", 1.33)
+    # Telephony infra cost (SIP phone calls): priced per minute from the
+    # catalog's telephony cost — zero for browser calls (no telephony model).
+    telephony_cost = _get_cost("telephony", telephony_provider_id) if telephony_provider_id else {}
+    telephony_cost_inr = duration_mins * float(telephony_cost.get("per_min", 0.0) or 0.0)
     consts = _billing_consts()
     server_cost_inr = duration_mins * consts["server_cost_per_min"]
 
-    total_cost_inr = stt_cost_inr + llm_cost_inr + tts_cost_inr + server_cost_inr
+    total_cost_inr = (stt_cost_inr + llm_cost_inr + tts_cost_inr
+                      + telephony_cost_inr + server_cost_inr)
 
     # Customer price = rate card (selected models' customer ₹/min + server
     # ₹/min), floored at the per-mode minimum and at max(infra cost × margin,
     # min client price) — never a loss. Concurrency is a monthly subscription
-    # item now, not a per-minute surcharge.
+    # item now, not a per-minute surcharge. Announcement rate = TTS+telephony.
     from . import billing_rates
     models_rate = billing_rates.selected_models_rate_per_min(
         llm_provider=v2_provider or "", llm_model_id=v2_model or "",
         stt_id=stt_provider_id or "", tts_id=tts_provider_id or "",
-        agent_mode=agent_mode)
+        telephony_id=telephony_provider_id or "", agent_mode=agent_mode)
     price_parts = billing_rates.customer_price(
         total_cost_inr=total_cost_inr, duration_mins=duration_mins,
         agent_mode=agent_mode, models_rate_per_min=models_rate, consts=consts,
@@ -189,6 +195,7 @@ def calculate_call_cost(
         "stt_cost_inr": round(stt_cost_inr, 4),
         "llm_cost_inr": round(llm_cost_inr, 4),
         "tts_cost_inr": round(tts_cost_inr, 4),
+        "telephony_cost_inr": round(telephony_cost_inr, 4),
         "server_cost_inr": round(server_cost_inr, 4),
         "total_cost_inr": round(total_cost_inr, 2),
         "client_rate_per_min": round(client_price_inr / duration_mins, 2),

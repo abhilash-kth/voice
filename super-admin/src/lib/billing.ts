@@ -87,4 +87,5 @@ export const ratePreview = (body: {
   llm_provider_id?: string;
   stt_provider_id?: string;
   tts_provider_id?: string;
+  telephony_provider_id?: string;
 }) => req<RatePreview>("/api/cost-preview", { method: "POST", body: JSON.stringify(body) });
