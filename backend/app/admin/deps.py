@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from .. import auth, repo
@@ -39,11 +39,13 @@ def check_not_disabled(user: Any) -> None:
 
 
 async def get_super_admin(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
 ) -> dict:
-    if credentials is None:
+    token = auth.extract_token(request, credentials)
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    user_id = auth.decode_token(credentials.credentials)
+    user_id = auth.decode_token(token)
     user = await repo.get_user(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")

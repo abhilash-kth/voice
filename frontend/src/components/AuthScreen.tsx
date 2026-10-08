@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { login, register, setToken, User } from "@/lib/api";
+import { login, register, User } from "@/lib/api";
 
 interface Props {
   onAuth: (user: User) => void;
@@ -45,7 +45,7 @@ export default function AuthScreen({ onAuth }: Props) {
     try {
       const fn = mode === "login" ? login : register;
       const res = await fn({ email, password, name });
-      setToken(res.token);
+      // Session cookie is set by the server (httpOnly) — nothing to store here.
       onAuth(res.user);
     } catch (e) {
       setErr((e as Error).message);

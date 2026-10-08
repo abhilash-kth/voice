@@ -4,13 +4,13 @@ import { costPreview, type CostPreview } from "@/lib/api";
 
 /**
  * Live estimate of what THIS agent configuration bills per minute:
- *   the flat mode rate (if the Super Admin set one) or your selected
- *   LLM+STT+TTS models' ₹/min rate card
- *   + concurrency surcharge (agent's Max concurrent)
- *   + miscellaneous fee — all set by the Super Admin.
+ *   your selected LLM+STT+TTS models' ₹/min prices (set per model by the
+ *   Super Admin) + the platform server cost ₹/min, floored at the mode
+ *   minimum. Concurrency, telephony and the agent plan itself are monthly
+ *   subscription items (Billing page), not per-minute.
  * If you've configured fallback models, only the primaries are priced here;
  * a fallback leg is billed at its own rate only when it actually serves a call.
- * Refreshes (debounced) whenever the mode/models/concurrency change.
+ * Refreshes (debounced) whenever the mode/models change.
  */
 export default function CostEstimate({
   mode,
@@ -58,21 +58,17 @@ export default function CostEstimate({
   }
 
   const parts: string[] = [];
-  if (Number(preview.applied_flat_rate_per_min) > 0) {
-    parts.push(`${mode === "announcement" ? "announcement" : "assistant"} rate ₹${Number(preview.applied_flat_rate_per_min).toFixed(2)}/min`);
-  } else if (Number(preview.models_rate_per_min) > 0) {
-    parts.push(`selected models ₹${Number(preview.models_rate_per_min).toFixed(2)}/min`);
-  } else {
-    parts.push("standard rate");
+  if (Number(preview.models_rate_per_min) > 0) {
+    parts.push(`models ₹${Number(preview.models_rate_per_min).toFixed(2)}/min`);
   }
-  if (Number(preview.concurrency_addon_per_min) > 0) {
-    parts.push(`concurrency +₹${Number(preview.concurrency_addon_per_min).toFixed(2)}/min`);
+  if (Number(preview.server_per_min) > 0) {
+    parts.push(`server ₹${Number(preview.server_per_min).toFixed(2)}/min`);
   }
-  if (Number(preview.misc_fee_per_min) > 0) {
-    parts.push(`misc +₹${Number(preview.misc_fee_per_min).toFixed(2)}/min`);
+  if (Number(preview.applied_rate_per_min) > Number(preview.rate_card_per_min)) {
+    parts.push(`${mode === "announcement" ? "announcement" : "assistant"} minimum ₹${Number(preview.mode_min_per_min).toFixed(2)}/min applies`);
   }
-  if (preview.floor_applied && Number(preview.models_rate_per_min) > 0) {
-    parts.push("minimum rate applied");
+  if (preview.floor_applied) {
+    parts.push("minimum price applied");
   }
 
   return (

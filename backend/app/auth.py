@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, Any
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -21,6 +21,24 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_ALGO = "HS256"
 ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", str(60 * 24 * 7)))
 TOKEN_EXPIRY = timedelta(minutes=ACCESS_TOKEN_MINUTES)
+
+# Session lives in an httpOnly cookie so the JWT is NEVER readable by
+# JavaScript (XSS can't exfiltrate it). SameSite=Lax blocks cross-site POSTs
+# (CSRF). The Authorization: Bearer header stays accepted for API clients.
+SESSION_COOKIE = "va_session"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") in ("1", "true", "TRUE", "yes")
+COOKIE_MAX_AGE = ACCESS_TOKEN_MINUTES * 60
+
+
+def set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="lax",
+        secure=COOKIE_SECURE, max_age=COOKIE_MAX_AGE, path="/",
+    )
+
+
+def clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE, path="/")
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
@@ -60,12 +78,22 @@ def decode_token(token: str) -> str:
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
+def extract_token(request: Request, credentials: Optional[HTTPAuthorizationCredentials]) -> str:
+    """Cookie session first (httpOnly, not JS-readable), Bearer header second
+    (API clients). Empty string when neither is present."""
+    if credentials is not None and credentials.credentials:
+        return credentials.credentials
+    return request.cookies.get(SESSION_COOKIE, "")
+
+
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
 ) -> Any:
-    if credentials is None:
+    token = extract_token(request, credentials)
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    user_id = decode_token(credentials.credentials)
+    user_id = decode_token(token)
     user = await repo.get_user(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")

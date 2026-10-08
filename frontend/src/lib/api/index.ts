@@ -1,45 +1,16 @@
 "use client";
 
-// Backend base URL (FastAPI on :8000). Override with NEXT_PUBLIC_BACKEND_URL.
-const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+// Session security: the JWT lives in an httpOnly, SameSite=Lax cookie that
+// JavaScript can never read. No token is stored in localStorage anymore —
+// these shims only keep older imports compiling.
+import { BASE, req, cachedReq, invalidate } from "./request";
 
-const TOKEN_KEY = "va_token";
-
-export function setToken(t: string) {
-  if (typeof window !== "undefined") localStorage.setItem(TOKEN_KEY, t);
-}
-export function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem(TOKEN_KEY);
-}
+export function setToken(_t?: string) { /* cookie session — nothing to store */ }
+export function getToken(): string | null { return null; }
 export function clearToken() {
-  if (typeof window !== "undefined") localStorage.removeItem(TOKEN_KEY);
-}
-
-async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getToken();
-  const res = await fetch(`${BASE}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers || {}),
-    },
-  });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json();
-      detail = body?.detail || detail;
-    } catch {
-      /* ignore */
-    }
-    throw Object.assign(new Error(detail || `Request failed (${res.status})`), {
-      status: res.status,
-    });
-  }
-  if (res.status === 204) return undefined as T;
-  return res.json();
+  // Best-effort server-side logout; ignore failures (session may already be gone).
+  fetch(`${BASE}/api/auth/logout`, { method: "POST", credentials: "include" }).catch(() => {});
+  invalidate("/");
 }
 
 // ------ types --------------------------------------------------------------
@@ -174,30 +145,39 @@ export const register = (body: {
   password: string;
   name?: string;
 }) =>
-  req<{ token: string; user: User }>("/api/auth/register", {
+  req<{ user: User }>("/api/auth/register", {
     method: "POST",
     body: JSON.stringify(body),
   });
 export const login = (body: { email: string; password: string }) =>
-  req<{ token: string; user: User }>("/api/auth/login", {
+  req<{ user: User }>("/api/auth/login", {
     method: "POST",
     body: JSON.stringify(body),
   });
 export const me = () => req<User>("/api/auth/me");
 
 // ------ catalog / agents ---------------------------------------------------
-export const getCatalog = () => req<Catalog>("/api/catalog");
-export const listAgents = () => req<{ agents: Agent[] }>("/api/agents");
+export const getCatalog = () => cachedReq<Catalog>("/api/catalog", 60_000);
+export const listAgents = () => cachedReq<{ agents: Agent[] }>("/api/agents", 10_000);
 export const getAgent = (id: string) => req<Agent>(`/api/agents/${id}`);
-export const createAgent = (body: Record<string, unknown>) =>
-  req<Agent>("/api/agents", { method: "POST", body: JSON.stringify(body) });
-export const updateAgent = (id: string, body: Record<string, unknown>) =>
-  req<Agent>(`/api/agents/${id}`, {
+export const createAgent = async (body: Record<string, unknown>) => {
+  const out = await req<Agent>("/api/agents", { method: "POST", body: JSON.stringify(body) });
+  invalidate("/api/agents");
+  return out;
+};
+export const updateAgent = async (id: string, body: Record<string, unknown>) => {
+  const out = await req<Agent>(`/api/agents/${id}`, {
     method: "PUT",
     body: JSON.stringify(body),
   });
-export const deleteAgent = (id: string) =>
-  req<void>(`/api/agents/${id}`, { method: "DELETE" });
+  invalidate("/api/agents");
+  return out;
+};
+export const deleteAgent = async (id: string) => {
+  const out = await req<void>(`/api/agents/${id}`, { method: "DELETE" });
+  invalidate("/api/agents");
+  return out;
+};
 
 // ------ calls --------------------------------------------------------------
 export const startCall = (body: {
@@ -219,69 +199,22 @@ export const getCall = (id: string) => req<CallRecord>(`/api/calls/${id}`);
 export const endCall = (id: string) => req<{ ok: boolean; call_id: string }>(`/api/calls/${id}/end`, { method: "POST" });
 export const deleteCall = (id: string) => req<void>(`/api/calls/${id}`, { method: "DELETE" });
 
-// ------ campaigns (bulk calling) ------------------------------------------
-export interface CampaignLead {
-  index: number;
-  data: Record<string, string>;
-  status: "queued" | "calling" | "done" | "failed";
-  call_id?: string;
-  error?: string;
-  updated_at?: string;
-}
-export interface Campaign {
-  id: string;
-  user_id: string;
-  agent_id: string;
-  name: string;
-  concurrency: number;
-  sip_trunk_id: string;
-  phone_column: string;
-  created_at: string;
-  status: "paused" | "running" | "done";
-  summary: {
-    queued: number;
-    calling: number;
-    done: number;
-    failed: number;
-    total: number;
-  };
-  leads?: CampaignLead[];
-}
-
-export const createCampaign = async (form: FormData) => {
-  const token = getToken();
-  const res = await fetch(`${BASE}/api/campaigns`, {
-    method: "POST",
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-    body: form,
-  });
-  if (!res.ok)
-    throw new Error(
-      (await res.json().catch(() => ({})))?.detail || "Campaign create failed",
-    );
-  return res.json();
-};
-export const listCampaigns = () =>
-  req<{ campaigns: Campaign[] }>("/api/campaigns");
-export const getCampaign = (id: string) =>
-  req<Campaign>(`/api/campaigns/${id}`);
-export const startCampaign = (id: string) =>
-  req<Campaign>(`/api/campaigns/${id}/start`, { method: "POST" });
-export const pauseCampaign = (id: string) =>
-  req<Campaign>(`/api/campaigns/${id}/pause`, { method: "POST" });
-export const deleteCampaign = (id: string) =>
-  req<void>(`/api/campaigns/${id}`, { method: "DELETE" });
+export * from "./campaigns";
 
 // ------ wallet / billing ---------------------------------------------------
 export const getWallet = () =>
-  req<{ balance: number; currency: string; transactions: unknown[] }>(
-    "/api/wallet",
+  cachedReq<{ balance: number; currency: string; transactions: unknown[] }>(
+    "/api/wallet", 4_000,
   );
-export const recharge = (amount: number) =>
-  req("/api/wallet/recharge", {
+export const recharge = async (amount: number) => {
+  const out = await req("/api/wallet/recharge", {
     method: "POST",
     body: JSON.stringify({ add_amount: amount }),
   });
+  invalidate("/api/wallet");
+  invalidate("/api/subscription");
+  return out;
+};
 export const getUsage = () => req<Usage>("/api/billing/usage");
 
 // ------ knowledge ----------------------------------------------------------
@@ -297,7 +230,7 @@ export const setKnowledge = (
   req<{ ok: boolean }>(`/api/agents/${agentId}/knowledge`, {
     method: "PUT",
     body: JSON.stringify(body),
-  });
+  }).then((out) => { invalidate("/api/agents"); return out; });
 
 export const addKnowledge = async (
   agentId: string,
@@ -307,16 +240,16 @@ export const addKnowledge = async (
   if (opts.text) form.set("text", opts.text);
   if (opts.faq) form.set("faq", JSON.stringify(opts.faq));
   if (opts.file) form.set("file", opts.file);
-  const token = getToken();
   const res = await fetch(`${BASE}/api/agents/${agentId}/knowledge`, {
     method: "POST",
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    credentials: "include",
     body: form,
   });
   if (!res.ok)
     throw new Error(
       (await res.json().catch(() => ({})))?.detail || "Upload failed",
     );
+  invalidate("/api/agents");
   return res.json();
 };
 
@@ -326,10 +259,11 @@ export interface CostPreview {
   client_rate_per_min: number;
   duration_mins: number;
   total_cost_inr: number;
-  applied_flat_rate_per_min: number;
-  models_rate_per_min: number;
-  concurrency_addon_per_min: number;
-  misc_fee_per_min: number;
+  models_rate_per_min: number;   // selected LLM+STT+TTS rate card
+  server_per_min: number;        // platform server cost component
+  rate_card_per_min: number;     // models + server
+  mode_min_per_min: number;      // per-mode minimum that applies
+  applied_rate_per_min: number;  // max(rate_card, mode_min)
   floor_applied?: boolean;
   [k: string]: unknown;
 }

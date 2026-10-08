@@ -9,7 +9,6 @@ import {
   listAgents,
   deleteAgent,
   me,
-  getToken,
   clearToken,
   getWallet,
 } from "@/lib/api";
@@ -40,14 +39,11 @@ export default function Dashboard() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   useEffect(() => {
-    const token = getToken();
-    if (!token) {
-      setChecking(false);
-      return;
-    }
+    // Session is an httpOnly cookie (JS can't see it) — probe the server
+    // instead of checking localStorage. 401 → AuthScreen.
     me()
       .then(setUser)
-      .catch(() => clearToken())
+      .catch(() => setUser(null))
       .finally(() => setChecking(false));
   }, []);
 

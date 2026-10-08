@@ -1,11 +1,15 @@
-"""Auth routes (/api/auth/*): register, login, me.
-Extracted from the old monolithic main.py — behavior unchanged.
+"""Auth routes (/api/auth/*): register, login, me, logout.
+
+Session security: the JWT is delivered ONLY as an httpOnly, SameSite=Lax
+cookie (never in the response body) so JavaScript cannot read it — XSS can't
+steal the token, and SameSite=Lax blocks cross-site POST forgery. API
+clients may still send the JWT via Authorization: Bearer.
 """
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Response
 
 from ..models import RegisterBody, LoginBody
 from .. import auth
@@ -24,18 +28,18 @@ router = APIRouter(tags=["auth"])
 # /api/setup/super-admin (see routes/setup_routes.py); later promotions go
 # through the audited /api/admin/users/{id}/role path.
 @router.post("/api/auth/register", status_code=201)
-async def register(body: RegisterBody):
+async def register(body: RegisterBody, response: Response):
     if not body.email or not body.password:
         raise HTTPException(400, "Email and password required")
     if await repo.get_user_by_email(body.email):
         raise HTTPException(409, "Email already registered")
     user = await repo.create_user(body.email, body.name, auth.hash_password(body.password))
-    token = auth.create_access_token(user["id"])
-    return {"token": token, "user": user}
+    auth.set_session_cookie(response, auth.create_access_token(user["id"]))
+    return {"user": user}
 
 
 @router.post("/api/auth/login")
-async def login(body: LoginBody):
+async def login(body: LoginBody, response: Response):
     user = await repo.get_user_by_email(body.email)
     if not user:
         raise HTTPException(401, "Invalid credentials")
@@ -44,8 +48,14 @@ async def login(body: LoginBody):
     if getattr(user, "disabled", False):
         raise HTTPException(403, "This account has been disabled by an administrator.")
     user_dict = repo._user_dict(user)
-    token = auth.create_access_token(user.id)
-    return {"token": token, "user": user_dict}
+    auth.set_session_cookie(response, auth.create_access_token(user.id))
+    return {"user": user_dict}
+
+
+@router.post("/api/auth/logout")
+async def logout(response: Response):
+    auth.clear_session_cookie(response)
+    return {"ok": True}
 
 
 @router.get("/api/auth/me")

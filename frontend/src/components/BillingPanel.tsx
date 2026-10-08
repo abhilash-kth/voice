@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getUsage, getWallet, recharge, Usage } from "@/lib/api";
+import SubscriptionPanel from "@/components/SubscriptionPanel";
 
 interface Tx {
   ts: string;
@@ -18,6 +19,7 @@ export default function BillingPanel() {
   const [msg, setMsg] = useState("");
   const [loading, setLoading] = useState(true);
   const [recharging, setRecharging] = useState<number | null>(null);
+  const [customAmt, setCustomAmt] = useState("");
 
   const load = async () => {
     try {
@@ -179,6 +181,8 @@ export default function BillingPanel() {
           </div>
         </div>
 
+        <SubscriptionPanel onChanged={load} />
+
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {amounts.map((a) => (
             <button
@@ -201,6 +205,27 @@ export default function BillingPanel() {
               )}
             </button>
           ))}
+        </div>
+
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            type="number"
+            min={1}
+            value={customAmt}
+            onChange={(e) => setCustomAmt(e.target.value)}
+            placeholder="Custom amount ₹"
+            className="flex-1 max-w-xs bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white"
+          />
+          <button
+            onClick={() => {
+              const amt = Math.floor(Number(customAmt));
+              if (amt > 0) { addFunds(amt); setCustomAmt(""); }
+            }}
+            disabled={recharging !== null || Math.floor(Number(customAmt)) <= 0}
+            className="bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold px-4 py-2 rounded-lg disabled:opacity-50"
+          >
+            {recharging !== null ? "Processing…" : "Add custom amount"}
+          </button>
         </div>
 
         {msg && (

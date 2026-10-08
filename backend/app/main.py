@@ -137,9 +137,19 @@ app.include_router(campaigns_routes.router)
 app.include_router(billing_routes.router)
 app.include_router(subscription_routes.router)
 
+# Credentialed-cookie sessions require explicit origins (browsers reject "*"
+# with credentials) — and an explicit allowlist is better hygiene anyway.
+# Server-to-server webhooks (Twilio/Exotel/SIP) are unaffected by CORS.
+# Extra origins: set CORS_ORIGINS="https://app.example.com,https://admin.example.com"
+_cors_origins = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:3002,"
+    "http://127.0.0.1:3000,http://127.0.0.1:3002",
+).split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

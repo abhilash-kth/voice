@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { login, setToken } from "@/lib/api";
+import { login, clearToken } from "@/lib/api";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -17,10 +17,11 @@ export default function LoginPage() {
     try {
       const out = await login({ email: email.trim(), password });
       if (out.user?.role !== "SUPER_ADMIN") {
+        // The server already set a session cookie — drop it (admin panel only).
+        clearToken();
         setErr("This account is not a SUPER_ADMIN. Use the customer dashboard instead.");
         return;
       }
-      setToken(out.token);
       router.replace("/");
     } catch (e2) {
       setErr((e2 as Error).message || "Login failed");

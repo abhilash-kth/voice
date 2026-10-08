@@ -3,26 +3,20 @@
 // Backend base URL (FastAPI on :8000). Override with NEXT_PUBLIC_BACKEND_URL.
 const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-const TOKEN_KEY = "sa_token";   // separate key from the customer dashboard token
-
-export function setToken(t: string) {
-  if (typeof window !== "undefined") localStorage.setItem(TOKEN_KEY, t);
-}
-export function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem(TOKEN_KEY);
-}
+// Session security: the JWT lives in an httpOnly, SameSite=Lax cookie that
+// JavaScript can never read — the panel stores NOTHING in localStorage.
+export function setToken(_t?: string) { /* cookie session — nothing to store */ }
+export function getToken(): string | null { return null; }
 export function clearToken() {
-  if (typeof window !== "undefined") localStorage.removeItem(TOKEN_KEY);
+  fetch(`${BASE}/api/auth/logout`, { method: "POST", credentials: "include" }).catch(() => {});
 }
 
 export async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getToken();
   const res = await fetch(`${BASE}${path}`, {
     ...options,
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
     },
   });
@@ -70,7 +64,7 @@ export interface Paged<T> {
 
 // ------ auth ----------------------------------------------------------------
 export const login = (body: { email: string; password: string }) =>
-  req<{ token: string; user: ApiUser }>("/api/auth/login", {
+  req<{ user: ApiUser }>("/api/auth/login", {
     method: "POST",
     body: JSON.stringify(body),
   });
