@@ -45,65 +45,9 @@ async def apply_per_turn_rag(self, turn_ctx, new_message, cfg, rag_prefetch,
         # --- Conversational context for RAG (fix for pronoun follow-ups) ---
         # Preserve actual user message for LLM (new_message unchanged).
         # Only the INTERNAL retrieval query gets enriched with recent context.
+        from .ab_rag_context import build_contextual_retrieval
         original_user_query = user_text
-        retrieval_query = original_user_query
-        recent_user_ctx = ""
-        recent_assistant_ctx = ""
-        context_used = False
-        try:
-            _ctx_for_recent = _find_chat_ctx(turn_ctx)
-            if _ctx_for_recent is not None:
-                _items = getattr(_ctx_for_recent, "items", []) or []
-                # Find last user before current (not ack/incomplete, not same text)
-                for m in reversed(_items):
-                    if getattr(m, "role", "") == "user":
-                        _txt = _chat_msg_text(m).strip()
-                        if not _txt or _txt == original_user_query or len(_txt) < 4:
-                            continue
-                        try:
-                            from ...turn_rules import is_acknowledgement as _is_ack_r, is_incomplete_turn as _is_inc_r
-                            if _is_ack_r(_txt) or _is_inc_r(_txt):
-                                continue
-                        except Exception:
-                            pass
-                        recent_user_ctx = _txt
-                        break
-                if not recent_user_ctx:
-                    for m in reversed(_items):
-                        if getattr(m, "role", "") == "assistant":
-                            _txt = _chat_msg_text(m).strip()
-                            if _txt and len(_txt) > 10:
-                                recent_assistant_ctx = _txt[:200]
-                                break
-        except Exception:
-            recent_user_ctx = ""
-            recent_assistant_ctx = ""
-
-        try:
-            if is_contextual_followup(original_user_query):
-                _ctx_candidate = recent_user_ctx or recent_assistant_ctx
-                if _ctx_candidate:
-                    _built = build_contextual_retrieval_query(
-                        original_user_query, recent_user_ctx, recent_assistant_ctx
-                    )
-                    if _built and _built != original_user_query:
-                        retrieval_query = _built
-                        context_used = True
-        except Exception:
-            retrieval_query = original_user_query
-            context_used = False
-
-        try:
-            logger.info(
-                "🔎 [RAG_CONTEXT_QUERY] user_query='%s' retrieval_query='%s' context_used=%s recent_len=%d",
-                original_user_query[:80],
-                retrieval_query[:120],
-                "yes" if context_used else "no",
-                len(recent_user_ctx or recent_assistant_ctx),
-            )
-        except Exception:
-            pass
-
+        retrieval_query, context_used = build_contextual_retrieval(turn_ctx, original_user_query)
         logger.info(
             "🔎 [RAG_STARTED] query='%s' retrieval_query='%s' context_used=%s",
             original_user_query[:60],

@@ -293,9 +293,6 @@ def calculate_llm_cost_detailed(
             "error": str(e),
             "total_llm_cost": 0,
         }
-
 def estimate_unit_tokens(text: str) -> int:
     """Approx token count for billing when runtime tokeniser isn't available."""
-    if not text:
-        return 0
-    return max(1, int(len(text) / 4))
+    return max(1, int(len(text) / 4)) if text else 0
