@@ -32,11 +32,11 @@ export default function BillingPanel() {
     }
   };
 
-  useEffect(() => {
-    load();
-    const id = setInterval(load, 5000);
-    return () => clearInterval(id);
-  }, []);
+  // useEffect(() => {
+  //   load();
+  //   const id = setInterval(load, 5000);
+  //   return () => clearInterval(id);
+  // }, []);
 
   const addFunds = async (amt: number) => {
     setRecharging(amt);
@@ -103,7 +103,7 @@ export default function BillingPanel() {
       {/* Header Stats - Professional SaaS cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* Wallet Balance - Hero card */}
-        <div className="sm:col-span-2 lg:col-span-1 relative overflow-hidden rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 p-5 text-white shadow-xl shadow-emerald-500/20">
+        <div className="sm:col-span-2 lg:col-span-1 relative overflow-hidden rounded-2xl bg-linear-to-br from-emerald-500 to-teal-600 p-5 text-white shadow-xl shadow-emerald-500/20">
           <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-16 -mt-16 blur-2xl" />
           <div className="relative">
             <div className="flex items-center justify-between mb-2">
@@ -127,7 +127,7 @@ export default function BillingPanel() {
           </div>
         </div>
 
-        <div className="rounded-2xl bg-gray-900 border border-gray-800 p-5 hover:border-gray-700 transition-colors shadow-sm">
+        <div className="rounded-2xl bg-gray-900 border border-gray-800 p-5 hover:border-gray-700 transition-colors shadow-xs">
           <div className="flex items-center justify-between mb-3">
             <p className="text-gray-400 text-xs font-semibold tracking-wider uppercase">Total Calls</p>
             <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">📞</div>
@@ -139,7 +139,7 @@ export default function BillingPanel() {
           </div>
         </div>
 
-        <div className="rounded-2xl bg-gray-900 border border-gray-800 p-5 hover:border-gray-700 transition-colors shadow-sm">
+        <div className="rounded-2xl bg-gray-900 border border-gray-800 p-5 hover:border-gray-700 transition-colors shadow-xs">
           <div className="flex items-center justify-between mb-3">
             <p className="text-gray-400 text-xs font-semibold tracking-wider uppercase">Minutes Used</p>
             <div className="w-8 h-8 rounded-lg bg-violet-500/10 border border-violet-500/20 flex items-center justify-center text-violet-400">⏱️</div>
@@ -151,7 +151,7 @@ export default function BillingPanel() {
           </div>
         </div>
 
-        <div className="rounded-2xl bg-gray-900 border border-gray-800 p-5 hover:border-gray-700 transition-colors shadow-sm">
+        <div className="rounded-2xl bg-gray-900 border border-gray-800 p-5 hover:border-gray-700 transition-colors shadow-xs">
           <div className="flex items-center justify-between mb-3">
             <p className="text-gray-400 text-xs font-semibold tracking-wider uppercase">Customer Spend</p>
             <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">💰</div>
@@ -236,7 +236,7 @@ export default function BillingPanel() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <p className="text-sm font-medium text-white truncate">{isSpend ? "Call charge" : "Wallet top-up"}</p>
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${isSpend ? "bg-red-500/10 text-red-300" : "bg-emerald-500/10 text-emerald-300"}`}>{t.kind}</span>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded-sm font-medium ${isSpend ? "bg-red-500/10 text-red-300" : "bg-emerald-500/10 text-emerald-300"}`}>{t.kind}</span>
                       </div>
                       <p className="text-[11px] text-gray-500 truncate mt-0.5">{formatDate(t.ts)} {t.note ? `• ${t.note}` : ""}</p>
                     </div>

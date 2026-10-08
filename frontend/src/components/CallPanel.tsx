@@ -91,9 +91,11 @@ function ActiveSession({
       setAgentJoined(true);
       onStateChange("connected");
       const remote = remoteAgents[0];
-      console.log(`[AGENT_JOINED] room=${roomName} identity=${remote.identity}`);
       console.log(
-        `[AGENT_STARTED] room=${roomName} agent_id=${agent?.id || ""} mode=${agent?.agent_mode || "assistant"}`
+        `[AGENT_JOINED] room=${roomName} identity=${remote.identity}`,
+      );
+      console.log(
+        `[AGENT_STARTED] room=${roomName} agent_id=${agent?.id || ""} mode=${agent?.agent_mode || "assistant"}`,
       );
       if (agent?.agent_mode === "announcement") {
         console.log(`[ANNOUNCEMENT_STARTED] room=${roomName}`);
@@ -102,9 +104,18 @@ function ActiveSession({
       }
     } else if (remoteAgents.length === 0 && !agentJoined && !waitingLogged) {
       setWaitingLogged(true);
-      console.log(`[AGENT_WAITING] room=${roomName} agent_id=${agent?.id || ""}`);
+      console.log(
+        `[AGENT_WAITING] room=${roomName} agent_id=${agent?.id || ""}`,
+      );
     }
-  }, [participants, agentJoined, roomName, agent, waitingLogged, onStateChange]);
+  }, [
+    participants,
+    agentJoined,
+    roomName,
+    agent,
+    waitingLogged,
+    onStateChange,
+  ]);
 
   // Track announcement playback state
   useEffect(() => {
@@ -179,7 +190,8 @@ function ActiveSession({
                     : "Connected to agent"}
         </p>
         <p className="text-[11px] text-gray-500 mt-1">
-          {participants.length} participant{participants.length !== 1 ? "s" : ""} in room
+          {participants.length} participant
+          {participants.length !== 1 ? "s" : ""} in room
           {announcementDone && " • You can stay connected or press End Call"}
         </p>
       </div>
@@ -277,7 +289,9 @@ export default function CallPanel({
         if (cancelled) return;
         if (c.status === "failed") {
           const why =
-            (typeof c.usage === "object" && c.usage !== null && (c.usage as any).error) ||
+            (typeof c.usage === "object" &&
+              c.usage !== null &&
+              (c.usage as any).error) ||
             "the agent worker could not start this call";
           await failWait(`The agent could not start: ${why}`);
         }
@@ -344,12 +358,15 @@ export default function CallPanel({
     const found = agents.find((a) => a.id === newId);
     if (found) {
       console.log(
-        `[AGENT_SELECTED] agent_id=${found.id} name=${found.name} mode=${found.agent_mode || "assistant"}`
+        `[AGENT_SELECTED] agent_id=${found.id} name=${found.name} mode=${found.agent_mode || "assistant"}`,
       );
     }
   };
 
-  const selected = useMemo(() => agents.find((a) => a.id === agentId), [agents, agentId]);
+  const selected = useMemo(
+    () => agents.find((a) => a.id === agentId),
+    [agents, agentId],
+  );
 
   const fetchCallSummary = async (cid: string) => {
     if (!cid) {
@@ -374,7 +391,9 @@ export default function CallPanel({
           // Surface the real reason (worker setup failure, LiveKit timeout…)
           // instead of a fake "completed, billed ₹0.00" summary.
           const why =
-            (typeof c.usage === "object" && c.usage !== null && (c.usage as any).error) ||
+            (typeof c.usage === "object" &&
+              c.usage !== null &&
+              (c.usage as any).error) ||
             "the agent worker could not start the call";
           setErr(`Call failed: ${why}`);
           setCallState("error");
@@ -386,10 +405,14 @@ export default function CallPanel({
         const isFinalized = c.status === "completed" || c.status === "failed";
 
         // Check if billing is ready: either cost is posted or duration is > 0
-        if (costInr !== undefined && costInr !== null && (Number(costInr) > 0 || duration > 0)) {
+        if (
+          costInr !== undefined &&
+          costInr !== null &&
+          (Number(costInr) > 0 || duration > 0)
+        ) {
           const finalCost = Number(costInr) || 0;
           setCallEndedMsg(
-            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`
+            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`,
           );
           onStarted(); // triggers refreshWallet() and refreshAgents() in parent
           return;
@@ -398,7 +421,7 @@ export default function CallPanel({
         if (isFinalized && duration > 0) {
           const finalCost = Number(costInr || 0);
           setCallEndedMsg(
-            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`
+            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`,
           );
           onStarted();
           return;
@@ -416,7 +439,7 @@ export default function CallPanel({
       const costInr = Number((c.cost as any)?.client_price_inr || 0);
       const duration = c.duration_seconds ?? 0;
       setCallEndedMsg(
-        `Call completed • ${duration}s • Billed ₹${costInr.toFixed(2)} • Wallet balance updated`
+        `Call completed • ${duration}s • Billed ₹${costInr.toFixed(2)} • Wallet balance updated`,
       );
       onStarted();
     } catch {
@@ -439,13 +462,15 @@ export default function CallPanel({
     try {
       if (curCallId) {
         await endCall(curCallId).catch((e) =>
-          console.warn("endCall backend call error:", e)
+          console.warn("endCall backend call error:", e),
         );
       }
     } catch {
       // ignore backend error on end
     } finally {
-      console.log(`[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=user_ended`);
+      console.log(
+        `[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=user_ended`,
+      );
       setTimeout(() => {
         setSession(null);
         setCallState("ended");
@@ -458,7 +483,10 @@ export default function CallPanel({
 
   const handleAnnouncementFinished = useCallback(() => {
     if (!selected) return;
-    if (selected.agent_mode === "announcement" && selected.end_after_announcement) {
+    if (
+      selected.agent_mode === "announcement" &&
+      selected.end_after_announcement
+    ) {
       console.log(`[CALL_END_REQUESTED] source=announcement call_id=${callId}`);
       callEndReasonRef.current = "announcement_completed";
     }
@@ -473,18 +501,31 @@ export default function CallPanel({
 
       let finalReason = callEndReasonRef.current;
       if (!finalReason) {
-        if (selected?.agent_mode === "announcement" && selected?.end_after_announcement) {
+        if (
+          selected?.agent_mode === "announcement" &&
+          selected?.end_after_announcement
+        ) {
           finalReason = "announcement_completed";
-        } else if (reason === 5 || String(reason).includes("5") || String(reason).includes("ROOM_DELETED")) {
+        } else if (
+          reason === 5 ||
+          String(reason).includes("5") ||
+          String(reason).includes("ROOM_DELETED")
+        ) {
           finalReason = "completed";
-        } else if (reason === 7 || String(reason).includes("7") || String(reason).includes("JOIN_FAILURE")) {
+        } else if (
+          reason === 7 ||
+          String(reason).includes("7") ||
+          String(reason).includes("JOIN_FAILURE")
+        ) {
           finalReason = "connection_error";
         } else {
           finalReason = "room_disconnected";
         }
       }
 
-      console.log(`[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=${finalReason}`);
+      console.log(
+        `[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=${finalReason}`,
+      );
 
       setCallState("ending");
       setTimeout(() => {
@@ -495,7 +536,7 @@ export default function CallPanel({
         fetchCallSummary(curCallId);
       }, 250);
     },
-    [callId, session, selected]
+    [callId, session, selected],
   );
 
   const go = async () => {
@@ -516,11 +557,12 @@ export default function CallPanel({
     if (!agentId) return setErr("Select an agent first.");
     const selectedAgent = agents.find((a) => a.id === agentId);
     if (!selectedAgent) return setErr("Selected agent not found.");
-    if (mode === "sip" && !phone) return setErr("Enter a phone number for SIP calling.");
+    if (mode === "sip" && !phone)
+      return setErr("Enter a phone number for SIP calling.");
 
     console.log(`[CALL_START] agent_id=${agentId} mode=${mode}`);
     console.log(
-      `[AGENT_SELECTED] agent_id=${agentId} name=${selectedAgent.name} mode=${selectedAgent.agent_mode || "assistant"}`
+      `[AGENT_SELECTED] agent_id=${agentId} name=${selectedAgent.name} mode=${selectedAgent.agent_mode || "assistant"}`,
     );
 
     setBusy(true);
@@ -623,7 +665,8 @@ export default function CallPanel({
           )}
           {agents.map((a) => (
             <option key={a.id} value={a.id}>
-              {a.name} — {a.agent_mode === "announcement" ? "Announcement" : "Assistant"}
+              {a.name} —{" "}
+              {a.agent_mode === "announcement" ? "Announcement" : "Assistant"}
             </option>
           ))}
         </select>
@@ -638,7 +681,8 @@ export default function CallPanel({
           </p>
         ) : (
           <p className="text-[11px] text-gray-500 mb-4">
-            Create an agent, then select it here. The call uses only the agent you pick.
+            Create an agent, then select it here. The call uses only the agent
+            you pick.
           </p>
         )}
 
@@ -726,16 +770,16 @@ export default function CallPanel({
           className="w-full bg-green-600 hover:bg-green-500 text-white font-bold text-lg py-3 rounded-xl mt-4 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
         >
           {!agentsReady && callState === "idle" && !isCallActive
-              ? "Loading agents..."
-              : busy || callState === "connecting"
+            ? "Loading agents..."
+            : busy || callState === "connecting"
               ? "Connecting..."
-            : callState === "waiting_for_agent"
-              ? "Waiting for agent..."
-              : isCallActive
-                ? "Call connected"
-                : mode === "browser"
-                  ? "📞 Start Voice Call"
-                  : "📲 Dial Number"}
+              : callState === "waiting_for_agent"
+                ? "Waiting for agent..."
+                : isCallActive
+                  ? "Call connected"
+                  : mode === "browser"
+                    ? "📞 Start Voice Call"
+                    : "📲 Dial Number"}
         </button>
 
         {isCallActive && (
@@ -751,13 +795,15 @@ export default function CallPanel({
 
         {mode === "browser" && session && (
           <p className="text-xs text-gray-500 mt-3">
-            Room: <span className="font-mono text-blue-400">{session.room}</span> • Call:{" "}
-            <span className="font-mono text-purple-400">{callId}</span>
+            Room:{" "}
+            <span className="font-mono text-blue-400">{session.room}</span> •
+            Call: <span className="font-mono text-purple-400">{callId}</span>
           </p>
         )}
         {mode === "sip" && callId && !session && (
           <p className="text-xs text-green-400 mt-3">
-            ✅ SIP call dispatched. The agent is dialing the number. View transcripts in Calls tab.
+            ✅ SIP call dispatched. The agent is dialing the number. View
+            transcripts in Calls tab.
           </p>
         )}
       </div>
@@ -768,12 +814,19 @@ export default function CallPanel({
           <LiveKitRoom
             token={session.token}
             serverUrl={session.url}
-            connect={!isDisconnectingRef.current && (callState === "connecting" || callState === "waiting_for_agent" || callState === "connected")}
+            connect={
+              !isDisconnectingRef.current &&
+              (callState === "connecting" ||
+                callState === "waiting_for_agent" ||
+                callState === "connected")
+            }
             audio={STATIC_AUDIO_OPTIONS}
             video={false}
             onDisconnected={handleRoomDisconnected}
             onError={(error) => {
-              console.error(`[CALL_ERROR] LiveKitRoom error: ${error?.message || error}`);
+              console.error(
+                `[CALL_ERROR] LiveKitRoom error: ${error?.message || error}`,
+              );
             }}
             className="w-full flex items-center justify-center"
           >
@@ -792,15 +845,21 @@ export default function CallPanel({
             {callEndedMsg ? (
               <>
                 <div className="text-5xl mb-3">✅</div>
-                <p className="text-sm text-white font-semibold">Last call ended</p>
+                <p className="text-sm text-white font-semibold">
+                  Last call ended
+                </p>
                 <p className="text-xs mt-1 text-gray-400">{callEndedMsg}</p>
-                <p className="text-xs mt-3">Start a new call from the left panel.</p>
+                <p className="text-xs mt-3">
+                  Start a new call from the left panel.
+                </p>
               </>
             ) : callState === "error" ? (
               <>
                 <div className="text-5xl mb-3">⚠️</div>
                 <p className="text-sm text-red-400 font-semibold">Call Error</p>
-                <p className="text-xs mt-1 text-gray-400">{err || "An error occurred"}</p>
+                <p className="text-xs mt-1 text-gray-400">
+                  {err || "An error occurred"}
+                </p>
               </>
             ) : mode === "browser" ? (
               <>

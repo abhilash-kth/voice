@@ -347,23 +347,23 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     return (
       <div className="mt-2 p-2 bg-gray-800/50 rounded-lg border border-gray-700/50 text-[11px] space-y-1">
         <div className="flex flex-wrap gap-2">
-          <span className="bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded">
+          <span className="bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-sm">
             Input {meta.price_currency === "INR" ? `\u20B9${meta.input_price_per_1m}/1M` : `$${meta.input_price_per_1m}/1M`}
           </span>
-          <span className="bg-green-500/20 text-green-300 px-2 py-0.5 rounded">
+          <span className="bg-green-500/20 text-green-300 px-2 py-0.5 rounded-sm">
             Cached {meta.price_currency === "INR" ? `\u20B9${meta.cached_input_price_per_1m}/1M` : `$${meta.cached_input_price_per_1m}/1M`}
           </span>
-          <span className="bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">
+          <span className="bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded-sm">
             Output {meta.price_currency === "INR" ? `\u20B9${meta.output_price_per_1m}/1M` : `$${meta.output_price_per_1m}/1M`}
           </span>
           {meta.free_tier && (
-            <span className="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded">free tier (rate-limited)</span>
+            <span className="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-sm">free tier (rate-limited)</span>
           )}
           {meta.voice_recommended && (
-            <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded">\u2605 recommended for voice</span>
+            <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-sm">\u2605 recommended for voice</span>
           )}
           {meta.status === "deprecated" && (
-            <span className="bg-red-500/20 text-red-300 px-2 py-0.5 rounded">deprecated — works, but switch</span>
+            <span className="bg-red-500/20 text-red-300 px-2 py-0.5 rounded-sm">deprecated — works, but switch</span>
           )}
         </div>
         <div className="flex flex-wrap gap-2 text-gray-400">
@@ -378,11 +378,11 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         </div>
         <div className="flex flex-wrap gap-1">
           {meta.capabilities.map(c => (
-            <span key={c} className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">{c}</span>
+            <span key={c} className="bg-gray-700 px-1.5 py-0.5 rounded-sm text-[10px]">{c}</span>
           ))}
-          {meta.streaming_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">streaming</span>}
-          {meta.tool_calling_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">tools</span>}
-          {meta.structured_output_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[10px]">structured</span>}
+          {meta.streaming_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded-sm text-[10px]">streaming</span>}
+          {meta.tool_calling_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded-sm text-[10px]">tools</span>}
+          {meta.structured_output_supported && <span className="bg-gray-700 px-1.5 py-0.5 rounded-sm text-[10px]">structured</span>}
         </div>
         {meta.notes && <div className="text-amber-300/80">{meta.notes}</div>}
         {meta.base_url && <div className="text-gray-500">Base URL: {meta.base_url}</div>}
@@ -931,14 +931,14 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
                       value={item.q}
                       onChange={(e) => setFaq((f) => f.map((x, j) => (j === i ? { ...x, q: e.target.value } : x)))}
                       placeholder="Question"
-                      className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm"
+                      className="bg-gray-800 border border-gray-700 rounded-sm px-2 py-1.5 text-sm"
                     />
                     <div className="flex gap-1">
                       <input
                         value={item.a}
                         onChange={(e) => setFaq((f) => f.map((x, j) => (j === i ? { ...x, a: e.target.value } : x)))}
                         placeholder="Answer"
-                        className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm"
+                        className="flex-1 bg-gray-800 border border-gray-700 rounded-sm px-2 py-1.5 text-sm"
                       />
                       <button onClick={() => setFaq((f) => f.filter((_, j) => j !== i))} className="text-red-400 text-xs px-2">
                         ✕

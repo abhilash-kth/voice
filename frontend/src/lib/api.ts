@@ -1,9 +1,8 @@
 "use client";
 
-// Backend base URL (FastAPI on :8000). Override with NEXT_PUBLIC_BACKEND_URL.
 const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-const TOKEN_KEY = "va_token";
+export const TOKEN_KEY = "va_token";
 
 export function setToken(t: string) {
   if (typeof window !== "undefined") localStorage.setItem(TOKEN_KEY, t);

@@ -140,7 +140,7 @@ export default function CallsPanel() {
                       type="checkbox"
                       checked={calls.length > 0 && selected.length === calls.length}
                       onChange={(e) => setSelected(e.target.checked ? calls.map((c) => c.id) : [])}
-                      className="rounded"
+                      className="rounded-sm"
                     />
                   </th>
                   <th className="p-3">Call ID</th>
@@ -185,7 +185,7 @@ export default function CallsPanel() {
                           onClick={(e) => e.stopPropagation()}
                           checked={selected.includes(c.id)}
                           onChange={(e) => setSelected((ids) => (e.target.checked ? [...ids, c.id] : ids.filter((id) => id !== c.id)))}
-                          className="rounded"
+                          className="rounded-sm"
                         />
                       </td>
                       <td className="p-3">
@@ -282,7 +282,7 @@ export default function CallsPanel() {
               </div>
 
               {/* Business billing card */}
-              <div className="bg-gradient-to-br from-gray-800 to-gray-800/60 rounded-xl border border-gray-700 p-4">
+              <div className="bg-linear-to-br from-gray-800 to-gray-800/60 rounded-xl border border-gray-700 p-4">
                 <h4 className="text-xs uppercase tracking-wider text-gray-400 font-semibold mb-3">Billing Summary</h4>
                 <div className="grid grid-cols-3 gap-3">
                   <div className="bg-gray-900/60 rounded-lg p-3 border border-gray-800">
@@ -326,7 +326,7 @@ export default function CallsPanel() {
                       }`}
                     >
                       <div className="flex items-center gap-2 mb-1">
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase ${t.role === "user" ? "bg-blue-500/20 text-blue-300" : "bg-gray-700 text-gray-300"}`}>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded-sm font-bold uppercase ${t.role === "user" ? "bg-blue-500/20 text-blue-300" : "bg-gray-700 text-gray-300"}`}>
                           {t.role === "user" ? "Customer" : "Agent"}
                         </span>
                       </div>
