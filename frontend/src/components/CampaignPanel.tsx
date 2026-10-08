@@ -283,7 +283,7 @@ export default function CampaignPanel({
               <div className="flex items-center gap-2 mb-3">
                 <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
                   <div
-                    className="h-full bg-gradient-to-r from-blue-500 to-emerald-500 rounded-full transition-all duration-700"
+                    className="h-full bg-linear-to-r from-blue-500 to-emerald-500 rounded-full transition-all duration-700"
                     style={{ width: `${pct}%` }}
                   />
                 </div>
@@ -294,13 +294,13 @@ export default function CampaignPanel({
               ) : (
                 <>
                   <div className="flex flex-wrap gap-2 text-[11px] text-gray-400 mb-2">
-                    <span className="bg-gray-800 rounded px-2 py-0.5">
+                    <span className="bg-gray-800 rounded-sm px-2 py-0.5">
                       ×{c.concurrency} concurrent
                     </span>
-                    <span className="bg-gray-800 rounded px-2 py-0.5">
+                    <span className="bg-gray-800 rounded-sm px-2 py-0.5">
                       {c.summary.total} leads
                     </span>
-                    <span className="bg-gray-800 rounded px-2 py-0.5">
+                    <span className="bg-gray-800 rounded-sm px-2 py-0.5">
                       {c.phone_column}?
                     </span>
                   </div>
