@@ -65,3 +65,26 @@ export interface SubscriptionRow {
 }
 export const listSubscriptions = () =>
   req<{ items: SubscriptionRow[] }>("/api/admin/subscriptions");
+
+// ---- per-call rate preview (used by the Billing-page calculator) ----------
+// Mirrors the customer /api/cost-preview response fields the UI needs.
+export interface RatePreview {
+  agent_mode: string;
+  duration_mins: number;
+  models_rate_per_min: number;   // Σ selected models' customer ₹/min (TTS-only for announcement)
+  server_per_min: number;
+  rate_card_per_min: number;     // models + server
+  mode_min_per_min: number;      // per-mode minimum applied as floor
+  applied_rate_per_min: number;  // max(rate_card, mode_min)
+  floor_applied: boolean;        // true → absolute min / margin floor raised the price
+  client_price_inr: number;      // rupees billed for the given duration
+  your_profit_inr: number;
+  is_profit: boolean;
+}
+export const ratePreview = (body: {
+  agent_mode: "assistant" | "announcement";
+  duration_seconds: number;
+  llm_provider_id?: string;
+  stt_provider_id?: string;
+  tts_provider_id?: string;
+}) => req<RatePreview>("/api/cost-preview", { method: "POST", body: JSON.stringify(body) });

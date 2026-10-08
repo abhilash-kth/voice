@@ -176,7 +176,8 @@ def calculate_call_cost(
     from . import billing_rates
     models_rate = billing_rates.selected_models_rate_per_min(
         llm_provider=v2_provider or "", llm_model_id=v2_model or "",
-        stt_id=stt_provider_id or "", tts_id=tts_provider_id or "")
+        stt_id=stt_provider_id or "", tts_id=tts_provider_id or "",
+        agent_mode=agent_mode)
     price_parts = billing_rates.customer_price(
         total_cost_inr=total_cost_inr, duration_mins=duration_mins,
         agent_mode=agent_mode, models_rate_per_min=models_rate, consts=consts,

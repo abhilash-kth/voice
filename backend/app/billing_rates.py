@@ -2,8 +2,10 @@
 
 Per-minute rate card — the customer pays, per call:
 
-  ₹/min = Σ customer_price_per_min of the call's selected LLM + STT + TTS
-          models (Super-Admin per-model prices on the Models page)
+  ₹/min = Σ customer_price_per_min of the call's selected models
+          (Super-Admin per-model prices on the Models page):
+            • assistant mode   → LLM + STT + TTS
+            • announcement mode → TTS only (fixed script: LLM/STT never run)
         + server_cost_per_min (platform infra component, also admin-set)
   floored at the per-mode minimum (assistant_min / announcement_min ₹/min),
   then per-call at max(infra_cost × (1+margin), min_client_price) so a call
@@ -72,13 +74,20 @@ def _snapshot_model_price(kind: str, key: str, model_id: str = "") -> float:
 
 
 def selected_models_rate_per_min(*, llm_provider: str = "", llm_model_id: str = "",
-                                 stt_id: str = "", tts_id: str = "") -> float:
-    """Rate card total (₹/min) for the call's selected LLM+STT+TTS models."""
+                                 stt_id: str = "", tts_id: str = "",
+                                 agent_mode: str = "assistant") -> float:
+    """Rate card total (₹/min) for the call's selected models.
+
+    Announcement calls only speak a fixed script — the LLM and STT legs never
+    run, so they are NEVER priced: the announcement rate card is the TTS
+    model's price (+server), nothing else.
+    """
     total = 0.0
-    if llm_provider:
-        total += _snapshot_model_price("llm", llm_provider, llm_model_id)
-    if stt_id:
-        total += _snapshot_model_price("stt", stt_id)
+    if agent_mode != "announcement":
+        if llm_provider:
+            total += _snapshot_model_price("llm", llm_provider, llm_model_id)
+        if stt_id:
+            total += _snapshot_model_price("stt", stt_id)
     if tts_id:
         total += _snapshot_model_price("tts", tts_id)
     return round(total, 4)

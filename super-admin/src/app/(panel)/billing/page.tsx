@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import PageHeader, { StateBox, useBusy } from "@/components/PageHeader";
+import RateCalculator from "@/components/RateCalculator";
 import { getBilling, updateBilling, type BillingConfig } from "@/lib/billing";
 import { fmtINR, toNum } from "@/lib/format";
 
@@ -89,9 +90,11 @@ export default function BillingPage() {
             <h2 className="text-sm font-bold">Customer ₹/min — rate card</h2>
             <p className="text-xs text-gray-500 leading-relaxed">
               What a customer pays per minute = <b className="text-gray-300">their agent&apos;s model
-              prices</b> (LLM + STT + TTS, set per model on the Models page) <b className="text-gray-300">+
-              server cost</b> below. The per-mode minimums are the floor of that rate; below that the mode
-              minimum applies instead.
+              prices</b> (set per model on the Models page) <b className="text-gray-300">+ server cost</b> below —
+              <b className="text-gray-300"> assistant</b> uses LLM + STT + TTS,{" "}
+              <b className="text-gray-300">announcement</b> uses TTS only (fixed script). The per-mode
+              minimums are the floor of that rate; below that the mode minimum applies instead. Try any
+              combination in the <span className="text-gray-300">Pricing calculator</span> below.
             </p>
             <Field label="Server cost ₹ / min (infra: telephony + compute)" hint="Added to every call's rate. Not shown separately to users.">
               <input className="input" type="number" step="0.01" min="0" value={serverCost} onChange={(e) => setServerCost(e.target.value)} />
@@ -135,6 +138,7 @@ export default function BillingPage() {
             </div>
           </div>
         </div>
+        <RateCalculator />
       </StateBox>
     </>
   );
