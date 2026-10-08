@@ -20,7 +20,7 @@ from app import config  # noqa: F401  (loads .env exactly like the app)
 
 
 async def main() -> int:
-    from app.db import db_init
+    from app.db import init as db_init
     from app.services import config_store
 
     await db_init()
@@ -30,8 +30,9 @@ async def main() -> int:
           f"models={sum(len(v) for v in snap.models.values())} "
           f"credentials={sorted(snap.credentials)}")
     if snap.source != "db":
-        print("!! snapshot did NOT load from the DB — nothing else can work; "
-              "check DATABASE_URL above this line.")
+        print(f"!! snapshot did NOT load from the DB — last refresh error: "
+              f"{config_store.last_refresh_error() or 'none recorded'}\n"
+              "   check DATABASE_URL above this line.")
         return 1
     if not snap.credentials:
         print("!! DB snapshot loaded but ZERO credential rows — the panel keys "

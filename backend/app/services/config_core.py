@@ -44,14 +44,29 @@ class ConfigSnapshot:
 
 _SNAPSHOT: Optional[ConfigSnapshot] = None
 _STALE = True
-_LOCK: Optional[asyncio.Lock] = None
+# Per-event-loop locks: LiveKit runs each job on its own loop, so ONE global
+# lock binds to the first job's loop and every later job crashes awaiting it
+# ("Future attached to a different loop") — leaving the snapshot stuck on the
+# empty code fallback forever (the exact "panel key set but not found" bug).
+_LOCKS: Dict[int, asyncio.Lock] = {}
+# The last build failure, for self-diagnosing missing-key errors downstream.
+_LAST_REFRESH_ERROR = ""
 
 
 def _snapshot_lock() -> asyncio.Lock:
-    global _LOCK
-    if _LOCK is None:
-        _LOCK = asyncio.Lock()
-    return _LOCK
+    try:
+        key = id(asyncio.get_running_loop())
+    except RuntimeError:
+        key = 0
+    lock = _LOCKS.get(key)
+    if lock is None:
+        lock = _LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+def last_refresh_error() -> str:
+    """repr() of the last snapshot build failure ('' after any success)."""
+    return _LAST_REFRESH_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +109,7 @@ def invalidate() -> None:
 async def refresh_if_stale(force: bool = False) -> ConfigSnapshot:
     """Rebuild the snapshot from the DB if stale/TTL-expired. Safe no-op when
     the DB is unavailable: keeps the last good snapshot (or code fallback)."""
-    global _SNAPSHOT, _STALE
+    global _SNAPSHOT, _STALE, _LAST_REFRESH_ERROR
     snap = get_snapshot()
     if not force and not _STALE and (time.time() - snap.ts) < _REFRESH_TTL:
         return snap
@@ -110,7 +125,9 @@ async def refresh_if_stale(force: bool = False) -> ConfigSnapshot:
                 _SNAPSHOT = new_snap
                 _STALE = False
                 snap = new_snap
+                _LAST_REFRESH_ERROR = ""
         except Exception as e:
+            _LAST_REFRESH_ERROR = repr(e)
             # Stuck on the code-fallback snapshot means EMPTY credentials —
             # panel API keys silently can't resolve. That is no longer a mere
             # warning: provider keys come ONLY from the panel now.

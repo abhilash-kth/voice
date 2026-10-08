@@ -65,29 +65,34 @@ async def _entrypoint_body(ctx, setup_complete):
 
     # --- Panel-set API keys / models: force-load the DB snapshot so Super-Admin
     # panel keys are used by THIS call. Panel credentials are now the ONLY key
-    # source (.env is never read), so a failed refresh MUST be loud — and the
-    # summary line must report what actually loaded (source=code means EMPTY:
-    # the old "snapshot loaded" line printed even then, hiding the failure).
-    try:
-        from app.services import config_store as _cs
-        await asyncio.wait_for(_cs.refresh_if_stale(force=True), timeout=30)
-        _snap = _cs.get_snapshot()
-        _n_prov = sum(len(v) for v in (_snap.providers or {}).values())
-        _n_models = sum(len(v) for v in (_snap.models or {}).values())
-        _cred_slugs = sorted({k.split(":", 1)[1] for k in (_snap.credentials or {})})
-        logger.info(
-            "🔧 config snapshot: source=%s providers=%d models=%d credentials=%s",
-            _snap.source, _n_prov, _n_models, _cred_slugs,
-        )
-        if _snap.source != "db":
-            logger.error(
-                "⛔ Panel config NOT loaded from DB (snapshot source=%s) — Super-Admin "
-                "API keys/models/billing will NOT apply to this call. Check DATABASE_URL "
-                "and DB reachability from the worker, then redial.", _snap.source)
-    except Exception as _e:
+    # source (.env is never read), so retry the refresh a few times (fresh spawn
+    # workers can race prisma's per-loop engine startup) and log the REAL
+    # snapshot contents — source=code means EMPTY, panel keys can't be found.
+    from app.services import config_store as _cs
+    for _snap_try in range(3):
+        try:
+            await asyncio.wait_for(_cs.refresh_if_stale(force=True), timeout=30)
+            if _cs.get_snapshot().source == "db":
+                break
+            logger.error("⛔ config snapshot attempt %d: still source=code (%s)",
+                         _snap_try + 1, _cs.last_refresh_error())
+        except Exception as _e:
+            logger.error("⛔ config snapshot refresh attempt %d failed: %r", _snap_try + 1, _e)
+        await asyncio.sleep(1.0)
+    _snap = _cs.get_snapshot()
+    _cred_slugs = sorted({k.split(":", 1)[1] for k in (_snap.credentials or {})})
+    logger.info(
+        "🔧 config snapshot: source=%s providers=%d models=%d credentials=%s",
+        _snap.source,
+        sum(len(v) for v in (_snap.providers or {}).values()),
+        sum(len(v) for v in (_snap.models or {}).values()), _cred_slugs,
+    )
+    if _snap.source != "db":
         logger.error(
-            "⛔ Config snapshot refresh failed: %r — panel API keys will NOT apply "
-            "to this call (.env fallbacks are disabled by design).", _e)
+            "⛔ Panel config NOT loaded from DB (source=%s, last refresh error: %s) — "
+            "Super-Admin API keys/models/billing will NOT apply to this call. Check "
+            "DATABASE_URL and DB reachability from the worker, then redial.",
+            _snap.source, _cs.last_refresh_error())
 
     # --- Monthly-plan gate (no active subscription → no calls) ---
     if await subscription_call_gate(ctx, user_id, call_id):

@@ -26,9 +26,11 @@ def _diag(kind: str, slug: str) -> str:
         from ...services import config_core, crypto
         snap = config_core.get_snapshot()
         if getattr(snap, "source", "code") != "db":
+            err = config_core.last_refresh_error() or "no error recorded"
             return (" [diag: worker config snapshot NOT loaded from DB "
-                    f"(source={snap.source}) — panel keys can't be found; check "
-                    "DATABASE_URL / DB reachability from the worker, then redial]")
+                    f"(source={snap.source}) — panel keys can't be found. "
+                    f"Last refresh error: {err}; check DATABASE_URL / DB "
+                    "reachability from the worker, then redial]")
         rows = (snap.credentials.get(f"{kind}:{slug}") or []) + \
                (snap.credentials.get(f":{slug}") or [])
         if not rows:

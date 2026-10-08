@@ -27,6 +27,7 @@ from .config_core import (
     get_snapshot,
     invalidate,
     refresh_if_stale,
+    last_refresh_error,
     init,
     _code_fallback_snapshot,
     _reset_for_tests,
