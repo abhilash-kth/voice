@@ -17,11 +17,11 @@ def default_config(agent_id: str = "demo") -> AgentConfig:
         providers=ProviderSelection(
             llm=ProviderPair(
                 id="groq_gpt_oss_20b",
-                config={"model": "openai/gpt-oss-20b", "temperature": 0.1},
+                config={"model": "openai/gpt-oss-20b"},
             ),
             llm_fallback=ProviderPair(
                 id="openrouter_gemma_free",
-                config={"model": "google/gemma-3-27b-it:free", "temperature": 0.1},
+                config={"model": "google/gemma-3-27b-it:free"},
             ),
             stt=ProviderPair(id="deepgram_nova2", config={"language": "hi"}),
             stt_fallback=ProviderPair(id="google_stt", config={"language": "hi-IN"}),

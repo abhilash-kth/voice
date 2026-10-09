@@ -1,7 +1,7 @@
 "use client";
 
-// Backend base URL (FastAPI on :8000). Override with NEXT_PUBLIC_BACKEND_URL.
-const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+// Backend base URL (FastAPI on :9000). Override with NEXT_PUBLIC_BACKEND_URL.
+const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:9000";
 
 const TOKEN_KEY = "sa_token";   // separate key from the customer dashboard token
 
@@ -16,7 +16,7 @@ export function clearToken() {
   if (typeof window !== "undefined") localStorage.removeItem(TOKEN_KEY);
 }
 
-async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   const res = await fetch(`${BASE}${path}`, {
     ...options,
