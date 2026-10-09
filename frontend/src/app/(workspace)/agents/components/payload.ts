@@ -1,6 +1,6 @@
 // Pure form-state → API payload builders for the agent-config form
 // (moved out of AgentConfigForm; no JSX, no React — unit-testable).
-import { ProviderDef } from "@/lib/api";
+import { ProviderDef } from "@/lib/index";
 import { getModelMeta, LLMModel } from "./llmBits";
 import { optionKey } from "./constants";
 

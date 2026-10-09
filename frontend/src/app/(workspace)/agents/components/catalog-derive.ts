@@ -2,7 +2,7 @@
 // editing-state initializers and model/pricing labelling.
 // Extracted from AgentConfigForm.tsx (verbatim) — no behavior change.
 
-import { Agent } from "@/lib/api";
+import { Agent } from "@/lib/index";
 import { LLMModel } from "./types";
 
 export const optionKey = (kind: string, providerId: string, role: "primary" | "fallback" = "primary") =>
@@ -114,7 +114,7 @@ export const priceLabel = (m: LLMModel) => {
   if (m.price_inr_per_1m || m.price_currency === "INR") {
     const pin = m.price_inr_per_1m;
     return pin ? `\u20B9${pin.input}/1M in, \u20B9${pin.output}/1M out`
-               : `\u20B9${m.input_price_per_1m}/1M in, \u20B9${m.output_price_per_1m}/1M out`;
+      : `\u20B9${m.input_price_per_1m}/1M in, \u20B9${m.output_price_per_1m}/1M out`;
   }
   return `$${m.input_price_per_1m}/1M in, $${m.output_price_per_1m}/1M out`;
 };

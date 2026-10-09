@@ -1,7 +1,7 @@
 // Shared types + UI constants for the agent configuration form.
 // Extracted from AgentConfigForm.tsx (verbatim) — no behavior change.
 
-import { Catalog, Agent } from "@/lib/api";
+import { Catalog, Agent } from "@/lib/index";
 
 // Languages the stack can transcribe and speak (Deepgram + Google + Sarvam).
 export const LANGUAGES = [

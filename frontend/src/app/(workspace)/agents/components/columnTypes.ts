@@ -1,6 +1,6 @@
 // Prop bags shared by LeftColumn / RightColumn (kept here so the column
 // files stay under the 300-line budget and this is the one import point).
-import { ProviderDef } from "@/lib/api";
+import { ProviderDef } from "@/lib/index";
 import { FaqItem } from "./constants";
 import { LLMModel, LLMProvider } from "./llmBits";
 
