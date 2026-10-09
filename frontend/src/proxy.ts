@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 
 export function proxy(request: NextRequest) {
-    const loggedIn = request.cookies.has('access_token');
+    const loggedIn = request.cookies.has('va_session');
     const isLogin = request.nextUrl.pathname.startsWith('/login');
 
     if (!loggedIn && !isLogin) return NextResponse.redirect(new URL('/login', request.url));

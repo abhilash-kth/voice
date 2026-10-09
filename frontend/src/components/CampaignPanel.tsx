@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import {
-  Agent,
   Campaign,
   CampaignLead,
   createCampaign,
@@ -11,7 +10,8 @@ import {
   pauseCampaign,
   deleteCampaign,
   getCampaign,
-} from "@/lib/api";
+} from "@/lib/campaigns";
+import { Agent } from "@/lib";
 
 const STATUS_COLOR: Record<string, string> = {
   running: "bg-green-500/20 text-green-300",

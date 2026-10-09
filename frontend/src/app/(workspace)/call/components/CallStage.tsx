@@ -7,7 +7,7 @@ import {
   Monitor,
   Phone,
 } from "lucide-react";
-import type { Agent } from "@/lib/api";
+import type { Agent } from "@/lib/index";
 import type { CallState } from "../types/call-types";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";

@@ -12,7 +12,7 @@ import {
   AlertCircle,
   CheckCircle2,
 } from "lucide-react";
-import { Agent } from "@/lib/api";
+import { Agent } from "@/lib/index";
 import type { CallState } from "../types/call-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";

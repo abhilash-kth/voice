@@ -11,7 +11,7 @@ import {
   AlertCircle,
   Headphones,
 } from "lucide-react";
-import { deleteCall, getCall, listCalls, type CallRecord } from "@/lib/api";
+import { deleteCall, getCall, listCalls, type CallRecord } from "@/lib/index";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";

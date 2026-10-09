@@ -13,7 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { register, User } from "@/lib/api";
+import { register, User } from "@/lib/index";
 import { useAuth } from "@/lib/auth-provider";
 
 const FEATURES = [

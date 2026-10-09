@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Agent, listAgents } from "@/lib/api";
+import { Agent, listAgents } from "@/lib/index";
 import CampaignPanel from "@/components/CampaignPanel";
 
 export default function CampaignsPage() {

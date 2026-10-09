@@ -24,6 +24,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import RateCalculator from "@/components/RateCalculator";
 
 export default function BillingPage() {
   const [cfg, setCfg] = useState<BillingConfig | null>(null);
@@ -108,7 +109,7 @@ export default function BillingPage() {
     run(async () => {
       const out = await updateBilling(patch);
       setCfg(out);
-    }, "Billing config saved ✓ (customers see it after a config reload)");
+    }, "Billing config saved ✓ (applied dynamically)");
   };
 
   const valid =
@@ -122,7 +123,8 @@ export default function BillingPage() {
     toNum(assistMin) >= 0 &&
     toNum(announceMin) >= 0 &&
     toNum(assistMinSecs) >= 0 &&
-    toNum(announceMinSecs) >= 0;
+    toNum(announceMinSecs) >= 0 &&
+    amountsValid(topups);
 
   const topupPreview = topups
     .split(",")
@@ -447,9 +449,18 @@ export default function BillingPage() {
             </Card>
           </div>
         </div>
+        <RateCalculator />
       </StateBox>
     </>
   );
+}
+
+function amountsValid(topups: string): boolean {
+  const parts = topups
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length > 0 && parts.every((p) => Number(p) > 0);
 }
 
 function Field({

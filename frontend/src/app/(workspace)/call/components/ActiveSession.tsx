@@ -19,7 +19,7 @@ import {
   Sparkles,
   Volume2,
 } from "lucide-react";
-import { Agent } from "@/lib/api";
+import { Agent } from "@/lib/index";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";

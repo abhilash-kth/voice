@@ -136,7 +136,7 @@ function MetricCard({
   return (
     <Card
       className={`flex h-full flex-col border-border/60 py-0 shadow-sm transition-colors hover:border-foreground/20 ${
-        highlight ? "bg-primary/5" : "bg-card"
+        highlight ? "bg-primary/5" : "bg-muted/20"
       }`}
     >
       <div className="flex h-full flex-col p-4">

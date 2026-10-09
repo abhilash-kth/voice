@@ -1,7 +1,7 @@
 "use client";
 
 import { Headphones, AlertCircle } from "lucide-react";
-import type { CallRecord } from "@/lib/api";
+import type { CallRecord } from "@/lib/index";
 import { Badge } from "@/components/ui/badge";
 import {
   Dialog,

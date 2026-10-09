@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { ShieldCheck, AlertCircle, Loader2, Lock } from "lucide-react";
-import { login, setToken } from "@/lib/api";
+import { login, logout } from "@/lib/api";
 import {
   Card,
   CardContent,
@@ -29,11 +29,14 @@ export default function LoginPage() {
     try {
       const out = await login({ email: email.trim(), password });
       if (out.user?.role !== "SUPER_ADMIN") {
-        setErr("This account is not a SUPER_ADMIN. Use the customer dashboard instead.");
+        await logout().catch(() => {}); // the cookie is already set, so remove it
+        setErr(
+          "This account is not a SUPER_ADMIN. Use the customer dashboard instead.",
+        );
         return;
       }
-      setToken(out.token);
       router.replace("/");
+      router.refresh();
     } catch (e2) {
       setErr((e2 as Error).message || "Login failed");
     } finally {

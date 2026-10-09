@@ -2,7 +2,7 @@
 
 import { LiveKitRoom, RoomAudioRenderer } from "@livekit/components-react";
 import "@livekit/components-styles";
-import type { Agent } from "@/lib/api";
+import type { Agent } from "@/lib/index";
 import type { CallState } from "../types/call-types";
 import ActiveSession from "./ActiveSession";
 

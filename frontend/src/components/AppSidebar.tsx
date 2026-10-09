@@ -15,7 +15,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { type User } from "@/lib/api";
+import { type User } from "@/lib/index";
 import { cn } from "@/lib/utils";
 import {
   Sidebar,
