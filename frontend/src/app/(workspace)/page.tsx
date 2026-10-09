@@ -1,3 +1,5 @@
+import DashboardHeader from "@/components/DashboardHeader";
+
 export default function Page() {
-  return <p>Overview Here...</p>;
+  return <DashboardHeader />;
 }
