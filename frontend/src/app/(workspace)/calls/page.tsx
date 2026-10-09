@@ -1,7 +1,5 @@
-"use client";
-
-import CallsPanel from "@/components/CallsPanel";
+import CallsTable from "./components/CallsTable";
 
 export default function CallsPage() {
-  return <CallsPanel />;
+  return <CallsTable />;
 }

@@ -4,7 +4,7 @@ import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { PhoneCall, RefreshCw } from "lucide-react";
 import { listAgents } from "@/lib/api";
-import CallPanel from "@/components/CallPanel";
+import CallPanel from "@/app/(workspace)/call/components/CallPanel";
 import { Button } from "@/components/ui/button";
 
 export default function CallPage() {
@@ -50,7 +50,7 @@ export default function CallPage() {
           <RefreshCw
             className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`}
           />
-          Refresh agents
+          {isFetching ? "Refreshing..." : "Refresh agents"}
         </Button>
       </div>
 
