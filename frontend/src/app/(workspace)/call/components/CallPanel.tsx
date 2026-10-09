@@ -1,10 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { LiveKitRoom, RoomAudioRenderer } from "@livekit/components-react";
 import "@livekit/components-styles";
-import { Agent, startCall, getCall, endCall } from "@/lib/api";
-import ActiveSession from "@/app/(workspace)/call/components/ActiveSession";
+import { Agent, startCall, getCall, endCall } from "@/lib/index";
 import { CallState } from "@/app/(workspace)/call/types/call-types";
 import CallSetupForm from "@/app/(workspace)/call/components/CallSetupForm";
 import CallStage from "@/app/(workspace)/call/components/CallStage";

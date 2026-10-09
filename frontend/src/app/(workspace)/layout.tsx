@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { me } from "@/lib/api";
+import { me } from "@/lib/index";
 import { useAuth } from "@/lib/auth-provider";
 import { Loader2 } from "lucide-react";
 import AppSidebar from "@/components/AppSidebar";

@@ -2,8 +2,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Agent, Catalog, getCatalog, listAgents, deleteAgent } from "@/lib/api";
-import AgentConfigForm from "@/components/AgentConfigForm";
+import {
+  Agent,
+  Catalog,
+  getCatalog,
+  listAgents,
+  deleteAgent,
+} from "@/lib/index";
+import AgentConfigForm from "@/app/(workspace)/agents/components/AgentConfigForm";
 
 export default function AgentsPage() {
   const router = useRouter();

@@ -57,6 +57,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # pick the model that `openrouter` providers use by default.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
+# Dynamic-catalog providers (Super Admin can also store these in ProviderCredential).
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY", "")
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS", os.path.join(str(BASE_DIR), "google-key.json")
 )
@@ -71,6 +77,9 @@ PROFIT_MARGIN_PERCENT = float(os.getenv("PROFIT_MARGIN_PERCENT", "50"))
 # Minimum per-call price charged to the customer (guards against a free call).
 MIN_CLIENT_PRICE = float(os.getenv("MIN_CLIENT_PRICE", "1.00"))
 SERVER_COST_PER_MIN = float(os.getenv("SERVER_COST_PER_MIN", "0.05"))
+# Enterprise minimum billed duration per mode (seconds). 0 = bill actual time.
+ASSISTANT_MIN_BILL_SECONDS = int(os.getenv("ASSISTANT_MIN_BILL_SECONDS", "0"))
+ANNOUNCEMENT_MIN_BILL_SECONDS = int(os.getenv("ANNOUNCEMENT_MIN_BILL_SECONDS", "0"))
 WALLET_TOPUP_AMOUNT = json.loads(
     os.getenv("WALLET_TOPUP_AMOUNTS", "[100, 250, 500, 1000]")
 )

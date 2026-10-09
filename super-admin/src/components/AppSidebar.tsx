@@ -29,6 +29,7 @@ const NAV = [
   { href: "providers", label: "Providers", icon: Plug },
   { href: "api-keys", label: "API Keys", icon: Key },
   { href: "billing", label: "Billing", icon: CreditCard },
+  { href: "plans", label: "Plans", icon: CreditCard },
   { href: "usage", label: "Usage", icon: BarChart3 },
   { href: "audit-logs", label: "Audit Logs", icon: ScrollText },
 ] as const;

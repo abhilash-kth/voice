@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
-import { me, clearToken, type ApiUser } from "@/lib/api";
+import { logout, me, type ApiUser } from "@/lib/api";
 import AppSidebar from "@/components/AppSidebar";
 
 export default function Shell({ children }: { children: React.ReactNode }) {
@@ -15,7 +15,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     me()
       .then((u) => {
         if (u.role !== "SUPER_ADMIN") {
-          clearToken();
+          logout();
           router.replace("/login");
           return;
         }
@@ -23,13 +23,13 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         setReady(true);
       })
       .catch(() => {
-        clearToken();
+        logout();
         router.replace("/login");
       });
   }, [router]);
 
   const handleLogout = () => {
-    clearToken();
+    logout();
     router.replace("/login");
   };
 

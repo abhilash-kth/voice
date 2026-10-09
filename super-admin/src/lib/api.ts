@@ -1,28 +1,16 @@
 "use client";
 
-// Backend base URL (FastAPI on :8000). Override with NEXT_PUBLIC_BACKEND_URL.
+// Backend base URL (FastAPI on :9000). Override with NEXT_PUBLIC_BACKEND_URL.
 const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-const TOKEN_KEY = "sa_token";   // separate key from the customer dashboard token
+export const TOKEN_KEY = "va_session";   // separate key from the customer dashboard token
 
-export function setToken(t: string) {
-  if (typeof window !== "undefined") localStorage.setItem(TOKEN_KEY, t);
-}
-export function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem(TOKEN_KEY);
-}
-export function clearToken() {
-  if (typeof window !== "undefined") localStorage.removeItem(TOKEN_KEY);
-}
-
-async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getToken();
+export async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...options,
+    credentials: "include", // sends the cookie
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
     },
   });
@@ -31,18 +19,19 @@ async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
     try {
       const body = await res.json();
       detail = body?.detail || detail;
-    } catch {
-      /* ignore */
-    }
+    } catch { }
     const err = Object.assign(new Error(detail || `Request failed (${res.status})`), {
       status: res.status,
     });
-    // Session expired or no longer authorized → bounce to login.
-    if (res.status === 401 || res.status === 403) {
-      clearToken();
-      if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
-        window.location.href = "/login";
-      }
+    if (
+      (res.status === 401 || res.status === 403) &&
+      typeof window !== "undefined" &&
+      !window.location.pathname.startsWith("/login") &&
+      path !== "/api/auth/logout"
+    ) {
+      // the cookie is httpOnly, so only the backend can clear it
+      await fetch(`${BASE}/api/auth/logout`, { method: "POST", credentials: "include" }).catch(() => { });
+      window.location.href = "/login";
     }
     throw err;
   }
@@ -70,11 +59,12 @@ export interface Paged<T> {
 
 // ------ auth ----------------------------------------------------------------
 export const login = (body: { email: string; password: string }) =>
-  req<{ token: string; user: ApiUser }>("/api/auth/login", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+  req<{ user: ApiUser }>("/api/auth/login", { method: "POST", body: JSON.stringify(body) });
+export const logout = () => req<unknown>("/api/auth/logout", { method: "POST" });
 export const me = () => req<ApiUser>("/api/auth/me");
+
+
+
 
 // ------ stats / health -------------------------------------------------------
 export interface Stats {

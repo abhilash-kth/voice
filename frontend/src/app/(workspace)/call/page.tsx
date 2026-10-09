@@ -3,7 +3,7 @@
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { PhoneCall, RefreshCw } from "lucide-react";
-import { listAgents } from "@/lib/api";
+import { listAgents } from "@/lib/index";
 import CallPanel from "@/app/(workspace)/call/components/CallPanel";
 import { Button } from "@/components/ui/button";
 
