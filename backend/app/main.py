@@ -145,6 +145,8 @@ _cors_origins = [o.strip() for o in os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,http://localhost:3002,"
     "http://127.0.0.1:3000,http://127.0.0.1:3002",
+    "https://agents.kriscenttechnohub.com,"
+    "https://agents-admin.kriscenttechnohub.com",
 ).split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
