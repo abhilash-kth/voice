@@ -28,16 +28,15 @@ SESSION_COOKIE = "va_session"
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") in ("1", "true", "TRUE", "yes")
 COOKIE_MAX_AGE = ACCESS_TOKEN_MINUTES * 60
 
-
 def set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(
         SESSION_COOKIE, token, httponly=True, samesite="lax",
         secure=COOKIE_SECURE, max_age=COOKIE_MAX_AGE, path="/",
+        domain=".kriscenttechnohub.com",
     )
 
-
 def clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(SESSION_COOKIE, path="/", domain=".kriscenttechnohub.com")
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
