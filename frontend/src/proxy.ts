@@ -1,11 +1,21 @@
 import { NextResponse, type NextRequest } from 'next/server';
 
+const publicRoutes = ['/login', '/error'];
+
 export function proxy(request: NextRequest) {
     const loggedIn = request.cookies.has('va_session');
-    const isLogin = request.nextUrl.pathname.startsWith('/login');
+    const pathname = request.nextUrl.pathname;
+    const isLogin = pathname.startsWith('/login');
+    const isPublicRoute = publicRoutes.some((route) => pathname.startsWith(route));
 
-    if (!loggedIn && !isLogin) return NextResponse.redirect(new URL('/login', request.url));
-    if (loggedIn && isLogin) return NextResponse.redirect(new URL('/', request.url)); // CHANGE
+    if (!loggedIn && !isPublicRoute) {
+        return NextResponse.redirect(new URL('/login', request.url));
+    }
+
+    if (loggedIn && isLogin) {
+        return NextResponse.redirect(new URL('/', request.url)); // CHANGE
+    }
+
     return NextResponse.next();
 }
 

@@ -176,13 +176,13 @@ export default function CallSetupForm({
           <Label className="text-xs font-medium text-muted-foreground">
             Call mode
           </Label>
-          <div className="grid grid-cols-2 gap-1 rounded-lg border border-border/60 bg-muted/40 p-1">
+          <div className="grid grid-cols-2 gap-1 rounded-md border border-border/60 bg-muted/40 p-1">
             <button
               type="button"
               disabled={isCallActive}
               onClick={() => onModeChange("browser")}
               className={cn(
-                "inline-flex h-9 items-center justify-center gap-2 rounded-md text-xs font-semibold transition-all disabled:opacity-50",
+                "inline-flex h-9 items-center justify-center gap-2 rounded-sm text-xs font-semibold transition-all disabled:opacity-50",
                 mode === "browser"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",

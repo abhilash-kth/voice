@@ -5,7 +5,6 @@ import { me } from "@/lib/index";
 import { useAuth } from "@/lib/auth-provider";
 import { Loader2 } from "lucide-react";
 import AppSidebar from "@/components/AppSidebar";
-import DashboardHeader from "@/components/DashboardHeader";
 
 export default function DashboardLayout({
   children,

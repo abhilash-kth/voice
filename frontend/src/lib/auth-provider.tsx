@@ -1,18 +1,13 @@
 "use client";
 
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useState,
-  type ReactNode,
-} from "react";
-import { useRouter } from "next/navigation";
+import { createContext, useContext, useEffect, type ReactNode } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { login, logout, me, type User } from "@/lib/index";
 
 type AuthCtx = {
   user: User | null;
-  loading: boolean; // true until /me has answered
+  loading: boolean;
   signIn: (body: { email: string; password: string }) => Promise<void>;
   signOut: () => Promise<void>;
 };
@@ -20,37 +15,45 @@ type AuthCtx = {
 const Ctx = createContext<AuthCtx | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
   const router = useRouter();
+  const pathname = usePathname();
+  const queryClient = useQueryClient();
 
-  // restore the session: the browser sends the cookie, the backend says who it is
+  const {
+    data: user,
+    error,
+    isPending,
+  } = useQuery({
+    queryKey: ["me"],
+    queryFn: async () => {
+      try {
+        return await me();
+      } catch (e) {
+        // 401 just means "not logged in", so it is a valid answer, not an error
+        if ((e as { status?: number }).status === 401) return null;
+        throw e;
+      }
+    },
+    retry: false,
+    staleTime: 5 * 60_000,
+  });
+
+  // real failures only (backend down, 500, network)
   useEffect(() => {
-    let cancelled = false;
-    me()
-      .then((u) => {
-        if (!cancelled) setUser(u);
-      })
-      .catch(async (e) => {
-        if (cancelled) return;
-        setUser(null);
-        if (e?.status === 401) {
-          // stale cookie: have the backend clear it, then go to login
-          await logout().catch(() => {});
-          router.replace("/login");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
+    if (error) router.replace("/error");
+  }, [error, router]);
+
+  // logged out, but still on a protected page (for example a stale cookie)
+  useEffect(() => {
+    if (!isPending && user === null && !pathname.startsWith("/login")) {
+      logout().catch(() => {}); // the backend clears the httpOnly cookie
+      router.replace("/login");
+    }
+  }, [isPending, user, pathname, router]);
 
   async function signIn(body: { email: string; password: string }) {
-    const { user: u } = await login(body); // throws on wrong password
-    setUser(u);
+    const { user: u } = await login(body);
+    queryClient.setQueryData(["me"], u);
     router.replace("/");
     router.refresh();
   }
@@ -59,14 +62,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       await logout();
     } finally {
-      setUser(null);
+      queryClient.setQueryData(["me"], null);
       router.replace("/login");
       router.refresh();
     }
   }
 
   return (
-    <Ctx.Provider value={{ user, loading, signIn, signOut }}>
+    <Ctx.Provider
+      value={{ user: user ?? null, loading: isPending, signIn, signOut }}
+    >
       {children}
     </Ctx.Provider>
   );
