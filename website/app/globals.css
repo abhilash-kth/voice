@@ -3,10 +3,6 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/*
- * Design-system foundation only.
- * Layout and product-specific component decisions are intentionally deferred.
- */
 @theme inline {
   /* shadcn semantic colors */
   --color-background: var(--background);

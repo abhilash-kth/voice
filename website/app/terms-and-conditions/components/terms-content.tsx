@@ -1,18 +1,100 @@
 import Header from "@/components/landing/header";
 import Footer from "@/components/landing/footer";
 
-const sections=[
- ["1. About these terms","These terms govern access to the Voxura website and, once made available, the Voxura voice-agent platform. The legal entity name, registered address, and jurisdiction details must be inserted before publication."],
- ["2. Eligibility and accounts","You must be legally capable of entering into a binding agreement and authorised to act for the business you represent. You are responsible for accurate account information, access credentials, and activity performed through your account."],
- ["3. Permitted use","You may use Voxura only for lawful business communications. You must have the permissions, notices, and consents required for calling, recording, processing personal data, and sending commercial communications in every applicable jurisdiction."],
- ["4. Prohibited use","You must not use Voxura for fraud, impersonation, harassment, unlawful surveillance, deceptive calling, prohibited content, unauthorised data collection, security attacks, or activity that violates telecom, privacy, consumer-protection, or intellectual-property laws."],
- ["5. AI-generated conversations","Voice agents can produce incomplete or incorrect responses. You are responsible for configuring, testing, monitoring, and supervising your agents and for deciding when a call should be transferred to a human. Voxura should not be used as the sole source of medical, legal, financial, or emergency advice."],
- ["6. Pricing and wallet","Any applicable fees, taxes, telephony charges, model costs, wallet rules, validity periods, and refund conditions will be presented in the final commercial terms. Pricing currently shown on the website may be an estimate or placeholder unless expressly identified as final."],
- ["7. Customer content and data","You retain responsibility for instructions, scripts, knowledge sources, contact data, recordings, and other material you provide. You grant Voxura the limited rights necessary to host, process, transmit, and use that material to provide and secure the service."],
- ["8. Intellectual property","Voxura and its licensors retain rights in the platform, interface, software, documentation, branding, and related materials. These terms do not transfer ownership of those materials to you."],
- ["9. Availability and changes","The service may change, be interrupted, or be withdrawn. Features described during development may not be available in the final product. We may update these terms and will publish the revised date on this page."],
- ["10. Suspension and termination","Access may be restricted or terminated for unlawful use, security risk, non-payment, material breach, or harm to Voxura, its providers, callers, or other users. Provisions that should logically survive termination will continue to apply."],
- ["11. Disclaimers and liability","The final warranty exclusions, liability cap, indemnities, governing law, dispute process, and force-majeure provisions require review and approval by qualified legal counsel before commercial launch."],
- ["12. Contact","Questions about these terms can be sent to hello@voxura.ai. A formal legal-notice address must be added before publication."],
+const sections = [
+  [
+    "1. About these terms",
+    "These terms govern access to the Voxura website and, once made available, the Voxura voice-agent platform. The legal entity name, registered address, and jurisdiction details must be inserted before publication.",
+  ],
+  [
+    "2. Eligibility and accounts",
+    "You must be legally capable of entering into a binding agreement and authorised to act for the business you represent. You are responsible for accurate account information, access credentials, and activity performed through your account.",
+  ],
+  [
+    "3. Permitted use",
+    "You may use Voxura only for lawful business communications. You must have the permissions, notices, and consents required for calling, recording, processing personal data, and sending commercial communications in every applicable jurisdiction.",
+  ],
+  [
+    "4. Prohibited use",
+    "You must not use Voxura for fraud, impersonation, harassment, unlawful surveillance, deceptive calling, prohibited content, unauthorised data collection, security attacks, or activity that violates telecom, privacy, consumer-protection, or intellectual-property laws.",
+  ],
+  [
+    "5. AI-generated conversations",
+    "Voice agents can produce incomplete or incorrect responses. You are responsible for configuring, testing, monitoring, and supervising your agents and for deciding when a call should be transferred to a human. Voxura should not be used as the sole source of medical, legal, financial, or emergency advice.",
+  ],
+  [
+    "6. Pricing and wallet",
+    "Any applicable fees, taxes, telephony charges, model costs, wallet rules, validity periods, and refund conditions will be presented in the final commercial terms. Pricing currently shown on the website may be an estimate or placeholder unless expressly identified as final.",
+  ],
+  [
+    "7. Customer content and data",
+    "You retain responsibility for instructions, scripts, knowledge sources, contact data, recordings, and other material you provide. You grant Voxura the limited rights necessary to host, process, transmit, and use that material to provide and secure the service.",
+  ],
+  [
+    "8. Intellectual property",
+    "Voxura and its licensors retain rights in the platform, interface, software, documentation, branding, and related materials. These terms do not transfer ownership of those materials to you.",
+  ],
+  [
+    "9. Availability and changes",
+    "The service may change, be interrupted, or be withdrawn. Features described during development may not be available in the final product. We may update these terms and will publish the revised date on this page.",
+  ],
+  [
+    "10. Suspension and termination",
+    "Access may be restricted or terminated for unlawful use, security risk, non-payment, material breach, or harm to Voxura, its providers, callers, or other users. Provisions that should logically survive termination will continue to apply.",
+  ],
+  [
+    "11. Disclaimers and liability",
+    "The final warranty exclusions, liability cap, indemnities, governing law, dispute process, and force-majeure provisions require review and approval by qualified legal counsel before commercial launch.",
+  ],
+  [
+    "12. Contact",
+    "Questions about these terms can be sent to hello@voxura.ai. A formal legal-notice address must be added before publication.",
+  ],
 ];
-export default function TermsContent(){return <main id="top" className="bg-white text-midnight-ink"><Header/><section className="px-5 pb-20 pt-36 sm:px-8 lg:pt-44"><div className="mx-auto grid max-w-[1280px] gap-12 lg:grid-cols-[.55fr_1.45fr]"><aside className="lg:sticky lg:top-32 lg:self-start"><div className="text-xs font-bold uppercase tracking-[.14em] text-voltage-violet">Legal</div><h1 className="mt-5 text-[clamp(3.2rem,6vw,5.5rem)] font-semibold leading-[.9] tracking-[-.07em]">Terms and conditions</h1><p className="mt-6 text-sm text-slate">Draft · Last updated 2 October 2026</p><div className="mt-7 rounded-[22px] bg-amber-50 p-5 text-xs leading-6 text-amber-900">This is working website copy and must be reviewed by qualified legal counsel before launch.</div></aside><article className="overflow-hidden rounded-[34px] border border-mist bg-white shadow-[0_24px_70px_rgba(49,29,72,.07)]">{sections.map(([title,text],index)=><section key={title} className="border-b border-mist p-6 last:border-0 sm:p-8"><div className="flex gap-5"><span className="mt-1 text-xs font-bold text-lavender-mist">{String(index+1).padStart(2,"0")}</span><div><h2 className="text-xl font-semibold tracking-[-.02em]">{title}</h2><p className="mt-4 text-sm leading-7 text-slate">{text}</p></div></div></section>)}</article></div></section><Footer/></main>}
+export default function TermsContent() {
+  return (
+    <main id="top" className="bg-white text-midnight-ink">
+      <Header />
+      <section className="px-5 pb-20 pt-36 sm:px-8 lg:pt-44">
+        <div className="mx-auto grid max-w-[1280px] gap-12 lg:grid-cols-[.55fr_1.45fr]">
+          <aside className="lg:sticky lg:top-32 lg:self-start">
+            <div className="text-xs font-bold uppercase tracking-[.14em] text-voltage-violet">
+              Legal
+            </div>
+            <h1 className="mt-5 text-[clamp(3.2rem,6vw,5.5rem)] font-semibold leading-[.9] tracking-[-.07em]">
+              Terms and conditions
+            </h1>
+            <p className="mt-6 text-sm text-slate">
+              Draft · Last updated 2 October 2026
+            </p>
+            <div className="mt-7 rounded-[22px] bg-amber-50 p-5 text-xs leading-6 text-amber-900">
+              This is working website copy and must be reviewed by qualified
+              legal counsel before launch.
+            </div>
+          </aside>
+          <article className="overflow-hidden rounded-l-[34px] bg-white shadow-[0_24px_70px_rgba(49,29,72,.27)]">
+            {sections.map(([title, text], index) => (
+              <section
+                key={title}
+                className="border-b border-mist p-6 last:border-0 sm:p-8"
+              >
+                <div className="flex gap-5">
+                  <span className="mt-1 text-xs font-bold text-lavender-mist">
+                    {String(index + 1).padStart(2, "0")}
+                  </span>
+                  <div>
+                    <h2 className="text-xl font-semibold tracking-[-.02em]">
+                      {title}
+                    </h2>
+                    <p className="mt-4 text-sm leading-7 text-slate">{text}</p>
+                  </div>
+                </div>
+              </section>
+            ))}
+          </article>
+        </div>
+      </section>
+      <Footer />
+    </main>
+  );
+}

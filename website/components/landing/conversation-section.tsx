@@ -27,7 +27,7 @@ export default function ConversationSection() {
             <span className="h-1.5 w-1.5 rounded-full bg-lavender-mist" />
             Natural conversation
           </Eyebrow>
-          <h2 className="text-[clamp(2.7rem,4.5vw,4.4rem)] font-semibold leading-[1.03] tracking-[-.05em]">
+          <h2 className="text-[clamp(2.7rem,4.5vw,3.8rem)] font-semibold leading-[1.03] tracking-[-.05em]">
             No awkward pause.
             <br />
             <span className="text-lavender-mist">No rigid phone tree.</span>

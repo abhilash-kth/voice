@@ -72,7 +72,7 @@ export default function PrivacyContent() {
               providers, retention controls, and applicable law before launch.
             </div>
           </aside>
-          <article className="overflow-hidden rounded-[34px] border border-mist bg-white shadow-[0_24px_70px_rgba(49,29,72,.07)]">
+          <article className="overflow-hidden rounded-l-[34px] bg-white shadow-[0_24px_70px_rgba(49,29,72,.27)]">
             {sections.map(([title, text], index) => (
               <section
                 key={title}
