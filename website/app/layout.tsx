@@ -13,6 +13,11 @@ export const metadata: Metadata = {
   title: "Voxura | AI Voice Agents for Business",
   description:
     "Create multilingual AI voice agents for inbound calls, outbound campaigns, and everyday business conversations.",
+  icons: {
+    icon: "/icon.svg",
+    shortcut: "/icon.svg",
+    apple: "/icon.svg",
+  },
 };
 
 export default function RootLayout({

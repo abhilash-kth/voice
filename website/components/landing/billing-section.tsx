@@ -113,17 +113,19 @@ export default function BillingSection() {
           eyebrow="Wallet billing"
           title={
             <>
-              Add to your <span className="text-primary">Wallet</span>.
+              Minutes used.
               <br />
-              Use it per minute.
+              Nothing more.
             </>
           }
           body="See the rate before a call and the exact deduction after it. Your wallet keeps usage visible as calls happen."
         />
 
         <div className="mt-10 grid gap-4 md:grid-cols-[.85fr_1.15fr]">
-          <div className="relative flex min-h-[445px] flex-col justify-between overflow-hidden rounded-[34px] bg-voltage-violet p-7 text-white sm:p-9">
-            <div className="absolute -right-24 -top-24 h-72 w-72 rounded-full bg-lavender-mist/30 blur-[70px]" />
+          <div className="relative flex min-h-[445px] flex-col justify-between overflow-hidden rounded-[34px] bg-[linear-gradient(145deg,#6f24d9_0%,#862fe7_48%,#a347ed_100%)] p-7 text-white shadow-[0_28px_70px_rgba(134,47,231,.2)] sm:p-9">
+            <div className="absolute -right-24 -top-24 h-72 w-72 rounded-full bg-lavender-mist/35 blur-[70px]" />
+            <div className="absolute -bottom-32 -left-20 h-72 w-72 rounded-full bg-[#c982ff]/25 blur-[85px]" />
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(255,255,255,.16),transparent_32%)]" />
 
             <div className="relative">
               <div className="flex items-center justify-between">
@@ -135,7 +137,9 @@ export default function BillingSection() {
                 </span>
               </div>
 
-              <div className="mt-9 text-sm text-white/60">Wallet balance</div>
+              <div className="mt-9 text-sm text-white/60">
+                Available balance
+              </div>
               <div className="mt-2 flex h-[82px] items-center">
                 <div className="flex items-center whitespace-nowrap text-[clamp(3rem,6vw,5.2rem)] font-semibold leading-none tracking-[-.065em]">
                   <span className="inline-flex h-[1em] items-center leading-none">

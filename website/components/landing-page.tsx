@@ -26,7 +26,6 @@ export default function LandingPage() {
         <AgentsSection />
         <ProvidersSection />
         <BillingSection />
-        <LanguagesIndustries />
         <VisionAndCta />
         <IndustryTrustSection />
         <FaqSection />

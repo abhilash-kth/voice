@@ -114,8 +114,8 @@ export default function AboutPageContent() {
               <div className="text-xs font-bold uppercase tracking-[.14em] text-voltage-violet">
                 The company behind Voxura
               </div>
-              <h2 className="mt-5 text-[clamp(2.8rem,5vw,4.7rem)] font-semibold leading-[.97] tracking-[-.06em]">
-                Developed by Kriscent Techno Hub.
+              <h2 className="mt-5 text-[clamp(2.8rem,5vw,4.7rem)] font-semibold leading-[.79] tracking-[-.06em]">
+                Developed by <br /> <span className="text-red-500 text-[clamp(2.8rem,5vw,3.8rem)]">Kriscent Techno Hub.</span>
               </h2>
             </div>
             <div>
@@ -127,7 +127,7 @@ export default function AboutPageContent() {
                 practical AI voice operations.
               </p>
               <a
-                href="https://kriscent.in/about/"
+                href="https://kriscent.in"
                 target="_blank"
                 rel="noreferrer"
                 className="group mt-5 inline-flex items-center gap-2 text-sm font-semibold text-voltage-violet"
