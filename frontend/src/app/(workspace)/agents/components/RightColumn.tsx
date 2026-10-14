@@ -1,5 +1,6 @@
 "use client";
-// Right column of AgentConfigForm: provider pickers, fallbacks, pricing, save.
+
+import { Brain, AlertCircle, Loader2, Save, Plus, Shield } from "lucide-react";
 import { Catalog } from "@/lib/index";
 import ProviderOptions from "./ProviderOptions";
 import { KIND_LABEL, optionKey } from "./constants";
@@ -10,12 +11,37 @@ import {
   ModelInfo,
   TuningControls,
 } from "./llmBits";
-
 import type { RightState, RightSetters } from "./columnTypes";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 
 export type { RightState, RightSetters } from "./columnTypes";
 
 const FALLBACK_KINDS = ["llm", "stt", "tts"] as const;
+
+// Helper: Safely resolves Edit-mode legacy DB values that might not exist in the current catalog
+// ensuring shadcn Select always has a matching SelectItem to display.
+function getSafeList(
+  list: any[] = [],
+  idKey: string,
+  currentVal: string,
+  nameKey: string = "display_name",
+) {
+  if (!currentVal) return list;
+  if (list.some((item) => item[idKey] === currentVal)) return list;
+  return [
+    ...list,
+    { [idKey]: currentVal, [nameKey]: `${currentVal} (Legacy)` },
+  ];
+}
 
 export default function RightColumn({
   v,
@@ -32,287 +58,309 @@ export default function RightColumn({
     modelsForSelect(v.llmByProvider, v.llmModelsAll, p, cur);
 
   return (
-    <div className="space-y-4">
-      {/* V2 LLM Provider → Multiple Models */}
-      {v.mode === "assistant" && v.isV2 && (
-        <div className="bg-gray-900 p-4 rounded-xl border border-gray-800">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-semibold">
-              {KIND_LABEL.llm} - V2 Provider → Models
-            </span>
-            <span className="text-[11px] text-green-400">
-              Exact model passed to runtime
-            </span>
-          </div>
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              <label className="flex flex-col gap-1 text-xs">
-                <span className="text-gray-400 font-medium">Provider</span>
-                <select
-                  value={v.primaryLlmProvider}
-                  onChange={(e) => set.setPrimaryLlmProvider(e.target.value)}
-                  className="input"
-                >
-                  {(v.llmProviders.some((p) => p.id === v.primaryLlmProvider)
-                    ? v.llmProviders
-                    : [
-                        ...v.llmProviders,
-                        ...v.llmProvidersAll.filter(
-                          (p) => p.id === v.primaryLlmProvider,
-                        ),
-                      ]
-                  ).map((p: any) => (
-                    <option
-                      key={p.id}
-                      value={p.id}
-                      title={`${p.display_name} - ${p.base_url || "native"} - ${p.tier}${p.notes ? "\n" + p.notes : ""}`}
-                    >
-                      {p.display_name}{" "}
-                      {p.tier === "free"
-                        ? "(free)"
-                        : p.tier === "freemium"
-                          ? "(free tier)"
-                          : "(paid)"}
-                      {p.key_env ? ` · ${p.key_env}` : ""}
-                      {p.deprecated ? " — legacy only" : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="flex flex-col gap-1 text-xs">
-                <span className="text-gray-400 font-medium">
-                  Model (for {v.primaryLlmProvider})
-                </span>
-                <select
-                  value={v.primaryLlmModel}
-                  onChange={(e) => set.setPrimaryLlmModel(e.target.value)}
-                  className="input"
-                >
-                  {forSelect(v.primaryLlmProvider, v.primaryLlmModel).map(
-                    (m) => (
-                      <option
-                        key={m.model_id}
-                        value={m.model_id}
-                        title={`${priceLabel(m)} | cached $${m.cached_input_price_per_1m}/1M | ${(m.context_window / 1000).toLocaleString()}K context | max out ${m.max_output_tokens.toLocaleString()} | speed: ${m.expected_speed} | ${m.reasoning_supported ? "reasoning: " + m.reasoning_default : "no reasoning"} | ${m.capabilities.join(", ")}`}
-                      >
-                        {m.voice_recommended ? "★ " : ""}
-                        {m.display_name} — {priceLabel(m)}, {m.expected_speed}
-                        {m.free_tier ? " [free tier]" : ""}
-                        {m.status === "deprecated"
-                          ? " (deprecated — switch recommended)"
-                          : ""}
-                      </option>
-                    ),
-                  )}
-                </select>
-              </label>
+    <div className="space-y-8">
+      {/* ── SECTION 4: AI Providers & Models ── */}
+      <div className="space-y-4">
+        <h3 className="text-sm font-semibold text-foreground">
+          Providers & Models
+        </h3>
+
+        {/* Primary LLM Brain */}
+        {v.mode === "assistant" && v.isV2 && (
+          <div className="rounded-2xl border border-primary/20 bg-primary/5 p-5 sm:p-6">
+            <div className="mb-5 flex items-center gap-2">
+              <Brain className="h-5 w-5 text-primary" />
+              <p className="font-semibold text-primary">
+                Primary Intelligence Brain
+              </p>
             </div>
-            <ModelInfo meta={meta(v.primaryLlmProvider, v.primaryLlmModel)} />
-            <TuningControls
-              meta={meta(v.primaryLlmProvider, v.primaryLlmModel)}
-              effort={v.reasoningEffort}
-              onEffort={set.setReasoningEffort}
-            />
-          </div>
-          <p className="mt-2 text-[11px] text-amber-300/90">
-            Provider and model remain separate. No silent substitution. If
-            invalid, returns clear config error.
-          </p>
-        </div>
-      )}
 
-      {/* Legacy LLM fallback if V2 not available */}
-      {v.mode === "assistant" && !v.isV2 && (
-        <div className="bg-gray-900 p-4 rounded-xl border border-gray-800">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-semibold">{KIND_LABEL.llm}</span>
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <label className="flex flex-col gap-1 text-xs">
-              <span className="text-gray-400 font-medium">Provider</span>
-              <select
-                value={v.picked.llm}
-                onChange={(e) => set.setPick("llm", e.target.value)}
-                className="input"
-              >
-                {catalog.catalog.llm
-                  .filter((p: any) => !(p as any).legacy)
-                  .map((p: any) => (
-                    <option
-                      key={p.id}
-                      value={p.id}
-                      title={`${(p as any).models ? (p as any).models.length + " models" : ""} ${(p as any).base_url || ""}`}
-                    >
-                      {p.display_name} {p.tier === "free" ? "(free)" : "*"}{" "}
-                      {(p as any).model_count
-                        ? `(${(p as any).model_count} models)`
-                        : ""}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            <ProviderOptions
-              provider={v.providerByName[v.picked.llm]}
-              optKey={optionKey("llm", v.picked.llm)}
-              optionVals={v.optionVals}
-              onOption={set.onOption}
-            />
-          </div>
-        </div>
-      )}
+            <div className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label className="text-primary/80">Provider</Label>
+                <Select
+                  value={v.primaryLlmProvider || undefined}
+                  onValueChange={(val) => val && set.setPrimaryLlmProvider(val)}
+                >
+                  <SelectTrigger className="border-primary/20 bg-background shadow-sm">
+                    <SelectValue placeholder="Select provider" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {getSafeList(
+                      v.llmProviders.some((p) => p.id === v.primaryLlmProvider)
+                        ? v.llmProviders
+                        : [
+                            ...v.llmProviders,
+                            ...v.llmProvidersAll.filter(
+                              (p) => p.id === v.primaryLlmProvider,
+                            ),
+                          ],
+                      "id",
+                      v.primaryLlmProvider,
+                    ).map((p: any) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.display_name}{" "}
+                        {p.tier === "free"
+                          ? "(free)"
+                          : p.tier === "freemium"
+                            ? "(free tier)"
+                            : p.tier
+                              ? "(paid)"
+                              : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
 
-      {v.visibleKinds.map((kind) => (
-        <div
-          key={kind}
-          className="bg-gray-900 p-4 rounded-xl border border-gray-800"
-        >
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-semibold">{KIND_LABEL[kind]}</span>
-            {kind === "telephony" && (
-              <span className="text-[11px] text-gray-500">
-                browser = free, no carrier
-              </span>
-            )}
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <label className="flex flex-col gap-1 text-xs">
-              <span className="text-gray-400 font-medium">Provider</span>
-              <select
-                value={v.picked[kind]}
-                onChange={(e) => set.setPick(kind, e.target.value)}
-                className="input"
-              >
-                {catalog.catalog[kind].map((p: any) => (
-                  <option key={p.id} value={p.id}>
-                    {p.display_name} {p.tier === "free" ? "(free)" : "*"}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <ProviderOptions
-              provider={v.providerByName[v.picked[kind]]}
-              optKey={optionKey(kind, v.picked[kind])}
-              optionVals={v.optionVals}
-              onOption={set.onOption}
-            />
-          </div>
-          {v.providerByName[v.picked[kind]]?.notes && (
-            <p className="mt-2 text-[11px] text-amber-300/90 leading-snug">
-              {v.providerByName[v.picked[kind]]!.notes}
-            </p>
-          )}
-        </div>
-      ))}
+              <div className="space-y-2">
+                <Label className="text-primary/80">Model</Label>
+                <Select
+                  value={v.primaryLlmModel || undefined}
+                  onValueChange={(val) => val && set.setPrimaryLlmModel(val)}
+                >
+                  <SelectTrigger className="border-primary/20 bg-background shadow-sm">
+                    <SelectValue placeholder="Select model" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {getSafeList(
+                      forSelect(v.primaryLlmProvider, v.primaryLlmModel),
+                      "model_id",
+                      v.primaryLlmModel,
+                    ).map((m: any) => (
+                      <SelectItem key={m.model_id} value={m.model_id}>
+                        {m.display_name}{" "}
+                        {m.input_price_per_1m ? `— ${priceLabel(m)}` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
 
-      {/* Fallback providers V2 */}
-      <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 border-dashed">
-        <div className="flex items-center justify-between mb-3">
-          <span className="text-sm font-semibold">
-            🔁 Fallback Providers - V2 Multiple Models
-          </span>
+            <div className="mt-5 space-y-4">
+              <ModelInfo meta={meta(v.primaryLlmProvider, v.primaryLlmModel)} />
+              <TuningControls
+                meta={meta(v.primaryLlmProvider, v.primaryLlmModel)}
+                effort={v.reasoningEffort}
+                onEffort={set.setReasoningEffort}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Legacy LLM */}
+        {v.mode === "assistant" && !v.isV2 && (
+          <div className="rounded-2xl bg-muted/20 p-5 sm:p-6">
+            <h4 className="mb-4 text-sm font-semibold">{KIND_LABEL.llm}</h4>
+            <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>Provider</Label>
+                <Select
+                  value={v.picked.llm || undefined}
+                  onValueChange={(val) => val && set.setPick("llm", val)}
+                >
+                  <SelectTrigger className="bg-background">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {getSafeList(
+                      catalog.catalog.llm.filter(
+                        (p: any) => !(p as any).legacy,
+                      ),
+                      "id",
+                      v.picked.llm,
+                    ).map((p: any) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.display_name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <ProviderOptions
+                provider={v.providerByName[v.picked.llm]}
+                optKey={optionKey("llm", v.picked.llm)}
+                optionVals={v.optionVals}
+                onOption={set.onOption}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Other Providers (STT, TTS, Telephony) */}
+        {v.visibleKinds.map((kind) => (
+          <div key={kind} className="rounded-2xl bg-muted/20 p-5 sm:p-6">
+            <h4 className="mb-4 text-sm font-semibold">{KIND_LABEL[kind]}</h4>
+            <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>Provider</Label>
+                <Select
+                  value={v.picked[kind] || undefined}
+                  onValueChange={(val) => val && set.setPick(kind, val)}
+                >
+                  <SelectTrigger className="bg-background">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {getSafeList(
+                      catalog.catalog[kind],
+                      "id",
+                      v.picked[kind],
+                    ).map((p: any) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.display_name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <ProviderOptions
+                provider={v.providerByName[v.picked[kind]]}
+                optKey={optionKey(kind, v.picked[kind])}
+                optionVals={v.optionVals}
+                onOption={set.onOption}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Fallbacks */}
+      <div className="rounded-2xl border border-dashed border-border/80 bg-muted/10 p-5 sm:p-6">
+        <div className="mb-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Shield className="h-4 w-4" />
+            </div>
+            <div>
+              <h4 className="text-sm font-semibold">Fallback Providers</h4>
+              <p className="text-[11px] text-muted-foreground">
+                V2 · Multiple models
+              </p>
+            </div>
+          </div>
           <button
             type="button"
             onClick={() => set.setFallbackEnabled(!v.fallbackEnabled)}
-            className={`text-xs px-3 py-1 rounded-full border ${v.fallbackEnabled ? "bg-green-600 border-green-500 text-white" : "bg-gray-800 border-gray-700 text-gray-400"}`}
+            className={cn(
+              "rounded-full px-3 py-1 text-xs font-semibold transition-colors",
+              v.fallbackEnabled
+                ? "bg-primary text-primary-foreground"
+                : "bg-muted text-muted-foreground",
+            )}
           >
             {v.fallbackEnabled ? "Enabled" : "Disabled"}
           </button>
         </div>
-        <p className="text-[11px] text-gray-500 mb-3">
+
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
           {v.mode === "announcement"
             ? "Announcement mode plays a fixed script — only a backup voice (TTS) applies. If the primary TTS fails, the fallback TTS speaks the script."
-            : "Fallback supports multiple models with provider+model separate. Example: primary OpenAI gpt-4.1-mini, fallback Groq openai/gpt-oss-120b. Do not treat Groq 120B as OpenAI."}
+            : "Fallback supports multiple models with provider+model separate. Example: primary OpenAI gpt-4.1-mini, fallback Groq openai/gpt-oss-120b."}
         </p>
+
         {v.fallbackEnabled && (
-          <div className="space-y-3">
+          <div className="mt-4 space-y-4">
             {v.mode === "assistant" && v.isV2 && (
-              <div className="bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold text-gray-300">
-                    LLM fallback - Provider → Model
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="flex flex-col gap-1 text-xs">
-                    <span className="text-gray-400 font-medium">Provider</span>
-                    <select
-                      value={v.fallbackLlmProvider}
-                      onChange={(e) =>
-                        set.setFallbackLlmProvider(e.target.value)
+              <div className="rounded-xl border border-border/50 bg-background p-4 shadow-sm">
+                <p className="mb-3 text-xs font-semibold text-muted-foreground">
+                  LLM Fallback
+                </p>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>Provider</Label>
+                    <Select
+                      value={v.fallbackLlmProvider || undefined}
+                      onValueChange={(val) =>
+                        val && set.setFallbackLlmProvider(val)
                       }
-                      className="input"
                     >
-                      {v.llmProviders.map((p: any) => (
-                        <option
-                          key={p.id}
-                          value={p.id}
-                          title={`${p.display_name} - ${p.base_url}`}
-                        >
-                          {p.display_name}{" "}
-                          {p.tier === "free" ? "(free)" : "(paid)"}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="flex flex-col gap-1 text-xs">
-                    <span className="text-gray-400 font-medium">
-                      Model (for {v.fallbackLlmProvider})
-                    </span>
-                    <select
-                      value={v.fallbackLlmModel}
-                      onChange={(e) => set.setFallbackLlmModel(e.target.value)}
-                      className="input"
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {getSafeList(
+                          v.llmProviders,
+                          "id",
+                          v.fallbackLlmProvider,
+                        ).map((p: any) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.display_name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Model</Label>
+                    <Select
+                      value={v.fallbackLlmModel || undefined}
+                      onValueChange={(val) =>
+                        val && set.setFallbackLlmModel(val)
+                      }
                     >
-                      {(v.llmByProvider[v.fallbackLlmProvider] || []).map(
-                        (m) => (
-                          <option
-                            key={m.model_id}
-                            value={m.model_id}
-                            title={`$${m.input_price_per_1m}/1M in, $${m.cached_input_price_per_1m}/1M cached, $${m.output_price_per_1m}/1M out | ${m.context_window / 1000}K context | Speed: ${m.expected_speed}`}
-                          >
-                            {m.display_name} - ${m.input_price_per_1m}/1M in,{" "}
-                            {m.expected_speed}
-                          </option>
-                        ),
-                      )}
-                    </select>
-                  </label>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {getSafeList(
+                          v.llmByProvider[v.fallbackLlmProvider] || [],
+                          "model_id",
+                          v.fallbackLlmModel,
+                        ).map((m: any) => (
+                          <SelectItem key={m.model_id} value={m.model_id}>
+                            {m.display_name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
-                <ModelInfo
-                  meta={meta(v.fallbackLlmProvider, v.fallbackLlmModel)}
-                />
+                <div className="mt-3">
+                  <ModelInfo
+                    meta={meta(v.fallbackLlmProvider, v.fallbackLlmModel)}
+                  />
+                </div>
               </div>
             )}
+
             {(v.mode === "announcement"
               ? FALLBACK_KINDS.filter((k) => k === "tts")
               : FALLBACK_KINDS.filter((k) => k !== "llm" || !v.isV2)
             ).map((kind) => (
               <div
                 key={kind}
-                className="bg-gray-800/50 p-3 rounded-lg border border-gray-700/50"
+                className="rounded-xl border border-border/50 bg-background p-4 shadow-sm"
               >
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold text-gray-300">
-                    {KIND_LABEL[kind]} fallback
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <label className="flex flex-col gap-1 text-xs">
-                    <span className="text-gray-400 font-medium">Provider</span>
-                    <select
-                      value={v.fallbackPicked[kind]}
-                      onChange={(e) =>
-                        set.setFallbackPick(kind, e.target.value)
+                <p className="mb-3 text-xs font-semibold text-muted-foreground">
+                  {KIND_LABEL[kind]} Fallback
+                </p>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>Provider</Label>
+                    <Select
+                      value={v.fallbackPicked[kind] || undefined}
+                      onValueChange={(val) =>
+                        val && set.setFallbackPick(kind, val)
                       }
-                      className="input"
                     >
-                      {catalog.catalog[kind].map((p: any) => (
-                        <option key={p.id} value={p.id}>
-                          {p.display_name} {p.tier === "free" ? "(free)" : "*"}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {getSafeList(
+                          catalog.catalog[kind],
+                          "id",
+                          v.fallbackPicked[kind],
+                        ).map((p: any) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.display_name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
                   <ProviderOptions
                     provider={v.providerByName[v.fallbackPicked[kind]]}
                     optKey={optionKey(kind, v.fallbackPicked[kind], "fallback")}
@@ -326,38 +374,38 @@ export default function RightColumn({
         )}
       </div>
 
-      <div className="bg-gray-900 p-4 rounded-xl border border-gray-800">
-        <label className="text-xs text-gray-400 font-medium">Pricing</label>
-        <p className="text-[13px] text-gray-300 mt-1">
-          The per-minute charge to the customer is{" "}
-          <b>calculated automatically</b> from the provider costs (LLM + STT +
-          TTS + telephony) plus a platform margin set in <code>.env</code>. Your
-          daily margin and each call&apos;s total &amp; per-minute cost are
-          shown in the <span className="text-blue-400">Wallet</span> /{" "}
-          <span className="text-blue-400">Calls</span> tabs.
-        </p>
-        {v.isV2 && (
-          <p className="text-[11px] text-gray-500 mt-2">
-            V2 cost tracking: input_tokens*input_price +
-            cached_input_tokens*cached_input_price + output_tokens*output_price.
-            Logs provider, model, TTFT, generation_time.
-          </p>
+      {/* Save Strip */}
+      <div className="mt-8 space-y-4">
+        {v.err && (
+          <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{v.err}</span>
+          </div>
         )}
+
+        <Button
+          onClick={set.submit}
+          disabled={v.busy}
+          className="h-12 w-full text-base font-bold shadow-lg shadow-primary/20"
+        >
+          {v.busy ? (
+            <>
+              <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+              Saving...
+            </>
+          ) : v.editing ? (
+            <>
+              <Save className="mr-2 h-5 w-5" />
+              Save Changes
+            </>
+          ) : (
+            <>
+              <Plus className="mr-2 h-5 w-5" />
+              Create Agent
+            </>
+          )}
+        </Button>
       </div>
-
-      {v.err && (
-        <div className="text-red-400 text-sm bg-red-500/10 border border-red-500/30 rounded-lg p-3">
-          {v.err}
-        </div>
-      )}
-
-      <button
-        onClick={set.submit}
-        disabled={v.busy}
-        className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-xl disabled:opacity-50"
-      >
-        {v.busy ? "Saving..." : v.editing ? "Save Changes" : "Create Agent"}
-      </button>
     </div>
   );
 }

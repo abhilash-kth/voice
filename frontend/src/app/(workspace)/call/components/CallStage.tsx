@@ -45,11 +45,10 @@ export default function CallStage({
   return (
     <Card
       className={cn(
-        "flex min-h-[380px] items-center justify-center border-border/60 py-0 shadow-sm",
-        "bg-card",
+        "flex min-h-[440px] items-stretch justify-center overflow-hidden border-border/60 bg-card p-0 shadow-sm xl:min-h-[560px]",
       )}
     >
-      <div className="flex w-full items-center justify-center p-4 sm:p-6">
+      <div className="relative flex w-full flex-1 items-center justify-center bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-primary/10 via-background to-background p-5 sm:p-8">
         {session ? (
           <LiveCallRoom
             session={session}
@@ -88,19 +87,19 @@ function EmptyStage({
 }) {
   if (callEndedMsg) {
     return (
-      <div className="mx-auto max-w-sm space-y-3 px-4 text-center">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+      <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-500/20 bg-emerald-500/10 text-emerald-600 shadow-sm dark:text-emerald-400">
           <CheckCircle2 className="h-7 w-7" />
         </div>
-        <div className="space-y-1">
-          <p className="text-sm font-semibold text-foreground">
+        <div className="space-y-2">
+          <p className="text-lg font-semibold tracking-tight text-foreground">
             Last call ended
           </p>
-          <p className="text-xs leading-relaxed text-muted-foreground">
+          <p className="text-sm leading-relaxed text-muted-foreground">
             {callEndedMsg}
           </p>
         </div>
-        <p className="text-[11px] text-muted-foreground">
+        <p className="rounded-full border border-border/70 bg-background/80 px-3 py-1.5 text-xs text-muted-foreground">
           Start a new call from the panel on the left.
         </p>
       </div>
@@ -109,13 +108,15 @@ function EmptyStage({
 
   if (callState === "error") {
     return (
-      <div className="mx-auto max-w-sm space-y-3 px-4 text-center">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-destructive/20 bg-destructive/10 text-destructive">
+      <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-destructive/20 bg-destructive/10 text-destructive shadow-sm">
           <AlertTriangle className="h-7 w-7" />
         </div>
-        <div className="space-y-1">
-          <p className="text-sm font-semibold text-destructive">Call error</p>
-          <p className="text-xs leading-relaxed text-muted-foreground">
+        <div className="space-y-2">
+          <p className="text-lg font-semibold tracking-tight text-destructive">
+            Call error
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
             {err || "An error occurred"}
           </p>
         </div>
@@ -125,15 +126,15 @@ function EmptyStage({
 
   if (mode === "browser") {
     return (
-      <div className="mx-auto max-w-sm space-y-3 px-4 text-center">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-border/60 bg-muted/40 text-muted-foreground">
+      <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-primary/15 bg-primary/10 text-primary shadow-sm">
           <Monitor className="h-7 w-7" />
         </div>
-        <div className="space-y-1">
-          <p className="text-sm font-semibold text-foreground">
+        <div className="space-y-2">
+          <p className="text-lg font-semibold tracking-tight text-foreground">
             Ready for a voice call
           </p>
-          <p className="text-xs leading-relaxed text-muted-foreground">
+          <p className="text-sm leading-relaxed text-muted-foreground">
             Select an agent, then press{" "}
             <span className="font-medium text-foreground">
               Start voice call
@@ -141,7 +142,7 @@ function EmptyStage({
             . Your microphone will be used in this browser.
           </p>
         </div>
-        <div className="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground">
+        <div className="flex items-center justify-center gap-2 rounded-full border border-border/70 bg-background/80 px-3 py-1.5 text-xs text-muted-foreground">
           <PhoneCall className="h-3 w-3" />
           LiveKit · WebRTC
         </div>
@@ -150,13 +151,15 @@ function EmptyStage({
   }
 
   return (
-    <div className="mx-auto max-w-sm space-y-3 px-4 text-center">
-      <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-border/60 bg-muted/40 text-muted-foreground">
+    <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">
+      <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-primary/15 bg-primary/10 text-primary shadow-sm">
         <Phone className="h-7 w-7" />
       </div>
-      <div className="space-y-1">
-        <p className="text-sm font-semibold text-foreground">Ready to dial</p>
-        <p className="text-xs leading-relaxed text-muted-foreground">
+      <div className="space-y-2">
+        <p className="text-lg font-semibold tracking-tight text-foreground">
+          Ready to dial
+        </p>
+        <p className="text-sm leading-relaxed text-muted-foreground">
           Enter an E.164 number, then press{" "}
           <span className="font-medium text-foreground">Dial number</span>. The
           agent will place a real SIP call.

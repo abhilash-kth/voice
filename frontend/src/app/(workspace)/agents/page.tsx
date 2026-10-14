@@ -1,40 +1,59 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  Agent,
-  Catalog,
-  getCatalog,
-  listAgents,
-  deleteAgent,
-} from "@/lib/index";
-import AgentConfigForm from "@/app/(workspace)/agents/components/AgentConfigForm";
+  Bot,
+  Plus,
+  Pencil,
+  PhoneCall,
+  Trash2,
+  Brain,
+  Mic,
+  Volume2,
+  MemoryStick,
+  CircleDot,
+  Layers,
+  Sparkles,
+} from "lucide-react";
+import { toast } from "sonner";
+import { Agent, getCatalog, listAgents, deleteAgent } from "@/lib/index";
+import { useQuery } from "@tanstack/react-query";
+import { LoadingGrid } from "@/components/LoadingGrid";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 
 export default function AgentsPage() {
   const router = useRouter();
-  const [catalog, setCatalog] = useState<Catalog | null>(null);
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [editing, setEditing] = useState<Agent | null>(null);
-  const [notice, setNotice] = useState("");
-  const [backendError, setBackendError] = useState("");
+  const backendError =
+    "Could not reach the backend at localhost:8000. Start it with: uvicorn app.main:app --port 8000";
 
-  const refreshAgents = useCallback(async () => {
-    try {
+  const {
+    data,
+    isPending,
+    error,
+    refetch: refetchCatalogAgents,
+  } = useQuery({
+    queryKey: ["catalogs", "agents"],
+    queryFn: async () => {
       const [c, a] = await Promise.all([getCatalog(), listAgents()]);
-      setCatalog(c);
-      setAgents(a.agents);
-      setBackendError("");
-    } catch (e) {
-      setBackendError(
-        "Could not reach the backend at localhost:8000. Start it with: uvicorn app.main:app --port 8000",
-      );
-    }
-  }, []);
+      return {
+        c,
+        agents: a.agents,
+      };
+    },
+  });
 
-  useEffect(() => {
-    refreshAgents();
-  }, [refreshAgents]);
+  if (isPending || error) {
+    return (
+      <LoadingGrid
+        loading={isPending}
+        error={error instanceof Error ? error.message : backendError}
+      />
+    );
+  }
+
+  const agents: Agent[] = data?.agents ?? [];
 
   const removeAgent = async (a: Agent) => {
     const ok = window.confirm(
@@ -43,186 +62,252 @@ export default function AgentsPage() {
     if (!ok) return;
     try {
       await deleteAgent(a.id);
-      setNotice(`Deleted ${a.name}`);
-      refreshAgents();
+      toast.success(`Deleted ${a.name}`);
+      refetchCatalogAgents();
     } catch (e) {
-      setNotice(`Could not delete: ${(e as Error).message}`);
+      toast.error(`Could not delete: ${(e as Error).message}`);
     }
   };
 
   return (
     <div className="space-y-6">
-      {/* Moved error banners here so they render correctly */}
-      {backendError && (
-        <div className="-mx-4 sm:-mx-6 -mt-4 sm:-mt-6 mb-6 bg-red-500/10 border-b border-red-500/20 text-red-300 text-sm px-4 sm:px-6 py-3 flex items-center gap-2">
-          <span>⚠️</span> <span className="truncate">{backendError}</span>
+      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            <Bot className="h-5 w-5" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold tracking-tight text-foreground sm:text-2xl">
+              Agents
+            </h2>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              Create and configure voice agents, then assign them to calls.
+            </p>
+          </div>
         </div>
-      )}
-      {notice && (
-        <div className="-mx-4 sm:-mx-6 -mt-4 sm:-mt-6 mb-6 bg-emerald-500/10 border-b border-emerald-500/20 text-emerald-300 text-sm px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
-          <span className="truncate">{notice}</span>
-          <button
-            onClick={() => setNotice("")}
-            className="shrink-0 w-6 h-6 rounded-full bg-gray-800 flex items-center justify-center text-gray-400 hover:text-white"
-          >
-            ✕
-          </button>
-        </div>
-      )}
-
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div>
-          <h2 className="text-xl sm:text-2xl font-black tracking-tight">
-            🤖 Agents
-          </h2>
-          <p className="text-sm text-gray-400 mt-1">
-            Create & configure voice agents, then assign to calls.
-          </p>
-        </div>
-        <button
-          onClick={() => setEditing(null)}
-          className="w-full sm:w-auto bg-white text-gray-900 hover:bg-gray-100 border border-white rounded-xl px-4 py-2.5 text-sm font-bold shadow-lg shadow-white/10 transition-all"
+        <Button
+          type="button"
+          className="h-9 w-full gap-2 sm:w-auto"
+          onClick={() => router.push("/agents/new")}
         >
-          + New Agent
-        </button>
+          <Plus className="h-4 w-4" />
+          New agent
+        </Button>
       </div>
 
-      {catalog && (
-        <div className="bg-gray-900 rounded-2xl border border-gray-800 p-4 sm:p-6 shadow-xs">
-          <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">
-            {editing ? `Editing: ${editing.name}` : "Create a new agent"}
-          </h3>
-          <AgentConfigForm
-            key={editing?.id ?? "new"}
-            catalog={catalog}
-            editing={editing}
-            onDone={(m) => {
-              setNotice(m);
-              setTimeout(() => setEditing(null), 600);
-              refreshAgents();
-            }}
-          />
-        </div>
-      )}
-
-      {!editing && agents.length === 0 && (
-        <div className="bg-gray-900 rounded-2xl border border-dashed border-gray-800 p-12 text-center animate-fade-in-up">
-          <div className="w-14 h-14 rounded-2xl bg-gray-800 flex items-center justify-center text-2xl mx-auto mb-4">
-            🤖
+      {agents.length === 0 && (
+        <div className="flex w-full flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
+          <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+            <Bot className="h-7 w-7" />
           </div>
-          <p className="text-sm font-semibold text-gray-300">No agents yet</p>
-          <p className="text-xs text-gray-500 mt-1 max-w-[300px] mx-auto leading-relaxed">
-            Fill in the form above — pick a provider, language and voice — and
-            your first agent will be ready to take calls in seconds.
+          <p className="text-sm font-semibold text-foreground">No agents yet</p>
+          <p className="mt-1.5 max-w-[320px] text-xs leading-relaxed text-muted-foreground">
+            Create an agent — pick a provider, language and voice — and it will
+            be ready to take calls in seconds.
           </p>
         </div>
       )}
 
-      {!editing && agents.length > 0 && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {agents.map((a) => (
-            <div
-              key={a.id}
-              className="group bg-gray-900 rounded-2xl border border-gray-800 hover:border-gray-700 p-5 transition-all hover:shadow-xl hover:shadow-black/20 hover:-translate-y-0.5"
-            >
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="font-bold text-[15px] truncate pr-2">
-                  {a.name}
-                </h3>
-                <span
-                  className={`text-[10px] px-2 py-1 rounded-full font-bold tracking-wider uppercase shrink-0 ${
-                    a.enabled
-                      ? "bg-emerald-500/10 text-emerald-300 border border-emerald-500/20"
-                      : "bg-gray-800 text-gray-500 border border-gray-700"
-                  }`}
-                >
-                  {a.enabled ? "active" : "disabled"}
-                </span>
+      {agents.length > 0 && (
+        <div className="flex w-full flex-col gap-3">
+          {agents.map((a) => {
+            const isAnnouncement = a.agent_mode === "announcement";
+            const isLive = (a.active_calls ?? 0) > 0;
+
+            return (
+              <div
+                key={a.id}
+                className={cn(
+                  "group w-full overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm transition-colors",
+                  "hover:border-primary/30 hover:bg-accent/30",
+                )}
+              >
+                <div className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:gap-5 sm:p-5">
+                  <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="truncate text-base font-semibold tracking-tight text-foreground">
+                          {a.name}
+                        </h3>
+
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "h-5 gap-1 px-1.5 text-[10px] font-semibold uppercase tracking-wider",
+                            a.enabled
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                              : "border-border bg-muted text-muted-foreground",
+                          )}
+                        >
+                          {a.enabled ? (
+                            <span className="relative flex h-1.5 w-1.5">
+                              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
+                              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                            </span>
+                          ) : null}
+                          {a.enabled ? "Active" : "Off"}
+                        </Badge>
+
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "h-5 px-1.5 text-[10px] font-semibold capitalize",
+                            isAnnouncement
+                              ? "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-400"
+                              : "border-primary/25 bg-primary/10 text-primary",
+                          )}
+                        >
+                          {isAnnouncement ? "Announcement" : "Assistant"}
+                        </Badge>
+
+                        {isLive && (
+                          <Badge
+                            variant="outline"
+                            className="h-5 gap-1 border-amber-500/30 bg-amber-500/10 px-1.5 text-[10px] font-semibold text-amber-700 dark:text-amber-400"
+                          >
+                            <span className="relative flex h-1.5 w-1.5">
+                              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500 opacity-70" />
+                              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-500" />
+                            </span>
+                            {a.active_calls} live
+                          </Badge>
+                        )}
+                      </div>
+
+                      <p className="mt-1 line-clamp-1 text-sm text-muted-foreground">
+                        {a.description || "No description"}
+                      </p>
+
+                      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                        <MetaChip
+                          icon={Brain}
+                          text={a.providers.llm.id}
+                          className="border-violet-500/20 bg-violet-500/10 text-violet-700 dark:text-violet-400"
+                        />
+                        <MetaChip
+                          icon={Mic}
+                          text={a.providers.stt.id}
+                          className="border-sky-500/20 bg-sky-500/10 text-sky-700 dark:text-sky-400"
+                        />
+                        <MetaChip
+                          icon={Volume2}
+                          text={a.providers.tts.id}
+                          className="border-teal-500/20 bg-teal-500/10 text-teal-700 dark:text-teal-400"
+                        />
+                        <span className="mx-0.5 hidden h-4 w-px bg-border sm:inline-block" />
+                        <MetaChip
+                          icon={MemoryStick}
+                          text={a.memory_enabled ? "Memory" : "No memory"}
+                          className={
+                            a.memory_enabled
+                              ? "border-violet-500/20 bg-violet-500/10 text-violet-700 dark:text-violet-400"
+                              : "border-border bg-muted text-muted-foreground"
+                          }
+                        />
+                        <MetaChip
+                          icon={CircleDot}
+                          text={a.recording_enabled ? "Recording" : "No rec"}
+                          className={
+                            a.recording_enabled
+                              ? "border-rose-500/20 bg-rose-500/10 text-rose-700 dark:text-rose-400"
+                              : "border-border bg-muted text-muted-foreground"
+                          }
+                        />
+                        <MetaChip
+                          icon={Layers}
+                          text={`×${a.max_concurrency}`}
+                          className="border-blue-500/20 bg-blue-500/10 text-blue-700 dark:text-blue-400"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 flex-col gap-3 border-t border-border pt-3 sm:border-l sm:border-t-0 sm:pl-5 sm:pt-0">
+                    <div className="flex items-center gap-4 sm:justify-end">
+                      <div className="text-left sm:text-right">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          Calls
+                        </p>
+                        <p className="text-sm font-bold tabular-nums text-foreground">
+                          {a.call_count ?? 0}
+                          <span className="ml-1 text-xs font-medium text-muted-foreground">
+                            · {a.active_calls ?? 0} live
+                          </span>
+                        </p>
+                      </div>
+                      <div className="text-left sm:text-right">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          Billed
+                        </p>
+                        <p className="text-sm font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
+                          ₹{a.total_billed ?? 0}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 sm:justify-end">
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="h-8 gap-1.5 bg-background text-xs"
+                        onClick={() => router.push(`/agents/${a.id}`)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        Edit
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="h-8 gap-1.5 bg-green-400 text-xs text-black hover:bg-green-500"
+                        onClick={() => {
+                          router.push(`/dashboard/call?preset=${a.id}`);
+                        }}
+                      >
+                        <PhoneCall className="h-3.5 w-3.5" />
+                        Call
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        size="sm"
+                        className="h-8 gap-1.5"
+                        onClick={() => removeAgent(a)}
+                        title="Delete this agent"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+                </div>
               </div>
-              <p className="text-[13px] text-gray-400 mb-4 line-clamp-2 min-h-[36px]">
-                {a.description || "—"}
-              </p>
-              <div className="flex flex-wrap gap-1.5 text-[11px] text-gray-400 mb-3">
-                <span
-                  className={`rounded-full px-2.5 py-1 border ${
-                    a.agent_mode === "announcement"
-                      ? "bg-blue-500/10 text-blue-300 border-blue-500/20"
-                      : "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
-                  }`}
-                >
-                  {a.agent_mode === "announcement"
-                    ? "announcement"
-                    : "assistant"}
-                </span>
-                <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
-                  LLM: {a.providers.llm.id.slice(0, 18)}
-                </span>
-                <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
-                  STT: {a.providers.stt.id.slice(0, 14)}
-                </span>
-                <span className="bg-gray-800 border border-gray-700/50 rounded-full px-2.5 py-1">
-                  TTS: {a.providers.tts.id.slice(0, 14)}
-                </span>
-              </div>
-              <div className="flex flex-wrap gap-1.5 text-[11px] mb-4">
-                <span
-                  className={`rounded-full px-2.5 py-1 border ${
-                    a.memory_enabled
-                      ? "bg-indigo-500/10 text-indigo-300 border-indigo-500/20"
-                      : "bg-gray-800 text-gray-500 border-gray-700"
-                  }`}
-                >
-                  memory {a.memory_enabled ? "on" : "off"}
-                </span>
-                <span
-                  className={`rounded-full px-2.5 py-1 border ${
-                    a.recording_enabled
-                      ? "bg-red-500/10 text-red-300 border-red-500/20"
-                      : "bg-gray-800 text-gray-500 border-gray-700"
-                  }`}
-                >
-                  rec {a.recording_enabled ? "on" : "off"}
-                </span>
-                <span className="rounded-full px-2.5 py-1 bg-blue-500/10 text-blue-300 border border-blue-500/20">
-                  ×{a.max_concurrency}
-                </span>
-              </div>
-              <div className="flex justify-between text-xs text-gray-500 mb-4 bg-gray-800/50 rounded-xl px-3 py-2">
-                <span>
-                  {a.call_count ?? 0} calls · {a.active_calls ?? 0} live
-                </span>
-                <span className="font-bold text-white">
-                  ₹{a.total_billed ?? 0}
-                </span>
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  onClick={() => setEditing(a)}
-                  className="bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl py-2 text-xs font-semibold transition-colors"
-                >
-                  Edit
-                </button>
-                <button
-                  onClick={() => {
-                    // Pass the preset ID in the URL instead of context state
-                    router.push(`/dashboard/call?preset=${a.id}`);
-                  }}
-                  className="bg-white hover:bg-gray-100 text-gray-900 rounded-xl py-2 text-xs font-bold shadow-sm transition-colors"
-                >
-                  Call
-                </button>
-                <button
-                  onClick={() => removeAgent(a)}
-                  title="Delete this agent"
-                  className="bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/20 rounded-xl py-2 text-xs font-semibold transition-colors"
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
+  );
+}
+
+function MetaChip({
+  icon: Icon,
+  text,
+  className,
+}: {
+  icon: React.ElementType;
+  text: string;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex max-w-[160px] items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium",
+        className,
+      )}
+    >
+      <Icon className="h-3 w-3 shrink-0" />
+      <span className="truncate font-mono">{text}</span>
+    </span>
   );
 }

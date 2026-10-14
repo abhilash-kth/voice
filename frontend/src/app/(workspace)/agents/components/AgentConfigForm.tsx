@@ -1,13 +1,6 @@
 "use client";
 
 // Agent create/edit form — state owner only; visuals live in *
-// (≤300-line rule):
-//   LeftColumn.tsx      identity, mode, voice, knowledge base
-//   RightColumn.tsx     provider pickers + fallbacks + save
-//   ProviderOptions.tsx per-provider option selects + Toggle
-//   llmBits.tsx         LLM types, model lookup + info/tuning UI
-//   payload.ts          state → API payload builders (pure)
-//   constants.ts        languages, labels, optionKey
 import { useEffect, useMemo, useState } from "react";
 import {
   Catalog,
@@ -27,8 +20,9 @@ import {
   initOptionVals,
   BuildInput,
 } from "./payload";
-import { optionKey, FaqItem } from "./constants";
+import { FaqItem } from "./constants";
 import LeftColumn, { LeftSetters, LeftState } from "./LeftColumn";
+import { Separator } from "@/components/ui/separator";
 
 interface Props {
   catalog: Catalog;
@@ -64,7 +58,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     editing?.voice_personality || "friendly",
   );
   const [language, setLanguage] = useState(editing?.language || "hi");
-  // Spoken-voice gender: picks the Google Chirp 3 speaker / Sarvam Bulbul speaker.
   const [gender, setGender] = useState(editing?.gender || "female");
   const [reasoningEffort, setReasoningEffort] = useState<string>(
     () => (editing?.providers as any)?.llm?.config?.reasoning_effort || "low",
@@ -86,7 +79,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   );
   const [faq, setFaq] = useState<FaqItem[]>(editing?.knowledge?.faq || []);
 
-  // V2 LLM lists (tolerant of array- or object-shaped payloads).
   const llmProviders: LLMProvider[] = asList<LLMProvider>(
     (catalog as any).llm_providers,
   );
@@ -117,7 +109,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     () => initFallback(editing).model,
   );
 
-  // Snap model to the first available one when the provider changes.
   useEffect(() => {
     if (!isV2) return;
     const models = llmByProvider[primaryLlmProvider] || [];
@@ -127,7 +118,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     ) {
       setPrimaryLlmModel(models[0].model_id);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [primaryLlmProvider]);
 
   useEffect(() => {
@@ -139,7 +129,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     ) {
       setFallbackLlmModel(models[0].model_id);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fallbackLlmProvider]);
 
   const [picked, setPicked] = useState<Record<string, string>>(
@@ -192,7 +181,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     const m: Record<string, ProviderDef> = {};
     for (const k of kinds) for (const p of catalog.catalog[k]) m[p.id] = p;
     return m;
-  }, [catalog]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [catalog]);
 
   const setPick = (kind: string, id: string) =>
     setPicked((p) => ({ ...p, [kind]: id }));
@@ -204,7 +193,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       [optKey]: { ...(v[optKey] || {}), [optName]: value },
     }));
 
-  // Follow the selected model: reasoning models have their own effort default.
   useEffect(() => {
     const meta = getModelMeta(
       llmModels,
@@ -216,7 +204,6 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     if (meta.supports_reasoning_effort || meta.reasoning_supported) {
       setReasoningEffort(meta.reasoning_default || "low");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [primaryLlmProvider, primaryLlmModel]);
 
   const buildInput: BuildInput = {
@@ -244,10 +231,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     if (!name) return setErr("Please give the agent a name.");
     if (mode === "announcement" && !announceText.trim()) {
       return setErr(
-        "For Announcement mode, fill in the Fixed script — it is the only thing the agent will speak.",
+        "For Announcement mode, fill in the Fixed script, it is the only thing the agent will speak.",
       );
     }
-    // Validate V2 LLM provider/model
     if (isV2) {
       const primaryMeta = getModelMeta(
         llmModels,
@@ -316,7 +302,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         });
         if (file) await addKnowledge(agent.id, { file });
       }
-      onDone(editing ? "Agent updated ✅" : "Agent created ✅");
+      onDone(editing ? "Agent updated" : "Agent created");
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -408,8 +394,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div className="flex flex-col gap-10">
       <LeftColumn v={leftState} set={leftSet} />
+      <Separator className="bg-border/60" />
       <RightColumn v={rightState} set={rightSet} catalog={catalog} />
     </div>
   );

@@ -9,7 +9,6 @@ import {
   Eye,
   X,
   AlertCircle,
-  Headphones,
 } from "lucide-react";
 import { deleteCall, getCall, listCalls, type CallRecord } from "@/lib/index";
 import { Button } from "@/components/ui/button";
@@ -23,16 +22,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import CallDetailDialog from "./CallDetailsDialog";
+import { LoadingGrid } from "@/components/LoadingGrid";
 
 function formatDuration(sec: number) {
   if (!sec) return "0s";
@@ -156,6 +148,20 @@ export default function CallsTable() {
     (cost?.durationMins as number | string | undefined) ??
     (detail ? (detail.duration_seconds / 60).toFixed(2) : 0);
 
+  if (loading || listError) {
+    return (
+      <LoadingGrid
+        loading={loading}
+        error={
+          listError instanceof Error
+            ? listError.message
+            : "Something Went Wrong"
+        }
+        height={600}
+      />
+    );
+  }
+
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col gap-5 overflow-hidden pb-4">
       {/* ── Header Toolbar ── */}
@@ -270,16 +276,6 @@ export default function CallsTable() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {loading && (
-                <TableRow>
-                  <TableCell
-                    colSpan={9}
-                    className="p-8 text-center text-sm text-muted-foreground"
-                  >
-                    Loading call history…
-                  </TableCell>
-                </TableRow>
-              )}
               {!loading && calls.length === 0 && (
                 <TableRow>
                   <TableCell

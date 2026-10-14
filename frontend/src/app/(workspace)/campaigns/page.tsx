@@ -1,22 +1,10 @@
-"use client";
+import { Metadata } from "next";
+import CampaignList from "./components/CampaignList";
 
-import { useCallback, useEffect, useState } from "react";
-import { Agent, listAgents } from "@/lib/index";
-import CampaignPanel from "@/components/CampaignPanel";
+export const metadata:Metadata = {
+  title : "Campaigns | AI Voice Calling"
+}
 
 export default function CampaignsPage() {
-  const [agents, setAgents] = useState<Agent[]>([]);
-
-  const refreshAgents = useCallback(async () => {
-    try {
-      const a = await listAgents();
-      setAgents(a.agents);
-    } catch (e) {}
-  }, []);
-
-  useEffect(() => {
-    refreshAgents();
-  }, [refreshAgents]);
-
-  return <CampaignPanel agents={agents} onChanged={refreshAgents} />;
+  return <CampaignList />;
 }

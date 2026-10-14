@@ -21,7 +21,6 @@ import {
 } from "lucide-react";
 import { Agent } from "@/lib/index";
 import { Badge } from "@/components/ui/badge";
-import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { CallState } from "../types/call-types";
 
@@ -146,12 +145,12 @@ export default function ActiveSession({
             : Bot;
 
   return (
-    <Card className="flex w-full max-w-md flex-col items-center gap-6 border-border/60 bg-card py-0 shadow-sm">
-      <div className="flex w-full flex-col items-center gap-6 p-6 sm:p-8">
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-5">
+      <div className="flex w-full flex-col items-center gap-6 rounded-2xl border border-border/70 bg-background/75 p-6 shadow-sm sm:p-9">
         {/* Status orb */}
         <div
           className={cn(
-            "relative flex h-28 w-28 items-center justify-center rounded-full border transition-all duration-300",
+            "relative flex h-28 w-28 items-center justify-center rounded-full border transition-all duration-300 sm:h-32 sm:w-32",
             vaState === "speaking" &&
               "border-emerald-500/40 bg-emerald-500/15 text-emerald-600 shadow-[0_0_32px_-8px] shadow-emerald-500/40 dark:text-emerald-400",
             vaState === "listening" &&
@@ -189,8 +188,8 @@ export default function ActiveSession({
         </div>
 
         {/* Identity + status copy */}
-        <div className="space-y-2 text-center">
-          <h2 className="text-xl font-bold tracking-tight text-foreground">
+        <div className="space-y-3 text-center">
+          <h2 className="text-2xl font-bold tracking-tight text-foreground">
             {agent?.name || "Live Agent"}
           </h2>
 
@@ -213,8 +212,10 @@ export default function ActiveSession({
             </Badge>
           </div>
 
-          <p className="text-sm font-medium text-foreground">{statusLabel}</p>
-          <p className="text-[11px] text-muted-foreground">
+          <p className="text-base font-semibold text-foreground">
+            {statusLabel}
+          </p>
+          <p className="text-xs text-muted-foreground">
             {participants.length} participant
             {participants.length !== 1 ? "s" : ""} in room
             {announcementDone ? " · Stay connected or end the call" : null}
@@ -223,7 +224,7 @@ export default function ActiveSession({
 
         {/* Visualizer */}
         {audioTrack && (
-          <div className="h-14 w-full overflow-hidden rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5">
+          <div className="h-16 w-full overflow-hidden rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <BarVisualizer
               state={vaState}
               barCount={24}
@@ -233,7 +234,10 @@ export default function ActiveSession({
           </div>
         )}
 
-        {/* LiveKit controls */}
+      </div>
+
+      {/* LiveKit controls */}
+      <div className="rounded-2xl border border-border/70 bg-card p-4 sm:px-5">
         <div className="flex w-full flex-col items-center gap-3">
           <StartAudio
             label="Click if audio is muted"
@@ -246,6 +250,6 @@ export default function ActiveSession({
           </div>
         </div>
       </div>
-    </Card>
+    </div>
   );
 }
