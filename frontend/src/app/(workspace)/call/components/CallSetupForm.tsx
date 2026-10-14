@@ -96,27 +96,10 @@ export default function CallSetupForm({
     (!agentsReady && callState === "idle");
 
   return (
-    <Card className="border-border/60 py-0 shadow-sm">
+    <Card className="overflow-hidden border-border/70 bg-card py-0 shadow-sm">
       <div className="flex flex-col gap-5 p-5 sm:p-6">
-        {/* Header */}
-        <div className="flex items-start gap-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <PhoneCall className="h-4 w-4" />
-          </div>
-          <div className="min-w-0">
-            <h2 className="text-base font-semibold tracking-tight text-foreground">
-              Start a call
-            </h2>
-            <p className="text-xs text-muted-foreground">
-              Choose an agent and connect in the browser or via SIP.
-            </p>
-          </div>
-        </div>
-
-        <Separator className="bg-border/60" />
-
         {/* Agent */}
-        <div className="space-y-1.5">
+        <div className="space-y-2">
           <Label
             htmlFor="call-agent"
             className="text-xs font-medium text-muted-foreground"
@@ -131,7 +114,7 @@ export default function CallSetupForm({
               disabled={isCallActive}
               onChange={(e) => onAgentChange(e.target.value)}
               className={cn(
-                "flex h-9 w-full appearance-none rounded-md border border-input bg-background py-1 pl-9 pr-8 text-sm shadow-sm transition-colors",
+                "flex h-11 w-full appearance-none rounded-lg border border-input bg-background py-1 pl-9 pr-8 text-sm shadow-sm transition-colors",
                 "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
                 "disabled:cursor-not-allowed disabled:opacity-50",
               )}
@@ -153,7 +136,7 @@ export default function CallSetupForm({
           </div>
 
           {selected ? (
-            <div className="flex items-start gap-2 rounded-md border border-border/60 bg-muted/20 px-3 py-2">
+            <div className="flex items-start gap-2.5 rounded-lg border border-primary/10 bg-primary/[0.04] px-3 py-2.5">
               <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <p className="text-[11px] leading-relaxed text-muted-foreground">
                 {selected.agent_mode === "announcement"
@@ -164,7 +147,7 @@ export default function CallSetupForm({
               </p>
             </div>
           ) : (
-            <p className="text-[11px] text-muted-foreground">
+            <p className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
               Create an agent first, then select it here. The call uses only the
               agent you pick.
             </p>
@@ -176,16 +159,16 @@ export default function CallSetupForm({
           <Label className="text-xs font-medium text-muted-foreground">
             Call mode
           </Label>
-          <div className="grid grid-cols-2 gap-1 rounded-md border border-border/60 bg-muted/40 p-1">
+          <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
               disabled={isCallActive}
               onClick={() => onModeChange("browser")}
               className={cn(
-                "inline-flex h-9 items-center justify-center gap-2 rounded-sm text-xs font-semibold transition-all disabled:opacity-50",
+                "inline-flex h-11 items-center justify-center gap-2 rounded-lg border text-xs font-semibold transition-all disabled:opacity-50",
                 mode === "browser"
-                  ? "bg-background text-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground",
+                  ? "border-primary/30 bg-primary/5 text-primary shadow-sm"
+                  : "border-border bg-background text-muted-foreground hover:bg-muted/40 hover:text-foreground",
               )}
             >
               <Monitor className="h-3.5 w-3.5" />
@@ -202,10 +185,10 @@ export default function CallSetupForm({
               disabled={isCallActive}
               onClick={() => onModeChange("sip")}
               className={cn(
-                "inline-flex h-9 items-center justify-center gap-2 rounded-md text-xs font-semibold transition-all disabled:opacity-50",
+                "inline-flex h-11 items-center justify-center gap-2 rounded-lg border text-xs font-semibold transition-all disabled:opacity-50",
                 mode === "sip"
-                  ? "bg-background text-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground",
+                  ? "border-primary/30 bg-primary/5 text-primary shadow-sm"
+                  : "border-border bg-background text-muted-foreground hover:bg-muted/40 hover:text-foreground",
               )}
             >
               <Phone className="h-3.5 w-3.5" />
@@ -216,7 +199,7 @@ export default function CallSetupForm({
 
         {/* SIP fields */}
         {mode === "sip" && (
-          <div className="space-y-3 rounded-lg border border-border/60 bg-muted/15 p-3.5">
+          <div className="space-y-3 rounded-xl border border-border/70 bg-muted/20 p-3.5">
             <div className="space-y-1.5">
               <Label
                 htmlFor="call-phone"
@@ -266,7 +249,7 @@ export default function CallSetupForm({
 
         {/* Error */}
         {err && (
-          <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2.5 text-sm font-medium text-destructive">
+          <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2.5 text-sm font-medium text-destructive">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
             <span className="leading-snug">{err}</span>
           </div>
@@ -286,17 +269,17 @@ export default function CallSetupForm({
 
         {/* Success / ended summary */}
         {callEndedMsg && !callEndedMsg.startsWith("Finalizing") && !err && (
-          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
+          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
             <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
             <span className="leading-snug">{callEndedMsg}</span>
           </div>
         )}
 
         {/* Primary actions */}
-        <div className="space-y-2 pt-1">
+        <div className="space-y-2 border-t border-border/60 pt-4">
           <Button
             type="button"
-            className="h-10 w-full gap-2 text-sm font-semibold"
+            className="h-11 w-full gap-2 text-sm font-semibold shadow-sm"
             onClick={onStart}
             disabled={busy || isCallActive || !agentId || !agentsReady}
           >
@@ -314,7 +297,7 @@ export default function CallSetupForm({
             <Button
               type="button"
               variant="destructive"
-              className="h-10 w-full gap-2 text-sm font-semibold"
+              className="h-11 w-full gap-2 text-sm font-semibold shadow-sm"
               onClick={onEnd}
               disabled={callState === "ending"}
             >
@@ -330,7 +313,7 @@ export default function CallSetupForm({
 
         {/* Session meta */}
         {mode === "browser" && session && (
-          <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-2 font-mono text-[11px] text-muted-foreground">
+          <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2 font-mono text-[11px] text-muted-foreground">
             <span className="text-foreground/80">Room</span> {session.room}
             <span className="mx-1.5 text-border">·</span>
             <span className="text-foreground/80">Call</span> {callId}
@@ -338,7 +321,7 @@ export default function CallSetupForm({
         )}
 
         {mode === "sip" && callId && !session && (
-          <div className="flex items-start gap-2 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
             <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>
               SIP call dispatched. The agent is dialing. Check Call History for

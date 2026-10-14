@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useCallback, useState } from "react";
 import "@livekit/components-styles";
-import { Agent, startCall, getCall, endCall } from "@/lib/index";
-import { CallState } from "@/app/(workspace)/call/types/call-types";
+import { Agent } from "@/lib/index";
 import CallSetupForm from "@/app/(workspace)/call/components/CallSetupForm";
 import CallStage from "@/app/(workspace)/call/components/CallStage";
+import useCallSession from "../hooks/useCallSession";
+import useCallSummary from "../hooks/useCallSummary";
+import useAgentSelection from "../hooks/useAgentSelection";
 
 interface Props {
   agents: Agent[];
@@ -21,8 +23,6 @@ interface Props {
   agentsReady?: boolean;
 }
 
-const LAST_AGENT_KEY = "voice_agent_last_selected_id";
-
 export default function CallPanel({
   agents,
   onStarted,
@@ -31,419 +31,66 @@ export default function CallPanel({
   agentsReady = true,
 }: Props) {
   const [mode, setMode] = useState<"browser" | "sip">("browser");
-  const [agentId, setAgentId] = useState("");
   const [phone, setPhone] = useState("");
   const [trunkId, setTrunkId] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const [callState, setCallState] = useState<CallState>("idle");
-  const [session, setSession] = useState<{
-    token: string;
-    url: string;
-    room: string;
-  } | null>(null);
-  const [callId, setCallId] = useState("");
-  const [callEndedMsg, setCallEndedMsg] = useState("");
 
-  const isDisconnectingRef = useRef(false);
-  const callEndReasonRef = useRef<string | null>(null);
-  const activeSummaryPollRef = useRef<number>(0);
-  const [agentWaitSeconds, setAgentWaitSeconds] = useState(0);
+  // hooks
+  const {
+    agentWaitSeconds,
+    busy,
+    callId,
+    callState,
+    err,
+    isDisconnectingRef,
+    session,
+    setCallState,
+    setErr,
+    setSession,
+    GoStart,
+    endBrowserCall,
+    handleAnnouncementFinished,
+    handleRoomDisconnected,
+  } = useCallSession();
 
-  // Watch the "agent joining" window. The backend/worker now marks a broken
-  // call with a real reason (call.status === "failed" + call.usage.error), so
-  // surface it the moment it appears instead of showing "Waiting for agent…"
-  // forever. A hard 30s timeout covers the other failure: no worker process
-  // picked up the dispatch at all (worker stopped / busy / crashed on setup).
-  useEffect(() => {
-    if (callState !== "waiting_for_agent" || !callId) return;
-    const startedAt = Date.now();
-    let cancelled = false;
+  const { callEndedMsg, setCallEndedMsg, clearCallSummary, fetchCallSummary } =
+    useCallSummary({ onStarted, setCallState, setErr });
 
-    const failWait = async (message: string) => {
-      if (cancelled) return;
-      console.error(`[CALL_ERROR] agent_join_failed: ${message}`);
-      setErr(message);
-      setCallState("error");
-      isDisconnectingRef.current = true; // suppress handleRoomDisconnected takeover
-      try {
-        await endCall(callId); // release the room so "Try again" starts clean
-      } catch {
-        /* backend error on cleanup is fine — the state reset below still works */
-      }
-      setSession(null);
-      window.setTimeout(() => {
-        isDisconnectingRef.current = false;
-      }, 800);
-    };
+  const { agentId, selected, handleAgentSelect } = useAgentSelection({
+    agents,
+    presetAgentId,
+    onPresetConsumed,
+    clearCallSummary,
+    clearError: () => setErr(""),
+  });
 
-    setAgentWaitSeconds(0);
-    const iv = window.setInterval(async () => {
-      if (cancelled) return;
-      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-      setAgentWaitSeconds(elapsed);
-      if (elapsed >= 30) {
-        await failWait(
-          "The agent did not join within 30 seconds. The agent worker may be stopped or busy — " +
-            "check that exactly ONE agent worker is running (`python -m app.agents.worker`), close any " +
-            "old worker windows, then try again.",
-        );
-        return;
-      }
-      try {
-        const c = await getCall(callId);
-        if (cancelled) return;
-        if (c.status === "failed") {
-          const why =
-            (typeof c.usage === "object" &&
-              c.usage !== null &&
-              (c.usage as any).error) ||
-            "the agent worker could not start this call";
-          await failWait(`The agent could not start: ${why}`);
-        }
-      } catch {
-        // backend briefly unreachable — keep waiting until the hard timeout
-      }
-    }, 2000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
-  }, [callState, callId]);
-
-  // Preselect an agent: preset > localStorage (last chosen) > first agent
-  useEffect(() => {
-    if (!agents.length) return;
-
-    if (presetAgentId && agents.some((a) => a.id === presetAgentId)) {
-      setAgentId(presetAgentId);
-      if (typeof window !== "undefined") {
-        try {
-          localStorage.setItem(LAST_AGENT_KEY, presetAgentId);
-        } catch {}
-      }
-      onPresetConsumed?.();
-      return;
-    }
-
-    if (agentId && agents.some((a) => a.id === agentId)) {
-      return;
-    }
-
-    let savedAgentId: string | null = null;
-    if (typeof window !== "undefined") {
-      try {
-        savedAgentId = localStorage.getItem(LAST_AGENT_KEY);
-      } catch {}
-    }
-
-    if (savedAgentId && agents.some((a) => a.id === savedAgentId)) {
-      setAgentId(savedAgentId);
-    } else {
-      const fallbackId = agents[0].id;
-      setAgentId(fallbackId);
-      if (typeof window !== "undefined") {
-        try {
-          localStorage.setItem(LAST_AGENT_KEY, fallbackId);
-        } catch {}
-      }
-    }
-  }, [agents, presetAgentId, agentId, onPresetConsumed]);
-
-  const handleAgentSelect = (newId: string) => {
-    setAgentId(newId);
-    setCallEndedMsg("");
-    setErr("");
-    activeSummaryPollRef.current += 1;
-    if (typeof window !== "undefined") {
-      try {
-        localStorage.setItem(LAST_AGENT_KEY, newId);
-      } catch {}
-    }
-    const found = agents.find((a) => a.id === newId);
-    if (found) {
-      console.log(
-        `[AGENT_SELECTED] agent_id=${found.id} name=${found.name} mode=${found.agent_mode || "assistant"}`,
-      );
-    }
-  };
-
-  const selected = useMemo(
-    () => agents.find((a) => a.id === agentId),
-    [agents, agentId],
+  // Supplies the current agent and summary callback to the call event handlers.
+  const onAnnouncementFinished = useCallback(
+    () => handleAnnouncementFinished(selected),
+    [handleAnnouncementFinished, selected],
+  );
+  
+  const onRoomDisconnected = useCallback(
+    (reason?: unknown) =>
+      handleRoomDisconnected(reason, selected, fetchCallSummary),
+    [handleRoomDisconnected, selected, fetchCallSummary],
   );
 
-  const fetchCallSummary = async (cid: string) => {
-    if (!cid) {
-      setCallEndedMsg("Call ended. Select an agent to start a new call.");
-      return;
-    }
-    const pollId = ++activeSummaryPollRef.current;
-    setCallEndedMsg("Finalizing call & calculating billing summary…");
+  // function for starting the call
+  async function go() {
+    await GoStart({
+      agentId: agentId,
+      selectedAgent: selected,
+      agentsReady: agentsReady,
+      mode: mode,
+      phone: phone,
+      trunkId: trunkId,
+      clearCallSummary,
+      setCallEndedMsg,
+      onStarted,
+    });
+  }
 
-    // Poll until billing is finalized and written to DB (up to 12s)
-    let attempts = 0;
-    const maxAttempts = 12;
-    while (attempts < maxAttempts) {
-      if (activeSummaryPollRef.current !== pollId) return;
-      try {
-        await new Promise((r) => setTimeout(r, attempts === 0 ? 800 : 1200));
-        if (activeSummaryPollRef.current !== pollId) return;
-        attempts++;
-        const c = await getCall(cid);
-        if (activeSummaryPollRef.current !== pollId) return;
-        if (c.status === "failed") {
-          // Surface the real reason (worker setup failure, LiveKit timeout…)
-          // instead of a fake "completed, billed ₹0.00" summary.
-          const why =
-            (typeof c.usage === "object" &&
-              c.usage !== null &&
-              (c.usage as any).error) ||
-            "the agent worker could not start the call";
-          setErr(`Call failed: ${why}`);
-          setCallState("error");
-          onStarted();
-          return;
-        }
-        const costInr = (c.cost as any)?.client_price_inr;
-        const duration = c.duration_seconds ?? 0;
-        const isFinalized = c.status === "completed" || c.status === "failed";
-
-        // Check if billing is ready: either cost is posted or duration is > 0
-        if (
-          costInr !== undefined &&
-          costInr !== null &&
-          (Number(costInr) > 0 || duration > 0)
-        ) {
-          const finalCost = Number(costInr) || 0;
-          setCallEndedMsg(
-            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`,
-          );
-          onStarted(); // triggers refreshWallet() and refreshAgents() in parent
-          return;
-        }
-
-        if (isFinalized && duration > 0) {
-          const finalCost = Number(costInr || 0);
-          setCallEndedMsg(
-            `Call completed • ${duration}s • Billed ₹${finalCost.toFixed(2)} • Wallet balance updated`,
-          );
-          onStarted();
-          return;
-        }
-      } catch {
-        // continue polling on error
-      }
-    }
-
-    if (activeSummaryPollRef.current !== pollId) return;
-    // Final attempt fallback
-    try {
-      const c = await getCall(cid);
-      if (activeSummaryPollRef.current !== pollId) return;
-      const costInr = Number((c.cost as any)?.client_price_inr || 0);
-      const duration = c.duration_seconds ?? 0;
-      setCallEndedMsg(
-        `Call completed • ${duration}s • Billed ₹${costInr.toFixed(2)} • Wallet balance updated`,
-      );
-      onStarted();
-    } catch {
-      if (activeSummaryPollRef.current === pollId) {
-        setCallEndedMsg("Call ended. Select an agent to start a new call.");
-      }
-    }
-  };
-
-  const endBrowserCall = async () => {
-    if (isDisconnectingRef.current) return;
-    isDisconnectingRef.current = true;
-    callEndReasonRef.current = "user_ended";
-    console.log(`[CALL_END_REQUESTED] source=user call_id=${callId}`);
-    setCallState("ending");
-
-    const curCallId = callId;
-    const curRoom = session?.room || "";
-
-    try {
-      if (curCallId) {
-        await endCall(curCallId).catch((e) =>
-          console.warn("endCall backend call error:", e),
-        );
-      }
-    } catch {
-      // ignore backend error on end
-    } finally {
-      console.log(
-        `[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=user_ended`,
-      );
-      setTimeout(() => {
-        setSession(null);
-        setCallState("ended");
-        isDisconnectingRef.current = false;
-        callEndReasonRef.current = null;
-        fetchCallSummary(curCallId);
-      }, 300);
-    }
-  };
-
-  const handleAnnouncementFinished = useCallback(() => {
-    if (!selected) return;
-    if (
-      selected.agent_mode === "announcement" &&
-      selected.end_after_announcement
-    ) {
-      console.log(`[CALL_END_REQUESTED] source=announcement call_id=${callId}`);
-      callEndReasonRef.current = "announcement_completed";
-    }
-  }, [selected, callId]);
-
-  const handleRoomDisconnected = useCallback(
-    (reason?: any) => {
-      if (isDisconnectingRef.current) return;
-      isDisconnectingRef.current = true;
-      const curCallId = callId;
-      const curRoom = session?.room || "";
-
-      let finalReason = callEndReasonRef.current;
-      if (!finalReason) {
-        if (
-          selected?.agent_mode === "announcement" &&
-          selected?.end_after_announcement
-        ) {
-          finalReason = "announcement_completed";
-        } else if (
-          reason === 5 ||
-          String(reason).includes("5") ||
-          String(reason).includes("ROOM_DELETED")
-        ) {
-          finalReason = "completed";
-        } else if (
-          reason === 7 ||
-          String(reason).includes("7") ||
-          String(reason).includes("JOIN_FAILURE")
-        ) {
-          finalReason = "connection_error";
-        } else {
-          finalReason = "room_disconnected";
-        }
-      }
-
-      console.log(
-        `[CALL_ENDED] room=${curRoom} call_id=${curCallId} reason=${finalReason}`,
-      );
-
-      setCallState("ending");
-      setTimeout(() => {
-        setSession(null);
-        setCallState("ended");
-        isDisconnectingRef.current = false;
-        callEndReasonRef.current = null;
-        fetchCallSummary(curCallId);
-      }, 250);
-    },
-    [callId, session, selected],
-  );
-
-  const go = async () => {
-    activeSummaryPollRef.current += 1;
-    setErr("");
-    setCallEndedMsg("");
-    if (isDisconnectingRef.current) return;
-    if (
-      callState === "connecting" ||
-      callState === "waiting_for_agent" ||
-      callState === "connected" ||
-      session !== null
-    ) {
-      return setErr("A call is already active. End the current call first.");
-    }
-    if (!agentsReady)
-      return setErr("Loading your agents — one moment before starting a call.");
-    if (!agentId) return setErr("Select an agent first.");
-    const selectedAgent = agents.find((a) => a.id === agentId);
-    if (!selectedAgent) return setErr("Selected agent not found.");
-    if (mode === "sip" && !phone)
-      return setErr("Enter a phone number for SIP calling.");
-
-    console.log(`[CALL_START] agent_id=${agentId} mode=${mode}`);
-    console.log(
-      `[AGENT_SELECTED] agent_id=${agentId} name=${selectedAgent.name} mode=${selectedAgent.agent_mode || "assistant"}`,
-    );
-
-    setBusy(true);
-    setCallState("connecting");
-
-    try {
-      if (mode === "browser") {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-          });
-          stream.getTracks().forEach((t) => t.stop());
-          const AC =
-            window.AudioContext ||
-            (window as unknown as { webkitAudioContext?: typeof AudioContext })
-              .webkitAudioContext;
-          if (AC) await new AC().resume();
-        } catch {
-          const errMsg =
-            "Microphone access denied. Please allow microphone access in your browser settings.";
-          console.error(`[CALL_ERROR] ${errMsg}`);
-          setErr(errMsg);
-          setCallState("error");
-          setBusy(false);
-          return;
-        }
-      }
-
-      const res = await startCall({
-        agent_id: agentId,
-        mode,
-        phone: mode === "sip" ? phone : undefined,
-        sip_trunk_id: trunkId || undefined,
-      });
-
-      console.log(`[ROOM_CREATED] room=${res.room} call_id=${res.call_id}`);
-      setCallId(res.call_id);
-
-      if (mode === "sip") {
-        onStarted();
-        setCallState("connected");
-        setCallEndedMsg("SIP call dispatched — agent is dialing");
-        setBusy(false);
-        return;
-      }
-
-      if (!res.token || !res.url) {
-        const errMsg =
-          "LiveKit server returned empty token or URL. Please verify backend status.";
-        console.error(`[CALL_ERROR] ${errMsg}`);
-        setErr(errMsg);
-        setCallState("error");
-        setBusy(false);
-        return;
-      }
-
-      console.log(`[TOKEN_CREATED] room=${res.room}`);
-      console.log(`[LIVEKIT_CONNECT_START] room=${res.room} url=${res.url}`);
-
-      setSession({ token: res.token, url: res.url, room: res.room });
-      setCallState("waiting_for_agent");
-      onStarted();
-    } catch (e) {
-      const errMsg = (e as Error).message || "Call setup failed";
-      console.error(`[CALL_ERROR] ${errMsg}`);
-      setErr(`Agent failed to start: ${errMsg}`);
-      setCallState("error");
-    } finally {
-      setBusy(false);
-    }
-  };
+  const handleEndCall = () => endBrowserCall(fetchCallSummary);
 
   const isCallActive =
     (callState === "connecting" ||
@@ -453,7 +100,7 @@ export default function CallPanel({
     session !== null;
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(320px,0.85fr)_minmax(0,1.35fr)] 2xl:gap-6">
       <CallSetupForm
         agents={agents}
         agentsReady={agentsReady}
@@ -474,7 +121,7 @@ export default function CallPanel({
         session={session}
         callId={callId}
         onStart={go}
-        onEnd={endBrowserCall}
+        onEnd={handleEndCall}
       />
       <CallStage
         session={session}
@@ -487,8 +134,8 @@ export default function CallPanel({
         agentWaitSeconds={agentWaitSeconds}
         isDisconnecting={isDisconnectingRef.current}
         onStateChange={setCallState}
-        onAnnouncementFinished={handleAnnouncementFinished}
-        onDisconnected={handleRoomDisconnected}
+        onAnnouncementFinished={onAnnouncementFinished}
+        onDisconnected={onRoomDisconnected}
       />
     </div>
   );

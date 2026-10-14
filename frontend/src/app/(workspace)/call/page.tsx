@@ -19,7 +19,6 @@ export default function CallPage() {
   });
 
   const agents = data?.agents ?? [];
-  const agentsReady = !isPending && !isError;
 
   return (
     <div className="flex flex-col gap-6">
@@ -70,7 +69,7 @@ export default function CallPage() {
         onPresetConsumed={() => {
           router.replace(pathname, { scroll: false });
         }}
-        agentsReady={agentsReady}
+        agentsReady={!isPending && !isError}
       />
     </div>
   );
