@@ -35,7 +35,7 @@ export function ArrowButton({
     <a
       href={href}
       className={cn(
-        "group inline-flex min-h-12 items-center justify-center gap-3 rounded-full px-6 py-3 text-sm font-semibold transition-all duration-300 active:scale-[.98]",
+        "group inline-flex min-h-12 items-center justify-center gap-3 rounded-full px-6 py-3 text-base font-semibold transition-all duration-300 active:scale-[.98]",
         dark
           ? "bg-midnight-ink text-white hover:bg-graphite"
           : "bg-voltage-violet text-white shadow-subtle hover:-translate-y-0.5 hover:bg-ultra-violet hover:shadow-[0_12px_30px_rgba(134,47,231,.22)]",

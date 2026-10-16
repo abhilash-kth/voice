@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 
 const voices = [
   {
-    name: "Aanya",
+    name: "Priya",
     language: "Hindi",
     native: "हिंदी",
     lang: "hi-IN",

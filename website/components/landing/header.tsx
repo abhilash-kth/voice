@@ -101,9 +101,9 @@ export default function Header() {
               <a
                 key={item.href}
                 href={item.href}
-                className="group relative flex items-center gap-1.5 rounded-full px-3 py-2 transition-all hover:bg-fog hover:text-voltage-violet"
+                className="group relative flex items-center gap-1.5 rounded-full px-3 py-2 transition-all hover:bg-fog hover:text-voltage-violet text-base"
               >
-                <Icon className="h-3.5 w-3.5 text-slate transition-colors group-hover:text-voltage-violet" />
+                <Icon className="h-4 w-4 text-primary transition-colors group-hover:text-voltage-violet" />
                 {item.label}
               </a>
             );
@@ -113,7 +113,7 @@ export default function Header() {
         <div className="hidden items-center gap-2 lg:flex">
           <a
             href="/contact"
-            className="rounded-full px-4 py-2.5 text-sm font-semibold transition-colors hover:bg-fog"
+            className="rounded-full px-4 py-2.5 text-base font-semibold transition-colors hover:bg-fog"
           >
             Contact sales
           </a>

@@ -40,10 +40,10 @@ export default function Footer() {
               multilingual business operations.
             </p>
             <a
-              href="mailto:hello@voxura.ai"
+              href="mailto:info@kriscent.in"
               className="mt-7 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/[.06] px-4 py-2.5 text-sm font-semibold transition-colors hover:bg-white/10"
             >
-              <Mail className="h-4 w-4 text-lavender-mist" /> hello@voxura.ai
+              <Mail className="h-4 w-4 text-lavender-mist" /> info@kriscent.in
             </a>
           </div>
           <div className="grid grid-cols-2 gap-9 sm:grid-cols-3">
