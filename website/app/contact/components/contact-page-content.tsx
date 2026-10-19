@@ -1,51 +1,21 @@
 "use client";
 
 import { motion } from "framer-motion";
-import {
-  ArrowUpRight,
-  Building2,
-  Globe2,
-  Mail,
-  MessageSquare,
-  PhoneCall,
-} from "lucide-react";
+import { ArrowRight, Mail, MessageSquare } from "lucide-react";
 import Header from "@/components/landing/header";
 import Footer from "@/components/landing/footer";
 
-const contactDetails = [
-  {
-    icon: Mail,
-    label: "Email",
-    value: "info@kriscent.in",
-    href: "mailto:info@kriscent.in",
-  },
-  {
-    icon: PhoneCall,
-    label: "Call",
-    value: "+91 89470 27625",
-    href: "tel:+918947027625",
-  },
-  {
-    icon: MessageSquare,
-    label: "WhatsApp",
-    value: "+91 89470 27625",
-    href: "https://wa.me/918947027625",
-  },
-  {
-    icon: Building2,
-    label: "Company",
-    value: "Kriscent Techno Hub Pvt Ltd",
-    href: "https://kriscent.in/",
-  },
-];
-
-const emailChecklist = [
-  "The calls you want the agent to handle",
-  "Inbound, outbound, or both",
-  "Preferred languages and expected call volume",
-];
-
 export default function ContactPageContent() {
+  const submitByEmail = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const subject = encodeURIComponent("Voxura voice agent enquiry");
+    const body = encodeURIComponent(
+      `Name: ${data.get("name")}\nPhone: ${data.get("phone")}\nEmail: ${data.get("email")}\n\nMessage:\n${data.get("message")}`,
+    );
+    window.location.href = `mailto:info@kriscent.in?subject=${subject}&body=${body}`;
+  };
+
   return (
     <main id="top" className="min-h-screen bg-white text-midnight-ink">
       <Header />
@@ -81,6 +51,23 @@ export default function ContactPageContent() {
                 ),
               )}
             </div>
+
+            <a
+              href="mailto:info@kriscent.in"
+              className="group mt-10 inline-flex items-center gap-4 rounded-[22px] border border-mist bg-white/80 p-4 pr-6 shadow-[0_16px_45px_rgba(61,28,95,.07)] backdrop-blur transition-all hover:-translate-y-1 hover:border-lavender-mist"
+            >
+              <span className="grid h-11 w-11 place-items-center rounded-2xl bg-lavender-field text-voltage-violet">
+                <Mail className="h-5 w-5" />
+              </span>
+              <span>
+                <span className="block text-[10px] font-bold uppercase tracking-[.13em] text-slate">
+                  Email
+                </span>
+                <span className="mt-1 block text-sm font-semibold">
+                  info@kriscent.in
+                </span>
+              </span>
+            </a>
           </motion.div>
 
           <motion.div
@@ -94,71 +81,80 @@ export default function ContactPageContent() {
             <div className="absolute inset-0 opacity-[.04] [background-image:radial-gradient(white_1px,transparent_1px)] [background-size:18px_18px]" />
 
             <div className="relative">
-              <div className="flex items-start justify-between gap-5">
-                <div className="flex items-center gap-3">
-                  <span className="grid h-11 w-11 place-items-center rounded-2xl bg-white/10 text-lavender-mist">
-                    <MessageSquare className="h-5 w-5" />
-                  </span>
-                  <div>
-                    <div className="text-[10px] font-bold uppercase tracking-[.15em] text-white/40">
-                      Start a conversation
-                    </div>
-                    <h2 className="mt-1 text-xl font-semibold">
-                      Contact details
-                    </h2>
+              <div className="flex items-center gap-3">
+                <span className="grid h-11 w-11 place-items-center rounded-2xl bg-white/10 text-lavender-mist">
+                  <MessageSquare className="h-5 w-5" />
+                </span>
+                <div>
+                  <div className="text-[10px] font-bold uppercase tracking-[.15em] text-white/40">
+                    Start a conversation
                   </div>
+                  <h2 className="mt-1 text-xl font-semibold">
+                    Tell us what you need
+                  </h2>
                 </div>
-                <Globe2 className="hidden h-5 w-5 text-white/25 sm:block" />
               </div>
 
-              <div className="mt-8 space-y-2">
-                {contactDetails.map((detail) => {
-                  const Icon = detail.icon;
-                  const content = (
-                    <>
-                      <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-white/[.07] text-lavender-mist">
-                        <Icon className="h-4.5 w-4.5" />
-                      </span>
-                      <span className="ml-4 min-w-0 flex-1">
-                        <span className="block text-[10px] font-bold uppercase tracking-[.13em] text-white/35">
-                          {detail.label}
-                        </span>
-                        <span className="mt-1 block text-sm font-semibold leading-5 text-white">
-                          {detail.value}
-                        </span>
-                      </span>
-                      {detail.href && (
-                        <ArrowUpRight className="h-4 w-4 text-white/30 transition-all group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:text-lavender-mist" />
-                      )}
-                    </>
-                  );
-
-                  return detail.href ? (
-                    <a
-                      key={detail.label}
-                      href={detail.href}
-                      target={
-                        detail.href.startsWith("http") ? "_blank" : undefined
-                      }
-                      rel={
-                        detail.href.startsWith("http")
-                          ? "noreferrer"
-                          : undefined
-                      }
-                      className="group flex items-center rounded-[22px] border border-white/[.07] bg-white/[.045] p-3 transition-colors hover:bg-white/[.08]"
-                    >
-                      {content}
-                    </a>
-                  ) : (
-                    <div
-                      key={detail.label}
-                      className="flex items-center rounded-[22px] border border-white/[.07] bg-white/[.045] p-3"
-                    >
-                      {content}
-                    </div>
-                  );
-                })}
-              </div>
+              <form
+                onSubmit={submitByEmail}
+                className="mt-8 rounded-[28px] bg-white p-5 text-midnight-ink sm:p-7"
+              >
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <label className="text-xs font-semibold text-graphite">
+                    Name
+                    <input
+                      name="name"
+                      required
+                      autoComplete="name"
+                      placeholder="Your name"
+                      className="mt-2 h-12 w-full rounded-2xl border border-mist bg-fog/60 px-4 text-sm outline-none transition focus:border-lavender-mist focus:bg-white"
+                    />
+                  </label>
+                  <label className="text-xs font-semibold text-graphite">
+                    Phone
+                    <input
+                      name="phone"
+                      required
+                      type="tel"
+                      autoComplete="tel"
+                      placeholder="Your phone number"
+                      className="mt-2 h-12 w-full rounded-2xl border border-mist bg-fog/60 px-4 text-sm outline-none transition focus:border-lavender-mist focus:bg-white"
+                    />
+                  </label>
+                  <label className="text-xs font-semibold text-graphite sm:col-span-2">
+                    Email
+                    <input
+                      name="email"
+                      required
+                      type="email"
+                      autoComplete="email"
+                      placeholder="you@company.com"
+                      className="mt-2 h-12 w-full rounded-2xl border border-mist bg-fog/60 px-4 text-sm outline-none transition focus:border-lavender-mist focus:bg-white"
+                    />
+                  </label>
+                  <label className="text-xs font-semibold text-graphite sm:col-span-2">
+                    Message
+                    <textarea
+                      name="message"
+                      required
+                      rows={4}
+                      placeholder="Tell us what your voice agent should handle."
+                      className="mt-2 w-full resize-none rounded-2xl border border-mist bg-fog/60 p-4 text-sm leading-6 outline-none transition focus:border-lavender-mist focus:bg-white"
+                    />
+                  </label>
+                </div>
+                <p className="mt-4 text-[11px] leading-5 text-slate">
+                  Submitting opens your email application with these details. No
+                  information is stored on this website.
+                </p>
+                <button
+                  type="submit"
+                  className="group mt-5 inline-flex min-h-12 w-full items-center justify-center gap-3 rounded-full bg-voltage-violet px-6 text-sm font-semibold text-white transition-all hover:-translate-y-0.5 hover:bg-ultra-violet"
+                >
+                  Continue by email{" "}
+                  <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
+                </button>
+              </form>
             </div>
           </motion.div>
         </div>

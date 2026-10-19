@@ -8,7 +8,7 @@ import { ShaderBackground } from "@/components/ui/manu";
 
 const ease = [0.22, 1, 0.36, 1] as const;
 const agentAudio =
-  "https://ik.imagekit.io/qk2ww553c/ai-calling-agent/WhatsApp%20Audio%202026-10-16%20at%2011.28.23%20AM.mp3";
+  "https://ik.imagekit.io/qk2ww553c/ai-calling-agent/priya-agent";
 const agentTranscript =
   "नमस्ते, मैं प्रिया बोल रही हूँ। Apollo Clinic की तरफ से यह आपको आपकी Upcoming Doctor Appointment याद दिलाने के लिए कॉल है। आपकी Appointment Apollo Clinic में Scheduled है। कृपया अपने Appointment के समय पर Clinic पहुँचना सुनिश्चित करें। अगर आप Appointment रिस्केजूल या कैंसल करना चाहते हैं, तो Apollo Clinic से संपर्क करें। धन्यवाद।";
 
