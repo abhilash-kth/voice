@@ -5,6 +5,7 @@ import Image from "next/image";
 import { AnimatePresence, motion } from "framer-motion";
 import { ArrowRight, Pause, Play, Radio } from "lucide-react";
 import { ShaderBackground } from "@/components/ui/manu";
+import Link from "next/link";
 
 const ease = [0.22, 1, 0.36, 1] as const;
 const agentAudio =
@@ -106,20 +107,13 @@ export default function Hero() {
             transition={{ delay: 0.52, duration: 0.7, ease }}
             className="mt-9 flex w-full flex-col justify-center gap-3 sm:w-auto sm:flex-row"
           >
-            <a
-              href="#final-cta"
+            <Link
+              href="/contact"
               className="group inline-flex min-h-14 items-center justify-center gap-3 rounded-full bg-white px-7 text-sm font-semibold text-midnight-ink transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_16px_40px_rgba(255,255,255,.2)] active:translate-y-0"
             >
-              Create your agent{" "}
+              Contact Sales{" "}
               <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
-            </a>
-            <a
-              href="#platform"
-              className="group inline-flex min-h-14 items-center justify-center gap-3 rounded-full border border-white/20 bg-white/10 px-7 text-sm font-semibold text-white backdrop-blur-xl transition-all duration-300 hover:border-white/35 hover:bg-white/15"
-            >
-              See how it works{" "}
-              <Play className="h-4 w-4 fill-current transition-transform group-hover:scale-110" />
-            </a>
+            </Link>
           </motion.div>
         </div>
 

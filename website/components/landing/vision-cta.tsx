@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { ArrowRight, Check, Radio } from "lucide-react";
+import { Check, Radio } from "lucide-react";
 import { ShaderBackground } from "@/components/ui/manu";
 
 export default function VisionAndCta() {
@@ -45,14 +45,7 @@ export default function VisionAndCta() {
           </p>
           <div className="mt-9 flex flex-col justify-center gap-3 sm:flex-row">
             <a
-              href="#"
-              className="group inline-flex min-h-14 items-center justify-center gap-3 rounded-full bg-white px-8 text-sm font-semibold text-midnight-ink transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_18px_40px_rgba(17,24,39,.22)]"
-            >
-              Create your agent{" "}
-              <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
-            </a>
-            <a
-              href="#"
+              href="/contact"
               className="inline-flex min-h-14 items-center justify-center rounded-full border border-white/25 bg-white/10 px-8 text-sm font-semibold text-white backdrop-blur transition-all duration-300 hover:border-midnight-ink/40 hover:bg-white"
             >
               Talk to our team
