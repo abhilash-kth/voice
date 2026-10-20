@@ -8,7 +8,6 @@ const groups = [
       ["Platform", "/#platform"],
       ["Voice agents", "/#agents"],
       ["Languages", "/#languages"],
-      ["Pricing", "/pricing"],
     ],
   },
   {
@@ -20,16 +19,9 @@ const groups = [
     ],
   },
   {
-    title: "Resources",
-    links: [
-      ["Compliance", "/#compliance"],
-      ["FAQ", "/#faq"],
-      ["Contact sales", "/contact"],
-    ],
-  },
-  {
     title: "Legal",
     links: [
+      ["Compliance", "/#compliance"],
       ["Privacy policy", "/privacy-policy"],
       ["Terms & conditions", "/terms-and-conditions"],
     ],
@@ -37,11 +29,83 @@ const groups = [
 ];
 
 const socials = [
-  { label: "Instagram", mark: "IG" },
-  { label: "YouTube", mark: "YT" },
-  { label: "LinkedIn", mark: "in" },
-  { label: "X / Twitter", mark: "X" },
+  {
+    label: "Facebook",
+    platform: "facebook",
+    href: "https://www.facebook.com/KriscentTechnoHub/",
+  },
+  {
+    label: "Instagram",
+    platform: "instagram",
+    href: "https://www.instagram.com/kriscenttechnohub/",
+  },
+  {
+    label: "LinkedIn",
+    platform: "linkedin",
+    href: "https://www.linkedin.com/company/kriscenttechnohub/",
+  },
+  {
+    label: "YouTube",
+    platform: "youtube",
+    href: "https://www.youtube.com/channel/UC_xjC_bZgHtGWwGfRN4Qnug",
+  },
+  { label: "X", platform: "x", href: "https://x.com/kriscent_kth" },
 ];
+
+function SocialIcon({ platform }: { platform: string }) {
+  if (platform === "facebook")
+    return (
+      <svg
+        viewBox="0 0 24 24"
+        aria-hidden="true"
+        className="h-4 w-4 fill-current"
+      >
+        <path d="M14 8.5V7c0-.8.5-1 1-1h2V2.2A27 27 0 0 0 14.1 2C11.2 2 9 3.8 9 7.2v1.3H6v4h3V22h4.2v-9.5h3.2l.6-4H14Z" />
+      </svg>
+    );
+  if (platform === "instagram")
+    return (
+      <svg
+        viewBox="0 0 24 24"
+        aria-hidden="true"
+        className="h-4 w-4 fill-none stroke-current"
+        strokeWidth="2"
+      >
+        <rect x="3" y="3" width="18" height="18" rx="5" />
+        <circle cx="12" cy="12" r="4" />
+        <circle cx="17.5" cy="6.5" r="1" className="fill-current stroke-none" />
+      </svg>
+    );
+  if (platform === "linkedin")
+    return (
+      <svg
+        viewBox="0 0 24 24"
+        aria-hidden="true"
+        className="h-4 w-4 fill-current"
+      >
+        <path d="M5.2 7.8A2.4 2.4 0 1 0 5.2 3a2.4 2.4 0 0 0 0 4.8ZM3.2 9.5h4V21h-4V9.5ZM9.5 9.5h3.8v1.6h.1c.5-1 1.8-2.1 3.7-2.1 4 0 4.7 2.6 4.7 6V21h-4v-5.3c0-1.3 0-3-1.9-3s-2.2 1.4-2.2 2.9V21h-4V9.5Z" />
+      </svg>
+    );
+  if (platform === "youtube")
+    return (
+      <svg
+        viewBox="0 0 24 24"
+        aria-hidden="true"
+        className="h-4 w-4 fill-current"
+      >
+        <path d="M22 7.2a3 3 0 0 0-2.1-2.1C18 4.6 12 4.6 12 4.6s-6 0-7.9.5A3 3 0 0 0 2 7.2 31 31 0 0 0 1.5 12c0 1.6.1 3.2.5 4.8a3 3 0 0 0 2.1 2.1c1.9.5 7.9.5 7.9.5s6 0 7.9-.5a3 3 0 0 0 2.1-2.1c.4-1.6.5-3.2.5-4.8s-.1-3.2-.5-4.8ZM9.8 15.2V8.8l5.5 3.2-5.5 3.2Z" />
+      </svg>
+    );
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className="h-4 w-4 fill-current"
+    >
+      <path d="M18.9 2H22l-6.8 7.8L23.2 22H17l-4.9-6.4L6.5 22H3.4l7.2-8.2L2.8 2H9l4.4 5.8L18.9 2Zm-1.1 17.9h1.7L8.1 4H6.3l11.5 15.9Z" />
+    </svg>
+  );
+}
 
 export default function Footer() {
   return (
@@ -50,7 +114,7 @@ export default function Footer() {
         <div className="pointer-events-none absolute -right-32 -top-40 h-[430px] w-[430px] rounded-full bg-voltage-violet/20 blur-[110px]" />
         <div className="pointer-events-none absolute -bottom-48 left-[18%] h-96 w-96 rounded-full bg-[#a94df0]/10 blur-[120px]" />
 
-        <div className="relative grid gap-16 border-b border-white/10 pb-16 lg:grid-cols-[1fr_1.55fr] lg:gap-24 lg:pb-24">
+        <div className="relative grid gap-16 pb-10 lg:grid-cols-[1fr_1.35fr] lg:gap-24 lg:pb-12">
           <div className="[&>a>span:first-child]:h-14 [&>a>span:first-child]:w-14 [&>a>span:first-child]:rounded-[18px] [&>a>span:first-child>svg]:h-6 [&>a>span:first-child>svg]:w-6 [&>a>span:last-child]:text-3xl [&>a>span:last-child]:text-white">
             <LogoMark />
             <p className="mt-7 max-w-[430px] text-base leading-8 text-white/50">
@@ -65,9 +129,24 @@ export default function Footer() {
               info@kriscent.in
               <ArrowUpRight className="h-3.5 w-3.5 text-white/35 transition-all group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:text-white" />
             </a>
+            <div className="mt-8 flex flex-wrap gap-2.5">
+              {socials.map((social) => (
+                <a
+                  key={social.label}
+                  href={social.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  aria-label={social.label}
+                  title={social.label}
+                  className="grid h-11 w-11 place-items-center rounded-full border border-white/10 bg-white/[.045] text-white/55 transition-all hover:-translate-y-1 hover:border-white/20 hover:bg-white/10 hover:text-white"
+                >
+                  <SocialIcon platform={social.platform} />
+                </a>
+              ))}
+            </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-x-8 gap-y-10 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-x-10 gap-y-10 sm:grid-cols-3">
             {groups.map((group) => (
               <div key={group.title}>
                 <div className="text-[11px] font-bold uppercase tracking-[.14em] text-white/35">
@@ -92,24 +171,35 @@ export default function Footer() {
           </div>
         </div>
 
-        <div className="mt-4 flex items-center justify-center flex-wrap md:flex-nowrap gap-2.5">
-          {socials.map(({ label, mark }) => (
+        <div className="relative flex flex-col gap-7 border-y border-white/10 py-8 sm:flex-row sm:items-center sm:justify-between lg:py-10">
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-[.16em] text-lavender-mist">
+              Start a conversation
+            </div>
+            <h3 className="mt-3 max-w-[700px] text-[clamp(1.8rem,3.2vw,3.2rem)] font-semibold leading-[1.05] tracking-[-.05em]">
+              Ready to put an AI voice agent to work?
+            </h3>
+          </div>
+          <div className="flex shrink-0 flex-wrap gap-2.5">
             <a
-              key={label}
-              href="#"
-              aria-label={label}
-              className="group inline-flex min-h-11 items-center gap-2.5 rounded-full border border-white/10 bg-white/[.045] px-3.5 text-xs font-semibold text-white/55 transition-all hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/10 hover:text-white"
+              href="https://agents.kriscenttechnohub.com/"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex min-h-12 items-center justify-center rounded-full border border-white/12 bg-white/[.055] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
             >
-              <span className="grid h-6 w-6 place-items-center rounded-full bg-white/10 text-[9px] font-bold text-lavender-mist">
-                {mark}
-              </span>
-              {label}
-              <ArrowUpRight className="h-3 w-3 text-white/25 transition-colors group-hover:text-white" />
+              Login
             </a>
-          ))}
+            <a
+              href="/contact"
+              className="group inline-flex min-h-12 items-center justify-center gap-2 rounded-full bg-white px-5 text-sm font-semibold text-midnight-ink transition-transform hover:-translate-y-0.5"
+            >
+              Contact sales{" "}
+              <ArrowUpRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+            </a>
+          </div>
         </div>
 
-        <div className="relative flex flex-col gap-5 pt-10 text-xs text-white/35 sm:flex-row sm:items-center sm:justify-between">
+        <div className="relative flex flex-col gap-5 pt-8 text-xs text-white/35 sm:flex-row sm:items-center sm:justify-between">
           <span>
             © 2026 Voxura. A product developed by Kriscent Techno Hub Pvt Ltd.
           </span>

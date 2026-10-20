@@ -84,7 +84,7 @@ export default function Header() {
               : "rgba(255,255,255,.72)",
         }}
         transition={{ duration: 0.35 }}
-        className="relative z-50 mx-auto flex items-center justify-between overflow-hidden rounded-full border border-white/70 px-4 py-2.5 shadow-[0_12px_50px_rgba(17,24,39,.18)] backdrop-blur-2xl"
+        className="relative z-50 mx-auto flex items-center justify-between overflow-hidden rounded-full border border-white/70 px-4 py-2.5 shadow-[0_12px_50px_rgba(17,24,39,.08)] backdrop-blur-2xl"
       >
         <motion.div
           animate={{ x: ["-120%", "220%"] }}
@@ -101,9 +101,9 @@ export default function Header() {
               <a
                 key={item.href}
                 href={item.href}
-                className="group relative flex items-center gap-1.5 rounded-full px-3 py-2 transition-all hover:bg-fog hover:text-voltage-violet text-base"
+                className="group relative flex items-center gap-1.5 rounded-full px-3 py-2 transition-all hover:bg-fog hover:text-voltage-violet"
               >
-                <Icon className="h-4 w-4 text-primary transition-colors group-hover:text-voltage-violet" />
+                <Icon className="h-3.5 w-3.5 text-slate transition-colors group-hover:text-voltage-violet" />
                 {item.label}
               </a>
             );
@@ -112,12 +112,14 @@ export default function Header() {
 
         <div className="hidden items-center gap-2 lg:flex">
           <a
-            href="/contact"
-            className="rounded-full px-4 py-2.5 text-base font-semibold transition-colors hover:bg-fog"
+            href="https://agents.kriscenttechnohub.com/"
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-full px-4 py-2.5 text-sm font-semibold transition-colors hover:bg-fog"
           >
-            Contact sales
+            Login
           </a>
-          <ArrowButton href="/contact">Create your agent</ArrowButton>
+          <ArrowButton href="/contact">Contact sales</ArrowButton>
         </div>
 
         <button
@@ -204,7 +206,7 @@ export default function Header() {
 
               <motion.div
                 variants={linkVariants}
-                className="mt-3 rounded-[28px] bg-midnight-ink p-5 text-white shadow-[0_24px_60px_rgba(25,11,42,.2)]"
+                className="mt-auto rounded-[28px] bg-midnight-ink p-5 text-white shadow-[0_24px_60px_rgba(25,11,42,.2)]"
               >
                 <div className="flex items-start gap-3">
                   <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-white/10 text-lavender-mist">
@@ -221,18 +223,20 @@ export default function Header() {
                 </div>
                 <div className="mt-5 grid grid-cols-2 gap-2">
                   <a
-                    href="/contact"
+                    href="https://agents.kriscenttechnohub.com/"
+                    target="_blank"
+                    rel="noreferrer"
                     onClick={() => setOpen(false)}
                     className="inline-flex min-h-12 items-center justify-center rounded-full border border-white/15 bg-white/[.06] px-4 text-xs font-semibold text-white"
                   >
-                    Contact sales
+                    Login
                   </a>
                   <a
                     href="/contact"
                     onClick={() => setOpen(false)}
                     className="inline-flex min-h-12 items-center justify-center gap-2 rounded-full bg-white px-4 text-xs font-semibold text-midnight-ink"
                   >
-                    Create an agent <ArrowUpRight className="h-3.5 w-3.5" />
+                    Contact sales <ArrowUpRight className="h-3.5 w-3.5" />
                   </a>
                 </div>
               </motion.div>

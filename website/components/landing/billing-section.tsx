@@ -143,9 +143,10 @@ export default function BillingSection() {
               <div className="mt-2 flex h-[82px] items-center">
                 <div className="flex items-center whitespace-nowrap text-[clamp(3rem,6vw,5.2rem)] font-semibold leading-none tracking-[-.065em]">
                   <span className="inline-flex h-[1em] items-center leading-none">
-                    ₹
+                    ₹ 00,000
                   </span>
-                  <CasinoBalance value={inView ? 12500 : 0} />
+                  {/* <CasinoBalance value={inView ? 12500 : 0} /> */}
+
                 </div>
               </div>
             </div>
