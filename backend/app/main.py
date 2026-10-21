@@ -33,7 +33,7 @@ from .admin import routes as admin_routes
 from .services import config_store
 from .routes import (auth_routes, catalog_routes, agents_routes,
                      calls_routes, campaigns_routes, billing_routes,
-                     setup_routes, subscription_routes)
+                     setup_routes, subscription_routes, contact_routes)
 
 logger = logging.getLogger("voice-agent-saas-api")
 
@@ -136,6 +136,7 @@ app.include_router(calls_routes.router)
 app.include_router(campaigns_routes.router)
 app.include_router(billing_routes.router)
 app.include_router(subscription_routes.router)
+app.include_router(contact_routes.router)
 
 # Credentialed-cookie sessions require explicit origins (browsers reject "*"
 # with credentials) — and an explicit allowlist is better hygiene anyway.

@@ -35,6 +35,7 @@ from .calls import (
     count_live_calls,
     fail_stale_calls,
 )
+from .contacts import _contact_dict, create_contact_message, list_contact_messages
 from .wallet import (
     get_wallet,
     recharge,
@@ -54,4 +55,5 @@ __all__ = [
     "count_live_calls", "fail_stale_calls",
     "get_wallet", "recharge", "deduct", "has_spend_for_call", "get_usage",
     "cost_calc",
+    "_contact_dict", "create_contact_message", "list_contact_messages",
 ]

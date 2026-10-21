@@ -31,6 +31,7 @@ from .records import (
     RegisterBody,
     LoginBody,
     UserOut,
+    ContactBody,
 )
 
 __all__ = [
@@ -39,5 +40,5 @@ __all__ = [
     "KnowledgeItem", "KnowledgeBase",
     "AgentConfig", "AgentCreate", "AgentUpdate",
     "CallRecord", "Recharge", "Wallet",
-    "RegisterBody", "LoginBody", "UserOut",
+    "RegisterBody", "LoginBody", "UserOut", "ContactBody",
 ]

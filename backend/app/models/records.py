@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional, List, Any, Dict
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .providers import CallMode
 
@@ -66,3 +66,20 @@ class UserOut(BaseModel):
     name: str
     wallet_balance: float
     created_at: str
+
+
+# ---------------------------------------------------------------------------
+# Website contact form
+# ---------------------------------------------------------------------------
+class ContactBody(BaseModel):
+    """Also accepts `contact` for the phone number and `requirement` for the
+    message (names used on the landing page)."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    phone: str = Field(validation_alias=AliasChoices("phone", "contact"),
+                       min_length=1, max_length=30)
+    email: str = Field(min_length=3, max_length=254,
+                       pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    message: str = Field(validation_alias=AliasChoices("message", "requirement"),
+                         min_length=1, max_length=5000)

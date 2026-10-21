@@ -333,3 +333,17 @@ model AdminAuditLog {
   @@index([createdAt])
   @@index([adminId])
 }
+
+// --------------------------------------------------------------------------
+// Contact-form submissions from the marketing website (public POST, no user).
+// --------------------------------------------------------------------------
+model ContactMessage {
+  id        String @id @default(cuid())
+  name      String
+  phone     String
+  email     String
+  message   String
+  createdAt String @default("")
+
+  @@index([createdAt])
+}

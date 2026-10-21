@@ -52,7 +52,7 @@ async def _wipe_db():
     await init()
     db = get_prisma()
     for table in ("transaction", "call", "agent", "adminauditlog", "providercredential",
-                  "catalogmodel", "provider", "billingconfig", "user"):
+                  "catalogmodel", "provider", "billingconfig", "contactmessage", "user"):
         await getattr(db, table).delete_many()
 
 
