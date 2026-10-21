@@ -36,7 +36,9 @@ def set_session_cookie(response: Response, token: str) -> None:
     )
 
 def clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE, path="/", domain=".kriscenttechnohub.com")
+    response.delete_cookie(SESSION_COOKIE, path="/",
+                            domain=".kriscenttechnohub.com"
+                            )
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
