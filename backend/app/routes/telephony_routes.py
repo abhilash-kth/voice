@@ -60,6 +60,7 @@ def _kyc_from_account(account: dict, settings=None) -> dict:
             "pan": {"verified": False, "uploaded": False},
             "aadhaar": {"verified": False, "uploaded": False}},
         "ready_for_submission": bool(meta.get("ready_for_submission")),
+        "provider_complete": bool(meta.get("provider_complete")),
         "agreement_needs_acceptance": bool(
             meta.get("agreement_needs_acceptance")),
         "final_submission_available": bool(effective.kyc_finalize_verified),

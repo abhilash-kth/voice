@@ -43,6 +43,7 @@ export interface KycState {
   account_type: string;
   documents: Record<string, { verified: boolean; uploaded: boolean }>;
   ready_for_submission: boolean;
+  provider_complete: boolean;
   agreement_needs_acceptance: boolean;
   final_submission_available: boolean;
   terms_url: string;

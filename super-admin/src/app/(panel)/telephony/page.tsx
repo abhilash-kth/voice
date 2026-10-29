@@ -305,9 +305,9 @@ export default function TelephonyPage() {
                 aria-label="KYC filter"
               >
                 <option value="">All KYC</option>
-                {["not_started", "in_progress", "pending", "submitted", "verified", "rejected"].map((s) => (
+                {["not_started", "in_progress", "pending", "ready_to_submit", "submitted", "verified", "rejected"].map((s) => (
                   <option key={s} value={s}>
-                    {s.replace("_", " ")}
+                    {s.replace(/_/g, " ")}
                   </option>
                 ))}
               </select>

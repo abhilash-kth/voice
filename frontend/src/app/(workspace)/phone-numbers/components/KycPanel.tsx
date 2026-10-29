@@ -145,7 +145,7 @@ export default function KycPanel({
       "Aadhaar",
       !!(kyc.documents.aadhaar?.verified && kyc.documents.aadhaar?.uploaded),
     ],
-    ["Submit", kyc.ready_for_submission],
+    ["Final", kyc.provider_complete],
   ];
 
   return (
@@ -158,7 +158,7 @@ export default function KycPanel({
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-base font-semibold">Verify your identity (KYC)</h3>
             <Badge variant="outline" className="capitalize">
-              {kyc.status.replace("_", " ")}
+              {kyc.status.replace(/_/g, " ")}
             </Badge>
           </div>
           <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
@@ -410,16 +410,30 @@ export default function KycPanel({
 
           <div className="rounded-lg border border-border/70 p-4">
             <h4 className="text-sm font-semibold">Final submission</h4>
-            {kyc.ready_for_submission ? (
+            {kyc.provider_complete ? (
+              <p className="mt-2 text-sm leading-relaxed text-amber-700 dark:text-amber-400">
+                Submitted to the verification provider. Number buying stays
+                locked until the provider also marks this KYC
+                <strong> Verified</strong>; use Refresh provider status to
+                check again.
+              </p>
+            ) : kyc.ready_for_submission ? (
               kyc.final_submission_available ? (
-                <Button
-                  type="button"
-                  className="mt-3"
-                  disabled={busy}
-                  onClick={() => void act("submit")}
-                >
-                  Submit verification
-                </Button>
+                <>
+                  <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+                    Your documents are complete, but final provider
+                    acceptance is still pending. Buying unlocks only after
+                    the status above becomes <strong>Verified</strong>.
+                  </p>
+                  <Button
+                    type="button"
+                    className="mt-3"
+                    disabled={busy}
+                    onClick={() => void act("submit")}
+                  >
+                    Submit verification
+                  </Button>
+                </>
               ) : (
                 <p className="mt-2 text-sm leading-relaxed text-amber-700 dark:text-amber-400">
                   All steps are saved. Final submission is waiting for the

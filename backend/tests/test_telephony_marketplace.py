@@ -140,6 +140,47 @@ def test_kyc_step1_payload_and_safe_provider_validation():
     assert "also do not log this value" not in shape
 
 
+def test_kyc_state_distinguishes_ready_submitted_and_verified():
+    from types import SimpleNamespace
+
+    from app.services.telephony_account import (
+        _safe_kyc_completion_shape, kyc_state)
+
+    settings = SimpleNamespace(
+        kyc_finalize_verified=False, voicelink_kyc_terms_url="")
+    raw = {
+        "account_type": "individual", "is_complete": False,
+        "kyc_status": 0, "current_step": "aadhaar",
+        "pan_verified": True, "aadhaar_verified": True,
+        "documents": {
+            "pan": {"uploaded": True}, "aadhaar": {"uploaded": True}},
+        "live_photo_verified": False,
+        "email": "customer@example.test",
+        "full_name": "Fixture Person",
+    }
+
+    ready = kyc_state(raw, settings)
+    assert ready["ready_for_submission"] is True
+    assert ready["provider_complete"] is False
+    # A rejected final-submit leaves the account here; calling this
+    # "submitted" made the shop lock look like a purchase bug.
+    assert ready["status"] == "ready_to_submit"
+
+    submitted = kyc_state({**raw, "is_complete": True}, settings)
+    assert submitted["provider_complete"] is True
+    assert submitted["status"] == "submitted"
+
+    verified = kyc_state({
+        **raw, "is_complete": True, "kyc_status": 1,
+        "current_step": "complete"}, settings)
+    assert verified["status"] == "verified"
+
+    shape = _safe_kyc_completion_shape(raw, ready)
+    assert "is_complete" in shape and "live_photo_verified" in shape
+    assert "customer@example.test" not in shape
+    assert "Fixture Person" not in shape
+
+
 def test_digilocker_redirect_allowlist_includes_official_hosts():
     from types import SimpleNamespace
 

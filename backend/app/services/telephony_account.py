@@ -288,8 +288,9 @@ def kyc_state(raw: dict, settings=None) -> dict:
     documents = {"pan": doc("pan"), "aadhaar": doc("aadhaar")}
     if business:
         documents["gst"] = doc("gst")
+    provider_complete = raw.get("is_complete") is True
     verified = (
-        raw.get("is_complete") is True and raw.get("kyc_status") == 1
+        provider_complete and raw.get("kyc_status") == 1
         and raw.get("current_step") == "complete"
         and documents["pan"]["verified"] and documents["aadhaar"]["verified"]
         and (not business or documents["gst"]["verified"]))
@@ -302,8 +303,16 @@ def kyc_state(raw: dict, settings=None) -> dict:
         d["verified"] and d["uploaded"] for d in documents.values())
     if verified:
         status = "verified"
-    elif ready or raw.get("is_complete") is True:
+    elif provider_complete:
+        # VoiceLink says the KYC flow is complete/submitted but has not yet
+        # also flipped its authoritative verified status/step. Buying stays
+        # locked in this state.
         status = "submitted"
+    elif ready:
+        # All locally modelled document steps are done, but final provider
+        # acceptance has NOT happened yet. Do not call this "submitted":
+        # a rejected final-submit leaves the account exactly here.
+        status = "ready_to_submit"
     elif any_progress:
         status = "in_progress"
     else:
@@ -311,6 +320,7 @@ def kyc_state(raw: dict, settings=None) -> dict:
     return {
         "status": status, "step": step, "account_type": account_type,
         "documents": documents, "ready_for_submission": ready,
+        "provider_complete": provider_complete,
         "agreement_needs_acceptance":
             raw.get("agreement_reacceptance_required") is True,
         "final_submission_available":
@@ -319,14 +329,68 @@ def kyc_state(raw: dict, settings=None) -> dict:
     }
 
 
+def _safe_kyc_completion_shape(raw: dict, state: dict) -> str:
+    """Describe only provider completion flags/field names for diagnostics.
+
+    This is written to the operator's backend log when every document we
+    model is ready but VoiceLink has not marked the account verified. It
+    deliberately excludes identity values, email/phone/address/document
+    URLs and free text. Short status-like scalars and related field names
+    are enough to see, for example, ``is_complete=False`` or the presence
+    of a ``live_photo_verified`` provider field.
+    """
+    def scalar(value):
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, str) and re.fullmatch(
+                r"[A-Za-z0-9_ -]{0,30}", value):
+            return value
+        return type(value).__name__
+
+    known = (
+        "is_complete", "kyc_status", "current_step",
+        "pan_verified", "aadhaar_verified", "gst_verified",
+        "agreement_reacceptance_required",
+    )
+    fields = {key: scalar(raw.get(key)) for key in known if key in raw}
+
+    related_fields: dict[str, object] = {}
+    related_names: list[str] = []
+    tokens = ("photo", "signature", "email", "location", "agreement")
+    for key, value in raw.items():
+        name = str(key)
+        lower = name.lower()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", name):
+            continue
+        if not any(token in lower for token in tokens):
+            continue
+        if lower.endswith(("_verified", "_status", "_required", "_complete")):
+            related_fields[name] = scalar(value)
+        else:
+            related_names.append(name)
+
+    docs = raw.get("documents") if isinstance(raw.get("documents"), dict) else {}
+    document_keys = [str(key) for key in docs
+                     if re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", str(key))][:15]
+    return (f"fields={fields} documents={state.get('documents')} "
+            f"document_keys={document_keys} related_fields={related_fields} "
+            f"related_keys={sorted(related_names)[:15]}")
+
+
 async def sync_kyc(account: dict) -> dict:
     settings = await telephony_settings.get_settings()
-    state = kyc_state(await vl.kyc_status(account["client_id"]), settings)
+    raw = await vl.kyc_status(account["client_id"])
+    state = kyc_state(raw, settings)
+    if state["ready_for_submission"] and state["status"] != "verified":
+        logger.warning(
+            "VoiceLink KYC ready but not provider-verified: %s",
+            _safe_kyc_completion_shape(raw, state))
     await repo.update_account(account["id"], {
         "kyc_status": state["status"], "kyc_step": state["step"],
         "kyc_meta": {k: state[k] for k in
                      ("step", "account_type", "documents",
-                      "ready_for_submission", "agreement_needs_acceptance")},
+                      "ready_for_submission", "provider_complete",
+                      "agreement_needs_acceptance")},
         "last_synced_at": repo._ts(), "last_error": ""})
     return state
 
@@ -472,6 +536,13 @@ async def act_kyc(user_id: str, body, redirect_url: str) -> dict:
         if not state["ready_for_submission"]:
             raise TelephonyError(
                 "Complete verification and supporting documents first.", 409)
+        if state["status"] == "verified":
+            return {"kyc": state, "message": "Identity already verified."}
+        if state["provider_complete"]:
+            return {"kyc": state, "warning":
+                    "VoiceLink has marked this KYC complete/submitted, "
+                    "but has not yet marked it verified. Refresh provider "
+                    "status later; number buying unlocks only at Verified."}
         if not settings.kyc_finalize_verified:
             return {"kyc": state, "warning":
                     "All verification steps are saved with VoiceLink. Final "

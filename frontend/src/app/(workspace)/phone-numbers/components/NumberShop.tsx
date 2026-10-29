@@ -76,6 +76,12 @@ export default function NumberShop({
   const [accept, setAccept] = useState(false);
   const idempotency = useRef("");
   const kycVerified = overview.kyc?.status === "verified";
+  const kycBanner =
+    overview.kyc?.status === "ready_to_submit"
+      ? "Your KYC documents are complete, but final provider acceptance is still pending. Buying unlocks when KYC status becomes Verified."
+      : overview.kyc?.status === "submitted"
+        ? "KYC has been submitted and is awaiting final provider verification. Buying unlocks when KYC status becomes Verified."
+        : "You can browse available numbers now. Complete KYC before buying.";
   const accountReady = Boolean(overview.account);
 
   useEffect(() => {
@@ -210,7 +216,7 @@ export default function NumberShop({
         </p>
       ) : !kycVerified ? (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-800 dark:text-amber-300">
-          You can browse available numbers now. Complete KYC before buying.
+          {kycBanner}
         </p>
       ) : null}
 

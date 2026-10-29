@@ -197,7 +197,7 @@ export default function PhoneNumbersPage() {
           </p>
           <p className="mt-1 text-sm text-muted-foreground">
             {account
-              ? `KYC: ${(account.kyc_status || "pending").replace("_", " ")} · ${account.channels_allocated} allocated channels`
+              ? `KYC: ${(account.kyc_status || "pending").replace(/_/g, " ")} · ${account.channels_allocated} allocated channels`
               : "Create a managed calling account to begin KYC."}
           </p>
         </section>
