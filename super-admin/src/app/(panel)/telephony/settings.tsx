@@ -500,7 +500,7 @@ export function TelephonySettingsForm({
           })}
           {textField("Extra DigiLocker redirect hosts", "voicelink_kyc_redirect_hosts", {
             placeholder: "Comma-separated hostnames",
-          }, "digilocker.gov.in and digilocker.meripehchaan.gov.in are always allowed.")}
+          }, "Official DigiLocker hosts, including api.digitallocker.gov.in, are always allowed.")}
         </div>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="flex items-start gap-3 rounded-lg border border-border/60 p-3 text-sm">

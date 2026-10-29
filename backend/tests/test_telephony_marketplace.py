@@ -120,6 +120,42 @@ def test_kyc_step1_payload_and_safe_provider_validation():
     assert "must not be returned" not in detail
 
 
+def test_digilocker_redirect_allowlist_includes_official_hosts():
+    from types import SimpleNamespace
+
+    from app.services.telephony_account import validate_digilocker_redirect
+
+    settings = SimpleNamespace(voicelink_kyc_redirect_hosts=[])
+    for url in (
+        "https://api.digitallocker.gov.in/public/oauth2/1/authorize?state=x",
+        "https://digilocker.meripehchaan.gov.in/public/oauth2/1/authorize",
+        "https://www.digilocker.gov.in/signin",
+        "https://digilocker.gov.in/signin",
+    ):
+        assert validate_digilocker_redirect(url, settings) == url
+
+    custom = SimpleNamespace(
+        voicelink_kyc_redirect_hosts=["id.example.com"])
+    assert validate_digilocker_redirect(
+        "https://id.example.com/verify", custom) == (
+            "https://id.example.com/verify")
+
+    for url in (
+        "https://api.digitallocker.gov.in.evil.test/authorize",
+        "http://api.digitallocker.gov.in/public/oauth2/1/authorize",
+        "https://user:pass@api.digitallocker.gov.in/authorize",
+        "https://api.digitallocker.gov.in:8443/authorize",
+    ):
+        with pytest.raises(policy.TelephonyError):
+            validate_digilocker_redirect(url, settings)
+
+    with pytest.raises(policy.TelephonyError) as exc:
+        validate_digilocker_redirect(
+            "https://idp.example.com/authorize?state=do-not-show", settings)
+    assert "idp.example.com" in str(exc.value)
+    assert "do-not-show" not in str(exc.value)
+
+
 def test_manual_number_update_body_and_effective_concurrency():
     from app.routes.calls_routes import _effective_concurrency
 

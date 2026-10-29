@@ -6,6 +6,7 @@ memory only. Only sanitized progress booleans are persisted.
 """
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 import uuid
@@ -16,6 +17,8 @@ from .. import repo
 from . import telephony_settings
 from . import voicelink_client as vl
 from .telephony_policy import TelephonyError
+
+logger = logging.getLogger("voice-agent-saas-telephony")
 
 
 # ---------------------------------------------------------------------------
@@ -366,19 +369,53 @@ def _kyc_register_fields(body, account_email: str = "") -> dict:
     return fields
 
 
+# Exact official DigiLocker browser/OAuth hosts. `api.digitallocker.gov.in`
+# is DigiLocker's production `/public/oauth2/1/authorize` host, while
+# `digilocker.meripehchaan.gov.in` is the MeriPehchaan authorize host.
+# No wildcard/subdomain matching: lookalikes such as
+# `api.digitallocker.gov.in.evil.example` must remain rejected.
+_DIGILOCKER_HOSTS = {
+    "api.digitallocker.gov.in",
+    "digilocker.gov.in",
+    "www.digilocker.gov.in",
+    "digilocker.meripehchaan.gov.in",
+}
+
+
 def validate_digilocker_redirect(value: Any, settings=None) -> str:
     if not isinstance(value, str) or len(value) > 4096:
         raise TelephonyError("DigiLocker redirect is unavailable.", 503)
     effective = settings or telephony_settings.env_fallback_settings()
-    u = urlparse(value)
-    hosts = {"digilocker.gov.in", "digilocker.meripehchaan.gov.in"}
-    hosts.update(effective.voicelink_kyc_redirect_hosts)
-    if u.scheme != "https" or u.username or u.password or u.port \
-            or (u.hostname or "") not in hosts:
+    try:
+        u = urlparse(value)
+        port = u.port
+    except ValueError:
+        raise TelephonyError("DigiLocker redirect is unavailable.", 503) from None
+    host = (u.hostname or "").lower().rstrip(".")
+    safe_host = host if re.fullmatch(r"[a-z0-9.-]{1,253}", host) else ""
+    # Log URL shape only. Never log the path/query/fragment: OAuth state and
+    # other one-time verification parameters can appear there.
+    if u.scheme.lower() != "https" or u.username or u.password or port:
+        logger.warning(
+            "Rejected DigiLocker redirect format: scheme=%s host=%s "
+            "port_present=%s credentials_present=%s",
+            u.scheme.lower() or "<none>", safe_host or "<invalid>",
+            bool(port), bool(u.username or u.password))
         raise TelephonyError(
-            "The identity-service redirect domain is not allowlisted. "
-            "Ask the operator to add it in Super Admin -> Telephony -> "
-            "Settings.", 503)
+            "The identity-service redirect returned by VoiceLink does not "
+            "use a safe HTTPS URL format. Ask the operator to check it with "
+            "VoiceLink before retrying.", 503)
+    hosts = set(_DIGILOCKER_HOSTS)
+    hosts.update(effective.voicelink_kyc_redirect_hosts)
+    if host not in hosts:
+        logger.warning(
+            "Rejected DigiLocker redirect host: host=%s",
+            safe_host or "<invalid>")
+        host_text = f" ({safe_host})" if safe_host else ""
+        raise TelephonyError(
+            f"The identity-service redirect domain{host_text} is not "
+            "allowlisted. Ask the operator to add that exact host in "
+            "Super Admin -> Telephony -> Settings.", 503)
     return value
 
 
