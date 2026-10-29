@@ -172,3 +172,30 @@ class PlanUpdateBody(BaseModel):
     price_per_month: Optional[float] = Field(None, ge=0, le=10_000_000)
     enabled: Optional[bool] = None
     sort_order: Optional[int] = None
+
+
+SubscriptionStatus = Literal["active", "past_due", "inactive"]
+
+
+class SubscriptionCreateBody(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=64)
+    status: SubscriptionStatus = "active"
+    agent_limit: int = Field(0, ge=0, le=100_000)
+    # Plan-selected total VoiceLink channels (stored in concurrencyLines).
+    channels: int = Field(1, ge=1, le=1000)
+    telephony_rented: bool = False
+    kb_extra_chars: int = Field(0, ge=0, le=100_000_000)
+    kb_extra_faqs: int = Field(0, ge=0, le=1_000_000)
+    monthly_total: float = Field(0, ge=0, le=10_000_000)
+    renews_at: str = Field("", max_length=40)
+
+
+class SubscriptionUpdateBody(BaseModel):
+    status: Optional[SubscriptionStatus] = None
+    agent_limit: Optional[int] = Field(None, ge=0, le=100_000)
+    channels: Optional[int] = Field(None, ge=1, le=1000)
+    telephony_rented: Optional[bool] = None
+    kb_extra_chars: Optional[int] = Field(None, ge=0, le=100_000_000)
+    kb_extra_faqs: Optional[int] = Field(None, ge=0, le=1_000_000)
+    monthly_total: Optional[float] = Field(None, ge=0, le=10_000_000)
+    renews_at: Optional[str] = Field(None, max_length=40)

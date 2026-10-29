@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import {
   CheckCircle2,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
@@ -13,15 +14,20 @@ import PageHeader, { useBusy } from "@/components/PageHeader";
 import { StateBox } from "@/components/StateBox";
 import {
   createPlan,
+  createSubscription,
   deletePlan,
+  deleteSubscription,
   getBilling,
   listPlans,
   listSubscriptions,
   updateBilling,
   updatePlan,
+  updateSubscription,
   type PlanTier,
+  type SubscriptionCreate,
   type SubscriptionRow,
 } from "@/lib/billing";
+import { listUsers, type ApiUser } from "@/lib/api";
 import { fmtINR, toNum } from "@/lib/format";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -29,9 +35,45 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+type SubscriptionForm = SubscriptionCreate;
+
+const blankSubscription: SubscriptionForm = {
+  user_id: "",
+  status: "active",
+  agent_limit: 0,
+  channels: 1,
+  telephony_rented: false,
+  kb_extra_chars: 0,
+  kb_extra_faqs: 0,
+  monthly_total: 0,
+  renews_at: "",
+};
+
+const subscriptionToForm = (row: SubscriptionRow): SubscriptionForm => ({
+  user_id: row.user_id,
+  status:
+    row.status === "past_due" || row.status === "inactive"
+      ? row.status
+      : "active",
+  agent_limit: row.agent_limit,
+  channels: row.plan_channels ?? row.channels ?? row.concurrency_lines ?? 1,
+  telephony_rented: row.telephony_rented,
+  kb_extra_chars: row.kb_extra_chars ?? row.kb_char_limit ?? 0,
+  kb_extra_faqs: row.kb_extra_faqs ?? row.kb_faq_limit ?? 0,
+  monthly_total: row.monthly_total,
+  renews_at: row.renews_at ? row.renews_at.slice(0, 10) : "",
+});
+
 export default function PlansPage() {
   const [plans, setPlans] = useState<PlanTier[]>([]);
   const [subs, setSubs] = useState<SubscriptionRow[]>([]);
+  const [users, setUsers] = useState<ApiUser[]>([]);
+  const [newSubscription, setNewSubscription] =
+    useState<SubscriptionForm>(blankSubscription);
+  const [subscriptionEdits, setSubscriptionEdits] = useState<
+    Record<string, SubscriptionForm>
+  >({});
+  const [editingSubscription, setEditingSubscription] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const { busy, msg, err, run } = useBusy();
@@ -49,10 +91,16 @@ export default function PlansPage() {
     setLoading(true);
     setError("");
 
-    Promise.all([listPlans(), listSubscriptions(), getBilling()])
-      .then(([plansResult, subscriptionsResult, billing]) => {
+    Promise.all([
+      listPlans(),
+      listSubscriptions(),
+      getBilling(),
+      listUsers({ page_size: 100 }).catch(() => ({ items: [] as ApiUser[] })),
+    ])
+      .then(([plansResult, subscriptionsResult, billing, usersResult]) => {
         setPlans(plansResult.items);
         setSubs(subscriptionsResult.items);
+        setUsers(usersResult.items);
         setLinePrice(String(billing.concurrency_line_price_per_month ?? 0));
         setTeleRent(String(billing.telephony_rent_per_month ?? 0));
       })
@@ -125,6 +173,179 @@ export default function PlansPage() {
       await deletePlan(planId);
       load();
     }, "Plan deleted ✓");
+
+  const editedSubscription = (row: SubscriptionRow) =>
+    subscriptionEdits[row.user_id] || subscriptionToForm(row);
+
+  const setSubscriptionEdit = (
+    row: SubscriptionRow,
+    patch: Partial<SubscriptionForm>,
+  ) =>
+    setSubscriptionEdits((current) => ({
+      ...current,
+      [row.user_id]: {
+        ...(current[row.user_id] || subscriptionToForm(row)),
+        ...patch,
+      },
+    }));
+
+  const addSubscription = () =>
+    run(async () => {
+      await createSubscription(newSubscription);
+      setNewSubscription(blankSubscription);
+      load();
+    }, "Subscription created ✓ — visible on the customer dashboard now");
+
+  const saveSubscription = (row: SubscriptionRow) =>
+    run(async () => {
+      const form = editedSubscription(row);
+      await updateSubscription(row.user_id, {
+        status: form.status,
+        agent_limit: Math.trunc(form.agent_limit),
+        channels: Math.trunc(form.channels),
+        telephony_rented: form.telephony_rented,
+        kb_extra_chars: Math.trunc(form.kb_extra_chars),
+        kb_extra_faqs: Math.trunc(form.kb_extra_faqs),
+        monthly_total: Number(form.monthly_total),
+        renews_at: form.renews_at,
+      });
+      setEditingSubscription("");
+      setSubscriptionEdits((current) => {
+        const next = { ...current };
+        delete next[row.user_id];
+        return next;
+      });
+      load();
+    }, "Subscription saved ✓ — customer dashboard updated");
+
+  const removeSubscription = (row: SubscriptionRow) => {
+    if (
+      !window.confirm(
+        `Delete the subscription for ${row.user_name || row.user_email || row.user_id}? The customer dashboard will immediately show no active plan.`,
+      )
+    )
+      return;
+    void run(async () => {
+      await deleteSubscription(row.user_id);
+      if (editingSubscription === row.user_id) setEditingSubscription("");
+      load();
+    }, "Subscription deleted ✓");
+  };
+
+  const renderSubscriptionFields = (
+    form: SubscriptionForm,
+    update: (patch: Partial<SubscriptionForm>) => void,
+    includeCustomer = false,
+  ) => (
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {includeCustomer && (
+        <Field label="Customer">
+          <select
+            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            value={form.user_id}
+            onChange={(e) => update({ user_id: e.target.value })}
+          >
+            <option value="">Select customer…</option>
+            {users
+              .filter((user) => !subs.some((sub) => sub.user_id === user.id))
+              .map((user) => (
+                <option key={user.id} value={user.id}>
+                  {user.name || user.email}
+                  {user.name && user.email ? ` · ${user.email}` : ""}
+                </option>
+              ))}
+          </select>
+        </Field>
+      )}
+      <Field label="Status">
+        <select
+          className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          value={form.status}
+          onChange={(e) =>
+            update({
+              status: e.target.value as SubscriptionForm["status"],
+            })
+          }
+        >
+          <option value="active">Active</option>
+          <option value="past_due">Past due</option>
+          <option value="inactive">Inactive</option>
+        </select>
+      </Field>
+      <Field label="Agent limit">
+        <Input
+          className="h-9 tabular-nums"
+          type="number"
+          min="0"
+          value={form.agent_limit}
+          onChange={(e) => update({ agent_limit: Number(e.target.value) })}
+        />
+      </Field>
+      <Field
+        label="Plan VoiceLink channels"
+        hint="Total channels included in this subscription. Calls on a DID are still capped by that number's own channels."
+      >
+        <Input
+          className="h-9 tabular-nums"
+          type="number"
+          min="1"
+          max="1000"
+          value={form.channels}
+          onChange={(e) => update({ channels: Number(e.target.value) })}
+        />
+      </Field>
+      <Field label="Monthly total ₹">
+        <Input
+          className="h-9 tabular-nums"
+          type="number"
+          min="0"
+          step="0.01"
+          value={form.monthly_total}
+          onChange={(e) => update({ monthly_total: Number(e.target.value) })}
+        />
+      </Field>
+      <Field label="Renews on">
+        <Input
+          className="h-9"
+          type="date"
+          value={form.renews_at}
+          onChange={(e) => update({ renews_at: e.target.value })}
+        />
+      </Field>
+      <Field label="Extra KB characters">
+        <Input
+          className="h-9 tabular-nums"
+          type="number"
+          min="0"
+          value={form.kb_extra_chars}
+          onChange={(e) => update({ kb_extra_chars: Number(e.target.value) })}
+        />
+      </Field>
+      <Field label="Extra FAQs">
+        <Input
+          className="h-9 tabular-nums"
+          type="number"
+          min="0"
+          value={form.kb_extra_faqs}
+          onChange={(e) => update({ kb_extra_faqs: Number(e.target.value) })}
+        />
+      </Field>
+      <div className="space-y-1.5">
+        <Label className="text-xs font-medium text-muted-foreground">
+          Telephony rented
+        </Label>
+        <label className="flex h-9 items-center gap-2 rounded-md border border-input bg-background px-3 text-sm shadow-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-primary"
+            checked={form.telephony_rented}
+            onChange={(e) => update({ telephony_rented: e.target.checked })}
+          />
+          Included
+        </label>
+      </div>
+    </div>
+  );
 
   return (
     <>
@@ -438,7 +659,38 @@ export default function PlansPage() {
                 Subscribers
               </CardTitle>
             </CardHeader>
-            <CardContent className="pt-5">
+            <CardContent className="space-y-5 pt-5">
+              <div className="space-y-3 rounded-lg border border-dashed border-border p-4">
+                <div>
+                  <h3 className="text-sm font-semibold">
+                    Add a customer subscription
+                  </h3>
+                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                    Manual admin changes do not charge or refund the wallet
+                    immediately. The monthly total below is what renewals
+                    will charge, and saved values appear on the customer’s
+                    Billing dashboard.
+                  </p>
+                </div>
+                {renderSubscriptionFields(
+                  newSubscription,
+                  (patch) =>
+                    setNewSubscription((current) => ({
+                      ...current,
+                      ...patch,
+                    })),
+                  true,
+                )}
+                <Button
+                  size="sm"
+                  disabled={busy || !newSubscription.user_id}
+                  onClick={addSubscription}
+                >
+                  <Plus className="mr-2 h-3.5 w-3.5" />
+                  Add subscription
+                </Button>
+              </div>
+
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -456,14 +708,24 @@ export default function PlansPage() {
                         ₹/month
                       </th>
                       <th className="px-3 py-2 font-medium">Renews</th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Actions
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
-                    {subs.map((subscription) => (
-                      <tr
-                        key={subscription.user_id}
-                        className="border-b border-border/40 last:border-0"
-                      >
+                    {subs.map((subscription) => {
+                      const effectiveChannels = Math.max(
+                        1,
+                        Number(subscription.channels || 0),
+                        Number(subscription.plan_channels || 0),
+                        Number(subscription.allocated_channels || 0),
+                        Number(subscription.number_channels || 0),
+                        Number(subscription.concurrency_lines || 0),
+                      );
+                      return (
+                        <Fragment key={subscription.user_id}>
+                          <tr className="border-b border-border/40">
                         <td className="px-3 py-3">
                           <div className="text-sm font-medium">
                             {subscription.user_name ||
@@ -494,8 +756,14 @@ export default function PlansPage() {
                           {subscription.agent_limit}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums">
-                          {subscription.channels ??
-                            subscription.concurrency_lines}
+                          <div className="font-medium">
+                            {effectiveChannels}
+                          </div>
+                          <div className="whitespace-nowrap text-[10px] text-muted-foreground">
+                            plan {subscription.plan_channels ?? 1} · provider{" "}
+                            {subscription.allocated_channels ?? 0} · number{" "}
+                            {subscription.number_channels ?? 0}
+                          </div>
                         </td>
                         <td className="px-3 py-3">
                           {subscription.telephony_rented ? "Rented" : "—"}
@@ -508,13 +776,97 @@ export default function PlansPage() {
                             ? subscription.renews_at.slice(0, 10)
                             : "—"}
                         </td>
-                      </tr>
-                    ))}
+                        <td className="px-3 py-3">
+                          <div className="flex justify-end gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={busy}
+                              onClick={() => {
+                                setSubscriptionEdit(
+                                  subscription,
+                                  subscriptionToForm(subscription),
+                                );
+                                setEditingSubscription(
+                                  editingSubscription === subscription.user_id
+                                    ? ""
+                                    : subscription.user_id,
+                                );
+                              }}
+                            >
+                              <Pencil className="mr-1.5 h-3.5 w-3.5" />
+                              Edit
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="text-destructive hover:text-destructive"
+                              disabled={busy}
+                              onClick={() => removeSubscription(subscription)}
+                            >
+                              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                              Delete
+                            </Button>
+                          </div>
+                        </td>
+                          </tr>
+                          {editingSubscription === subscription.user_id && (
+                            <tr className="border-b border-border/40 bg-muted/20">
+                              <td colSpan={8} className="px-3 py-4">
+                                <div className="space-y-3">
+                                  <div>
+                                    <h3 className="text-sm font-semibold">
+                                      Edit subscription
+                                    </h3>
+                                    <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                                      Saved values are read by the customer
+                                      Billing dashboard on its next refresh.
+                                      Editing plan channels does not change a
+                                      DID’s own carrier channels; use Telephony
+                                      for a manual number or the customer’s
+                                      paid channel upgrade for a purchased
+                                      number.
+                                    </p>
+                                  </div>
+                                  {renderSubscriptionFields(
+                                    editedSubscription(subscription),
+                                    (patch) =>
+                                      setSubscriptionEdit(subscription, patch),
+                                  )}
+                                  <div className="flex flex-wrap gap-2">
+                                    <Button
+                                      size="sm"
+                                      disabled={busy}
+                                      onClick={() =>
+                                        saveSubscription(subscription)
+                                      }
+                                    >
+                                      <Save className="mr-2 h-3.5 w-3.5" />
+                                      Save subscription
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      disabled={busy}
+                                      onClick={() =>
+                                        setEditingSubscription("")
+                                      }
+                                    >
+                                      Cancel
+                                    </Button>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
 
                     {subs.length === 0 && (
                       <tr>
                         <td
-                          colSpan={7}
+                          colSpan={8}
                           className="py-6 text-center text-sm text-muted-foreground"
                         >
                           No subscribers yet.

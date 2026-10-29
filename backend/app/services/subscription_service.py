@@ -22,6 +22,7 @@ the plan becomes "inactive". A wallet recharge auto-retries a past_due plan.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -170,6 +171,26 @@ def price_selection(*, capacity_tier: Optional[Dict[str, Any]],
     return round(total, 2)
 
 
+def billable_channel_increase(current_effective: int, target: int) -> int:
+    """Extra channels not already granted by the plan/account/any DID."""
+    return max(0, int(target or 1) - max(1, int(current_effective or 1)))
+
+
+def prorated_charge(monthly_amount: float, renews_at: str,
+                    *, now: Optional[datetime] = None) -> tuple[float, int]:
+    """Charge only the part of a monthly add-on left in this 30-day cycle."""
+    amount = max(0.0, float(monthly_amount or 0))
+    if amount <= 0:
+        return 0.0, 0
+    current = now or _now()
+    due = _parse(renews_at or "")
+    if due is None:
+        return round(amount, 2), SUBSCRIPTION_DAYS
+    seconds = max(0.0, (due - current).total_seconds())
+    fraction = min(1.0, seconds / (SUBSCRIPTION_DAYS * 24 * 60 * 60))
+    return round(amount * fraction, 2), int(math.ceil(seconds / 86400))
+
+
 # ---------------------------------------------------------------------------
 # Purchase / renew / recharge-retry
 # ---------------------------------------------------------------------------
@@ -256,6 +277,114 @@ async def purchase(user_id: str, *, capacity_tier_id: str = "",
     ent["plan_label"] = ", ".join(labels)
     logger.info(f"🛒 Subscription purchased by {user_id}: {ent['plan_label']} @ ₹{monthly}/mo")
     return ent
+
+
+def _admin_renews_at(value: Optional[str], fallback: str = "") -> str:
+    raw = (value if value is not None else fallback or "").strip()
+    if not raw:
+        return _iso(_now() + timedelta(days=SUBSCRIPTION_DAYS))
+    if len(raw) == 10:  # date input from the admin panel
+        raw = f"{raw}T00:00:00Z"
+    if _parse(raw) is None:
+        raise SubscriptionError("renews_at must be a date or ISO timestamp")
+    return raw
+
+
+def _admin_subscription_data(fields: Dict[str, Any],
+                             existing: Any = None) -> Dict[str, Any]:
+    """Validate/map Super Admin subscription fields to the stored row.
+
+    `channels` in admin APIs means the plan-selected VoiceLink channel
+    total. It is stored in the legacy `concurrencyLines` column; the
+    customer-visible effective channel count additionally considers the
+    provider account and active DID grants in get_subscription().
+    """
+    def pick(name: str, attr: str, default: Any) -> Any:
+        if fields.get(name) is not None:
+            return fields[name]
+        return getattr(existing, attr) if existing is not None else default
+
+    status = str(pick("status", "status", "inactive") or "inactive")
+    if status not in ("active", "past_due", "inactive"):
+        raise SubscriptionError("status must be active, past_due, or inactive")
+    channels = int(pick("channels", "concurrencyLines", INCLUDED_CHANNELS))
+    if channels < 1 or channels > 1000:
+        raise SubscriptionError("channels must be between 1 and 1000")
+    now = _now()
+    renews_at = _admin_renews_at(
+        fields.get("renews_at"),
+        getattr(existing, "renewsAt", "") if existing is not None else "")
+    past_due_since = (
+        (getattr(existing, "pastDueSince", "") or _iso(now))
+        if status == "past_due" else "")
+    return {
+        "agentLimit": int(pick("agent_limit", "agentLimit", 0)),
+        "concurrencyLines": channels,
+        "telephonyRented": bool(
+            pick("telephony_rented", "telephonyRented", False)),
+        "kbCharLimit": int(pick("kb_extra_chars", "kbCharLimit", 0)),
+        "kbFaqLimit": int(pick("kb_extra_faqs", "kbFaqLimit", 0)),
+        "monthlyTotal": float(pick("monthly_total", "monthlyTotal", 0) or 0),
+        "status": status,
+        "renewsAt": renews_at,
+        "pastDueSince": past_due_since,
+        "updatedAt": _iso(now),
+    }
+
+
+async def admin_create_subscription(user_id: str,
+                                    **fields: Any) -> Dict[str, Any]:
+    """Create a subscription manually (no wallet charge; audited by route)."""
+    db = get_prisma()
+    if await db.subscription.find_unique(where={"userId": user_id}):
+        raise SubscriptionError("This customer already has a subscription")
+    now = _now()
+    data = _admin_subscription_data(fields)
+    await db.subscription.create(data={
+        **data, "userId": user_id, "startedAt": _iso(now),
+        "lastChargedAt": "", "createdAt": _iso(now)})
+    return await get_subscription(user_id)
+
+
+async def admin_update_subscription(user_id: str,
+                                    **fields: Any) -> Optional[Dict[str, Any]]:
+    """Edit a subscription manually (no immediate wallet charge/refund).
+
+    `monthly_total` is the amount the existing renewal sweep will charge on
+    `renews_at`; changing it here deliberately does not take money now.
+    """
+    db = get_prisma()
+    existing = await db.subscription.find_unique(where={"userId": user_id})
+    if not existing:
+        return None
+    await db.subscription.update(
+        where={"userId": user_id},
+        data=_admin_subscription_data(fields, existing))
+    return await get_subscription(user_id)
+
+
+async def admin_delete_subscription(user_id: str) -> bool:
+    db = get_prisma()
+    if not await db.subscription.find_unique(where={"userId": user_id}):
+        return False
+    await db.subscription.delete(where={"userId": user_id})
+    return True
+
+
+async def record_paid_channel_upgrade(user_id: str, target_channels: int,
+                                      monthly_increment: float) -> Dict[str, Any]:
+    """Persist a same-number channel upgrade in the monthly subscription."""
+    db = get_prisma()
+    existing = await db.subscription.find_unique(where={"userId": user_id})
+    if not existing or existing.status != "active":
+        raise SubscriptionError("An active subscription is required")
+    await db.subscription.update(where={"userId": user_id}, data={
+        "concurrencyLines": max(int(existing.concurrencyLines or 1),
+                                int(target_channels)),
+        "monthlyTotal": round(float(existing.monthlyTotal or 0)
+                              + float(monthly_increment or 0), 2),
+        "updatedAt": _iso(_now())})
+    return await get_subscription(user_id)
 
 
 def _renewal_note(period_due: datetime) -> str:

@@ -55,6 +55,7 @@ export const deletePlan = (id: string) =>
     req<void>(`/api/admin/plans/${id}`, { method: "DELETE" });
 
 export interface SubscriptionRow {
+    subscription_id?: string;
     user_id: string;
     user_name: string;
     user_email: string;
@@ -66,13 +67,44 @@ export interface SubscriptionRow {
     number_channels: number;
     concurrency_lines?: number;
     telephony_rented: boolean;
+    kb_extra_chars?: number;
+    kb_extra_faqs?: number;
     kb_char_limit: number;
     kb_faq_limit: number;
     monthly_total: number;
+    started_at?: string;
+    renews_at: string;
+    last_charged_at?: string;
+    past_due_since?: string;
+    created_at?: string;
+    updated_at?: string;
+}
+export interface SubscriptionCreate {
+    user_id: string;
+    status: "active" | "past_due" | "inactive";
+    agent_limit: number;
+    channels: number; // plan-selected total VoiceLink channels
+    telephony_rented: boolean;
+    kb_extra_chars: number;
+    kb_extra_faqs: number;
+    monthly_total: number;
     renews_at: string;
 }
+export type SubscriptionPatch = Partial<Omit<SubscriptionCreate, "user_id">>;
 export const listSubscriptions = () =>
     req<{ items: SubscriptionRow[] }>("/api/admin/subscriptions");
+export const createSubscription = (body: SubscriptionCreate) =>
+    req<SubscriptionRow>("/api/admin/subscriptions", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+export const updateSubscription = (userId: string, patch: SubscriptionPatch) =>
+    req<SubscriptionRow>(`/api/admin/subscriptions/${userId}`, {
+        method: "PUT",
+        body: JSON.stringify(patch),
+    });
+export const deleteSubscription = (userId: string) =>
+    req<void>(`/api/admin/subscriptions/${userId}`, { method: "DELETE" });
 
 // ---- per-call rate preview (used by the Billing-page calculator) ----------
 // Mirrors the customer /api/cost-preview response fields the UI needs.

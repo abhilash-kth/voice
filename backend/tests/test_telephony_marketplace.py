@@ -113,6 +113,32 @@ def test_plan_channels_pricing_and_purchase_body():
     with pytest.raises(ValidationError):
         PurchaseBody(channels=0)
 
+    # Same-number upgrades charge only capacity above every existing grant,
+    # prorated to the current subscription cycle.
+    from datetime import datetime, timezone
+
+    assert subscriptions.billable_channel_increase(2, 5) == 3
+    assert subscriptions.billable_channel_increase(5, 3) == 0
+    due, days = subscriptions.prorated_charge(
+        300, "2026-11-15T00:00:00Z",
+        now=datetime(2026, 10, 31, tzinfo=timezone.utc))
+    assert (due, days) == (150.0, 15)
+
+    from app.models.telephony_models import ChannelUpgradeBody
+
+    upgrade = ChannelUpgradeBody(
+        target_channels=3, accept_charge=True, expected_due_now=100,
+        expected_monthly_increment=250)
+    assert upgrade.target_channels == 3
+    with pytest.raises(ValidationError):
+        ChannelUpgradeBody(
+            target_channels=1, accept_charge=True, expected_due_now=0,
+            expected_monthly_increment=0)
+    with pytest.raises(ValidationError):
+        ChannelUpgradeBody(
+            target_channels=3, accept_charge=True, expected_due_now=0,
+            expected_monthly_increment=0, sip_trunk_id="ST_hidden")
+
 
 def test_customer_views_hide_provider_ids_trunks_and_sip_secrets():
     from app.routes.telephony_routes import (
@@ -346,6 +372,96 @@ async def test_assigned_did_channels_override_legacy_one_line_plan(normal_user):
     assert purchased["plan_channels"] == 3
     assert purchased["channels"] == 3
     await subscriptions.ensure_concurrency_allowed(user["id"], 3)
+
+
+async def test_super_admin_subscription_crud_reflects_in_customer_view(
+        normal_user):
+    from app.services import subscription_service as subscriptions
+
+    _, user = normal_user
+    created = await subscriptions.admin_create_subscription(
+        user["id"], status="active", agent_limit=3, channels=2,
+        telephony_rented=True, kb_extra_chars=10_000, kb_extra_faqs=20,
+        monthly_total=4999, renews_at="2026-11-19")
+    assert created["agent_limit"] == 3
+    assert created["plan_channels"] == 2
+    assert created["channels"] == 2
+    assert created["kb_char_limit"] == 30_000
+    assert created["kb_faq_limit"] == 70
+    assert created["monthly_total"] == 4999
+    assert created["renews_at"].startswith("2026-11-19")
+
+    with pytest.raises(subscriptions.SubscriptionError):
+        await subscriptions.admin_create_subscription(user["id"])
+
+    updated = await subscriptions.admin_update_subscription(
+        user["id"], status="active", agent_limit=5, channels=4,
+        monthly_total=5999)
+    assert updated is not None
+    assert updated["agent_limit"] == 5
+    assert updated["plan_channels"] == 4
+    assert updated["channels"] == 4
+    assert updated["monthly_total"] == 5999
+
+    assert await subscriptions.admin_delete_subscription(user["id"]) is True
+    deleted = await subscriptions.get_subscription(user["id"])
+    assert deleted["status"] == "inactive"
+    assert deleted["agent_limit"] == 0
+
+
+async def test_paid_same_number_channel_upgrade_updates_did_and_plan(
+        normal_user, monkeypatch):
+    from app.db import get_prisma
+    from app.services import subscription_service as subscriptions
+    from app.services import telephony_channels as channel_service
+
+    _, user = normal_user
+    await get_prisma().user.update(
+        where={"id": user["id"]}, data={"walletBalance": 1000})
+    account = await repo.create_account(user["id"], {
+        "client_id": f"client-{user['id']}", "email": user["email"],
+        "name": "Channel test", "channels_allocated": 1})
+    phone = await repo.create_phone_number({
+        "user_id": user["id"], "voice_link_account_id": account["id"],
+        "number": "+919876543210", "status": "active",
+        "source": "voicelink", "channels": 1,
+        "livekit_outbound_trunk_id": "ST_channel_test"})
+    await subscriptions.admin_create_subscription(
+        user["id"], status="active", agent_limit=3, channels=1,
+        monthly_total=100)
+
+    monkeypatch.setattr(channel_service, "_channel_price", lambda: 250.0)
+    provider_targets = []
+
+    async def fake_ensure_provider(account_arg, target):
+        provider_targets.append(target)
+        await repo.update_account(
+            account_arg["id"], {"channels_allocated": target})
+        return 1
+
+    monkeypatch.setattr(
+        channel_service, "_ensure_provider_channels", fake_ensure_provider)
+
+    quote = await channel_service.quote_channel_upgrade(
+        user["id"], phone["id"], 3)
+    assert quote["added_phone_channels"] == 2
+    assert quote["billable_added_channels"] == 2
+    assert quote["monthly_increment"] == 500
+    assert 490 < quote["due_now"] <= 500
+
+    out = await channel_service.upgrade_phone_channels(
+        user["id"], phone["id"], target_channels=3, accept_charge=True,
+        expected_due_now=quote["due_now"],
+        expected_monthly_increment=quote["monthly_increment"])
+    assert provider_targets == [3]
+    assert out["phone_number"]["channels"] == 3
+    assert out["entitlement"]["plan_channels"] == 3
+    assert out["entitlement"]["channels"] == 3
+    assert out["entitlement"]["monthly_total"] == 600
+    assert out["charged_now"] == quote["due_now"]
+    assert out["wallet"]["balance"] == round(1000 - quote["due_now"], 2)
+    refreshed_account = await repo.get_account(account["id"])
+    assert refreshed_account["channels_allocated"] == 3
 
 
 async def test_super_admin_can_edit_and_delete_only_manual_numbers(normal_user):

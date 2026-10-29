@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
+  ArrowUpCircle,
   Loader2,
   PhoneCall,
   RefreshCw,
@@ -12,11 +13,14 @@ import {
 import { toast } from "sonner";
 import {
   confirmPurchase,
+  quoteChannelUpgrade,
   quoteNumber,
   retryProvision,
   searchNumbers,
   syncInbound,
+  upgradePhoneChannels,
   type AvailableNumber,
+  type ChannelUpgradeQuote,
   type PhoneNumberRecord,
   type PhonePurchase,
   type TelephonyOverview,
@@ -450,6 +454,53 @@ export function OwnedNumbers({
   onChanged: () => Promise<void> | void;
 }) {
   const [busyId, setBusyId] = useState("");
+  const [channelTargets, setChannelTargets] = useState<Record<string, number>>(
+    {},
+  );
+  const [channelQuotes, setChannelQuotes] = useState<
+    Record<string, ChannelUpgradeQuote>
+  >({});
+
+  const getChannelQuote = async (n: PhoneNumberRecord) => {
+    const target = Math.max(
+      n.channels + 1,
+      Math.trunc(channelTargets[n.id] || n.channels + 1),
+    );
+    setBusyId(n.id);
+    try {
+      const out = await quoteChannelUpgrade(n.id, target);
+      setChannelQuotes((current) => ({ ...current, [n.id]: out.quote }));
+    } catch (e) {
+      toast.error((e as Error).message || "Could not price channel upgrade.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const confirmChannelUpgrade = async (n: PhoneNumberRecord) => {
+    const quote = channelQuotes[n.id];
+    if (!quote) return;
+    setBusyId(n.id);
+    try {
+      const out = await upgradePhoneChannels(n.id, quote);
+      setChannelQuotes((current) => {
+        const next = { ...current };
+        delete next[n.id];
+        return next;
+      });
+      toast.success(
+        `${out.phone_number.number} now has ${out.phone_number.channels} channels. ` +
+          `Charged ${inr(out.charged_now)} now; edit the assigned agent and set ` +
+          `Max concurrent calls to ${out.phone_number.channels}.`,
+      );
+      await onChanged();
+    } catch (e) {
+      toast.error((e as Error).message || "Channel upgrade failed.");
+      await onChanged();
+    } finally {
+      setBusyId("");
+    }
+  };
 
   const run = async (n: PhoneNumberRecord, kind: "retry" | "sync") => {
     setBusyId(n.id);
@@ -554,6 +605,134 @@ export function OwnedNumbers({
                   </>
                 )}
               </div>
+
+              {n.status === "active" && (
+                <div className="space-y-3 rounded-lg border border-border/70 bg-muted/20 p-3">
+                  <div>
+                    <p className="text-sm font-semibold">
+                      Increase channels on this same number
+                    </p>
+                    <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                      One channel carries one simultaneous call. Channels
+                      already included in your plan or provider allocation
+                      are not charged again.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Total channels</Label>
+                      <Input
+                        type="number"
+                        min={n.channels + 1}
+                        max={100}
+                        value={channelTargets[n.id] ?? n.channels + 1}
+                        disabled={busyId === n.id}
+                        onChange={(e) => {
+                          const target = Number(e.target.value);
+                          setChannelTargets((current) => ({
+                            ...current,
+                            [n.id]: target,
+                          }));
+                          setChannelQuotes((current) => {
+                            const next = { ...current };
+                            delete next[n.id];
+                            return next;
+                          });
+                        }}
+                        className="h-9 w-36 bg-background tabular-nums"
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={
+                        busyId === n.id ||
+                        Number(channelTargets[n.id] ?? n.channels + 1) <=
+                          n.channels
+                      }
+                      onClick={() => void getChannelQuote(n)}
+                    >
+                      {busyId === n.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ArrowUpCircle className="h-3.5 w-3.5" />
+                      )}
+                      Get upgrade price
+                    </Button>
+                  </div>
+
+                  {channelQuotes[n.id] && (
+                    <div className="space-y-3 rounded-lg border border-primary/25 bg-primary/5 p-3 text-sm">
+                      <div className="grid gap-2 sm:grid-cols-3">
+                        <p>
+                          Added to number:{" "}
+                          <strong>
+                            {channelQuotes[n.id].added_phone_channels}
+                          </strong>
+                        </p>
+                        <p>
+                          Billable new channels:{" "}
+                          <strong>
+                            {channelQuotes[n.id].billable_added_channels}
+                          </strong>
+                        </p>
+                        <p>
+                          Per channel:{" "}
+                          <strong>
+                            {inr(
+                              channelQuotes[n.id].channel_price_per_month,
+                            )}
+                            /month
+                          </strong>
+                        </p>
+                        <p>
+                          Due now:{" "}
+                          <strong>{inr(channelQuotes[n.id].due_now)}</strong>
+                        </p>
+                        <p>
+                          Monthly increase:{" "}
+                          <strong>
+                            {inr(channelQuotes[n.id].monthly_increment)}
+                          </strong>
+                        </p>
+                        <p>
+                          New plan total:{" "}
+                          <strong>
+                            {inr(channelQuotes[n.id].new_monthly_total)}/month
+                          </strong>
+                        </p>
+                      </div>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {channelQuotes[n.id].billable_added_channels === 0
+                          ? "This target is already covered by your plan/provider allocation, so there is no channel charge."
+                          : `Due now is prorated for the remaining ${channelQuotes[n.id].remaining_days} day(s) in this subscription cycle. The full monthly increase applies from the next renewal.`}{" "}
+                        Wallet balance: {inr(channelQuotes[n.id].wallet_balance)}.
+                      </p>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={
+                          busyId === n.id ||
+                          !channelQuotes[n.id].sufficient_balance
+                        }
+                        onClick={() => void confirmChannelUpgrade(n)}
+                      >
+                        {busyId === n.id && (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        )}
+                        Confirm &amp; upgrade to{" "}
+                        {channelQuotes[n.id].target_channels} channels
+                      </Button>
+                      {!channelQuotes[n.id].sufficient_balance && (
+                        <p className="text-xs font-medium text-destructive">
+                          Recharge your app wallet before confirming.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </li>
           ))}
         </ul>

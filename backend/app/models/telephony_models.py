@@ -65,6 +65,19 @@ class AllocateWalletBody(BaseModel):
     description: str = Field("", max_length=200)
 
 
+class ChannelUpgradeQuoteBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_channels: int = Field(..., ge=2, le=100)
+
+
+class ChannelUpgradeBody(ChannelUpgradeQuoteBody):
+    # The customer must confirm the exact quote shown to them; the backend
+    # recalculates it and refuses if pricing/capacity changed meanwhile.
+    accept_charge: bool = False
+    expected_due_now: float = Field(..., ge=0, le=10_000_000)
+    expected_monthly_increment: float = Field(..., ge=0, le=10_000_000)
+
+
 class TelephonyStatusBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["active", "suspended"]

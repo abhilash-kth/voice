@@ -38,6 +38,10 @@ export default function MyPlan() {
         agents: (a as { agents: unknown[] }).agents?.length || 0,
       };
     },
+    // Super Admin subscription edits are stored in the same subscription
+    // row this card reads; refresh periodically so an open dashboard picks
+    // them up without a hard reload.
+    refetchInterval: 15_000,
   });
 
   const info = data?.subcriptions;
@@ -232,6 +236,7 @@ export default function MyPlan() {
               icon={Layers}
               label="VoiceLink Channels"
               value={String(ent.channels ?? ent.concurrency_lines ?? 1)}
+              detail={`Plan ${ent.plan_channels ?? 1} · Provider ${ent.allocated_channels ?? 0} · Number ${ent.number_channels ?? 0}`}
               solid
             />
             <Metric
@@ -277,8 +282,9 @@ export default function MyPlan() {
           <div className="flex items-center gap-2 border-t border-primary-foreground/10 pt-4 text-xs text-primary-foreground/65">
             <Sparkles className="h-3.5 w-3.5 shrink-0 text-primary-foreground/80" />
             <p className="leading-normal">
-              Entitlements apply to this workspace · Scale or modify your plan
-              anytime below
+              Entitlements apply to this workspace · Telephony:{" "}
+              {ent.telephony_rented ? "rented" : "not rented"} · Scale or
+              modify your plan anytime below
             </p>
           </div>
         )}
@@ -294,11 +300,13 @@ function Metric({
   icon: Icon,
   label,
   value,
+  detail,
   solid,
 }: {
   icon: React.ElementType;
   label: string;
   value: string;
+  detail?: string;
   solid?: boolean;
 }) {
   return (
@@ -353,6 +361,16 @@ function Metric({
       >
         {value}
       </p>
+      {detail && (
+        <p
+          className={cn(
+            "relative mt-2 text-[10px] font-medium leading-relaxed",
+            solid ? "text-primary-foreground/60" : "text-muted-foreground",
+          )}
+        >
+          {detail}
+        </p>
+      )}
     </div>
   );
 }

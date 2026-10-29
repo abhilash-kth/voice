@@ -16,9 +16,12 @@ from fastapi.responses import RedirectResponse
 
 from .. import auth, repo
 from ..models.telephony_models import (AccountSetupBody, AllocateWalletBody,
-                                       ConfirmBody, KycActionBody, QuoteBody)
-from ..services import subscription_service
+                                       ChannelUpgradeBody,
+                                       ChannelUpgradeQuoteBody, ConfirmBody,
+                                       KycActionBody, QuoteBody)
+from ..services import config_store, subscription_service
 from ..services import telephony_account as accounts
+from ..services import telephony_channels as channels
 from ..services import telephony_provisioning as provisioning
 from ..services import telephony_purchase as purchases
 from ..services import telephony_settings
@@ -106,6 +109,7 @@ def _public_purchase(purchase):
 
 @router.get("/api/telephony/overview")
 async def overview(user=Depends(auth.get_current_user)):
+    await config_store.refresh_if_stale()
     settings = await telephony_settings.get_settings()
     account = await repo.get_account_by_user(user.id)
     numbers = await repo.list_phone_numbers(user.id)
@@ -127,6 +131,9 @@ async def overview(user=Depends(auth.get_current_user)):
         "provider_error": provider_error,
         "plan_channels": entitlement.get("plan_channels") or 1,
         "effective_channels": entitlement.get("channels") or 1,
+        "channel_price_per_month": float(
+            config_store.get_billing().get(
+                "concurrency_line_price_per_month") or 0),
         "account": _public_account(account),
         "kyc": _kyc_from_account(account, settings) if account else None,
         "numbers": [_public_phone(n) for n in numbers],
@@ -262,6 +269,35 @@ async def confirm_purchase(purchase_id: str, body: ConfirmBody,
             "numbers": [_public_phone(n)
                         for n in await repo.list_phone_numbers(user.id)],
             "wallet": await repo.get_wallet(user.id)}
+
+
+@router.post("/api/telephony/numbers/{phone_id}/channels/quote")
+async def quote_channel_upgrade(phone_id: str,
+                                body: ChannelUpgradeQuoteBody,
+                                user=Depends(auth.get_current_user)):
+    await config_store.refresh_if_stale()
+    try:
+        quote = await channels.quote_channel_upgrade(
+            user.id, phone_id, body.target_channels)
+    except Exception as e:
+        _raise(e)
+    phone = await repo.get_phone_number(phone_id, user.id)
+    return {"quote": quote, "phone_number": _public_phone(phone)}
+
+
+@router.post("/api/telephony/numbers/{phone_id}/channels/upgrade")
+async def upgrade_phone_channels(phone_id: str, body: ChannelUpgradeBody,
+                                 user=Depends(auth.get_current_user)):
+    await config_store.refresh_if_stale()
+    try:
+        out = await channels.upgrade_phone_channels(
+            user.id, phone_id, target_channels=body.target_channels,
+            accept_charge=body.accept_charge,
+            expected_due_now=body.expected_due_now,
+            expected_monthly_increment=body.expected_monthly_increment)
+    except Exception as e:
+        _raise(e)
+    return {**out, "phone_number": _public_phone(out.get("phone_number"))}
 
 
 @router.post("/api/telephony/numbers/{phone_id}/retry-provision")

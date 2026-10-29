@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..db import get_prisma
-from ..services import plan_tiers
+from ..services import admin_service, plan_tiers, subscription_service
 from . import deps, schemas
 
 router = APIRouter()
@@ -46,6 +46,57 @@ async def delete_plan(pid: str, admin=ADMIN):
         raise HTTPException(404, "Plan not found")
 
 
+def _subscription_item(row, *, user_name: str = "", user_email: str = "",
+                       allocated_channels: int = 0,
+                       number_channels: int = 0) -> dict:
+    plan_channels = max(1, int(row.concurrencyLines or 1))
+    channels = subscription_service.effective_channel_count(
+        plan_channels, allocated_channels, number_channels)
+    return {
+        "subscription_id": row.id,
+        "user_id": row.userId, "user_name": user_name,
+        "user_email": user_email,
+        "status": row.status, "agent_limit": row.agentLimit or 0,
+        "channels": channels,
+        "plan_channels": plan_channels,
+        "allocated_channels": int(allocated_channels or 0),
+        "number_channels": int(number_channels or 0),
+        # Legacy alias for older admin clients; UI now says Channels.
+        "concurrency_lines": channels,
+        "telephony_rented": bool(row.telephonyRented),
+        # Stored KB values are extras above the free base allowance.
+        "kb_extra_chars": row.kbCharLimit or 0,
+        "kb_extra_faqs": row.kbFaqLimit or 0,
+        "kb_char_limit": row.kbCharLimit or 0,
+        "kb_faq_limit": row.kbFaqLimit or 0,
+        "monthly_total": float(row.monthlyTotal or 0),
+        "started_at": row.startedAt or "",
+        "renews_at": row.renewsAt or "",
+        "last_charged_at": row.lastChargedAt or "",
+        "past_due_since": row.pastDueSince or "",
+        "created_at": row.createdAt or "",
+        "updated_at": row.updatedAt or "",
+    }
+
+
+async def _subscription_item_for_user(user_id: str):
+    db = get_prisma()
+    row = await db.subscription.find_unique(where={"userId": user_id})
+    if not row:
+        return None
+    user = await db.user.find_unique(where={"id": user_id})
+    account = await db.voicelinkaccount.find_unique(where={"userId": user_id})
+    numbers = await db.phonenumber.find_many(
+        where={"userId": user_id, "status": "active"})
+    return _subscription_item(
+        row,
+        user_name=(user.name or "") if user else "",
+        user_email=(user.email or "") if user else "",
+        allocated_channels=(account.channelsAllocated or 0) if account else 0,
+        number_channels=max(
+            [int(n.channels or 1) for n in numbers] or [0]))
+
+
 @router.get("/subscriptions")
 async def list_subscriptions(admin=ADMIN):
     """All customer subscriptions with effective channel capacity."""
@@ -66,25 +117,58 @@ async def list_subscriptions(admin=ADMIN):
             number_channels.get(number.userId, 0),
             int(number.channels or 1))
 
-    items = []
-    for r in rows:
-        plan_channels = max(1, int(r.concurrencyLines or 1))
-        channels = max(plan_channels, allocated.get(r.userId, 0),
-                       number_channels.get(r.userId, 0))
-        items.append({
-            "user_id": r.userId, "user_name": uname.get(r.userId, ""),
-            "user_email": uemail.get(r.userId, ""),
-            "status": r.status, "agent_limit": r.agentLimit or 0,
-            "channels": channels,
-            "plan_channels": plan_channels,
-            "allocated_channels": allocated.get(r.userId, 0),
-            "number_channels": number_channels.get(r.userId, 0),
-            # Legacy alias for older admin clients; UI now says Channels.
-            "concurrency_lines": channels,
-            "telephony_rented": bool(r.telephonyRented),
-            "kb_char_limit": r.kbCharLimit or 0,
-            "kb_faq_limit": r.kbFaqLimit or 0,
-            "monthly_total": float(r.monthlyTotal or 0),
-            "renews_at": r.renewsAt or "",
-        })
-    return {"items": items}
+    return {"items": [
+        _subscription_item(
+            r, user_name=uname.get(r.userId, ""),
+            user_email=uemail.get(r.userId, ""),
+            allocated_channels=allocated.get(r.userId, 0),
+            number_channels=number_channels.get(r.userId, 0))
+        for r in rows]}
+
+
+@router.post("/subscriptions", status_code=201)
+async def create_subscription(body: schemas.SubscriptionCreateBody, admin=ADMIN):
+    db = get_prisma()
+    user = await db.user.find_unique(where={"id": body.user_id})
+    if not user:
+        raise HTTPException(404, "Customer not found")
+    try:
+        await subscription_service.admin_create_subscription(
+            body.user_id, **body.model_dump(exclude={"user_id"}))
+    except subscription_service.SubscriptionError as e:
+        raise HTTPException(409 if "already has" in str(e) else 400, str(e))
+    item = await _subscription_item_for_user(body.user_id)
+    await admin_service.audit(
+        admin, "subscription_created", target_type="subscription",
+        target_id=body.user_id,
+        detail={"status": body.status, "agent_limit": body.agent_limit,
+                "channels": body.channels,
+                "monthly_total": body.monthly_total})
+    return item
+
+
+@router.put("/subscriptions/{user_id}")
+async def update_subscription(user_id: str,
+                              body: schemas.SubscriptionUpdateBody,
+                              admin=ADMIN):
+    try:
+        updated = await subscription_service.admin_update_subscription(
+            user_id, **body.model_dump(exclude_none=True))
+    except subscription_service.SubscriptionError as e:
+        raise HTTPException(400, str(e))
+    if updated is None:
+        raise HTTPException(404, "Subscription not found")
+    item = await _subscription_item_for_user(user_id)
+    await admin_service.audit(
+        admin, "subscription_updated", target_type="subscription",
+        target_id=user_id, detail=body.model_dump(exclude_none=True))
+    return item
+
+
+@router.delete("/subscriptions/{user_id}", status_code=204)
+async def delete_subscription(user_id: str, admin=ADMIN):
+    if not await subscription_service.admin_delete_subscription(user_id):
+        raise HTTPException(404, "Subscription not found")
+    await admin_service.audit(
+        admin, "subscription_deleted", target_type="subscription",
+        target_id=user_id)

@@ -206,6 +206,45 @@ agent has an active call.
 10. Check Super Admin → Telephony for account, KYC, purchase, provisioning
     step and trunk IDs. The SIP password should appear only masked/configured.
 
+### Manage a customer's subscription in Super Admin
+
+Super Admin → **Plans → Subscribers** supports create, edit, and delete for
+customer subscription rows. Editable values are status, agent limit,
+plan-selected VoiceLink channels, telephony-rented flag, extra KB
+characters/FAQs, monthly renewal total, and renewal date. These are stored
+in the same `Subscription` row read by the customer's **Billing → Your
+current plan** dashboard, which shows the effective channels plus the
+plan/provider/number breakdown. Manual admin edits do not charge or refund
+the wallet immediately; `monthly_total` is the amount future renewals use.
+Deleting a subscription makes the customer dashboard show no active plan.
+Every admin mutation is audit-logged.
+
+The channel column is the effective maximum of plan-selected channels,
+VoiceLink-account allocated channels, and the highest active DID's channels.
+If it unexpectedly shows `1`, first restart the backend after pulling, then
+check the small `plan · provider · number` breakdown and confirm that the
+VoiceLink account and active DID belong to the same customer as the
+subscription.
+
+### Increase channels on the same number
+
+Yes: after taking a plan and buying/activating a number, the customer can
+open **Phone Numbers → Your phone numbers → Increase channels on this same
+number**, enter the new total, and get a price before confirming.
+
+Example: current effective channels `2`, target `5`, Super Admin price
+`₹250` per extra channel/month. The billable increase is `3`, so the
+subscription increases by `₹750/month`. The amount charged immediately is
+prorated for the days left until the current subscription renewal; the full
+`₹750` increment is included in later monthly renewals. Channels already
+granted by the plan, provider account, or another DID are not charged again.
+
+On confirmation the backend verifies/raises the VoiceLink client's channel
+allocation, charges the app wallet, sets that DID's `channels`, and updates
+the subscription's plan channels/monthly total. The agent's separate
+**Max concurrent calls** must then be set no higher than the DID channels
+(for example, set it to `5` after upgrading the DID to 5).
+
 ### Phone hangup + concurrent SIP calls
 
 For a two-call test, the assigned DID's **Channels** and the agent's

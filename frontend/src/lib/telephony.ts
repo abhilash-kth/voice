@@ -69,6 +69,7 @@ export interface TelephonyOverview {
   configured: boolean;
   plan_channels?: number;
   effective_channels?: number;
+  channel_price_per_month?: number;
   provider: {
     did_type_rates: { type_id: string; name: string; monthly_rate: number }[];
     monthly_channel_rate: number;
@@ -88,6 +89,27 @@ export interface AvailableNumber {
   type_label: string;
   monthly_rate: number;
   country_code: string;
+}
+
+export interface ChannelUpgradeQuote {
+  phone_number_id: string;
+  number: string;
+  current_phone_channels: number;
+  target_channels: number;
+  added_phone_channels: number;
+  current_effective_channels: number;
+  plan_channels: number;
+  provider_channels_allocated: number;
+  billable_added_channels: number;
+  channel_price_per_month: number;
+  monthly_increment: number;
+  due_now: number;
+  remaining_days: number;
+  current_monthly_total: number;
+  new_monthly_total: number;
+  renews_at: string;
+  wallet_balance: number;
+  sufficient_balance: boolean;
 }
 
 export const getTelephonyOverview = () =>
@@ -191,6 +213,41 @@ export const confirmPurchase = async (id: string) => {
   });
   invalidate("/api/telephony");
   invalidate("/api/wallet");
+  invalidate("/api/agents");
+  return out;
+};
+
+export const quoteChannelUpgrade = (phoneId: string, targetChannels: number) =>
+  req<{ quote: ChannelUpgradeQuote; phone_number: PhoneNumberRecord }>(
+    `/api/telephony/numbers/${phoneId}/channels/quote`,
+    {
+      method: "POST",
+      body: JSON.stringify({ target_channels: targetChannels }),
+    },
+  );
+
+export const upgradePhoneChannels = async (
+  phoneId: string,
+  quote: ChannelUpgradeQuote,
+) => {
+  const out = await req<{
+    phone_number: PhoneNumberRecord;
+    quote: ChannelUpgradeQuote;
+    charged_now: number;
+    wallet: TelephonyOverview["wallet"];
+    entitlement: Record<string, unknown>;
+  }>(`/api/telephony/numbers/${phoneId}/channels/upgrade`, {
+    method: "POST",
+    body: JSON.stringify({
+      target_channels: quote.target_channels,
+      accept_charge: true,
+      expected_due_now: quote.due_now,
+      expected_monthly_increment: quote.monthly_increment,
+    }),
+  });
+  invalidate("/api/telephony");
+  invalidate("/api/wallet");
+  invalidate("/api/subscription");
   invalidate("/api/agents");
   return out;
 };
