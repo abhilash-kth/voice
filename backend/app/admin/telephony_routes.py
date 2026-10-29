@@ -60,7 +60,8 @@ async def update_settings(body: TelephonySettingsBody, admin=ADMIN):
         _raise(e)
     detail = {}
     for key, value in patch.items():
-        if key in ("voicelink_api_token", "voicelink_password"):
+        if key in ("voicelink_api_token", "voicelink_password",
+                   "voicelink_shared_trunk_password"):
             detail[key] = "rotated" if value else "unchanged"
         else:
             detail[key] = value

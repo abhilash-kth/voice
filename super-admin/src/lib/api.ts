@@ -433,6 +433,9 @@ export interface TelephonySettings {
   voicelink_username: string;
   voicelink_password_configured: boolean;
   voicelink_password_masked: string;
+  voicelink_shared_trunk_username: string;
+  voicelink_shared_trunk_password_configured: boolean;
+  voicelink_shared_trunk_password_masked: string;
   voicelink_sip_host: string;
   voicelink_sip_port: number;
   voicelink_tech_prefix: string;
@@ -457,6 +460,9 @@ export interface TelephonySettingsPatch {
   voicelink_username?: string;
   voicelink_password?: string;
   clear_voicelink_password?: boolean;
+  voicelink_shared_trunk_username?: string;
+  voicelink_shared_trunk_password?: string;
+  clear_voicelink_shared_trunk_password?: boolean;
   voicelink_sip_host?: string;
   voicelink_sip_port?: number;
   voicelink_tech_prefix?: string;

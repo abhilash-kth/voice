@@ -120,6 +120,10 @@ Log in to Super Admin and open **Telephony → Settings**.
     username/password
   - VoiceLink SIP: `sip.voicelink.co.in`, port `3300`
   - Public LiveKit SIP: your Oracle SIP hostname, port `5060`
+  - If VoiceLink already has its one allowed trunk for that LiveKit host,
+    copy that existing trunk's SIP username/password into **Existing shared
+    VoiceLink trunk username/password** because VoiceLink's trunk-list API
+    may omit the password. Do not use the VoiceLink API-login credentials.
   - Tech prefix `45454`, transport `1 (UDP)`, audio formats `alaw,ulaw`
   - Optional default fallback trunk: the existing working `ST_...` trunk
   - Wallet bypass: **off**; client KYC final-submit: **off** until VoiceLink
@@ -303,9 +307,10 @@ setup/test part; still regenerate from `schema.prisma` afterwards.
   the gate instead of risking a tenant-level submission.
 - Transport code `1` assumes the inferred SDK mapping `1=UDP`. Confirm it
   against a live VoiceLink trunk readback before changing it in the panel.
-- The code surfaces an error if VoiceLink does not honour/return the SIP
-  password needed for the LiveKit trunk. Confirm that behaviour with one
-  controlled purchase before opening self-service broadly.
+- VoiceLink's trunk-list response may omit the existing trunk's SIP
+  password. In that case activation stops until the operator copies the
+  existing trunk's credentials into the panel's SIP routing fields; it does
+  not rotate the shared trunk password automatically.
 - Confirm trial-plan DID/channel entitlements. VoiceLink allows only one
   trunk per SIP server host, so activation reuses the existing trunk that
   already points at the configured LiveKit SIP host; confirm shared-trunk

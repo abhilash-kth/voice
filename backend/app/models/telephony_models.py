@@ -130,6 +130,11 @@ class TelephonySettingsBody(BaseModel):
     voicelink_username: Optional[str] = Field(default=None, max_length=200)
     voicelink_password: Optional[str] = Field(default=None, max_length=1024)
     clear_voicelink_password: bool = False
+    voicelink_shared_trunk_username: Optional[str] = Field(
+        default=None, max_length=200)
+    voicelink_shared_trunk_password: Optional[str] = Field(
+        default=None, max_length=1024)
+    clear_voicelink_shared_trunk_password: bool = False
     voicelink_sip_host: Optional[str] = Field(default=None, max_length=253)
     voicelink_sip_port: Optional[int] = Field(default=None, ge=1, le=65535)
     voicelink_tech_prefix: Optional[str] = Field(default=None, max_length=20)

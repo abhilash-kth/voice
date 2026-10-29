@@ -75,6 +75,40 @@ def _trunk_active(row: dict) -> bool:
         row.get("status_label") or "").strip().lower() == "active"
 
 
+def _trunk_username(row: dict) -> str:
+    return vl.id_of(row, "username", "sip_username", "user_name",
+                    "auth_username", "trunk_username")
+
+
+def _trunk_password(row: dict) -> str:
+    value = vl.id_of(row, "registration_password", "password",
+                     "sip_password", "auth_password", "trunk_password",
+                     "registrationPassword")
+    if value and (set(value) <= {"*", "•"}
+                  or value.lower() in {"masked", "hidden"}):
+        return ""
+    return value
+
+
+def _resolve_trunk_credentials(row: dict, settings, *,
+                               local_username: str, local_password: str,
+                               exact: bool) -> Optional[tuple[str, str, str]]:
+    row_username = _trunk_username(row)
+    row_password = _trunk_password(row)
+    if row_username and row_password:
+        return row_username, row_password, "provider"
+    if exact and (not row_username or row_username == local_username):
+        return local_username, local_password, "local"
+    configured_username = str(
+        getattr(settings, "voicelink_shared_trunk_username", "") or "")
+    configured_password = str(
+        getattr(settings, "voicelink_shared_trunk_password", "") or "")
+    if configured_username and configured_password and (
+            not row_username or row_username == configured_username):
+        return configured_username, configured_password, "super_admin"
+    return None
+
+
 def _find_voicelink_trunk(rows: list[dict], *, trunk_name: str, username: str,
                           host: str, client_id: str,
                           shared: bool = False) -> Optional[dict]:
@@ -89,7 +123,7 @@ def _find_voicelink_trunk(rows: list[dict], *, trunk_name: str, username: str,
             continue
         usable.append(row)
         if str(row.get("trunk_name") or row.get("name") or "") == trunk_name \
-                or str(row.get("username") or "") == username:
+                or _trunk_username(row) == username:
             return row
     host_rows = [row for row in usable
                  if _trunk_host(row.get("sip_server_host")) == wanted_host]
@@ -128,17 +162,20 @@ async def _sync_voicelink_trunk(found: dict, settings, *, exact: bool,
     if exact:
         payload.update({"username": username,
                         "registration_password": password})
-    elif found.get("username") and (found.get("registration_password")
-                                     or found.get("password")):
+    elif _trunk_username(found) and _trunk_password(found):
         payload.update({
-            "username": str(found["username"]),
-            "registration_password": str(
-                found.get("registration_password") or found.get("password")),
+            "username": _trunk_username(found),
+            "registration_password": _trunk_password(found),
         })
     updated = _record(await vl.update_sip_trunk(trunk_id, payload))
     merged = dict(found)
     merged.update({key: value for key, value in updated.items()
                    if value not in (None, "")})
+    if _trunk_username(found):
+        merged["username"] = _trunk_username(updated) or _trunk_username(found)
+    if _trunk_password(found):
+        merged["registration_password"] = (
+            _trunk_password(updated) or _trunk_password(found))
     return merged
 
 
@@ -216,26 +253,46 @@ async def provision_number(phone_id: str,
             exact_reuse = bool(found and (
                 str(found.get("trunk_name") or found.get("name") or "")
                 == trunk_name
-                or str(found.get("username") or "") == username))
+                or _trunk_username(found) == username))
             if found is not None:
-                if not exact_reuse:
-                    returned_pw = found.get("registration_password") \
-                        or found.get("password")
-                    if not found.get("username") or not returned_pw:
+                resolved = _resolve_trunk_credentials(
+                    found, settings, local_username=username,
+                    local_password=password, exact=exact_reuse)
+                if resolved is None:
+                    row_username = _trunk_username(found)
+                    configured_username = (
+                        settings.voicelink_shared_trunk_username or "")
+                    if configured_username \
+                            and settings.voicelink_shared_trunk_password \
+                            and row_username \
+                            and row_username != configured_username:
                         raise TelephonyError(
-                            "VoiceLink already has a SIP trunk for this "
-                            "LiveKit host, but did not return its SIP "
-                            "credentials needed to reuse it safely. Check the "
-                            "existing trunk in VoiceLink; do not buy another "
-                            "number.", 502)
+                            "The shared VoiceLink trunk username saved in "
+                            "Super Admin does not match the existing trunk "
+                            "for this LiveKit host. Correct it in Super "
+                            "Admin -> Telephony -> Settings -> SIP routing, "
+                            "then retry activation.", 409)
+                    raise TelephonyError(
+                        "VoiceLink already has a SIP trunk for this LiveKit "
+                        "host, but its list response did not include the "
+                        "SIP password. Copy that existing trunk's username "
+                        "and SIP password into Super Admin -> Telephony -> "
+                        "Settings -> SIP routing, save, then retry. Do not "
+                        "buy another number.", 409)
+                resolved_username, resolved_password, credential_source = (
+                    resolved)
+                found = {**found, "username": resolved_username,
+                         "registration_password": resolved_password}
+                if not exact_reuse:
                     logger.info(
                         "[PROVISION_TRUNK_REUSE] phone=%s host=%s "
-                        "same_client=%s", phone_id,
+                        "same_client=%s credential_source=%s", phone_id,
                         _trunk_host(settings.livekit_sip_host),
-                        vl.id_of(found, "client_id") in ("", str(client_id)))
+                        vl.id_of(found, "client_id") in ("", str(client_id)),
+                        credential_source)
                 found = await _sync_voicelink_trunk(
                     found, settings, exact=exact_reuse,
-                    username=username, password=password)
+                    username=resolved_username, password=resolved_password)
             if found is None:
                 found = _record(await vl.create_sip_trunk({
                     "trunk_name": trunk_name,
@@ -255,10 +312,10 @@ async def provision_number(phone_id: str,
                     "Retry activation to reconcile.", 502)
             patch = {"voice_link_trunk_id": trunk_id,
                      "provisioning_step": "voicelink_trunk_ready"}
-            if found.get("username") and str(found["username"]) != username:
-                username = str(found["username"])
+            if _trunk_username(found) and _trunk_username(found) != username:
+                username = _trunk_username(found)
                 patch["sip_username"] = username
-            returned_pw = found.get("registration_password") or found.get("password")
+            returned_pw = _trunk_password(found)
             if returned_pw and str(returned_pw) != password:
                 password = str(returned_pw)
                 enc, masked = encrypt_secret(password)

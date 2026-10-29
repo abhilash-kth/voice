@@ -95,6 +95,28 @@ def test_voicelink_trunk_reuse_matches_unique_sip_host():
     assert exact["id"] == 14
 
 
+def test_voicelink_shared_trunk_credentials_fallback_is_guarded():
+    from types import SimpleNamespace
+
+    from app.services.telephony_provisioning import _resolve_trunk_credentials
+
+    settings = SimpleNamespace(
+        voicelink_shared_trunk_username="shared-user",
+        voicelink_shared_trunk_password="shared-secret")
+    assert _resolve_trunk_credentials(
+        {"username": "shared-user", "registration_password": "********"},
+        settings, local_username="local-user", local_password="local-secret",
+        exact=False) == ("shared-user", "shared-secret", "super_admin")
+    assert _resolve_trunk_credentials(
+        {"username": "different-user"}, settings,
+        local_username="local-user", local_password="local-secret",
+        exact=False) is None
+    assert _resolve_trunk_credentials(
+        {"auth_username": "provider-user", "sip_password": "provider-secret"},
+        settings, local_username="local-user", local_password="local-secret",
+        exact=False) == ("provider-user", "provider-secret", "provider")
+
+
 def test_voicelink_phone_payload_is_digits_only():
     from app.services.telephony_account import _indian_phone_forms
     from app.services.telephony_policy import TelephonyError
@@ -413,6 +435,7 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
 
     token_enc, token_masked = encrypt_secret("vl-token-1234567890")
     password_enc, password_masked = encrypt_secret("vl-password-9876")
+    shared_enc, shared_masked = encrypt_secret("shared-trunk-secret")
     settings = settings_svc._settings_from_record({
         "default_sip_trunk_id": "ST_default",
         "voicelink_api_base_url": "https://app.voicelink.co.in/api/v1",
@@ -421,6 +444,9 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
         "voicelink_username": "reseller@example.com",
         "voicelink_password_enc": password_enc,
         "voicelink_password_masked": password_masked,
+        "voicelink_shared_trunk_username": "shared-user",
+        "voicelink_shared_trunk_password_enc": shared_enc,
+        "voicelink_shared_trunk_password_masked": shared_masked,
         "voicelink_sip_host": "sip.voicelink.co.in",
         "voicelink_sip_port": 3300,
         "voicelink_tech_prefix": "45454",
@@ -439,13 +465,16 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
 
     assert settings.voicelink_api_token == "vl-token-1234567890"
     assert settings.voicelink_password == "vl-password-9876"
+    assert settings.voicelink_shared_trunk_password == "shared-trunk-secret"
     view = settings_svc.public_view(settings)
     rendered = repr(view)
     assert view["configured"] is True
     assert view["voicelink_api_token_configured"] is True
     assert view["voicelink_password_configured"] is True
+    assert view["voicelink_shared_trunk_password_configured"] is True
     for forbidden in ("vl-token-1234567890", "vl-password-9876",
-                      token_enc, password_enc):
+                      "shared-trunk-secret", token_enc, password_enc,
+                      shared_enc):
         assert forbidden not in rendered
 
 
@@ -459,6 +488,8 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
     patch = settings_svc._normalize_patch({
         "voicelink_api_base_url": "https://app.voicelink.co.in/api/v1/",
         "voicelink_api_token": "rotated-token-4321",
+        "voicelink_shared_trunk_username": "shared-user",
+        "voicelink_shared_trunk_password": "shared-secret-8765",
         "voicelink_audio_formats": ["ALAW", "ulaw", "alaw"],
         "voicelink_kyc_redirect_hosts": ["ID.Example.COM"],
         "livekit_sip_host": "SIP.Example.com",
@@ -467,7 +498,10 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
         "https://app.voicelink.co.in/api/v1")
     assert decrypt_secret(patch["voicelink_api_token_enc"]) == (
         "rotated-token-4321")
+    assert decrypt_secret(
+        patch["voicelink_shared_trunk_password_enc"]) == "shared-secret-8765"
     assert "rotated-token-4321" not in repr(patch)
+    assert "shared-secret-8765" not in repr(patch)
     assert patch["voicelink_audio_formats"] == "alaw,ulaw"
     assert patch["voicelink_kyc_redirect_hosts"] == "id.example.com"
     assert patch["livekit_sip_host"] == "sip.example.com"
@@ -837,6 +871,8 @@ async def test_super_admin_saves_telephony_settings_encrypted(
         json={
             "voicelink_api_token": "panel-token-998877",
             "voicelink_password": "panel-password-112233",
+            "voicelink_shared_trunk_username": "shared-user",
+            "voicelink_shared_trunk_password": "panel-shared-secret-445566",
             "voicelink_sip_host": "sip.voicelink.co.in",
             "voicelink_sip_port": 3300,
             "livekit_sip_host": "sip.example.com",
@@ -846,10 +882,12 @@ async def test_super_admin_saves_telephony_settings_encrypted(
     assert resp.status_code == 200, resp.text
     assert "panel-token-998877" not in resp.text
     assert "panel-password-112233" not in resp.text
+    assert "panel-shared-secret-445566" not in resp.text
     settings = resp.json()["settings"]
     assert settings["source"] == "super_admin"
     assert settings["configured"] is True
     assert settings["voicelink_api_token_configured"] is True
+    assert settings["voicelink_shared_trunk_password_configured"] is True
 
     stored = await repo.get_telephony_config(include_secrets=True)
     assert stored is not None
@@ -858,3 +896,6 @@ async def test_super_admin_saves_telephony_settings_encrypted(
         "panel-token-998877")
     assert decrypt_secret(stored["voicelink_password_enc"]) == (
         "panel-password-112233")
+    assert decrypt_secret(
+        stored["voicelink_shared_trunk_password_enc"]) == (
+            "panel-shared-secret-445566")

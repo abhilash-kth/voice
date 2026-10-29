@@ -350,6 +350,10 @@ _CONFIG_FIELDS = {
     "voicelink_username": "voicelinkUsername",
     "voicelink_password_enc": "voicelinkPasswordEnc",
     "voicelink_password_masked": "voicelinkPasswordMasked",
+    "voicelink_shared_trunk_username": "voicelinkSharedTrunkUsername",
+    "voicelink_shared_trunk_password_enc": "voicelinkSharedTrunkPasswordEnc",
+    "voicelink_shared_trunk_password_masked": (
+        "voicelinkSharedTrunkPasswordMasked"),
     "voicelink_sip_host": "voicelinkSipHost",
     "voicelink_sip_port": "voicelinkSipPort",
     "voicelink_tech_prefix": "voicelinkTechPrefix",
@@ -376,6 +380,10 @@ def _config_dict(c, *, include_secrets: bool = False) -> Optional[dict]:
         "voicelink_api_token_masked": c.voicelinkApiTokenMasked or "",
         "voicelink_username": c.voicelinkUsername or "",
         "voicelink_password_masked": c.voicelinkPasswordMasked or "",
+        "voicelink_shared_trunk_username": (
+            c.voicelinkSharedTrunkUsername or ""),
+        "voicelink_shared_trunk_password_masked": (
+            c.voicelinkSharedTrunkPasswordMasked or ""),
         "voicelink_sip_host": c.voicelinkSipHost or "",
         "voicelink_sip_port": int(c.voicelinkSipPort or 3300),
         "voicelink_tech_prefix": c.voicelinkTechPrefix or "",
@@ -394,6 +402,8 @@ def _config_dict(c, *, include_secrets: bool = False) -> Optional[dict]:
     if include_secrets:
         out["voicelink_api_token_enc"] = c.voicelinkApiTokenEnc or ""
         out["voicelink_password_enc"] = c.voicelinkPasswordEnc or ""
+        out["voicelink_shared_trunk_password_enc"] = (
+            c.voicelinkSharedTrunkPasswordEnc or "")
     return out
 
 

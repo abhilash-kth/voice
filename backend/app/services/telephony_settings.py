@@ -52,6 +52,9 @@ class TelephonySettings:
     voicelink_username: str = ""
     voicelink_password: str = field(default="", repr=False)
     voicelink_password_masked: str = ""
+    voicelink_shared_trunk_username: str = ""
+    voicelink_shared_trunk_password: str = field(default="", repr=False)
+    voicelink_shared_trunk_password_masked: str = ""
     voicelink_sip_host: str = "sip.voicelink.co.in"
     voicelink_sip_port: int = 3300
     voicelink_tech_prefix: str = "45454"
@@ -268,6 +271,12 @@ def _settings_from_record(record: dict) -> TelephonySettings:
         voicelink_password=_decrypt(record.get("voicelink_password_enc") or ""),
         voicelink_password_masked=str(
             record.get("voicelink_password_masked") or ""),
+        voicelink_shared_trunk_username=str(
+            record.get("voicelink_shared_trunk_username") or "").strip(),
+        voicelink_shared_trunk_password=_decrypt(
+            record.get("voicelink_shared_trunk_password_enc") or ""),
+        voicelink_shared_trunk_password_masked=str(
+            record.get("voicelink_shared_trunk_password_masked") or ""),
         voicelink_sip_host=_safe(
             lambda v: _clean_host(v, "VoiceLink SIP host"),
             record.get("voicelink_sip_host"), "sip.voicelink.co.in"),
@@ -311,6 +320,10 @@ def _record_from_settings(settings: TelephonySettings) -> dict:
     password_enc, password_masked = ("", "")
     if settings.voicelink_password:
         password_enc, password_masked = encrypt_secret(settings.voicelink_password)
+    shared_password_enc, shared_password_masked = ("", "")
+    if settings.voicelink_shared_trunk_password:
+        shared_password_enc, shared_password_masked = encrypt_secret(
+            settings.voicelink_shared_trunk_password)
     return {
         "default_sip_trunk_id": settings.default_sip_trunk_id,
         "voicelink_api_base_url": settings.voicelink_api_base_url,
@@ -319,6 +332,10 @@ def _record_from_settings(settings: TelephonySettings) -> dict:
         "voicelink_username": settings.voicelink_username,
         "voicelink_password_enc": password_enc,
         "voicelink_password_masked": password_masked,
+        "voicelink_shared_trunk_username": (
+            settings.voicelink_shared_trunk_username),
+        "voicelink_shared_trunk_password_enc": shared_password_enc,
+        "voicelink_shared_trunk_password_masked": shared_password_masked,
         "voicelink_sip_host": settings.voicelink_sip_host,
         "voicelink_sip_port": settings.voicelink_sip_port,
         "voicelink_tech_prefix": settings.voicelink_tech_prefix,
@@ -350,6 +367,12 @@ def public_view(settings: TelephonySettings) -> dict:
         "voicelink_username": settings.voicelink_username,
         "voicelink_password_configured": bool(settings.voicelink_password),
         "voicelink_password_masked": settings.voicelink_password_masked,
+        "voicelink_shared_trunk_username": (
+            settings.voicelink_shared_trunk_username),
+        "voicelink_shared_trunk_password_configured": bool(
+            settings.voicelink_shared_trunk_password),
+        "voicelink_shared_trunk_password_masked": (
+            settings.voicelink_shared_trunk_password_masked),
         "voicelink_sip_host": settings.voicelink_sip_host,
         "voicelink_sip_port": settings.voicelink_sip_port,
         "voicelink_tech_prefix": settings.voicelink_tech_prefix,
@@ -489,6 +512,25 @@ def _normalize_patch(patch: dict) -> dict:
                 "ADMIN_CONFIG_ENC_KEY.", 500) from None
         out["voicelink_password_enc"] = enc
         out["voicelink_password_masked"] = masked
+
+    if "voicelink_shared_trunk_username" in patch:
+        out["voicelink_shared_trunk_username"] = _clean_text_no_spaces(
+            patch.get("voicelink_shared_trunk_username"),
+            "Existing shared VoiceLink trunk username")
+
+    if patch.get("clear_voicelink_shared_trunk_password"):
+        out["voicelink_shared_trunk_password_enc"] = ""
+        out["voicelink_shared_trunk_password_masked"] = ""
+    elif str(patch.get("voicelink_shared_trunk_password") or ""):
+        try:
+            enc, masked = encrypt_secret(
+                str(patch["voicelink_shared_trunk_password"]))
+        except Exception:
+            raise TelephonyError(
+                "Could not encrypt the shared VoiceLink trunk password. "
+                "Check ADMIN_CONFIG_ENC_KEY.", 500) from None
+        out["voicelink_shared_trunk_password_enc"] = enc
+        out["voicelink_shared_trunk_password_masked"] = masked
 
     if "voicelink_sip_host" in patch:
         out["voicelink_sip_host"] = _clean_host(

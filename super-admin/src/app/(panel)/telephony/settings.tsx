@@ -32,6 +32,9 @@ interface FormState {
   voicelink_username: string;
   voicelink_password: string;
   clear_voicelink_password: boolean;
+  voicelink_shared_trunk_username: string;
+  voicelink_shared_trunk_password: string;
+  clear_voicelink_shared_trunk_password: boolean;
   voicelink_sip_host: string;
   voicelink_sip_port: string;
   voicelink_tech_prefix: string;
@@ -56,6 +59,10 @@ function toForm(settings: TelephonySettings): FormState {
     voicelink_username: settings.voicelink_username,
     voicelink_password: "",
     clear_voicelink_password: false,
+    voicelink_shared_trunk_username:
+      settings.voicelink_shared_trunk_username,
+    voicelink_shared_trunk_password: "",
+    clear_voicelink_shared_trunk_password: false,
     voicelink_sip_host: settings.voicelink_sip_host,
     voicelink_sip_port: String(settings.voicelink_sip_port),
     voicelink_tech_prefix: settings.voicelink_tech_prefix,
@@ -227,6 +234,10 @@ export function TelephonySettingsForm({
       clear_voicelink_api_token: form.clear_voicelink_api_token,
       voicelink_username: form.voicelink_username.trim(),
       clear_voicelink_password: form.clear_voicelink_password,
+      voicelink_shared_trunk_username:
+        form.voicelink_shared_trunk_username.trim(),
+      clear_voicelink_shared_trunk_password:
+        form.clear_voicelink_shared_trunk_password,
       voicelink_sip_host: form.voicelink_sip_host.trim(),
       voicelink_sip_port: voicelinkPort,
       voicelink_tech_prefix: form.voicelink_tech_prefix.trim(),
@@ -248,6 +259,13 @@ export function TelephonySettingsForm({
     }
     if (!form.clear_voicelink_password && form.voicelink_password) {
       patch.voicelink_password = form.voicelink_password;
+    }
+    if (
+      !form.clear_voicelink_shared_trunk_password &&
+      form.voicelink_shared_trunk_password
+    ) {
+      patch.voicelink_shared_trunk_password =
+        form.voicelink_shared_trunk_password;
     }
 
     setBusy("save");
@@ -479,6 +497,52 @@ export function TelephonySettingsForm({
             required: true,
             placeholder: "alaw,ulaw",
           })}
+          {textField(
+            "Existing shared VoiceLink trunk username",
+            "voicelink_shared_trunk_username",
+            { autoComplete: "off" },
+            "Copy from the one existing VoiceLink trunk that already points to the Public LiveKit SIP host. This is not the API login username.",
+          )}
+          <Field
+            label="Existing shared VoiceLink trunk SIP password"
+            hint="Required only when VoiceLink's trunk list omits the existing trunk password. Copy it exactly from that trunk; changing it here does not change VoiceLink."
+          >
+            <Input
+              type="password"
+              autoComplete="new-password"
+              value={form.voicelink_shared_trunk_password}
+              disabled={
+                busy !== "" || form.clear_voicelink_shared_trunk_password
+              }
+              onChange={(e) =>
+                set("voicelink_shared_trunk_password", e.target.value)
+              }
+              placeholder={
+                initial.voicelink_shared_trunk_password_configured
+                  ? "Leave blank to keep saved trunk password"
+                  : "Existing trunk registration/SIP password"
+              }
+            />
+            <SecretState
+              configured={initial.voicelink_shared_trunk_password_configured}
+              masked={initial.voicelink_shared_trunk_password_masked}
+            />
+            <label className="flex items-center gap-2 pt-1 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={form.clear_voicelink_shared_trunk_password}
+                disabled={busy !== ""}
+                onChange={(e) =>
+                  set(
+                    "clear_voicelink_shared_trunk_password",
+                    e.target.checked,
+                  )
+                }
+                className="h-3.5 w-3.5 accent-primary"
+              />
+              Clear saved shared trunk password
+            </label>
+          </Field>
         </div>
       </Section>
 
