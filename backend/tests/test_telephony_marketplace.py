@@ -68,6 +68,33 @@ def test_destination_and_carrier_dial_normalization():
     )
 
 
+def test_voicelink_trunk_reuse_matches_unique_sip_host():
+    from app.services.telephony_provisioning import _find_voicelink_trunk
+
+    rows = [
+        {"id": 11, "client_id": 99, "trunk_name": "manual",
+         "sip_server_host": "SIP.EXAMPLE.COM.", "status": 0},
+        {"id": 12, "client_id": 99, "trunk_name": "livekit",
+         "sip_server_host": "sip.example.com", "status": 1},
+        {"id": 13, "client_id": 42, "trunk_name": "other-host",
+         "sip_server_host": "other.example.com", "status": 1},
+    ]
+    assert _find_voicelink_trunk(
+        rows, trunk_name="voxura-new", username="trunk_new",
+        host="sip.example.com", client_id="42") is None
+    shared = _find_voicelink_trunk(
+        rows, trunk_name="voxura-new", username="trunk_new",
+        host="sip.example.com", client_id="42", shared=True)
+    assert shared["id"] == 12
+
+    rows.append({"id": 14, "client_id": 42, "username": "trunk_new",
+                  "sip_server_host": "old.example.com", "status": 1})
+    exact = _find_voicelink_trunk(
+        rows, trunk_name="voxura-new", username="trunk_new",
+        host="sip.example.com", client_id="42")
+    assert exact["id"] == 14
+
+
 def test_voicelink_phone_payload_is_digits_only():
     from app.services.telephony_account import _indian_phone_forms
     from app.services.telephony_policy import TelephonyError

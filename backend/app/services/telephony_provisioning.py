@@ -65,6 +65,83 @@ def _record(data: dict) -> dict:
     return data
 
 
+def _trunk_host(value) -> str:
+    host = re.sub(r"^sip:", "", str(value or "").strip().lower())
+    return host.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+
+
+def _trunk_active(row: dict) -> bool:
+    return row.get("status") in (1, "1", True) or str(
+        row.get("status_label") or "").strip().lower() == "active"
+
+
+def _find_voicelink_trunk(rows: list[dict], *, trunk_name: str, username: str,
+                          host: str, client_id: str,
+                          shared: bool = False) -> Optional[dict]:
+    """Find this DID's trunk, else the one trunk VoiceLink allows per host."""
+    usable: list[dict] = []
+    wanted_host = _trunk_host(host)
+    for row in rows:
+        if not vl.id_of(row, "id", "trunk_id", "sip_trunk_id"):
+            continue
+        owner = vl.id_of(row, "client_id")
+        if not shared and owner and owner != str(client_id):
+            continue
+        usable.append(row)
+        if str(row.get("trunk_name") or row.get("name") or "") == trunk_name \
+                or str(row.get("username") or "") == username:
+            return row
+    host_rows = [row for row in usable
+                 if _trunk_host(row.get("sip_server_host")) == wanted_host]
+    return next((row for row in host_rows if _trunk_active(row)),
+                host_rows[0] if host_rows else None)
+
+
+async def _sync_voicelink_trunk(found: dict, settings, *, exact: bool,
+                                username: str, password: str) -> dict:
+    """Repoint/activate a reused trunk without rotating shared credentials."""
+    trunk_id = vl.id_of(found, "id", "trunk_id", "sip_trunk_id")
+    try:
+        port_matches = int(found.get("sip_server_port")) \
+            == int(settings.livekit_sip_port)
+    except (TypeError, ValueError):
+        port_matches = False
+    transport = found.get("transport_type")
+    needs_update = (
+        _trunk_host(found.get("sip_server_host"))
+        != _trunk_host(settings.livekit_sip_host)
+        or not port_matches
+        or (transport not in (None, "")
+            and str(transport) != str(settings.voicelink_transport_type))
+        or ("status" in found and not _trunk_active(found)))
+    if not needs_update or not trunk_id:
+        return found
+    payload = {
+        "trunk_name": str(found.get("trunk_name") or found.get("name")
+                          or "voxura-livekit"),
+        "status": 1,
+        "sip_server_host": settings.livekit_sip_host,
+        "sip_server_port": settings.livekit_sip_port,
+        "transport_type": settings.voicelink_transport_type,
+        "audio_format": list(settings.voicelink_audio_formats),
+    }
+    if exact:
+        payload.update({"username": username,
+                        "registration_password": password})
+    elif found.get("username") and (found.get("registration_password")
+                                     or found.get("password")):
+        payload.update({
+            "username": str(found["username"]),
+            "registration_password": str(
+                found.get("registration_password") or found.get("password")),
+        })
+    updated = _record(await vl.update_sip_trunk(trunk_id, payload))
+    merged = dict(found)
+    merged.update({key: value for key, value in updated.items()
+                   if value not in (None, "")})
+    return merged
+
+
 async def _fail(phone_id: str, step: str, exc: Exception):
     msg = str(exc)[:500]
     await repo.update_phone_number(phone_id, {
@@ -123,11 +200,42 @@ async def provision_number(phone_id: str,
         step = "voicelink_trunk"
         if not phone.get("voice_link_trunk_id"):
             trunk_name = f"voxura-{_short(phone_id)}"
-            found = None
-            for row in await vl.list_sip_trunks(client_id):
-                if row.get("trunk_name") == trunk_name or row.get("username") == username:
-                    found = row
-                    break
+            found = _find_voicelink_trunk(
+                await vl.list_sip_trunks(client_id), trunk_name=trunk_name,
+                username=username, host=settings.livekit_sip_host,
+                client_id=client_id)
+            if found is None:
+                # VoiceLink permits one trunk per SIP server host across the
+                # reseller account. A trunk already targeting our configured
+                # LiveKit SIP host is therefore the platform trunk to reuse,
+                # even when VoiceLink records it under another managed client.
+                found = _find_voicelink_trunk(
+                    await vl.list_sip_trunks(), trunk_name=trunk_name,
+                    username=username, host=settings.livekit_sip_host,
+                    client_id=client_id, shared=True)
+            exact_reuse = bool(found and (
+                str(found.get("trunk_name") or found.get("name") or "")
+                == trunk_name
+                or str(found.get("username") or "") == username))
+            if found is not None:
+                if not exact_reuse:
+                    returned_pw = found.get("registration_password") \
+                        or found.get("password")
+                    if not found.get("username") or not returned_pw:
+                        raise TelephonyError(
+                            "VoiceLink already has a SIP trunk for this "
+                            "LiveKit host, but did not return its SIP "
+                            "credentials needed to reuse it safely. Check the "
+                            "existing trunk in VoiceLink; do not buy another "
+                            "number.", 502)
+                    logger.info(
+                        "[PROVISION_TRUNK_REUSE] phone=%s host=%s "
+                        "same_client=%s", phone_id,
+                        _trunk_host(settings.livekit_sip_host),
+                        vl.id_of(found, "client_id") in ("", str(client_id)))
+                found = await _sync_voicelink_trunk(
+                    found, settings, exact=exact_reuse,
+                    username=username, password=password)
             if found is None:
                 found = _record(await vl.create_sip_trunk({
                     "trunk_name": trunk_name,

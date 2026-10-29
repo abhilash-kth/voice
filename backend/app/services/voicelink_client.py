@@ -604,9 +604,11 @@ async def create_sip_trunk(payload: dict) -> dict:
     return as_record(await request("POST", "/sip-trunk/create", json=payload))
 
 
-async def list_sip_trunks(client_id: str) -> list[dict]:
-    data = await request("GET", "/sip-trunk/list", params={
-        "client_id": str(client_id), "page": "1", "per_page": "100"})
+async def list_sip_trunks(client_id: Optional[str] = None) -> list[dict]:
+    params = {"page": "1", "per_page": "100"}
+    if client_id:
+        params["client_id"] = str(client_id)
+    data = await request("GET", "/sip-trunk/list", params=params)
     return [r for r in as_list(data) if isinstance(r, dict)]
 
 

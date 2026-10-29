@@ -11,8 +11,10 @@
 - Customers use **Phone Numbers** in the workspace to start managed phone
   setup, complete KYC, move calling balance, browse/quote/buy a DID and retry
   activation.
-- Provisioning creates the VoiceLink SIP trunk/routing, the LiveKit outbound
-  trunk, a per-DID LiveKit inbound trunk and a trunk-scoped dispatch rule.
+- Provisioning creates or reuses the one VoiceLink SIP trunk allowed for the
+  configured LiveKit SIP host, then creates per-DID VoiceLink routing, the
+  LiveKit outbound trunk, a per-DID LiveKit inbound trunk and a trunk-scoped
+  dispatch rule.
   SIP passwords are encrypted server-side; customer APIs omit provider/trunk
   identifiers and SIP credentials entirely, while Super Admin sees trunk IDs
   and only a masked password.
@@ -304,8 +306,12 @@ setup/test part; still regenerate from `schema.prisma` afterwards.
 - The code surfaces an error if VoiceLink does not honour/return the SIP
   password needed for the LiveKit trunk. Confirm that behaviour with one
   controlled purchase before opening self-service broadly.
-- Confirm trial-plan DID/channel entitlements and whether many client trunks
-  may safely share `sip.voicelink.co.in:3300` and the same LiveKit SIP host.
+- Confirm trial-plan DID/channel entitlements. VoiceLink allows only one
+  trunk per SIP server host, so activation reuses the existing trunk that
+  already points at the configured LiveKit SIP host; confirm shared-trunk
+  call billing/client attribution with VoiceLink before broad self-service.
+  That trunk's **Peer Monitoring** toggle must be ON in the VoiceLink portal
+  because the API cannot set it.
 - Wallet-bypass semantics must be confirmed with VoiceLink before enabling
   that panel switch.
 
