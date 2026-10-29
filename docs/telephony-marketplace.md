@@ -124,6 +124,14 @@ Log in to Super Admin and open **Telephony → Settings**.
     must resolve to the same Oracle LiveKit SIP server. VoiceLink allows
     only one trunk per host and rejects routing through another client's
     trunk, so do not use one fixed host for multiple VoiceLink clients.
+  - **VoiceLink inbound source IPs/CIDRs**: the public signalling sources
+    VoiceLink uses for inbound INVITEs. Ask VoiceLink for the full list;
+    the Oracle `livekit-sip` log's `fromIP` on a real inbound attempt also
+    proves at least one live source. Purchased-number LiveKit inbound
+    trunks deliberately use **no inbound SIP password** because VoiceLink
+    does not answer LiveKit's 407 digest challenge; restrict them with
+    these source addresses instead. After changing the list, click
+    **Sync inbound** for each active purchased number.
   - **Existing shared VoiceLink trunk username/password** is only a legacy
     fallback for an existing trunk owned by the same VoiceLink client as
     the DID when VoiceLink's trunk-list API omits its password.
@@ -320,6 +328,11 @@ setup/test part; still regenerate from `schema.prisma` afterwards.
   VoiceLink client a unique alias for the same LiveKit SIP server. Each
   resulting trunk's **Peer Monitoring** toggle must be ON in the VoiceLink
   portal because the API cannot set it.
+- Do not copy the VoiceLink trunk registration password into a LiveKit
+  **inbound** trunk's auth fields. A live Oracle trace showed the INVITE
+  reaching LiveKit, matching the trunk, then stopping at LiveKit's 407
+  because VoiceLink sent no `Proxy-Authorization`. Inbound sync clears
+  those legacy auth fields and applies the panel's source-IP allowlist.
 - Wallet-bypass semantics must be confirmed with VoiceLink before enabling
   that panel switch.
 

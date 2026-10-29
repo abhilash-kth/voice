@@ -441,6 +441,7 @@ export interface TelephonySettings {
   voicelink_tech_prefix: string;
   voicelink_transport_type: number;
   voicelink_audio_formats: string[];
+  voicelink_inbound_allowed_addresses: string[];
   voicelink_wallet_bypass: boolean;
   voicelink_kyc_terms_url: string;
   voicelink_kyc_redirect_hosts: string[];
@@ -468,6 +469,7 @@ export interface TelephonySettingsPatch {
   voicelink_tech_prefix?: string;
   voicelink_transport_type?: number;
   voicelink_audio_formats?: string[];
+  voicelink_inbound_allowed_addresses?: string[];
   voicelink_wallet_bypass?: boolean;
   voicelink_kyc_terms_url?: string;
   voicelink_kyc_redirect_hosts?: string[];

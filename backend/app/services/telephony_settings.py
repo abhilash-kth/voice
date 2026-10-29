@@ -18,6 +18,7 @@ voice worker must use the same LiveKit server credentials).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
@@ -61,6 +62,7 @@ class TelephonySettings:
     voicelink_transport_type: int = 1
     voicelink_audio_formats: list[str] = field(
         default_factory=lambda: ["alaw", "ulaw"])
+    voicelink_inbound_allowed_addresses: list[str] = field(default_factory=list)
     voicelink_wallet_bypass: bool = False
     voicelink_kyc_terms_url: str = ""
     voicelink_kyc_redirect_hosts: list[str] = field(default_factory=list)
@@ -190,6 +192,35 @@ def _clean_hosts(values: Any, label: str) -> list[str]:
     return out
 
 
+def _clean_ip_networks(values: Any, label: str) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = values.split(",")
+    if not isinstance(values, (list, tuple, set)):
+        raise TelephonyError(
+            f"{label} must contain IP addresses or CIDR ranges only.", 400)
+    raw_values = [str(value or "").strip() for value in values]
+    raw_values = [value for value in raw_values if value]
+    if len(raw_values) > 50:
+        raise TelephonyError(f"{label} may contain at most 50 entries.", 400)
+    out: list[str] = []
+    for value in raw_values:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            raise TelephonyError(
+                f"{label} must contain IP addresses or CIDR ranges only.",
+                400) from None
+        if network.prefixlen == 0:
+            raise TelephonyError(
+                f"{label} must not allow every source address.", 400)
+        normalized = str(network)
+        if normalized not in out:
+            out.append(normalized)
+    return out
+
+
 def _clean_audio_formats(values: Any) -> list[str]:
     if isinstance(values, str):
         values = values.split(",")
@@ -253,6 +284,10 @@ def env_fallback_settings() -> TelephonySettings:
         voicelink_audio_formats=_safe(
             _clean_audio_formats, list(config.VOICELINK_AUDIO_FORMATS or []),
             ["alaw", "ulaw"]),
+        voicelink_inbound_allowed_addresses=_safe(
+            lambda v: _clean_ip_networks(
+                v, "VoiceLink inbound source address"),
+            list(config.VOICELINK_INBOUND_ALLOWED_ADDRESSES or []), []),
         voicelink_wallet_bypass=bool(config.VOICELINK_WALLET_BYPASS),
         voicelink_kyc_terms_url=_safe(
             _clean_terms_url, config.VOICELINK_KYC_TERMS_URL, ""),
@@ -323,6 +358,10 @@ def _settings_from_record(record: dict) -> TelephonySettings:
             _clean_audio_formats,
             record.get("voicelink_audio_formats") or "alaw,ulaw",
             ["alaw", "ulaw"]),
+        voicelink_inbound_allowed_addresses=_safe(
+            lambda v: _clean_ip_networks(
+                v, "VoiceLink inbound source address"),
+            record.get("voicelink_inbound_allowed_addresses") or "", []),
         voicelink_wallet_bypass=bool(record.get("voicelink_wallet_bypass")),
         voicelink_kyc_terms_url=_safe(
             _clean_terms_url, record.get("voicelink_kyc_terms_url"), ""),
@@ -375,6 +414,8 @@ def _record_from_settings(settings: TelephonySettings) -> dict:
         "voicelink_tech_prefix": settings.voicelink_tech_prefix,
         "voicelink_transport_type": settings.voicelink_transport_type,
         "voicelink_audio_formats": ",".join(settings.voicelink_audio_formats),
+        "voicelink_inbound_allowed_addresses": ",".join(
+            settings.voicelink_inbound_allowed_addresses),
         "voicelink_wallet_bypass": settings.voicelink_wallet_bypass,
         "voicelink_kyc_terms_url": settings.voicelink_kyc_terms_url,
         "voicelink_kyc_redirect_hosts": ",".join(
@@ -412,6 +453,8 @@ def public_view(settings: TelephonySettings) -> dict:
         "voicelink_tech_prefix": settings.voicelink_tech_prefix,
         "voicelink_transport_type": settings.voicelink_transport_type,
         "voicelink_audio_formats": list(settings.voicelink_audio_formats),
+        "voicelink_inbound_allowed_addresses": list(
+            settings.voicelink_inbound_allowed_addresses),
         "voicelink_wallet_bypass": settings.voicelink_wallet_bypass,
         "voicelink_kyc_terms_url": settings.voicelink_kyc_terms_url,
         "voicelink_kyc_redirect_hosts": list(
@@ -581,6 +624,11 @@ def _normalize_patch(patch: dict) -> dict:
     if "voicelink_audio_formats" in patch:
         out["voicelink_audio_formats"] = ",".join(
             _clean_audio_formats(patch.get("voicelink_audio_formats")))
+    if "voicelink_inbound_allowed_addresses" in patch:
+        out["voicelink_inbound_allowed_addresses"] = ",".join(
+            _clean_ip_networks(
+                patch.get("voicelink_inbound_allowed_addresses"),
+                "VoiceLink inbound source address"))
     if "voicelink_wallet_bypass" in patch:
         out["voicelink_wallet_bypass"] = bool(patch["voicelink_wallet_bypass"])
     if "voicelink_kyc_terms_url" in patch:

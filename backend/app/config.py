@@ -146,6 +146,11 @@ VOICELINK_TRANSPORT_TYPE = _env_int("VOICELINK_TRANSPORT_TYPE", 1)  # 1=UDP
 VOICELINK_AUDIO_FORMATS = [
     f.strip() for f in os.getenv("VOICELINK_AUDIO_FORMATS", "alaw,ulaw").split(",") if f.strip()
 ]
+VOICELINK_INBOUND_ALLOWED_ADDRESSES = [
+    value.strip()
+    for value in os.getenv("VOICELINK_INBOUND_ALLOWED_ADDRESSES", "").split(",")
+    if value.strip()
+]
 VOICELINK_WALLET_BYPASS = _env_int("VOICELINK_WALLET_BYPASS", 0)
 VOICELINK_KYC_TERMS_URL = os.getenv("VOICELINK_KYC_TERMS_URL", "")
 VOICELINK_KYC_REDIRECT_HOSTS = [

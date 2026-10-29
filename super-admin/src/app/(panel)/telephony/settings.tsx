@@ -40,6 +40,7 @@ interface FormState {
   voicelink_tech_prefix: string;
   voicelink_transport_type: string;
   voicelink_audio_formats: string;
+  voicelink_inbound_allowed_addresses: string;
   voicelink_wallet_bypass: boolean;
   voicelink_kyc_terms_url: string;
   voicelink_kyc_redirect_hosts: string;
@@ -68,6 +69,8 @@ function toForm(settings: TelephonySettings): FormState {
     voicelink_tech_prefix: settings.voicelink_tech_prefix,
     voicelink_transport_type: String(settings.voicelink_transport_type),
     voicelink_audio_formats: settings.voicelink_audio_formats.join(","),
+    voicelink_inbound_allowed_addresses:
+      settings.voicelink_inbound_allowed_addresses.join(","),
     voicelink_wallet_bypass: settings.voicelink_wallet_bypass,
     voicelink_kyc_terms_url: settings.voicelink_kyc_terms_url,
     voicelink_kyc_redirect_hosts:
@@ -243,6 +246,9 @@ export function TelephonySettingsForm({
       voicelink_tech_prefix: form.voicelink_tech_prefix.trim(),
       voicelink_transport_type: transport,
       voicelink_audio_formats: splitCsv(form.voicelink_audio_formats),
+      voicelink_inbound_allowed_addresses: splitCsv(
+        form.voicelink_inbound_allowed_addresses,
+      ),
       voicelink_wallet_bypass: form.voicelink_wallet_bypass,
       voicelink_kyc_terms_url: form.voicelink_kyc_terms_url.trim(),
       voicelink_kyc_redirect_hosts: splitCsv(
@@ -470,6 +476,12 @@ export function TelephonySettingsForm({
             min: 1,
             max: 65535,
           })}
+          {textField(
+            "VoiceLink inbound source IPs/CIDRs",
+            "voicelink_inbound_allowed_addresses",
+            { placeholder: "160.30.71.113/32" },
+            "Comma-separated. VoiceLink does not answer LiveKit's inbound 407 digest challenge, so purchased-number inbound trunks use no SIP password and should be restricted to VoiceLink signalling sources. Ask VoiceLink for the full range; after changing this, click Sync inbound on each active number.",
+          )}
           {textField("Default fallback LiveKit trunk ID", "default_sip_trunk_id", {
             placeholder: "ST_… (optional)",
           }, "Only for legacy agents without an assigned purchased number.")}

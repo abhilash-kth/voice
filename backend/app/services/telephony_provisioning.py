@@ -446,7 +446,9 @@ async def provision_number(phone_id: str,
         try:
             inbound_id = await lk_trunks.ensure_inbound_trunk(
                 name=f"voicelink-in-{_short(phone_id)}",
-                number=phone["number"], username=username, password=password)
+                number=phone["number"],
+                allowed_addresses=(
+                    settings.voicelink_inbound_allowed_addresses))
             await repo.update_phone_number(phone_id, {
                 "livekit_inbound_trunk_id": inbound_id})
         except Exception as e:
@@ -504,21 +506,26 @@ async def sync_inbound_dispatch(phone_id: str,
             "inbound routing starts after activation.", 409)
 
     target = targets[0]
-    inbound_trunk = phone.get("livekit_inbound_trunk_id") or ""
-    if not inbound_trunk:
-        if phone["source"] != "voicelink":
-            raise TelephonyError(
-                "This manual number has no LiveKit inbound trunk configured.", 400)
-        username, password = await _ensure_credentials(phone)
+    stored_inbound_trunk = phone.get("livekit_inbound_trunk_id") or ""
+    inbound_trunk = stored_inbound_trunk
+    if phone["source"] == "voicelink":
+        # Always reconcile purchased-number trunks: an older trunk may
+        # still carry inbound digest auth, which VoiceLink never answers.
+        settings = await telephony_settings.get_settings()
         inbound_trunk = await lk_trunks.ensure_inbound_trunk(
             name=f"voicelink-in-{_short(phone_id)}", number=phone["number"],
-            username=username, password=password)
-        await repo.update_phone_number(
-            phone_id, {"livekit_inbound_trunk_id": inbound_trunk})
+            allowed_addresses=settings.voicelink_inbound_allowed_addresses)
+        if inbound_trunk != stored_inbound_trunk:
+            await repo.update_phone_number(
+                phone_id, {"livekit_inbound_trunk_id": inbound_trunk})
+    elif not inbound_trunk:
+        raise TelephonyError(
+            "This manual number has no LiveKit inbound trunk configured.", 400)
 
     desired_name = f"voicelink-in-{_short(phone_id)}"
     if phone.get("livekit_dispatch_rule_id") \
-            and phone.get("inbound_agent_id") == target["id"]:
+            and phone.get("inbound_agent_id") == target["id"] \
+            and inbound_trunk == stored_inbound_trunk:
         try:
             live = {str(getattr(r, "sip_dispatch_rule_id", "") or "")
                     for r in await lk_trunks.list_dispatch_rules()}

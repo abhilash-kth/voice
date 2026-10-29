@@ -457,6 +457,8 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
         "voicelink_tech_prefix": "45454",
         "voicelink_transport_type": 1,
         "voicelink_audio_formats": "alaw,ulaw",
+        "voicelink_inbound_allowed_addresses": (
+            "203.0.113.10,198.51.100.0/24"),
         "voicelink_wallet_bypass": True,
         "voicelink_kyc_terms_url": "",
         "voicelink_kyc_redirect_hosts": "id.example.com",
@@ -472,6 +474,8 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
     assert settings.voicelink_password == "vl-password-9876"
     assert settings.voicelink_shared_trunk_password == "shared-trunk-secret"
     assert settings.livekit_sip_host == "c{client_id}.sip.example.com"
+    assert settings.voicelink_inbound_allowed_addresses == [
+        "203.0.113.10/32", "198.51.100.0/24"]
     assert settings_svc.resolve_livekit_sip_host(
         settings.livekit_sip_host, "42") == "c42.sip.example.com"
     view = settings_svc.public_view(settings)
@@ -499,6 +503,8 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
         "voicelink_shared_trunk_username": "shared-user",
         "voicelink_shared_trunk_password": "shared-secret-8765",
         "voicelink_audio_formats": ["ALAW", "ulaw", "alaw"],
+        "voicelink_inbound_allowed_addresses": [
+            "203.0.113.10", "198.51.100.37/24", "203.0.113.10/32"],
         "voicelink_kyc_redirect_hosts": ["ID.Example.COM"],
         "livekit_sip_host": "SIP.Example.com",
     })
@@ -511,6 +517,8 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
     assert "rotated-token-4321" not in repr(patch)
     assert "shared-secret-8765" not in repr(patch)
     assert patch["voicelink_audio_formats"] == "alaw,ulaw"
+    assert patch["voicelink_inbound_allowed_addresses"] == (
+        "203.0.113.10/32,198.51.100.0/24")
     assert patch["voicelink_kyc_redirect_hosts"] == "id.example.com"
     assert patch["livekit_sip_host"] == "sip.example.com"
 
@@ -532,6 +540,12 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
     with pytest.raises(policy.TelephonyError):
         settings_svc._normalize_patch({
             "livekit_sip_host": "https://sip.example.com:5060"})
+    with pytest.raises(policy.TelephonyError):
+        settings_svc._normalize_patch({
+            "voicelink_inbound_allowed_addresses": ["0.0.0.0/0"]})
+    with pytest.raises(policy.TelephonyError):
+        settings_svc._normalize_patch({
+            "voicelink_inbound_allowed_addresses": ["sip.example.com"]})
 
     cleared = settings_svc._normalize_patch({
         "clear_voicelink_api_token": True,
@@ -539,6 +553,30 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
     })
     assert cleared["voicelink_api_token_enc"] == ""
     assert cleared["voicelink_api_token_masked"] == ""
+
+
+def test_inbound_trunk_reconciliation_clears_voicelink_digest_auth():
+    from types import SimpleNamespace
+
+    from app.telephony import trunks
+
+    legacy = SimpleNamespace(
+        numbers=["+919876543210"], allowed_addresses=[],
+        auth_username="trunk_example", auth_password="must-be-cleared")
+    assert trunks._inbound_reconcile_update(
+        legacy, "+919876543210", ["203.0.113.10/32"]) == {
+            "numbers": ["+919876543210", "919876543210"],
+            "allowed_addresses": ["203.0.113.10/32"],
+            "auth_username": "",
+            "auth_password": "",
+        }
+
+    reconciled = SimpleNamespace(
+        numbers=["+919876543210", "919876543210"],
+        allowed_addresses=["203.0.113.10/32"],
+        auth_username="", auth_password="")
+    assert trunks._inbound_reconcile_update(
+        reconciled, "+919876543210", ["203.0.113.10/32"]) is None
 
 
 async def _active_phone(user_id: str) -> dict:

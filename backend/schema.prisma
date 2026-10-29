@@ -311,6 +311,7 @@ model TelephonyConfig {
   voicelinkTechPrefix        String  @default("45454")
   voicelinkTransportType     Int     @default(1)
   voicelinkAudioFormats      String  @default("alaw,ulaw")
+  voicelinkInboundAllowedAddresses String @default("")
   voicelinkWalletBypass      Boolean @default(false)
   voicelinkKycTermsUrl       String  @default("")
   voicelinkKycRedirectHosts  String  @default("")

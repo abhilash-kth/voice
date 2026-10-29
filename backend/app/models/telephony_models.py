@@ -140,6 +140,8 @@ class TelephonySettingsBody(BaseModel):
     voicelink_tech_prefix: Optional[str] = Field(default=None, max_length=20)
     voicelink_transport_type: Optional[int] = Field(default=None, ge=1, le=10)
     voicelink_audio_formats: Optional[list[str]] = Field(default=None, max_length=10)
+    voicelink_inbound_allowed_addresses: Optional[list[str]] = Field(
+        default=None, max_length=50)
     voicelink_wallet_bypass: Optional[bool] = None
     voicelink_kyc_terms_url: Optional[str] = Field(default=None, max_length=1000)
     voicelink_kyc_redirect_hosts: Optional[list[str]] = Field(default=None, max_length=20)

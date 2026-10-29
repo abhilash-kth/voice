@@ -359,6 +359,8 @@ _CONFIG_FIELDS = {
     "voicelink_tech_prefix": "voicelinkTechPrefix",
     "voicelink_transport_type": "voicelinkTransportType",
     "voicelink_audio_formats": "voicelinkAudioFormats",
+    "voicelink_inbound_allowed_addresses": (
+        "voicelinkInboundAllowedAddresses"),
     "voicelink_wallet_bypass": "voicelinkWalletBypass",
     "voicelink_kyc_terms_url": "voicelinkKycTermsUrl",
     "voicelink_kyc_redirect_hosts": "voicelinkKycRedirectHosts",
@@ -389,6 +391,8 @@ def _config_dict(c, *, include_secrets: bool = False) -> Optional[dict]:
         "voicelink_tech_prefix": c.voicelinkTechPrefix or "",
         "voicelink_transport_type": int(c.voicelinkTransportType or 1),
         "voicelink_audio_formats": c.voicelinkAudioFormats or "alaw,ulaw",
+        "voicelink_inbound_allowed_addresses": (
+            c.voicelinkInboundAllowedAddresses or ""),
         "voicelink_wallet_bypass": bool(c.voicelinkWalletBypass),
         "voicelink_kyc_terms_url": c.voicelinkKycTermsUrl or "",
         "voicelink_kyc_redirect_hosts": c.voicelinkKycRedirectHosts or "",
