@@ -245,7 +245,7 @@ async def sync_account(account: dict) -> dict:
     }
     account = await repo.update_account(account["id"], patch) or account
     try:
-        await sync_kyc(account)
+        await sync_kyc(account, row)
         account = await repo.get_account(account["id"]) or account
     except Exception as e:
         await repo.update_account(account["id"], {"last_error": str(e)[:500]})
@@ -272,9 +272,64 @@ def terms_url(raw_url: Optional[str] = None) -> str:
     return raw
 
 
-def kyc_state(raw: dict, settings=None) -> dict:
+def _provider_flag(value) -> bool:
+    """Normalize VoiceLink/Laravel boolean-ish status scalars.
+
+    The provider's mocked/documented shape uses JSON booleans and numeric
+    status 1, but live Laravel serializers also commonly expose 1/"1" or
+    status words. Accept only explicit positive values; unknown/free-text
+    values stay false so the purchase gate remains fail-closed.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "1", "true", "yes", "verified", "complete", "completed",
+            "approved", "success",
+        }
+    return False
+
+
+def _provider_status_text(value) -> str:
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return re.sub(r"[\s-]+", "_", str(value).strip().lower())
+
+
+def _kyc_verified_signal(record: dict) -> bool:
+    """Return an explicit provider KYC-verified signal from a record.
+
+    VoiceLink's reseller dashboard displays its KYC badge from the client
+    record, while the separate KYC-status endpoint can lag or use a
+    different completion representation. Check KYC-specific fields (and
+    the user record's ``is_verified`` flag) in the status response and in
+    the exact client row already fetched by account sync. Callers still
+    require the relevant identity-document flags before unlocking buying.
+    """
+    if not isinstance(record, dict):
+        return False
+    for key in (
+            "is_verified", "verified", "kyc_verified", "is_kyc_verified",
+            "kyc_is_verified"):
+        if _provider_flag(record.get(key)):
+            return True
+    for key in (
+            "kyc_status", "kyc_state", "kyc_verification_status",
+            "verification_status", "kyc_status_label"):
+        if _provider_flag(record.get(key)):
+            return True
+    for key in ("kyc", "kyc_verification", "verification", "kyc_details"):
+        nested = record.get(key)
+        if isinstance(nested, dict) and _kyc_verified_signal(nested):
+            return True
+    return False
+
+
+def kyc_state(raw: dict, settings=None, client_row: Optional[dict] = None) -> dict:
     effective = settings or telephony_settings.env_fallback_settings()
-    account_type = raw.get("account_type")
+    account_type = _provider_status_text(raw.get("account_type"))
     if account_type not in ("individual", "business"):
         account_type = "individual"
     business = account_type == "business"
@@ -282,24 +337,58 @@ def kyc_state(raw: dict, settings=None) -> dict:
 
     def doc(kind: str) -> dict:
         d = docs.get(kind) if isinstance(docs.get(kind), dict) else {}
-        return {"verified": raw.get(f"{kind}_verified") is True,
-                "uploaded": d.get("uploaded") is True}
+        status_text = _provider_status_text(d.get("status"))
+        verified = (
+            _provider_flag(raw.get(f"{kind}_verified"))
+            or _provider_flag(raw.get(f"{kind}_status"))
+            or _provider_flag(d.get("verified"))
+            or _provider_flag(d.get("is_verified"))
+            or _provider_flag(d.get("status")))
+        uploaded = (
+            any(_provider_flag(d.get(key)) for key in
+                ("uploaded", "is_uploaded", "has_document"))
+            or status_text in {
+                "uploaded", "received", "verified", "complete",
+                "completed", "approved", "success"}
+            or any(isinstance(d.get(key), str) and bool(d.get(key).strip())
+                   for key in ("url", "path", "file", "file_name",
+                               "document_url")))
+        return {"verified": verified, "uploaded": uploaded}
 
     documents = {"pan": doc("pan"), "aadhaar": doc("aadhaar")}
     if business:
         documents["gst"] = doc("gst")
-    provider_complete = raw.get("is_complete") is True
-    verified = (
-        provider_complete and raw.get("kyc_status") == 1
-        and raw.get("current_step") == "complete"
-        and documents["pan"]["verified"] and documents["aadhaar"]["verified"]
-        and (not business or documents["gst"]["verified"]))
-    step = str(raw.get("current_step") or "register")
-    if step not in ("register", "pan", "aadhaar", "gst", "complete"):
+    documents_verified = all(d["verified"] for d in documents.values())
+
+    step_text = _provider_status_text(raw.get("current_step") or "register")
+    if step_text in {"completed", "verified", "approved", "final", "done"}:
+        step = "complete"
+    elif step_text in ("register", "pan", "aadhaar", "gst", "complete"):
+        step = step_text
+    else:
         step = "register"
+
+    provider_complete = _provider_flag(raw.get("is_complete"))
+    endpoint_verified = (
+        provider_complete and _provider_flag(raw.get("kyc_status"))
+        and step == "complete" and documents_verified)
+    # The provider portal's client list is the operator-visible authority
+    # for its KYC badge. If that exact client record says KYC is verified
+    # and the status endpoint corroborates the required documents, do not
+    # keep the customer locked out merely because the endpoint encodes its
+    # final step/status differently.
+    explicit_verified = documents_verified and (
+        _kyc_verified_signal(raw)
+        or _kyc_verified_signal(client_row or {}))
+    verified = endpoint_verified or explicit_verified
+    if verified:
+        provider_complete = True
+        step = "complete"
+
     any_progress = any(d["verified"] or d["uploaded"]
                        for d in documents.values()) or step != "register"
-    ready = raw.get("agreement_reacceptance_required") is not True and all(
+    ready = not _provider_flag(
+        raw.get("agreement_reacceptance_required")) and all(
         d["verified"] and d["uploaded"] for d in documents.values())
     if verified:
         status = "verified"
@@ -322,14 +411,15 @@ def kyc_state(raw: dict, settings=None) -> dict:
         "documents": documents, "ready_for_submission": ready,
         "provider_complete": provider_complete,
         "agreement_needs_acceptance":
-            raw.get("agreement_reacceptance_required") is True,
+            _provider_flag(raw.get("agreement_reacceptance_required")),
         "final_submission_available":
             bool(effective.kyc_finalize_verified),
         "terms_url": terms_url(effective.voicelink_kyc_terms_url),
     }
 
 
-def _safe_kyc_completion_shape(raw: dict, state: dict) -> str:
+def _safe_kyc_completion_shape(raw: dict, state: dict,
+                               client_row: Optional[dict] = None) -> str:
     """Describe only provider completion flags/field names for diagnostics.
 
     This is written to the operator's backend log when every document we
@@ -348,8 +438,8 @@ def _safe_kyc_completion_shape(raw: dict, state: dict) -> str:
         return type(value).__name__
 
     known = (
-        "is_complete", "kyc_status", "current_step",
-        "pan_verified", "aadhaar_verified", "gst_verified",
+        "is_complete", "kyc_status", "current_step", "is_verified",
+        "kyc_verified", "pan_verified", "aadhaar_verified", "gst_verified",
         "agreement_reacceptance_required",
     )
     fields = {key: scalar(raw.get(key)) for key in known if key in raw}
@@ -372,19 +462,59 @@ def _safe_kyc_completion_shape(raw: dict, state: dict) -> str:
     docs = raw.get("documents") if isinstance(raw.get("documents"), dict) else {}
     document_keys = [str(key) for key in docs
                      if re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", str(key))][:15]
+
+    client_fields: dict[str, object] = {}
+    client_nested_keys: list[str] = []
+    if isinstance(client_row, dict):
+        for key, value in client_row.items():
+            name = str(key)
+            lower = name.lower()
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", name):
+                continue
+            if "kyc" not in lower and "verif" not in lower:
+                continue
+            if isinstance(value, dict):
+                client_fields[name] = {
+                    str(nested_key): scalar(nested_value)
+                    for nested_key, nested_value in value.items()
+                    if re.fullmatch(
+                        r"[A-Za-z0-9_.-]{1,60}", str(nested_key))
+                    and any(token in str(nested_key).lower() for token in
+                            ("kyc", "verif", "status", "complete"))}
+                client_nested_keys.extend(
+                    str(nested_key) for nested_key in value
+                    if re.fullmatch(
+                        r"[A-Za-z0-9_.-]{1,60}", str(nested_key)))
+            else:
+                client_fields[name] = scalar(value)
     return (f"fields={fields} documents={state.get('documents')} "
             f"document_keys={document_keys} related_fields={related_fields} "
-            f"related_keys={sorted(related_names)[:15]}")
+            f"related_keys={sorted(related_names)[:15]} "
+            f"client_fields={client_fields} "
+            f"client_nested_keys={sorted(set(client_nested_keys))[:15]}")
 
 
-async def sync_kyc(account: dict) -> dict:
+async def sync_kyc(account: dict,
+                   client_row: Optional[dict] = None) -> dict:
     settings = await telephony_settings.get_settings()
+    if client_row is None:
+        try:
+            client_row = next(
+                (c for c in await vl.clients()
+                 if vl.id_of(c, "id", "client_id") == str(account["client_id"])),
+                None)
+        except Exception:
+            # The KYC-status endpoint remains usable on its own; account
+            # sync will surface a broader client-list failure separately.
+            client_row = None
     raw = await vl.kyc_status(account["client_id"])
-    state = kyc_state(raw, settings)
-    if state["ready_for_submission"] and state["status"] != "verified":
+    state = kyc_state(raw, settings, client_row)
+    if state["status"] != "verified" and (
+            state["ready_for_submission"]
+            or _kyc_verified_signal(client_row or {})):
         logger.warning(
             "VoiceLink KYC ready but not provider-verified: %s",
-            _safe_kyc_completion_shape(raw, state))
+            _safe_kyc_completion_shape(raw, state, client_row))
     await repo.update_account(account["id"], {
         "kyc_status": state["status"], "kyc_step": state["step"],
         "kyc_meta": {k: state[k] for k in

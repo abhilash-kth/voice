@@ -175,9 +175,37 @@ def test_kyc_state_distinguishes_ready_submitted_and_verified():
         "current_step": "complete"}, settings)
     assert verified["status"] == "verified"
 
-    shape = _safe_kyc_completion_shape(raw, ready)
+    # Laravel serializers may encode the same final state as ints/strings
+    # rather than JSON booleans and the literal step "complete".
+    scalar_verified = kyc_state({
+        **raw, "is_complete": 1, "kyc_status": "verified",
+        "current_step": "completed", "pan_verified": 1,
+        "aadhaar_verified": "true", "documents": {
+            "pan": {"uploaded": 1}, "aadhaar": {"uploaded": "1"}}},
+        settings)
+    assert scalar_verified["status"] == "verified"
+    assert scalar_verified["step"] == "complete"
+
+    # Live regression from the VoiceLink reseller dashboard: its client
+    # record showed KYC Verified while the customer's dashboard stayed
+    # locked. An explicit verified signal on that exact client row is
+    # authoritative when the status endpoint corroborates both documents.
+    client_verified = kyc_state(
+        raw, settings,
+        {"is_verified": 1, "email": "customer@example.test",
+         "username": "private-username"})
+    assert client_verified["status"] == "verified"
+    assert client_verified["provider_complete"] is True
+    assert client_verified["step"] == "complete"
+
+    shape = _safe_kyc_completion_shape(
+        raw, ready,
+        {"is_verified": 0, "kyc_status": "pending",
+         "email": "customer@example.test", "username": "private-username"})
     assert "is_complete" in shape and "live_photo_verified" in shape
+    assert "is_verified" in shape and "kyc_status" in shape
     assert "customer@example.test" not in shape
+    assert "private-username" not in shape
     assert "Fixture Person" not in shape
 
 
