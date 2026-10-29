@@ -17,6 +17,7 @@ import Pager from "@/components/Pager";
 import { StateBox } from "@/components/StateBox";
 import {
   allocateTelephonyWallet,
+  deleteManualTelephonyNumber,
   getTelephonyAccount,
   getTelephonyOverview,
   getTelephonySettings,
@@ -28,6 +29,8 @@ import {
   setTelephonyNumberStatus,
   syncTelephonyAccount,
   syncTelephonyInbound,
+  updateManualTelephonyNumber,
+  type ManualNumberUpdateBody,
   type Paged,
   type TelephonyAccount,
   type TelephonyAccountDetail,
@@ -42,6 +45,7 @@ import { cn } from "@/lib/utils";
 import {
   AccountDetailPanel,
   AccountsTable,
+  ManualNumberEditForm,
   ManualNumberForm,
   NumbersTable,
   OverviewPanel,
@@ -82,6 +86,8 @@ export default function TelephonyPage() {
   const [purchases, setPurchases] =
     useState<Paged<TelephonyPurchase>>(emptyPage);
   const [detail, setDetail] = useState<TelephonyAccountDetail | null>(null);
+  const [editingNumber, setEditingNumber] =
+    useState<TelephonyNumber | null>(null);
   const [page, setPage] = useState(1);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
@@ -150,6 +156,7 @@ export default function TelephonyPage() {
     setPage(1);
     setStatus("");
     setDetail(null);
+    setEditingNumber(null);
   };
 
   const run = async (
@@ -382,6 +389,20 @@ export default function TelephonyPage() {
           </div>
         ) : tab === "numbers" ? (
           <div className="space-y-4">
+            {editingNumber && (
+              <ManualNumberEditForm
+                key={`${editingNumber.id}:${editingNumber.updated_at}`}
+                row={editingNumber}
+                busy={busy === editingNumber.id}
+                onCancel={() => setEditingNumber(null)}
+                onSave={(row, patch: ManualNumberUpdateBody) =>
+                  void run(row.id, `Manual number ${row.number} updated.`, async () => {
+                    await updateManualTelephonyNumber(row.id, patch);
+                    setEditingNumber(null);
+                  })
+                }
+              />
+            )}
             <NumbersTable
               rows={numbers.items}
               busy={busy}
@@ -404,6 +425,28 @@ export default function TelephonyPage() {
                 ) {
                   void run(row.id, `Number ${next}.`, () =>
                     setTelephonyNumberStatus(row.id, next),
+                  );
+                }
+              }}
+              onEdit={(row) => setEditingNumber(row)}
+              onDelete={(row) => {
+                const assigned = row.agents?.length
+                  ? ` ${row.agents.length} assigned agent(s) will be unassigned.`
+                  : "";
+                if (
+                  window.confirm(
+                    `Delete manual number ${row.number}? This removes its local routing record and inbound dispatch rule, but does not delete the carrier DID or shared LiveKit trunks.${assigned}`,
+                  )
+                ) {
+                  void run(
+                    row.id,
+                    `Manual number ${row.number} deleted.`,
+                    async () => {
+                      await deleteManualTelephonyNumber(row.id);
+                      if (editingNumber?.id === row.id) {
+                        setEditingNumber(null);
+                      }
+                    },
                   );
                 }
               }}

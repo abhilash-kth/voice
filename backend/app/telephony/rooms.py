@@ -153,15 +153,56 @@ async def end_active_room(room_name: str) -> bool:
         except Exception:
             pass
 
-async def room_agent_joined(room_name: str) -> Optional[bool]:
-    """True when a LiveKit **agent** participant is actually inside the room.
+def _participant_kind_value(participant: Any) -> Optional[int]:
+    kind = getattr(participant, "kind", None)
+    try:
+        return int(kind)
+    except Exception:
+        text = str(kind or "").lower()
+        if "agent" in text:
+            return 4
+        if "sip" in text:
+            return 3
+        if "egress" in text:
+            return 2
+        if "ingress" in text:
+            return 1
+        if "standard" in text:
+            return 0
+        return None
 
-    Room creation + agent dispatch succeeding only means the server ACCEPTED the
-    dispatch — a worker still has to pick the job up and join. This probe is how
-    the API learns that the dispatch realistically failed (worker stopped, busy,
-    or a stale second worker window eating jobs), instead of letting the caller
-    sit in a silent room. Returns None when LiveKit is unreachable, so callers
-    can treat "unknown" differently from a definitive miss.
+
+def _is_agent_participant(participant: Any) -> bool:
+    if _participant_kind_value(participant) == 4:
+        return True
+    identity = (getattr(participant, "identity", "") or "").lower()
+    return identity.startswith("agent")
+
+
+def _is_caller_participant(participant: Any) -> bool:
+    """True for the human side of a room (browser or SIP), not infrastructure."""
+    if _is_agent_participant(participant):
+        return False
+    kind = _participant_kind_value(participant)
+    if kind in (0, 3):  # STANDARD browser participant or SIP participant
+        return True
+    if kind in (1, 2, 4):  # ingress / egress / agent
+        return False
+    identity = (getattr(participant, "identity", "") or "").lower()
+    if identity.startswith(("eg_", "ingress", "egress")):
+        return False
+    return identity.startswith(("phone-", "sip", "caller-"))
+
+
+async def room_caller_state(room_name: str) -> Optional[dict]:
+    """Inspect who is currently in a room.
+
+    Returns None when LiveKit cannot be reached / the answer is unknown.
+    A definitive room-not-found answer is returned as an empty state because,
+    for a dispatched SIP call, that means the phone participant and room are
+    gone. `has_caller` is the management-plane signal used to notice that a
+    phone-side hangup happened even if the worker has not finalized the DB
+    row yet.
     """
     if not room_name:
         return None
@@ -177,28 +218,50 @@ async def room_agent_joined(room_name: str) -> Optional[bool]:
             timeout=6.0,
             op="ListParticipants",
         )
-        Kind = getattr(api.ParticipantInfo, "Kind", None)
-        agent_enum = getattr(Kind, "AGENT", None) if Kind else None
-        for p in getattr(resp, "participants", []) or []:
-            kind = getattr(p, "kind", None)
-            if agent_enum is not None and kind == agent_enum:
-                return True
-            try:  # protobuf open enums are ints in some SDK releases (AGENT=4)
-                if int(kind) == 4:
-                    return True
-            except Exception:
-                pass
-            if "agent" in str(kind).lower():
-                return True
-            # defensive fallback for SDKs that do not expose ParticipantInfo.Kind
-            ident = (getattr(p, "identity", "") or "").lower()
-            if ident.startswith("agent"):
-                return True
-        return False
-    except Exception:
+        participants = list(getattr(resp, "participants", []) or [])
+        return {
+            "exists": True,
+            "participant_count": len(participants),
+            "has_agent": any(_is_agent_participant(p) for p in participants),
+            "has_caller": any(_is_caller_participant(p) for p in participants),
+            "identities": [
+                str(getattr(p, "identity", "") or "") for p in participants
+            ],
+        }
+    except Exception as e:
+        text = (
+            f"{type(e).__name__} {e} {getattr(e, 'code', '')} "
+            f"{getattr(e, 'status', '')}"
+        ).lower()
+        if any(marker in text for marker in (
+                "not found", "not_found", "does not exist", "room not exist",
+                "could not find", " 404")):
+            return {
+                "exists": False,
+                "participant_count": 0,
+                "has_agent": False,
+                "has_caller": False,
+                "identities": [],
+            }
         return None
     finally:
         try:
             await client.aclose()
         except Exception:
             pass
+
+
+async def room_agent_joined(room_name: str) -> Optional[bool]:
+    """True when a LiveKit **agent** participant is actually inside the room.
+
+    Room creation + agent dispatch succeeding only means the server ACCEPTED the
+    dispatch — a worker still has to pick the job up and join. This probe is how
+    the API learns that the dispatch realistically failed (worker stopped, busy,
+    or a stale second worker window eating jobs), instead of letting the caller
+    sit in a silent room. Returns None when LiveKit is unreachable, so callers
+    can treat "unknown" differently from a definitive miss.
+    """
+    state = await room_caller_state(room_name)
+    if state is None:
+        return None
+    return bool(state.get("has_agent"))

@@ -8,6 +8,7 @@ from app import repo
 from app.models import AgentCreate
 from app.models.telephony_models import (
     ManualNumberBody,
+    ManualNumberUpdateBody,
     QuoteBody,
     TelephonySettingsBody,
 )
@@ -65,6 +66,25 @@ def test_destination_and_carrier_dial_normalization():
     assert policy.carrier_dial_number("45454919876543210", "45454") == (
         "45454919876543210"
     )
+
+
+def test_manual_number_update_body_and_effective_concurrency():
+    from app.routes.calls_routes import _effective_concurrency
+
+    body = ManualNumberUpdateBody(channels=2, dial_prefix="45454")
+    assert body.channels == 2
+    with pytest.raises(ValidationError):
+        ManualNumberUpdateBody(channels=0)
+    with pytest.raises(ValidationError):
+        ManualNumberUpdateBody(user_id="another-tenant")
+    with pytest.raises(ValidationError):
+        ManualNumberUpdateBody(sip_password="never-accept-this")
+
+    # The smallest of agent max, plan lines, and DID channels wins.
+    assert _effective_concurrency(5, 2, 3) == 2
+    assert _effective_concurrency(5, 4, 2) == 2
+    assert _effective_concurrency(1, 4, 2) == 1
+    assert _effective_concurrency(3, 4, None) == 3
 
 
 def test_customer_views_hide_provider_ids_trunks_and_sip_secrets():
@@ -268,7 +288,77 @@ async def test_assigned_number_derives_trunk_and_ignores_requested_one(normal_us
         "dial_prefix": "45454",
         "phone_number_id": phone["id"],
         "phone_number": "+919429399159",
+        "phone_channels": 1,
     }
+
+
+async def test_super_admin_can_edit_and_delete_only_manual_numbers(normal_user):
+    from app.services import telephony_provisioning as provisioning
+
+    _, user = normal_user
+    phone = await _active_phone(user["id"])
+    agent = await repo.create_agent(user["id"], {
+        "name": "Manual number owner",
+        "purpose": "outbound",
+        "phone_number_id": phone["id"],
+    })
+
+    updated = await provisioning.update_manual_number(phone["id"], {
+        "channels": 2,
+        "dial_prefix": "45454",
+        "expires_at": "2027-10-31",
+    })
+    assert updated["channels"] == 2
+    assert updated["status"] == "active"
+    assert updated["provisioning_step"] == "manual_ready"
+    assert updated["expires_at"] == "2027-10-31"
+
+    with pytest.raises(policy.TelephonyError):
+        await provisioning.update_manual_number(
+            phone["id"], {"dial_prefix": "45A54"})
+
+    purchased = await repo.create_phone_number({
+        "user_id": user["id"],
+        "number": "+919876543210",
+        "status": "active",
+        "source": "voicelink",
+        "livekit_outbound_trunk_id": "ST_purchased",
+    })
+    with pytest.raises(policy.TelephonyError) as exc:
+        await provisioning.update_manual_number(
+            purchased["id"], {"channels": 2})
+    assert exc.value.status_code == 409
+    with pytest.raises(policy.TelephonyError) as exc:
+        await provisioning.delete_manual_number(purchased["id"])
+    assert exc.value.status_code == 409
+
+    deleted = await provisioning.delete_manual_number(phone["id"])
+    assert deleted["number"] == phone["number"]
+    assert deleted["unassigned_agent_ids"] == [agent["id"]]
+    assert await repo.get_phone_number(phone["id"], user["id"]) is None
+    refreshed_agent = await repo.get_agent(agent["id"], user["id"])
+    assert refreshed_agent["phone_number_id"] is None
+
+
+async def test_manual_number_delete_is_blocked_during_an_active_call(normal_user):
+    from app.services import telephony_provisioning as provisioning
+
+    _, user = normal_user
+    phone = await _active_phone(user["id"])
+    agent = await repo.create_agent(user["id"], {
+        "name": "Busy manual agent",
+        "purpose": "outbound",
+        "phone_number_id": phone["id"],
+    })
+    await repo.create_call({
+        "user_id": user["id"], "agent_id": agent["id"], "mode": "sip",
+        "room": "manual-delete-active", "status": "in-progress",
+    })
+
+    with pytest.raises(policy.TelephonyError) as exc:
+        await provisioning.delete_manual_number(phone["id"])
+    assert exc.value.status_code == 409
+    assert "active call" in str(exc.value)
 
 
 async def test_inbound_only_agent_cannot_resolve_an_outbound_route(normal_user):

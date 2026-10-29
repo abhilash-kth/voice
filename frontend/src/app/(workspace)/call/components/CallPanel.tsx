@@ -5,7 +5,9 @@ import "@livekit/components-styles";
 import { Agent, getCall } from "@/lib/index";
 import CallSetupForm from "@/app/(workspace)/call/components/CallSetupForm";
 import CallStage from "@/app/(workspace)/call/components/CallStage";
-import useCallSession from "../hooks/useCallSession";
+import useCallSession, {
+  sipConcurrencyLimitFor,
+} from "../hooks/useCallSession";
 import useCallSummary from "../hooks/useCallSummary";
 import useAgentSelection from "../hooks/useAgentSelection";
 
@@ -47,6 +49,8 @@ export default function CallPanel({
     setErr,
     setSession,
     activeMode,
+    activeSipCalls,
+    updateActiveSipCall,
     finishSipCall,
     GoStart,
     endCurrentCall,
@@ -62,48 +66,66 @@ export default function CallPanel({
     fetchCallSummaryRef.current = fetchCallSummary;
   }, [fetchCallSummary]);
 
-  const finishedSipCallRef = useRef("");
+  const finishedSipCallsRef = useRef<Set<string>>(new Set());
+  const activeSipIdsKey = activeSipCalls
+    .filter((call) => call.status === "connected")
+    .map((call) => call.id)
+    .sort()
+    .join("|");
 
   // SIP participants are not connected to this browser, so LiveKit disconnect
-  // events cannot tell this page when the phone call ends. Poll the backend
-  // call record and transition to the same summary flow used by browser calls.
+  // events cannot tell this page when a phone call ends. Poll every active
+  // backend call record; GET /api/calls/{id} also reconciles a missing SIP
+  // participant server-side, so a phone-side hangup clears within seconds.
   useEffect(() => {
-    if (
-      activeMode !== "sip" ||
-      !callId ||
-      session ||
-      callState !== "connected"
-    ) {
-      return;
-    }
-
+    if (!activeSipIdsKey) return;
+    const ids = activeSipIdsKey.split("|").filter(Boolean);
     let cancelled = false;
-    const checkSipCall = async () => {
+    let checking = false;
+
+    const checkSipCalls = async () => {
+      if (checking) return;
+      checking = true;
       try {
-        const call = await getCall(callId);
-        if (
-          cancelled ||
-          (call.status !== "completed" && call.status !== "failed") ||
-          finishedSipCallRef.current === callId
-        ) {
-          return;
-        }
-        finishedSipCallRef.current = callId;
-        finishSipCall();
-        await fetchCallSummaryRef.current(callId);
-      } catch {
-        // A temporary backend/network error should not end a live phone call;
-        // the next poll (or the visible End call button) can still reconcile it.
+        await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const call = await getCall(id);
+            if (cancelled) return;
+            updateActiveSipCall(id, {
+              backendStatus: call.status,
+              ...(call.phone ? { phone: call.phone } : {}),
+            });
+            if (
+              (call.status !== "completed" && call.status !== "failed") ||
+              finishedSipCallsRef.current.has(id)
+            ) {
+              return;
+            }
+            finishedSipCallsRef.current.add(id);
+            const remaining = finishSipCall(id);
+            await fetchCallSummaryRef.current(id);
+            if (!cancelled && remaining > 0) {
+              setCallState("connected");
+            }
+          } catch {
+            // A temporary backend/network error should not end a live phone
+            // call; the next poll or per-call End button can reconcile it.
+          }
+        }),
+        );
+      } finally {
+        checking = false;
       }
     };
 
-    void checkSipCall();
-    const timer = window.setInterval(() => void checkSipCall(), 2000);
+    void checkSipCalls();
+    const timer = window.setInterval(() => void checkSipCalls(), 2000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeMode, callId, callState, finishSipCall, session]);
+  }, [activeSipIdsKey, finishSipCall, setCallState, updateActiveSipCall]);
 
   const { agentId, selected, handleAgentSelect } = useAgentSelection({
     agents,
@@ -125,9 +147,21 @@ export default function CallPanel({
     [handleRoomDisconnected, selected, fetchCallSummary],
   );
 
+  const sipConcurrencyLimit = Math.min(
+    sipConcurrencyLimitFor(selected),
+    activeSipCalls[0]?.concurrencyLimit ?? Number.POSITIVE_INFINITY,
+  );
+  const canDialAnother =
+    mode === "sip" &&
+    !session &&
+    activeMode !== "browser" &&
+    activeSipCalls.length < sipConcurrencyLimit;
+
   // function for starting the call
   async function go() {
-    await GoStart({
+    const willHaveAnotherSlot =
+      activeSipCalls.length + 1 < sipConcurrencyLimit;
+    const startedCallId = await GoStart({
       agentId: agentId,
       selectedAgent: selected,
       agentsReady: agentsReady,
@@ -138,11 +172,16 @@ export default function CallPanel({
       setCallEndedMsg,
       onStarted,
     });
+    if (mode === "sip" && startedCallId && willHaveAnotherSlot) {
+      setPhone("");
+    }
   }
 
-  const handleEndCall = () => endCurrentCall(fetchCallSummary);
+  const handleEndCall = (targetCallId?: string) =>
+    endCurrentCall(fetchCallSummary, targetCallId);
 
   const isCallActive =
+    activeSipCalls.length > 0 ||
     activeMode !== null ||
     ((callState === "connecting" ||
       callState === "waiting_for_agent" ||
@@ -169,6 +208,9 @@ export default function CallPanel({
         callState={callState}
         callEndedMsg={callEndedMsg}
         isCallActive={isCallActive}
+        activeSipCalls={activeSipCalls}
+        sipConcurrencyLimit={sipConcurrencyLimit}
+        canDialAnother={canDialAnother}
         session={session}
         callId={callId}
         onStart={go}
@@ -182,6 +224,8 @@ export default function CallPanel({
         mode={activeMode ?? mode}
         selected={selected}
         callId={callId}
+        activeSipCalls={activeSipCalls}
+        sipConcurrencyLimit={sipConcurrencyLimit}
         agentWaitSeconds={agentWaitSeconds}
         isDisconnecting={isDisconnectingRef.current}
         onStateChange={setCallState}

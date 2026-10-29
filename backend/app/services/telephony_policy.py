@@ -141,6 +141,7 @@ async def resolve_outbound(agent: dict, user_id: str,
             "dial_prefix": phone.get("dial_prefix") or "",
             "phone_number_id": phone["id"],
             "phone_number": phone["number"],
+            "phone_channels": max(1, int(phone.get("channels") or 1)),
         }
     from . import telephony_settings
     settings = await telephony_settings.get_settings()
@@ -151,4 +152,5 @@ async def resolve_outbound(agent: dict, user_id: str,
         "dial_prefix": "",
         "phone_number_id": None,
         "phone_number": "",
+        "phone_channels": None,
     }

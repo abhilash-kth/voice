@@ -83,6 +83,24 @@ class ManualNumberBody(BaseModel):
     expires_at: str = Field("", max_length=40)
 
 
+class ManualNumberUpdateBody(BaseModel):
+    """Super Admin: edit a manually registered DID's local routing record.
+
+    Ownership is intentionally immutable here; moving a number between
+    customers must be done by deleting/re-registering it so assignments and
+    provider routing cannot silently cross tenants.
+    """
+    model_config = ConfigDict(extra="forbid")
+    number: Optional[str] = Field(default=None, min_length=3, max_length=20)
+    livekit_outbound_trunk_id: Optional[str] = Field(
+        default=None, max_length=64)
+    livekit_inbound_trunk_id: Optional[str] = Field(
+        default=None, max_length=64)
+    dial_prefix: Optional[str] = Field(default=None, max_length=20)
+    channels: Optional[int] = Field(default=None, ge=1, le=100)
+    expires_at: Optional[str] = Field(default=None, max_length=40)
+
+
 class TelephonySettingsBody(BaseModel):
     """Super Admin telephony settings.
 

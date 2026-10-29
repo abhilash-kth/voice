@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..models.telephony_models import (AllocateWalletBody, ManualNumberBody,
+                                       ManualNumberUpdateBody,
                                        TelephonySettingsBody,
                                        TelephonyStatusBody)
 from ..services import (admin_service, telephony_admin, telephony_provisioning,
@@ -171,6 +172,36 @@ async def create_manual_number(body: ManualNumberBody, admin=ADMIN):
                               target_type="phone_number", target_id=out["id"],
                               detail={"number": out["number"],
                                       "user_id": body.user_id})
+    return out
+
+
+@router.put("/telephony/numbers/{phone_id}/manual")
+async def update_manual_number(phone_id: str, body: ManualNumberUpdateBody,
+                               admin=ADMIN):
+    patch = body.model_dump(exclude_unset=True, exclude_none=True)
+    try:
+        out = await telephony_provisioning.update_manual_number(phone_id, patch)
+    except Exception as e:
+        _raise(e)
+    await admin_service.audit(admin, "telephony_manual_number_updated",
+                              target_type="phone_number", target_id=phone_id,
+                              detail={"number": out["number"], "patch": patch})
+    return out
+
+
+@router.delete("/telephony/numbers/{phone_id}/manual")
+async def delete_manual_number(phone_id: str, admin=ADMIN):
+    try:
+        out = await telephony_provisioning.delete_manual_number(phone_id)
+    except Exception as e:
+        _raise(e)
+    await admin_service.audit(admin, "telephony_manual_number_deleted",
+                              target_type="phone_number", target_id=phone_id,
+                              detail={
+                                  "number": out["number"],
+                                  "unassigned_agent_ids": out[
+                                      "unassigned_agent_ids"],
+                              })
     return out
 
 

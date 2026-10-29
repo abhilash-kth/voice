@@ -13,6 +13,7 @@ import {
   CheckCircle2,
 } from "lucide-react";
 import { Agent } from "@/lib/index";
+import type { ActiveSipCall } from "../hooks/useCallSession";
 import type { CallState } from "../types/call-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -47,11 +48,14 @@ export interface CallSetupFormProps {
   callState: CallState;
   callEndedMsg: string;
   isCallActive: boolean;
+  activeSipCalls: ActiveSipCall[];
+  sipConcurrencyLimit: number;
+  canDialAnother: boolean;
   session: CallSessionInfo | null;
   callId: string;
 
   onStart: () => void;
-  onEnd: () => void;
+  onEnd: (callId?: string) => void;
 }
 
 export default function CallSetupForm({
@@ -71,32 +75,47 @@ export default function CallSetupForm({
   callState,
   callEndedMsg,
   isCallActive,
+  activeSipCalls,
+  sipConcurrencyLimit,
+  canDialAnother,
   session,
   callId,
   onStart,
   onEnd,
 }: CallSetupFormProps) {
+  const hasActiveSip =
+    mode === "sip" && !session && activeSipCalls.length > 0;
+  const phoneLocked = busy || (hasActiveSip ? !canDialAnother : isCallActive);
   const startLabel =
     !agentsReady && callState === "idle" && !isCallActive
       ? "Loading agents…"
-      : busy || callState === "connecting"
-        ? "Connecting…"
-        : callState === "waiting_for_agent"
-          ? "Waiting for agent…"
-          : callState === "ending"
-            ? "Ending call…"
-            : isCallActive
-              ? "Call connected"
-            : mode === "browser"
-              ? "Start voice call"
-              : "Dial number";
+      : busy
+        ? mode === "sip"
+          ? "Dialing…"
+          : "Connecting…"
+        : hasActiveSip
+          ? canDialAnother
+            ? `Dial another number (${activeSipCalls.length}/${sipConcurrencyLimit})`
+            : `Concurrency full (${activeSipCalls.length}/${sipConcurrencyLimit})`
+          : callState === "connecting"
+            ? "Connecting…"
+            : callState === "waiting_for_agent"
+              ? "Waiting for agent…"
+              : callState === "ending"
+                ? "Ending call…"
+                : isCallActive
+                  ? "Call connected"
+                  : mode === "browser"
+                    ? "Start voice call"
+                    : "Dial number";
 
   const startPending =
     busy ||
-    callState === "connecting" ||
-    callState === "waiting_for_agent" ||
-    callState === "ending" ||
-    (!agentsReady && callState === "idle");
+    (!hasActiveSip &&
+      (callState === "connecting" ||
+        callState === "waiting_for_agent" ||
+        callState === "ending")) ||
+    (!agentsReady && callState === "idle" && !isCallActive);
   const inboundOnly =
     selected != null &&
     !["outbound", "both"].includes(selected.purpose || "outbound");
@@ -152,8 +171,14 @@ export default function CallSetupForm({
                     : "Announcement mode: plays a fixed script and stays open until you end the call."
                   : "Assistant mode: greets on connect, then listens and converses turn by turn."}
                 {` Purpose: ${selected.purpose || "outbound"}.`}
+                {` Max concurrent calls: ${selected.max_concurrency || 1}.`}
                 {selected.phone_number
-                  ? ` Assigned caller number: ${selected.phone_number}.`
+                  ? ` Assigned caller number: ${selected.phone_number}` +
+                    (selected.phone_number_channels
+                      ? ` (${selected.phone_number_channels} channel${
+                          selected.phone_number_channels === 1 ? "" : "s"
+                        }).`
+                      : ".")
                   : " No assigned phone number."}
               </p>
             </div>
@@ -234,7 +259,7 @@ export default function CallSetupForm({
                 onChange={(e) => onPhoneChange(e.target.value)}
                 placeholder="+91804xxxxxxx"
                 className="h-9 font-mono text-sm"
-                disabled={isCallActive}
+                disabled={phoneLocked}
                 autoComplete="tel"
               />
             </div>
@@ -276,6 +301,63 @@ export default function CallSetupForm({
           </div>
         )}
 
+        {hasActiveSip && (
+          <div className="space-y-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3.5">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-emerald-800 dark:text-emerald-300">
+                Active SIP calls
+              </p>
+              <Badge
+                variant="outline"
+                className="border-emerald-500/25 bg-background/70 text-emerald-700 dark:text-emerald-300"
+              >
+                {activeSipCalls.length} / {sipConcurrencyLimit} concurrent
+              </Badge>
+            </div>
+            <div className="space-y-2">
+              {activeSipCalls.map((call) => (
+                <div
+                  key={call.id}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/80 px-3 py-2"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-xs font-semibold text-foreground">
+                      {call.phone || "Phone call"}
+                    </p>
+                    <p className="text-[11px] capitalize text-muted-foreground">
+                      {call.status === "ending"
+                        ? "Ending…"
+                        : call.backendStatus === "in-progress"
+                          ? "In progress"
+                          : "Dialing / agent joining"}
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="destructive"
+                    className="h-8 shrink-0 gap-1.5 text-xs"
+                    disabled={call.status === "ending"}
+                    onClick={() => onEnd(call.id)}
+                  >
+                    {call.status === "ending" ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <PhoneOff className="h-3.5 w-3.5" />
+                    )}
+                    End
+                  </Button>
+                </div>
+              ))}
+            </div>
+            <p className="text-[11px] leading-relaxed text-emerald-800/80 dark:text-emerald-300/80">
+              {canDialAnother
+                ? "A concurrency slot is available—enter another destination above and dial it without ending these calls."
+                : "All concurrency slots are in use. End a call above or wait for one to finish before dialing another number."}
+            </p>
+          </div>
+        )}
+
         {/* Error */}
         {err && (
           <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2.5 text-sm font-medium text-destructive">
@@ -312,7 +394,7 @@ export default function CallSetupForm({
             onClick={onStart}
             disabled={
               busy ||
-              isCallActive ||
+              (hasActiveSip ? !canDialAnother : isCallActive) ||
               !agentId ||
               !agentsReady ||
               (mode === "sip" && inboundOnly)
@@ -328,12 +410,12 @@ export default function CallSetupForm({
             {startLabel}
           </Button>
 
-          {isCallActive && (
+          {isCallActive && !hasActiveSip && (
             <Button
               type="button"
               variant="destructive"
               className="h-11 w-full gap-2 text-sm font-semibold shadow-sm"
-              onClick={onEnd}
+              onClick={() => onEnd()}
               disabled={callState === "ending"}
             >
               {callState === "ending" ? (
@@ -355,16 +437,6 @@ export default function CallSetupForm({
           </div>
         )}
 
-        {mode === "sip" && callId && !session && isCallActive && (
-          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
-            <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>
-              {callState === "ending"
-                ? "Ending the SIP call…"
-                : "SIP call in progress. Hang up on the phone or use End call here; this page will update automatically when it finishes."}
-            </span>
-          </div>
-        )}
       </div>
     </Card>
   );

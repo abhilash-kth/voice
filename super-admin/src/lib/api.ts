@@ -583,6 +583,36 @@ export const createManualTelephonyNumber = (body: ManualNumberBody) =>
     body: JSON.stringify(body),
   });
 
+export interface ManualNumberUpdateBody {
+  number?: string;
+  livekit_outbound_trunk_id?: string;
+  livekit_inbound_trunk_id?: string;
+  dial_prefix?: string;
+  channels?: number;
+  expires_at?: string;
+}
+
+export const updateManualTelephonyNumber = (
+  id: string,
+  body: ManualNumberUpdateBody,
+) =>
+  req<TelephonyNumber>(`/api/admin/telephony/numbers/${id}/manual`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+
+export interface DeleteManualNumberResult {
+  ok: boolean;
+  id: string;
+  number: string;
+  unassigned_agent_ids: string[];
+}
+
+export const deleteManualTelephonyNumber = (id: string) =>
+  req<DeleteManualNumberResult>(`/api/admin/telephony/numbers/${id}/manual`, {
+    method: "DELETE",
+  });
+
 export const listTelephonyPurchases = (params: {
   page?: number;
   page_size?: number;

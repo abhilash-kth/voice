@@ -171,6 +171,16 @@ buying another number:
 9. Register it, then edit/create an agent, choose **Outbound** or **Both**,
    and assign the number.
 
+### Edit or delete a manual number
+
+Super Admin → **Telephony → Numbers**: rows whose source is **manual** have
+**Edit** and **Delete** actions. Edit can change the number, LiveKit
+inbound/outbound trunk IDs, carrier prefix, channels, and expiry; it does not
+change the owner. Delete removes the local record, clears assigned agents,
+and removes the number's own inbound dispatch rule. It does not delete the
+carrier DID or shared LiveKit trunks, and it is blocked while an assigned
+agent has an active call.
+
 ## 4. End-to-end test order
 
 1. Start backend, frontend, Super Admin and the existing LiveKit/SIP stack.
@@ -185,6 +195,22 @@ buying another number:
 8. Check Super Admin → Telephony for account, KYC, purchase, provisioning
    step and trunk IDs. The SIP password should appear only masked/configured.
 
+### Phone hangup + concurrent SIP calls
+
+For a two-call test, all three limits must be at least `2`: the agent's
+**Max concurrent calls**, the workspace plan's concurrency lines, and the
+assigned DID's **Channels** (edit the manual number in Super Admin if it is
+still `1`). Then, on the customer Call page:
+
+1. Dial the first mobile number in SIP mode and answer it.
+2. The button changes to **Dial another number (1/2)**; enter a second
+   mobile number and dial it without ending the first call.
+3. Both calls appear with independent **End** buttons. Hanging up either
+   phone should remove only that call within a few seconds; the other call
+   remains live.
+4. With only one call active, hanging up on the phone should return the page
+   to the ended/summary state without a browser refresh or clicking End.
+
 ## 5. Backend tests
 
 The disposable test database is SQLite, so the test run temporarily
@@ -198,14 +224,14 @@ $env:DATABASE_URL = "file:./data/test.db"
 python -m prisma db push --schema schema.sqlite.prisma
 python -m prisma generate --schema schema.sqlite.prisma
 python -m pip install pytest pytest-asyncio   # only if pytest is missing
-python -m pytest tests/test_telephony_marketplace.py tests/test_contact.py -v
+python -m pytest tests/test_telephony_marketplace.py tests/test_services_and_repos.py tests/test_contact.py -v
 Remove-Item Env:DATABASE_URL
 python -m prisma generate --schema schema.prisma
 ```
 
 The final `generate` is required before starting the Postgres/Neon backend
 again. In a Git Bash/WSL checkout, `bash scripts/run-tests.sh
-tests/test_telephony_marketplace.py tests/test_contact.py -v` does the SQLite
+tests/test_telephony_marketplace.py tests/test_services_and_repos.py tests/test_contact.py -v` does the SQLite
 setup/test part; still regenerate from `schema.prisma` afterwards.
 
 ## Known provider gates — do not guess these

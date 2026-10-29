@@ -85,6 +85,7 @@ export interface Agent {
     purpose?: "outbound" | "inbound" | "both";
     phone_number_id?: string | null;
     phone_number?: string | null;
+    phone_number_channels?: number | null;
     telephony_warning?: string;
     providers: {
         llm: { id: string; config: Record<string, unknown> };
@@ -191,6 +192,15 @@ export const startCall = (body: {
         url: string;
         room: string;
         mode: string;
+        concurrency?: {
+            active_calls: number;
+            limit: number;
+            remaining: number;
+            agent_limit: number;
+            plan_lines: number;
+            phone_channels: number | null;
+            phone_active_calls: number;
+        };
     }>("/api/calls", { method: "POST", body: JSON.stringify(body) });
 export const listCalls = () => req<{ calls: CallRecord[] }>("/api/calls");
 export const getCall = (id: string) => req<CallRecord>(`/api/calls/${id}`);

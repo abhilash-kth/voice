@@ -359,3 +359,126 @@ async def create_manual_number(user_id: str, data: dict) -> dict:
         "livekit_inbound_trunk_id": data.get("livekit_inbound_trunk_id") or "",
         "dial_prefix": data.get("dial_prefix") or settings.voicelink_tech_prefix,
     })
+
+
+async def _require_manual_phone(phone_id: str) -> dict:
+    phone = await repo.get_phone_number(phone_id)
+    if not phone:
+        raise TelephonyError("Phone number not found.", 404)
+    if phone.get("source") != "manual":
+        raise TelephonyError(
+            "Only manually registered numbers can be edited or deleted here. "
+            "Purchased numbers remain provider-managed.", 409)
+    return phone
+
+
+async def update_manual_number(phone_id: str, data: dict) -> dict:
+    """Edit a manual DID record (number/trunks/prefix/channels/expiry)."""
+    phone = await _require_manual_phone(phone_id)
+    allowed = {
+        "number", "livekit_outbound_trunk_id", "livekit_inbound_trunk_id",
+        "dial_prefix", "channels", "expires_at",
+    }
+    patch = {k: v for k, v in (data or {}).items() if k in allowed}
+    if not patch:
+        raise TelephonyError("No manual-number fields to update.", 400)
+
+    if "number" in patch:
+        number = normalize_destination(patch.get("number") or "")
+        if not number or len(re.sub(r"\D", "", number)) < 10:
+            raise TelephonyError("Enter a valid phone number (E.164).", 400)
+        existing = await repo.get_phone_by_number(number)
+        if existing and existing["id"] != phone_id:
+            raise TelephonyError(f"{number} is already registered.", 409)
+        patch["number"] = number
+
+    for key in ("livekit_outbound_trunk_id", "livekit_inbound_trunk_id",
+                "dial_prefix", "expires_at"):
+        if key in patch:
+            patch[key] = str(patch.get(key) or "").strip()
+    if "dial_prefix" in patch and not re.fullmatch(
+            r"\d*", patch["dial_prefix"]):
+        raise TelephonyError("Carrier tech prefix must contain digits only.", 400)
+    if "channels" in patch:
+        try:
+            channels = int(patch["channels"])
+        except Exception:
+            raise TelephonyError("Channels must be a whole number.", 400) from None
+        if channels < 1 or channels > 100:
+            raise TelephonyError("Channels must be between 1 and 100.", 400)
+        patch["channels"] = channels
+
+    outbound_trunk = patch.get(
+        "livekit_outbound_trunk_id", phone.get("livekit_outbound_trunk_id") or "")
+    if phone.get("status") == "suspended":
+        patch.update({"status": "suspended", "provisioning_step": "suspended"})
+    elif outbound_trunk:
+        patch.update({
+            "status": "active", "provisioning_step": "manual_ready",
+            "last_error": "",
+        })
+    else:
+        patch.update({
+            "status": "provisioning", "provisioning_step": "manual_pending",
+            "last_error": "Manual number has no LiveKit outbound trunk.",
+        })
+
+    old_rule_id = phone.get("livekit_dispatch_rule_id") or ""
+    number_changed = patch.get("number", phone["number"]) != phone["number"]
+    inbound_trunk_changed = patch.get(
+        "livekit_inbound_trunk_id",
+        phone.get("livekit_inbound_trunk_id") or "") != (
+            phone.get("livekit_inbound_trunk_id") or "")
+
+    updated = await repo.update_phone_number(phone_id, patch) or phone
+    if old_rule_id and (
+            updated.get("status") != "active" or number_changed
+            or inbound_trunk_changed):
+        await lk_trunks.delete_dispatch_rule(old_rule_id)
+        updated = await repo.update_phone_number(phone_id, {
+            "livekit_dispatch_rule_id": "", "inbound_agent_id": None,
+        }) or updated
+    if updated.get("status") == "active" and (
+            number_changed or inbound_trunk_changed):
+        await _sync_inbound_best_effort(phone_id)
+    return await repo.get_phone_number(phone_id) or updated
+
+
+async def delete_manual_number(phone_id: str) -> dict:
+    """Delete a manual DID record after removing its local assignments.
+
+    This does not delete the carrier DID or shared LiveKit trunks—manual
+    numbers are externally provisioned and those resources may be shared.
+    The LiveKit inbound dispatch rule owned by this record is removed.
+    """
+    phone = await _require_manual_phone(phone_id)
+    agents = await repo.list_agents_for_phone(phone_id, phone["user_id"])
+    for agent in agents:
+        calls = await repo.list_calls(phone["user_id"], agent_id=agent["id"])
+        if any(c.get("status") in ("planned", "in-progress") for c in calls):
+            raise TelephonyError(
+                f"Agent '{agent.get('name', '')}' has an active call on "
+                "this number. End the call before deleting the number.", 409)
+
+    rule_id = phone.get("livekit_dispatch_rule_id") or ""
+    if rule_id and not await lk_trunks.delete_dispatch_rule(rule_id):
+        raise TelephonyError(
+            "Could not remove this number's LiveKit inbound routing. "
+            "Check LiveKit and retry before deleting it.", 503)
+
+    unassigned_agent_ids: list[str] = []
+    for agent in agents:
+        await repo.update_agent(
+            agent["id"], phone["user_id"], {"phone_number_id": None})
+        unassigned_agent_ids.append(agent["id"])
+
+    if not await repo.delete_phone_number(phone_id):
+        raise TelephonyError(
+            "Manual number could not be deleted; it may already be gone or "
+            "still referenced by another record.", 409)
+    return {
+        "ok": True,
+        "id": phone_id,
+        "number": phone["number"],
+        "unassigned_agent_ids": unassigned_agent_ids,
+    }

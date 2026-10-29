@@ -50,8 +50,11 @@ async def _enrich_phone(rec: dict, user_id: str) -> dict:
     if rec.get("phone_number_id"):
         phone = await repo.get_phone_number(rec["phone_number_id"], user_id)
         rec["phone_number"] = phone["number"] if phone else None
+        rec["phone_number_channels"] = (
+            max(1, int(phone.get("channels") or 1)) if phone else None)
     else:
         rec["phone_number"] = None
+        rec["phone_number_channels"] = None
     return rec
 
 
@@ -62,12 +65,16 @@ async def _enrich_phone(rec: dict, user_id: str) -> dict:
 async def list_agents(user=Depends(auth.get_current_user)):
     agents = await repo.list_agents(user.id)
     try:
-        phone_by_id = {p["id"]: p["number"]
+        phone_by_id = {p["id"]: p
                        for p in await repo.list_phone_numbers(user.id)}
     except Exception:
         phone_by_id = {}
     for a in agents:
-        a["phone_number"] = phone_by_id.get(a.get("phone_number_id") or "")
+        assigned_phone = phone_by_id.get(a.get("phone_number_id") or "")
+        a["phone_number"] = assigned_phone["number"] if assigned_phone else None
+        a["phone_number_channels"] = (
+            max(1, int(assigned_phone.get("channels") or 1))
+            if assigned_phone else None)
         calls = await repo.list_calls(user.id, agent_id=a["id"])
         a["call_count"] = len([c for c in calls if c["status"] in ("completed", "in-progress")])
         a["total_billed"] = round(

@@ -189,6 +189,7 @@ async def create_phone_number(data: dict) -> dict:
 
 
 _PHONE_MAP = {
+    "number": "number",
     "status": "status", "provisioning_step": "provisioningStep",
     "channels": "channels", "monthly_rate": "monthlyRate",
     "expires_at": "expiresAt", "provider_did_id": "providerDidId",
@@ -217,6 +218,14 @@ async def update_phone_number(phone_id: str, patch: dict) -> Optional[dict]:
     except Exception:
         return None
     return _phone_dict(p)
+
+
+async def delete_phone_number(phone_id: str) -> bool:
+    try:
+        await get_prisma().phonenumber.delete(where={"id": phone_id})
+    except Exception:
+        return False
+    return True
 
 
 async def list_agents_for_phone(phone_id: str, user_id: str) -> list[dict]:

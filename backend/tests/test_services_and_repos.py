@@ -291,6 +291,80 @@ class TestCallLifecycle:
         assert {i["target_id"] for i in logs["items"]} == {
             active["id"], planned["id"]}
 
+    async def test_sip_caller_leave_reconciles_call_after_grace(
+            self, seeded, monkeypatch):
+        import time as time_module
+
+        from app.routes import calls_watchdog
+
+        u = await repo.create_user("lc5@t.dev", "LC5", auth.hash_password("pw"))
+        a = await repo.create_agent(u["id"], {"name": "A5"})
+        active = await repo.create_call({
+            "user_id": u["id"], "agent_id": a["id"], "mode": "sip",
+            "room": "sip-caller-left", "status": "in-progress",
+            "phone": "+918114402203",
+        })
+        planned = await repo.create_call({
+            "user_id": u["id"], "agent_id": a["id"], "mode": "sip",
+            "room": "sip-planned-left", "status": "planned",
+            "phone": "+918114402204",
+        })
+
+        room_state = {
+            "exists": True, "participant_count": 2, "has_agent": True,
+            "has_caller": True, "identities": ["agent-1", "phone-1"],
+        }
+        ended_rooms = []
+
+        async def fake_room_state(room):
+            return room_state
+
+        async def fake_end_room(room):
+            ended_rooms.append(room)
+            return True
+
+        monkeypatch.setattr(
+            calls_watchdog.telephony, "room_caller_state", fake_room_state)
+        monkeypatch.setattr(
+            calls_watchdog.telephony, "end_active_room", fake_end_room)
+        calls_watchdog._sip_caller_missing_since.clear()
+
+        out = await calls_watchdog.reconcile_sip_call(active)
+        assert out["status"] == "in-progress"
+        assert ended_rooms == []
+
+        # Phone side is gone; first observation only starts the grace window.
+        room_state.update({
+            "participant_count": 1, "has_caller": False,
+            "identities": ["agent-1"],
+        })
+        out = await calls_watchdog.reconcile_sip_call(active)
+        assert out["status"] == "in-progress"
+
+        calls_watchdog._sip_caller_missing_since[active["id"]] = (
+            time_module.monotonic()
+            - calls_watchdog._SIP_CALLER_GONE_GRACE_SECONDS - 1)
+        out = await calls_watchdog.reconcile_sip_call(active)
+        assert out["status"] == "completed"
+        assert out["ended_at"]
+        assert ended_rooms == ["sip-caller-left"]
+
+        # A planned SIP call whose room/caller disappeared is a failed,
+        # unbilled attempt once the same grace window has elapsed.
+        room_state.update({
+            "exists": False, "participant_count": 0, "has_agent": False,
+            "has_caller": False, "identities": [],
+        })
+        out = await calls_watchdog.reconcile_sip_call(planned)
+        assert out["status"] == "planned"
+        calls_watchdog._sip_caller_missing_since[planned["id"]] = (
+            time_module.monotonic()
+            - calls_watchdog._SIP_CALLER_GONE_GRACE_SECONDS - 1)
+        out = await calls_watchdog.reconcile_sip_call(planned)
+        assert out["status"] == "failed"
+        assert "ended before the agent joined" in out["usage"]["error"]
+        assert ended_rooms == ["sip-caller-left"]
+
 
 class TestUsersAndAudit:
     async def test_role_guard_refuses_demote_last_admin(self, seeded):

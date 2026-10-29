@@ -8,6 +8,7 @@ import {
   Phone,
 } from "lucide-react";
 import type { Agent } from "@/lib/index";
+import type { ActiveSipCall } from "../hooks/useCallSession";
 import type { CallState } from "../types/call-types";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
@@ -21,6 +22,8 @@ interface CallStageProps {
   mode: "browser" | "sip";
   selected?: Agent;
   callId: string;
+  activeSipCalls: ActiveSipCall[];
+  sipConcurrencyLimit: number;
   agentWaitSeconds: number;
   isDisconnecting: boolean;
   onStateChange: (state: CallState) => void;
@@ -36,6 +39,8 @@ export default function CallStage({
   mode,
   selected,
   callId,
+  activeSipCalls,
+  sipConcurrencyLimit,
   agentWaitSeconds,
   isDisconnecting,
   onStateChange,
@@ -67,6 +72,8 @@ export default function CallStage({
             callEndedMsg={callEndedMsg}
             err={err}
             mode={mode}
+            activeSipCalls={activeSipCalls}
+            sipConcurrencyLimit={sipConcurrencyLimit}
           />
         )}
       </div>
@@ -79,12 +86,68 @@ function EmptyStage({
   callEndedMsg,
   err,
   mode,
+  activeSipCalls,
+  sipConcurrencyLimit,
 }: {
   callState: CallState;
   callEndedMsg: string;
   err: string;
   mode: "browser" | "sip";
+  activeSipCalls: ActiveSipCall[];
+  sipConcurrencyLimit: number;
 }) {
+  if (activeSipCalls.length > 0) {
+    return (
+      <div className="mx-auto flex w-full max-w-lg flex-col items-center gap-5 px-4 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-500/20 bg-emerald-500/10 text-emerald-600 shadow-sm dark:text-emerald-400">
+          <PhoneCall className="h-7 w-7 animate-pulse" />
+        </div>
+        <div className="space-y-2">
+          <p className="text-lg font-semibold tracking-tight text-foreground">
+            {activeSipCalls.length === 1
+              ? "SIP call in progress"
+              : `${activeSipCalls.length} SIP calls in progress`}
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            {activeSipCalls.length} of {sipConcurrencyLimit} concurrency
+            slot{sipConcurrencyLimit === 1 ? "" : "s"} in use. Hang up on a
+            phone or end that specific call from the list on the left.
+          </p>
+        </div>
+        <div className="grid w-full gap-2 text-left">
+          {activeSipCalls.map((call) => (
+            <div
+              key={call.id}
+              className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-background/80 px-3.5 py-2.5"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-mono text-sm font-semibold">
+                  {call.phone || "Phone call"}
+                </p>
+                <p className="text-xs capitalize text-muted-foreground">
+                  {call.status === "ending"
+                    ? "Ending"
+                    : call.backendStatus === "in-progress"
+                      ? "In progress"
+                      : "Dialing / agent joining"}
+                </p>
+              </div>
+              <span className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+                Live
+              </span>
+            </div>
+          ))}
+        </div>
+        {callEndedMsg && !callEndedMsg.startsWith("Finalizing") && (
+          <p className="rounded-full border border-emerald-500/20 bg-emerald-500/5 px-3 py-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+            Another call ended: {callEndedMsg}
+          </p>
+        )}
+      </div>
+    );
+  }
+
   if (callEndedMsg) {
     return (
       <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">

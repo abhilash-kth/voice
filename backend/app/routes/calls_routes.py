@@ -19,11 +19,21 @@ from ..config import LIVEKIT_URL
 from ..services.telephony_policy import (TelephonyError, carrier_dial_number,
                                          normalize_destination,
                                          resolve_outbound)
-from .calls_watchdog import agent_join_watchdog
+from .calls_watchdog import (agent_join_watchdog, reconcile_active_sip_calls,
+                             reconcile_sip_call)
 
 logger = logging.getLogger("voice-agent-saas-api")
 
 router = APIRouter(tags=["calls"])
+
+
+def _effective_concurrency(agent_limit: int, plan_lines: int,
+                           phone_channels: Optional[int]) -> int:
+    """Smallest applicable concurrent-call ceiling for one start request."""
+    limits = [max(1, int(agent_limit or 1)), max(1, int(plan_lines or 1))]
+    if phone_channels is not None:
+        limits.append(max(1, int(phone_channels or 1)))
+    return min(limits)
 
 
 # ---------------------------------------------------------------------------
@@ -101,18 +111,79 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         except Exception as e:
             logger.warning("Error auto-cleaning prior browser calls: %s", e)
 
-    live_rooms = await telephony.list_live_active_rooms()
-    active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
-    # The configured 'Max concurrent calls' limit is enforced for BOTH browser
-    # and SIP starts. The browser auto-clean above already ended this user's
-    # own prior browser rows (so a quick retry is not blocked by itself), but
-    # genuinely live calls — by anyone, on this agent — always count.
-    if active >= rec["max_concurrency"]:
-        raise HTTPException(
-            409,
-            f"This agent is already on {active} live call(s) (limit {rec['max_concurrency']}). "
-            "Wait for a call to end, or raise the 'Max concurrent calls' limit.",
-        )
+    agent_limit = max(1, int(rec.get("max_concurrency") or 1))
+    plan_lines = agent_limit
+    phone_channels: Optional[int] = None
+    phone_active = 0
+    effective_limit = agent_limit
+
+    if mode == "sip":
+        route_for_limit = outbound_route or {}
+        if route_for_limit.get("phone_channels") is not None:
+            phone_channels = max(
+                1, int(route_for_limit.get("phone_channels") or 1))
+        try:
+            from ..services import subscription_service
+            subscription = await subscription_service.get_subscription(user.id)
+            plan_lines = max(
+                1, int(subscription.get("concurrency_lines") or agent_limit))
+        except Exception as e:
+            logger.debug("plan concurrency lookup skipped: %r", e)
+        effective_limit = _effective_concurrency(
+            agent_limit, plan_lines, phone_channels)
+
+        phone_number_id = route_for_limit.get("phone_number_id")
+        if phone_number_id:
+            # A DID's channels are shared by every agent assigned to it, so
+            # count live SIP calls across those agents—not just this one.
+            phone_agent_ids = [agent_id]
+            try:
+                for assigned in await repo.list_agents_for_phone(
+                        phone_number_id, user.id):
+                    if assigned.get("id") not in phone_agent_ids:
+                        phone_agent_ids.append(assigned["id"])
+            except Exception as e:
+                logger.debug("assigned-phone agent lookup skipped: %r", e)
+            active_by_id: dict[str, dict] = {}
+            for assigned_agent_id in phone_agent_ids:
+                for row in await reconcile_active_sip_calls(
+                        user.id, assigned_agent_id):
+                    active_by_id[row["id"]] = row
+            active = sum(
+                1 for row in active_by_id.values()
+                if row.get("agent_id") == agent_id)
+            phone_active = len(active_by_id)
+            if phone_channels is not None and phone_active >= phone_channels:
+                raise HTTPException(
+                    409,
+                    f"Assigned number {route_for_limit.get('phone_number') or ''} "
+                    f"has {phone_channels} channel(s) and already has "
+                    f"{phone_active} live call(s). Wait for a call to end or "
+                    "increase the number's channels.",
+                )
+        else:
+            active = len(await reconcile_active_sip_calls(user.id, agent_id))
+    else:
+        live_rooms = await telephony.list_live_active_rooms()
+        active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
+
+    # The configured limit is enforced for BOTH browser and SIP starts. For
+    # SIP, the effective ceiling is the smallest of the agent limit, the
+    # workspace plan lines, and the assigned DID's channels.
+    if active >= effective_limit:
+        if mode == "sip":
+            detail = (
+                f"Concurrency limit reached: {active} live call(s) "
+                f"(agent limit {agent_limit}, plan lines {plan_lines}"
+                + (f", assigned-number channels {phone_channels}"
+                   if phone_channels is not None else "")
+                + "). Wait for a call to end or increase the applicable limit.")
+        else:
+            detail = (
+                f"This agent is already on {active} live call(s) "
+                f"(limit {agent_limit}). Wait for a call to end, or raise "
+                "the 'Max concurrent calls' limit.")
+        raise HTTPException(409, detail)
 
     wallet = await repo.get_wallet(user.id)
     if wallet["balance"] <= 0:
@@ -173,6 +244,15 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
     await repo.update_call(call["id"], {"room": result["room"]})
     result["call_id"] = call["id"]
+    result["concurrency"] = {
+        "active_calls": active + 1,
+        "limit": effective_limit,
+        "remaining": max(effective_limit - active - 1, 0),
+        "agent_limit": agent_limit,
+        "plan_lines": plan_lines,
+        "phone_channels": phone_channels,
+        "phone_active_calls": (phone_active + 1) if mode == "sip" else 0,
+    }
 
     # The room + dispatch are now accepted by LiveKit, but "accepted" is not
     # "a worker actually joined". Watch it in the background so a dead/absent
@@ -190,7 +270,14 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
 
 @router.get("/api/calls")
 async def list_calls(agent_id: Optional[str] = None, user=Depends(auth.get_current_user)):
-    return {"calls": await repo.list_calls(user.id, agent_id=agent_id)}
+    rows = await repo.list_calls(user.id, agent_id=agent_id)
+    out = []
+    for row in rows:
+        if row.get("mode") == "sip" and row.get("status") in (
+                "planned", "in-progress"):
+            row = await reconcile_sip_call(row)
+        out.append(row)
+    return {"calls": out}
 
 
 @router.get("/api/calls/{call_id}")
@@ -198,6 +285,8 @@ async def get_call(call_id: str, user=Depends(auth.get_current_user)):
     rec = await repo.get_call(call_id, user.id)
     if not rec:
         raise HTTPException(404, "Call not found")
+    if rec.get("mode") == "sip":
+        rec = await reconcile_sip_call(rec)
     return rec
 
 

@@ -7,11 +7,14 @@ import {
   Eye,
   Loader2,
   Pause,
+  Pencil,
   Phone,
   Play,
   Plus,
   RefreshCw,
+  Save,
   ShieldCheck,
+  Trash2,
   Wallet,
   X,
 } from "lucide-react";
@@ -20,6 +23,7 @@ import {
   listUsers,
   type ApiUser,
   type ManualNumberBody,
+  type ManualNumberUpdateBody,
   type TelephonyAccount,
   type TelephonyAccountDetail,
   type TelephonyNumber,
@@ -361,12 +365,16 @@ export function NumbersTable({
   onRetry,
   onSync,
   onStatus,
+  onEdit,
+  onDelete,
 }: {
   rows: TelephonyNumber[];
   busy: string;
   onRetry: (row: TelephonyNumber) => void;
   onSync: (row: TelephonyNumber) => void;
   onStatus: (row: TelephonyNumber, status: "active" | "suspended") => void;
+  onEdit: (row: TelephonyNumber) => void;
+  onDelete: (row: TelephonyNumber) => void;
 }) {
   return (
     <div className="overflow-hidden rounded-xl border border-border/60 bg-card shadow-sm">
@@ -423,8 +431,29 @@ export function NumbersTable({
                     </ul>
                   )}
                 </TableCell>
-                <TableCell className={`${cellCls} min-w-[230px] whitespace-normal`}>
+                <TableCell className={`${cellCls} min-w-[270px] whitespace-normal`}>
                   <div className="flex flex-wrap gap-1.5">
+                    {r.source === "manual" && (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={loading}
+                          onClick={() => onEdit(r)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" /> Edit
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="border-destructive/30 text-destructive hover:bg-destructive/10"
+                          disabled={loading}
+                          onClick={() => onDelete(r)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" /> Delete
+                        </Button>
+                      </>
+                    )}
                     <Button size="sm" variant="outline" disabled={loading} onClick={() => onRetry(r)}>
                       {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                       Retry
@@ -448,6 +477,134 @@ export function NumbersTable({
         </TableBody>
       </Table>
     </div>
+  );
+}
+
+export function ManualNumberEditForm({
+  row,
+  busy,
+  onCancel,
+  onSave,
+}: {
+  row: TelephonyNumber;
+  busy: boolean;
+  onCancel: () => void;
+  onSave: (row: TelephonyNumber, patch: ManualNumberUpdateBody) => void;
+}) {
+  const [form, setForm] = useState<ManualNumberUpdateBody>({
+    number: row.number,
+    livekit_outbound_trunk_id: row.livekit_outbound_trunk_id || "",
+    livekit_inbound_trunk_id: row.livekit_inbound_trunk_id || "",
+    dial_prefix: row.dial_prefix || "",
+    channels: row.channels || 1,
+    expires_at: row.expires_at || "",
+  });
+
+  const field = (
+    label: string,
+    key: keyof ManualNumberUpdateBody,
+    props: React.InputHTMLAttributes<HTMLInputElement> = {},
+  ) => (
+    <div className="space-y-1.5">
+      <Label className="text-xs">{label}</Label>
+      <Input
+        value={String(form[key] ?? "")}
+        disabled={busy}
+        onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+        {...props}
+      />
+    </div>
+  );
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSave(row, {
+          ...form,
+          number: String(form.number || "").trim(),
+          livekit_outbound_trunk_id: String(
+            form.livekit_outbound_trunk_id || "",
+          ).trim(),
+          livekit_inbound_trunk_id: String(
+            form.livekit_inbound_trunk_id || "",
+          ).trim(),
+          dial_prefix: String(form.dial_prefix || "").trim(),
+          channels: Number(form.channels || 1),
+          expires_at: String(form.expires_at || "").trim(),
+        });
+      }}
+      className="space-y-4 rounded-xl border border-primary/25 bg-card p-5 shadow-sm"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="flex items-center gap-2 text-base font-semibold">
+            <Pencil className="h-4 w-4 text-primary" /> Edit manual number
+          </h3>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Owner: {row.user_name || row.user_email || shortId(row.user_id)}.
+            Update channels here to change this DID&apos;s concurrency limit.
+          </p>
+        </div>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          disabled={busy}
+          onClick={onCancel}
+          aria-label="Close manual number editor"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+
+      <p className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        This edits the local routing record for an already-provisioned DID.
+        If you change the number or trunk IDs, the matching VoiceLink/LiveKit
+        routing must already exist externally.
+      </p>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        {field("Phone number (E.164)", "number", {
+          required: true,
+          placeholder: "+91XXXXXXXXXX",
+        })}
+        {field("Channels / concurrency", "channels", {
+          type: "number",
+          min: 1,
+          max: 100,
+          required: true,
+        })}
+        {field("LiveKit outbound trunk ID", "livekit_outbound_trunk_id", {
+          placeholder: "ST_…",
+        })}
+        {field("LiveKit inbound trunk ID", "livekit_inbound_trunk_id", {
+          placeholder: "ST_…",
+        })}
+        {field("Carrier tech prefix", "dial_prefix", {
+          placeholder: "45454",
+          inputMode: "numeric",
+        })}
+        {field("Expiry (ISO date, optional)", "expires_at", {
+          placeholder: "2026-10-31",
+        })}
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <Button type="submit" disabled={busy}>
+          {busy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Save className="h-4 w-4" />
+          )}
+          Save manual number
+        </Button>
+        <Button type="button" variant="outline" disabled={busy} onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </form>
   );
 }
 
