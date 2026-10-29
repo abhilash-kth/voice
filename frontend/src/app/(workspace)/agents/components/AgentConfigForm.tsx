@@ -23,6 +23,7 @@ import {
 import { FaqItem } from "./constants";
 import LeftColumn, { LeftSetters, LeftState } from "./LeftColumn";
 import { Separator } from "@/components/ui/separator";
+import { listPhoneNumbers } from "@/lib/telephony";
 
 interface Props {
   catalog: Catalog;
@@ -48,6 +49,34 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
       "I did not hear a response, so I will end the call now. Thank you for calling.",
   );
   const [mode, setMode] = useState(editing?.agent_mode || "assistant");
+  // New agents must explicitly choose a purpose (no silent default).
+  const [purpose, setPurpose] = useState(editing?.purpose || "");
+  const [phoneNumberId, setPhoneNumberId] = useState(
+    editing?.phone_number_id || "",
+  );
+  const [phoneNumbers, setPhoneNumbers] = useState<
+    { id: string; number: string; status: string }[]
+  >([]);
+  useEffect(() => {
+    let cancelled = false;
+    listPhoneNumbers()
+      .then((out) => {
+        if (cancelled) return;
+        setPhoneNumbers(
+          out.numbers
+            .filter(
+              (n) => n.status === "active" || n.id === editing?.phone_number_id,
+            )
+            .map((n) => ({ id: n.id, number: n.number, status: n.status })),
+        );
+      })
+      .catch(() => {
+        // Telephony may not be set up yet; the picker just stays empty.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editing?.phone_number_id]);
   const [announceText, setAnnounceText] = useState(
     editing?.announce_text || "",
   );
@@ -229,6 +258,11 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const submit = async () => {
     setErr("");
     if (!name) return setErr("Please give the agent a name.");
+    if (!["outbound", "inbound", "both"].includes(purpose)) {
+      return setErr(
+        "Please select the agent's call purpose: Outbound, Inbound, or Both.",
+      );
+    }
     if (mode === "announcement" && !announceText.trim()) {
       return setErr(
         "For Announcement mode, fill in the Fixed script, it is the only thing the agent will speak.",
@@ -275,6 +309,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         gender,
         voice_personality: personality,
         agent_mode: mode,
+        purpose,
+        phone_number_id: phoneNumberId || null,
         announce_text: mode === "announcement" ? announceText : "",
         end_after_announcement:
           mode === "announcement" ? endAfterAnnouncement : false,
@@ -302,7 +338,10 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
         });
         if (file) await addKnowledge(agent.id, { file });
       }
-      onDone(editing ? "Agent updated" : "Agent created");
+      onDone(
+        (editing ? "Agent updated" : "Agent created") +
+          (agent.telephony_warning ? ` — ${agent.telephony_warning}` : ""),
+      );
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -317,6 +356,9 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     noResponseTimeout,
     noResponseMessage,
     mode,
+    purpose,
+    phoneNumberId,
+    phoneNumbers,
     announceText,
     endAfterAnnouncement,
     personality,
@@ -340,6 +382,8 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     setNoResponseTimeout,
     setNoResponseMessage,
     setMode,
+    setPurpose,
+    setPhoneNumberId,
     setAnnounceText,
     setEndAfterAnnouncement,
     setPersonality,

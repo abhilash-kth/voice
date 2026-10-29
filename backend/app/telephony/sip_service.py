@@ -12,7 +12,6 @@ from ..config import (
     LIVEKIT_URL,
     LIVEKIT_API_KEY,
     LIVEKIT_API_SECRET,
-    DEFAULT_SIP_TRUNK_ID,
 )
 
 from .core import AGENT_NAME, _lk, _metadata, _req_creds, logger, make_room_name
@@ -21,6 +20,7 @@ from .core import AGENT_NAME, _lk, _metadata, _req_creds, logger, make_room_name
 async def create_sip_call(
     agent_id: str, phone: str, sip_trunk_id: Optional[str] = None, call_id: str = "", user_id: str = "",
     lead_data: Optional[dict] = None,
+    sip_call_to: Optional[str] = None, sip_number: Optional[str] = None,
 ) -> dict:
     """Places an outbound SIP call to `phone` and returns the room/token info.
 
@@ -28,13 +28,24 @@ async def create_sip_call(
     dispatch) config, and the number is dialed by an outbound SIP participant.
     ``lead_data`` is passed through the room metadata so the worker can fill the
     dynamic script placeholders for this specific lead.
+
+    ``phone`` stays the customer-visible destination stored in the call
+    record/metadata. ``sip_call_to`` optionally overrides only the carrier
+    dial string (VoiceLink needs its tech prefix, e.g. 45454+91+number), and
+    ``sip_number`` optionally sets the caller ID to the agent's assigned DID.
     """
     from livekit import api
 
     _req_creds()
-    trunk = sip_trunk_id or DEFAULT_SIP_TRUNK_ID
+    trunk = sip_trunk_id or ""
     if not trunk:
-        raise ValueError("No SIP trunk configured. Set DEFAULT_SIP_TRUNK_ID or pass sip_trunk_id.")
+        from ..services import telephony_settings
+        settings = await telephony_settings.get_settings()
+        trunk = settings.default_sip_trunk_id
+    if not trunk:
+        raise ValueError(
+            "No SIP trunk configured. Set the default SIP trunk in Super "
+            "Admin -> Telephony -> Settings or assign a purchased number.")
 
     room = make_room_name()
     metadata = _metadata(agent_id, "sip", phone, call_id, user_id, lead_data)
@@ -57,16 +68,19 @@ async def create_sip_call(
         # 2) Dial the number through the SIP trunk. If this fails the room would
         # otherwise sit with an agent dispatch and no caller — clean it up.
         try:
+            participant_req = api.CreateSIPParticipantRequest(
+                room_name=room,
+                participant_identity="phone-" + uuid.uuid4().hex[:6],
+                sip_call_to=sip_call_to or phone,   # carrier dial string
+                krisp_enabled=False,
+            )
+            if sip_number and hasattr(participant_req, "sip_number"):
+                try:
+                    participant_req.sip_number = sip_number
+                except Exception:
+                    pass
             resp = await _lk(
-                client.sip.create_sip_participant(
-                    api.CreateSIPParticipantRequest(
-                        room_name=room,
-                        participant_identity="phone-" + uuid.uuid4().hex[:6],
-                        sip_call_to=phone,          # e.g. +9180XXXXXXX
-                        krisp_enabled=False,
-                    ),
-                    trunk_id=trunk,
-                ),
+                client.sip.create_sip_participant(participant_req, trunk_id=trunk),
                 timeout=15.0,
                 op="CreateSIPParticipant",
             )

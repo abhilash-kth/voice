@@ -100,6 +100,72 @@ async def deduct(user_id: str, amount: float, note: str = "") -> dict:
     raise RuntimeError("wallet deduct failed: balance changed concurrently (retry)")
 
 
+async def credit(user_id: str, amount: float, note: str = "Refund",
+                 kind: str = "refund") -> dict:
+    """Atomic wallet credit with a caller-chosen ledger note/kind (refunds,
+    operator adjustments). `recharge` above stays the customer top-up path."""
+    db = get_prisma()
+    if amount <= 0:
+        return await get_wallet(user_id)
+    async with db.tx(timeout=8000) as tx:
+        u = await tx.user.find_unique(where={"id": user_id})
+        if not u:
+            raise ValueError("user not found")
+        new_balance = round((u.walletBalance or 0) + amount, 2)
+        await tx.user.update(where={"id": user_id}, data={"walletBalance": new_balance})
+        await tx.transaction.create(
+            data={"userId": user_id, "kind": kind, "amount": amount,
+                  "note": note, "ts": _ts()})
+    return await get_wallet(user_id)
+
+
+async def deduct_exact(user_id: str, amount: float, note: str = "") -> dict:
+    """Like `deduct`, but REFUSES (ValueError) when the balance cannot cover
+    the full amount instead of flooring at ₹0. Purchases use this so a number
+    is never "paid" with money the wallet did not have. Idempotent by note,
+    same compare-and-set discipline as `deduct`."""
+    db = get_prisma()
+    if amount <= 0:
+        return await get_wallet(user_id)
+    for _attempt in range(2):
+        if note:
+            try:
+                existing = await db.transaction.find_first(
+                    where={"userId": user_id, "kind": "spend", "note": note})
+                if existing:
+                    return await get_wallet(user_id)
+            except Exception:
+                pass
+        u = await db.user.find_unique(where={"id": user_id})
+        if not u:
+            raise ValueError("user not found")
+        old_balance = u.walletBalance or 0
+        if old_balance < amount:
+            raise ValueError(
+                f"Insufficient wallet balance (has ₹{old_balance:.2f}, "
+                f"needs ₹{amount:.2f}). Recharge first.")
+        new_balance = round(old_balance - amount, 2)
+        res = await db.user.update_many(
+            where={"id": user_id, "walletBalance": old_balance},
+            data={"walletBalance": new_balance})
+        if getattr(res, "count", 0) == 0:
+            continue
+        try:
+            await db.transaction.create(
+                data={"userId": user_id, "kind": "spend", "amount": -amount,
+                      "note": note, "ts": _ts()})
+        except Exception:
+            try:
+                await db.user.update_many(
+                    where={"id": user_id, "walletBalance": new_balance},
+                    data={"walletBalance": old_balance})
+            except Exception:
+                pass
+            raise
+        return await get_wallet(user_id)
+    raise RuntimeError("wallet deduct failed: balance changed concurrently (retry)")
+
+
 async def has_spend_for_call(user_id: str, call_id: str) -> bool:
     db = get_prisma()
     try:

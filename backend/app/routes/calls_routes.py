@@ -16,6 +16,9 @@ from .. import auth
 from .. import repo
 from .. import telephony
 from ..config import LIVEKIT_URL
+from ..services.telephony_policy import (TelephonyError, carrier_dial_number,
+                                         normalize_destination,
+                                         resolve_outbound)
 from .calls_watchdog import agent_join_watchdog
 
 logger = logging.getLogger("voice-agent-saas-api")
@@ -40,6 +43,18 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         raise HTTPException(404, "Agent not found")
     if not rec["enabled"]:
         raise HTTPException(400, "This agent is disabled")
+
+    # Purpose gate + trunk derivation for real phone calls. Inbound-only
+    # agents can still be browser-tested, but may never dial out. When the
+    # agent has an assigned purchased number, its stored trunk/caller-ID
+    # wins and any client-supplied sip_trunk_id is ignored.
+    outbound_route = None
+    if mode == "sip":
+        try:
+            outbound_route = await resolve_outbound(
+                rec, user.id, sip_trunk_id or "")
+        except TelephonyError as e:
+            raise HTTPException(e.status_code, str(e)) from None
 
     # PREFLIGHT: run the worker's exact config→runtime path BEFORE creating the
     # room. A saved agent whose config no longer builds (model removed from the
@@ -118,13 +133,24 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         "user_id": user.id,
         "agent_id": agent_id,
         "mode": mode,
-        "phone": phone or None,
+        "phone": normalize_destination(phone) if (mode == "sip" and phone) else (phone or None),
         "status": "planned",
     })
 
     try:
         if mode == "sip":
-            result = await telephony.create_sip_call(agent_id, phone, sip_trunk_id, call["id"], user.id)
+            route = outbound_route or {}
+            result = await telephony.create_sip_call(
+                agent_id, normalize_destination(phone),
+                route.get("sip_trunk_id") or sip_trunk_id,
+                call["id"], user.id,
+                sip_call_to=carrier_dial_number(
+                    phone, route.get("dial_prefix") or ""),
+                sip_number=route.get("caller_id") or None)
+            result["phone_number"] = route.get("phone_number") or ""
+            result["purpose"] = rec.get("purpose") or "outbound"
+            # The trunk is a server-managed routing detail, not customer data.
+            result.pop("sip_trunk_id", None)
         else:
             result = await telephony.create_browser_room(agent_id, phone, call["id"], user.id)
     except ModuleNotFoundError:

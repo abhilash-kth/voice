@@ -44,7 +44,9 @@ def _now() -> str:
 
 
 def create(*, user_id: str, agent_id: str, name: str, concurrency: int,
-           sip_trunk_id: str = "", lead_rows: list[dict], phone_column: str) -> dict:
+           sip_trunk_id: str = "", lead_rows: list[dict], phone_column: str,
+           phone_number_id: str = "", caller_id: str = "",
+           dial_prefix: str = "") -> dict:
     """Create a campaign with pre-parsed leads. Status starts as 'paused' (caller
     starts it explicitly, or the API can auto-start)."""
     cid = _new_id()
@@ -65,6 +67,12 @@ def create(*, user_id: str, agent_id: str, name: str, concurrency: int,
         "name": name,
         "concurrency": max(1, int(concurrency)),
         "sip_trunk_id": sip_trunk_id,
+        # Derived server-side from the agent's assigned number at creation;
+        # the runner re-resolves live each tick so purpose/assignment
+        # changes take effect before the next dial.
+        "phone_number_id": phone_number_id,
+        "caller_id": caller_id,
+        "dial_prefix": dial_prefix,
         "phone_column": phone_column,
         "created_at": _now(),
         "status": "paused",          # paused | running | done

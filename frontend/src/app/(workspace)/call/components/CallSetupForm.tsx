@@ -94,6 +94,10 @@ export default function CallSetupForm({
     callState === "connecting" ||
     callState === "waiting_for_agent" ||
     (!agentsReady && callState === "idle");
+  const inboundOnly =
+    selected != null &&
+    !["outbound", "both"].includes(selected.purpose || "outbound");
+  const hasAssignedNumber = Boolean(selected?.phone_number_id);
 
   return (
     <Card className="overflow-hidden border-border/70 bg-card py-0 shadow-sm">
@@ -144,6 +148,10 @@ export default function CallSetupForm({
                     ? "Announcement mode: plays a fixed script, then ends the call automatically."
                     : "Announcement mode: plays a fixed script and stays open until you end the call."
                   : "Assistant mode: greets on connect, then listens and converses turn by turn."}
+                {` Purpose: ${selected.purpose || "outbound"}.`}
+                {selected.phone_number
+                  ? ` Assigned caller number: ${selected.phone_number}.`
+                  : " No assigned phone number."}
               </p>
             </div>
           ) : (
@@ -182,7 +190,7 @@ export default function CallSetupForm({
             </button>
             <button
               type="button"
-              disabled={isCallActive}
+              disabled={isCallActive || inboundOnly}
               onClick={() => onModeChange("sip")}
               className={cn(
                 "inline-flex h-11 items-center justify-center gap-2 rounded-lg border text-xs font-semibold transition-all disabled:opacity-50",
@@ -196,6 +204,13 @@ export default function CallSetupForm({
             </button>
           </div>
         </div>
+
+        {mode === "sip" && inboundOnly && (
+          <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2.5 text-sm text-amber-800 dark:text-amber-300">
+            This agent is inbound-only. Switch to Browser testing or choose an
+            outbound/both-purpose agent.
+          </div>
+        )}
 
         {/* SIP fields */}
         {mode === "sip" && (
@@ -220,25 +235,36 @@ export default function CallSetupForm({
                 autoComplete="tel"
               />
             </div>
-            <div className="space-y-1.5">
-              <Label
-                htmlFor="call-trunk"
-                className="text-xs font-medium text-muted-foreground"
-              >
-                SIP trunk ID
-                <span className="ml-1 font-normal text-muted-foreground/70">
-                  (optional)
+            {hasAssignedNumber ? (
+              <div className="rounded-lg border border-primary/15 bg-primary/5 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
+                Calling from assigned number{" "}
+                <span className="font-mono font-semibold text-foreground">
+                  {selected?.phone_number || "purchased number"}
                 </span>
-              </Label>
-              <Input
-                id="call-trunk"
-                value={trunkId}
-                onChange={(e) => onTrunkChange(e.target.value)}
-                placeholder="Trunk ID registered in LiveKit"
-                className="h-9 font-mono text-sm"
-                disabled={isCallActive}
-              />
-            </div>
+                . Its SIP trunk and caller ID are managed automatically by the
+                backend.
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <Label
+                  htmlFor="call-trunk"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  SIP trunk ID
+                  <span className="ml-1 font-normal text-muted-foreground/70">
+                    (optional)
+                  </span>
+                </Label>
+                <Input
+                  id="call-trunk"
+                  value={trunkId}
+                  onChange={(e) => onTrunkChange(e.target.value)}
+                  placeholder="Trunk ID registered in LiveKit"
+                  className="h-9 font-mono text-sm"
+                  disabled={isCallActive}
+                />
+              </div>
+            )}
             <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground">
               <Info className="mt-0.5 h-3 w-3 shrink-0" />
               Requires a LiveKit SIP trunk and carrier credentials on the
@@ -281,7 +307,13 @@ export default function CallSetupForm({
             type="button"
             className="h-11 w-full gap-2 text-sm font-semibold shadow-sm"
             onClick={onStart}
-            disabled={busy || isCallActive || !agentId || !agentsReady}
+            disabled={
+              busy ||
+              isCallActive ||
+              !agentId ||
+              !agentsReady ||
+              (mode === "sip" && inboundOnly)
+            }
           >
             {startPending ? (
               <Loader2 className="h-4 w-4 animate-spin" />

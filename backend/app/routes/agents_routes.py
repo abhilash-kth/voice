@@ -15,10 +15,44 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from ..models import AgentCreate, AgentUpdate
 from .. import auth
 from .. import repo
+from ..services.telephony_policy import (TelephonyError,
+                                         validate_agent_phone_assignment)
 
 logger = logging.getLogger("voice-agent-saas-api")
 
 router = APIRouter(tags=["agents"])
+
+
+def _cache_agent(rec: dict) -> None:
+    try:
+        from ..config import DATA_DIR
+        cache_file = DATA_DIR / f"agent_{rec['id']}.json"
+        cache_file.write_text(json.dumps(rec))
+    except Exception:
+        pass
+
+
+async def _sync_agent_numbers(user_id: str, *phone_ids) -> str:
+    """Best-effort inbound dispatch sync after assignment changes. Returns a
+    warning (agent save still succeeds; the number shows the pending error)."""
+    from ..services import telephony_provisioning
+    warning = ""
+    for phone_id in {p for p in phone_ids if p}:
+        try:
+            await telephony_provisioning.sync_inbound_dispatch(phone_id, user_id)
+        except Exception as e:
+            logger.warning("[AGENT_INBOUND_SYNC_WARN] phone=%s: %s", phone_id, e)
+            warning = warning or f"Inbound routing sync pending: {e}"
+    return warning
+
+
+async def _enrich_phone(rec: dict, user_id: str) -> dict:
+    if rec.get("phone_number_id"):
+        phone = await repo.get_phone_number(rec["phone_number_id"], user_id)
+        rec["phone_number"] = phone["number"] if phone else None
+    else:
+        rec["phone_number"] = None
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +61,13 @@ router = APIRouter(tags=["agents"])
 @router.get("/api/agents")
 async def list_agents(user=Depends(auth.get_current_user)):
     agents = await repo.list_agents(user.id)
+    try:
+        phone_by_id = {p["id"]: p["number"]
+                       for p in await repo.list_phone_numbers(user.id)}
+    except Exception:
+        phone_by_id = {}
     for a in agents:
+        a["phone_number"] = phone_by_id.get(a.get("phone_number_id") or "")
         calls = await repo.list_calls(user.id, agent_id=a["id"])
         a["call_count"] = len([c for c in calls if c["status"] in ("completed", "in-progress")])
         a["total_billed"] = round(
@@ -42,7 +82,7 @@ async def get_agent(agent_id: str, user=Depends(auth.get_current_user)):
     rec = await repo.get_agent(agent_id, user.id)
     if not rec:
         raise HTTPException(404, "Agent not found")
-    return rec
+    return await _enrich_phone(rec, user.id)
 
 
 @router.post("/api/agents", status_code=201)
@@ -104,12 +144,41 @@ async def create_agent(body: AgentCreate, user=Depends(auth.get_current_user)):
             user.id, int(getattr(body, "max_concurrency", 1) or 1))
     except subscription_service.SubscriptionError as e:
         raise HTTPException(402, str(e)) from None
-    return await repo.create_agent(user.id, body.model_dump())
+    # Purpose is required by the schema; an assigned number must be this
+    # user's active DID, with at most one inbound-capable agent per DID.
+    try:
+        await validate_agent_phone_assignment(
+            user.id, body.purpose, body.phone_number_id)
+    except TelephonyError as e:
+        raise HTTPException(e.status_code, str(e)) from None
+    rec = await repo.create_agent(user.id, body.model_dump())
+    _cache_agent(rec)
+    warning = await _sync_agent_numbers(user.id, rec.get("phone_number_id"))
+    rec = await _enrich_phone(rec, user.id)
+    if warning:
+        rec["telephony_warning"] = warning
+    return rec
 
 
 @router.put("/api/agents/{agent_id}")
 async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_current_user)):
+    existing = await repo.get_agent(agent_id, user.id)
+    if not existing:
+        raise HTTPException(404, "Agent not found")
     patch = body.model_dump(exclude_none=True)
+    # exclude_none would drop an explicit null; present-but-null is how the
+    # form clears the assigned number.
+    if "phone_number_id" in body.model_fields_set:
+        patch["phone_number_id"] = body.phone_number_id or None
+    effective_purpose = patch.get("purpose", existing.get("purpose") or "outbound")
+    effective_phone = (patch["phone_number_id"] if "phone_number_id" in patch
+                       else existing.get("phone_number_id"))
+    try:
+        await validate_agent_phone_assignment(
+            user.id, effective_purpose, effective_phone,
+            current_agent_id=agent_id)
+    except TelephonyError as e:
+        raise HTTPException(e.status_code, str(e)) from None
     if patch.get("max_concurrency") is not None:
         from ..services import subscription_service
         try:
@@ -120,19 +189,22 @@ async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_c
     rec = await repo.update_agent(agent_id, user.id, patch)
     if not rec:
         raise HTTPException(404, "Agent not found")
-    try:
-        from ..config import DATA_DIR
-        cache_file = DATA_DIR / f"agent_{agent_id}.json"
-        cache_file.write_text(json.dumps(rec))
-    except Exception:
-        pass
+    _cache_agent(rec)
+    warning = await _sync_agent_numbers(
+        user.id, existing.get("phone_number_id"), rec.get("phone_number_id"))
+    rec = await _enrich_phone(rec, user.id)
+    if warning:
+        rec["telephony_warning"] = warning
     return rec
 
 
 @router.delete("/api/agents/{agent_id}", status_code=204)
 async def delete_agent(agent_id: str, user=Depends(auth.get_current_user)):
+    existing = await repo.get_agent(agent_id, user.id)
     if not await repo.delete_agent(agent_id, user.id):
         raise HTTPException(404, "Agent not found")
+    if existing and existing.get("phone_number_id"):
+        await _sync_agent_numbers(user.id, existing["phone_number_id"])
 
 
 # ---------------------------------------------------------------------------

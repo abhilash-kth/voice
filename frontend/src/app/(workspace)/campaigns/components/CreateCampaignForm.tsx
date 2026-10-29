@@ -24,6 +24,9 @@ export default function CreateCampaignForm({
   onChanged?: () => void;
 }) {
   const router = useRouter();
+  const eligibleAgents = agents.filter((agent) =>
+    ["outbound", "both"].includes(agent.purpose || "outbound"),
+  );
   const [name, setName] = useState("");
   const [agentId, setAgentId] = useState("");
   const [concurrency, setConcurrency] = useState(5);
@@ -33,8 +36,13 @@ export default function CreateCampaignForm({
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (!agentId && agents.length) setAgentId(agents[0].id);
-  }, [agents, agentId]);
+    if (agentId && !eligibleAgents.some((agent) => agent.id === agentId)) {
+      setAgentId("");
+    } else if (!agentId && eligibleAgents.length) {
+      setAgentId(eligibleAgents[0].id);
+    }
+  }, [eligibleAgents, agentId]);
+  const selectedAgent = eligibleAgents.find((agent) => agent.id === agentId);
 
   const submit = async () => {
     if (!agentId) {
@@ -51,7 +59,10 @@ export default function CreateCampaignForm({
       form.set("name", name || "Campaign");
       form.set("agent_id", agentId);
       form.set("concurrency", String(concurrency || 1));
-      if (sipTrunkId) form.set("sip_trunk_id", sipTrunkId);
+      // Assigned purchased numbers use their backend-managed trunk.
+      if (sipTrunkId && !selectedAgent?.phone_number_id) {
+        form.set("sip_trunk_id", sipTrunkId);
+      }
       if (phoneColumn) form.set("phone_column", phoneColumn);
       form.set("autostart", "true");
       form.set("file", file);
@@ -109,12 +120,20 @@ export default function CreateCampaignForm({
                 onChange={(e) => setAgentId(e.target.value)}
                 className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
               >
-                {agents.map((agent) => (
+                {eligibleAgents.map((agent) => (
                   <option key={agent.id} value={agent.id}>
-                    {agent.name}
+                    {agent.name} — {agent.purpose || "outbound"}
+                    {agent.phone_number ? ` · ${agent.phone_number}` : ""}
                   </option>
                 ))}
               </select>
+              <span className="block text-xs font-normal text-muted-foreground">
+                {eligibleAgents.length === 0
+                  ? "No outbound or both-purpose agents are available. Create one before starting a campaign."
+                  : selectedAgent?.phone_number
+                    ? `Calls will show caller ID ${selectedAgent.phone_number}; its trunk is managed automatically.`
+                    : "Inbound-only agents are hidden because campaigns place outbound calls."}
+              </span>
             </label>
             <label className="space-y-2 text-sm font-medium">
               Concurrent calls
@@ -128,17 +147,26 @@ export default function CreateCampaignForm({
                 Maximum calls placed at the same time.
               </span>
             </label>
-            <label className="space-y-2 text-sm font-medium">
-              SIP trunk ID{" "}
-              <span className="font-normal text-muted-foreground">
-                (optional)
-              </span>
-              <Input
-                value={sipTrunkId}
-                onChange={(e) => setSipTrunkId(e.target.value)}
-                placeholder="Default or ST_xxxx"
-              />
-            </label>
+            {selectedAgent?.phone_number_id ? (
+              <div className="space-y-2 text-sm font-medium">
+                SIP trunk
+                <div className="flex h-9 items-center rounded-md border border-input bg-muted/40 px-3 text-sm font-normal text-muted-foreground">
+                  Managed from assigned number
+                </div>
+              </div>
+            ) : (
+              <label className="space-y-2 text-sm font-medium">
+                SIP trunk ID{" "}
+                <span className="font-normal text-muted-foreground">
+                  (optional)
+                </span>
+                <Input
+                  value={sipTrunkId}
+                  onChange={(e) => setSipTrunkId(e.target.value)}
+                  placeholder="Default or ST_xxxx"
+                />
+              </label>
+            )}
           </div>
 
           <div className="space-y-2">
@@ -216,7 +244,7 @@ export default function CreateCampaignForm({
             >
               Cancel
             </Link>
-            <Button onClick={() => void submit()} disabled={busy}>
+            <Button onClick={() => void submit()} disabled={busy || !agentId}>
               <Users className="mr-2 size-4" />
               {busy ? "Creating…" : "Create and start campaign"}
             </Button>

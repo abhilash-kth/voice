@@ -279,4 +279,301 @@ export const listAuditLogs = (params: { page?: number; page_size?: number; actio
   return req<Paged<AuditLog>>(`/api/admin/audit-logs?${qs.toString()}`);
 };
 
+// ------ telephony marketplace ----------------------------------------------
+export interface TelephonyOverview {
+  configured: boolean;
+  config: {
+    source?: "super_admin" | "environment_fallback" | string;
+    api_base_url: string;
+    voicelink_sip: string;
+    livekit_sip: string;
+    tech_prefix: string;
+    wallet_bypass: boolean;
+    kyc_finalize_verified: boolean;
+    kyc_terms_configured: boolean;
+    default_trunk_configured?: boolean;
+    frontend_url?: string;
+    public_api_url?: string;
+    updated_at?: string;
+  };
+  provider_profile: Record<string, unknown> | null;
+  provider_error: string;
+  counts: {
+    accounts: number;
+    numbers: number;
+    purchases: number;
+    accounts_by_kyc: Record<string, number>;
+    numbers_by_status: Record<string, number>;
+    purchases_by_state: Record<string, number>;
+  };
+}
+
+export interface TelephonyAccount {
+  id: string;
+  user_id: string;
+  user_email?: string;
+  user_name?: string;
+  client_id: string;
+  username: string;
+  email: string;
+  name: string;
+  phone: string;
+  status: string;
+  kyc_status: string;
+  kyc_step: string;
+  kyc_meta: Record<string, unknown>;
+  wallet_balance: number;
+  channels_allocated: number;
+  channels_available: number;
+  numbers_count?: number;
+  last_error: string;
+  last_synced_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TelephonyAssignedAgent {
+  id: string;
+  name: string;
+  purpose: string;
+  enabled: boolean;
+}
+
+export interface TelephonyNumber {
+  id: string;
+  user_id: string;
+  user_email?: string;
+  user_name?: string;
+  voice_link_account_id: string | null;
+  number: string;
+  country_code: string;
+  status: string;
+  provisioning_step: string;
+  source: string;
+  channels: number;
+  monthly_rate: number;
+  expires_at: string;
+  provider_did_id: string;
+  provider_purchase_id: string;
+  sip_username: string;
+  sip_password_masked: string;
+  has_sip_password: boolean;
+  voice_link_trunk_id: string;
+  voice_link_routing_id: string;
+  livekit_outbound_trunk_id: string;
+  livekit_inbound_trunk_id: string;
+  livekit_dispatch_rule_id: string;
+  inbound_agent_id: string | null;
+  dial_prefix: string;
+  last_error: string;
+  agents?: TelephonyAssignedAgent[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TelephonyPurchase {
+  id: string;
+  user_id: string;
+  user_email?: string;
+  user_name?: string;
+  voice_link_account_id: string;
+  phone_number_id: string | null;
+  provider_did_id: string;
+  number: string;
+  months: number;
+  channels: number;
+  provider_order_id: string;
+  provider_purchase_id: string;
+  quote_total: number;
+  monthly_rate: number;
+  customer_charge: number;
+  state: string;
+  error: string;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TelephonyAccountDetail {
+  account: TelephonyAccount;
+  numbers: TelephonyNumber[];
+  purchases: TelephonyPurchase[];
+}
+
+const qsOf = (params: Record<string, string | number | undefined>) => {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== "") qs.set(k, String(v));
+  }
+  return qs.toString() ? `?${qs}` : "";
+};
+
+export interface TelephonySettings {
+  source: "super_admin" | "environment_fallback" | string;
+  configured: boolean;
+  encryption_key_configured: boolean;
+  default_sip_trunk_id: string;
+  voicelink_api_base_url: string;
+  voicelink_api_token_configured: boolean;
+  voicelink_api_token_masked: string;
+  voicelink_username: string;
+  voicelink_password_configured: boolean;
+  voicelink_password_masked: string;
+  voicelink_sip_host: string;
+  voicelink_sip_port: number;
+  voicelink_tech_prefix: string;
+  voicelink_transport_type: number;
+  voicelink_audio_formats: string[];
+  voicelink_wallet_bypass: boolean;
+  voicelink_kyc_terms_url: string;
+  voicelink_kyc_redirect_hosts: string[];
+  kyc_finalize_verified: boolean;
+  livekit_sip_host: string;
+  livekit_sip_port: number;
+  frontend_url: string;
+  public_api_url: string;
+  updated_at: string;
+}
+
+export interface TelephonySettingsPatch {
+  default_sip_trunk_id?: string;
+  voicelink_api_base_url?: string;
+  voicelink_api_token?: string;
+  clear_voicelink_api_token?: boolean;
+  voicelink_username?: string;
+  voicelink_password?: string;
+  clear_voicelink_password?: boolean;
+  voicelink_sip_host?: string;
+  voicelink_sip_port?: number;
+  voicelink_tech_prefix?: string;
+  voicelink_transport_type?: number;
+  voicelink_audio_formats?: string[];
+  voicelink_wallet_bypass?: boolean;
+  voicelink_kyc_terms_url?: string;
+  voicelink_kyc_redirect_hosts?: string[];
+  kyc_finalize_verified?: boolean;
+  livekit_sip_host?: string;
+  livekit_sip_port?: number;
+  frontend_url?: string;
+  public_api_url?: string;
+}
+
+export interface TelephonySettingsTest {
+  ok: boolean;
+  profile: {
+    id?: string;
+    active?: boolean;
+    verified?: boolean;
+    billing_mode?: string;
+    wallet_balance?: number;
+    channels_available?: number;
+    plan_name?: string;
+    [key: string]: unknown;
+  } | null;
+}
+
+export const getTelephonySettings = () =>
+  req<{ settings: TelephonySettings }>("/api/admin/telephony/settings");
+
+export const updateTelephonySettings = (body: TelephonySettingsPatch) =>
+  req<{ settings: TelephonySettings }>("/api/admin/telephony/settings", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+
+export const testTelephonySettings = () =>
+  req<TelephonySettingsTest>("/api/admin/telephony/settings/test", {
+    method: "POST",
+  });
+
+export const getTelephonyOverview = () =>
+  req<TelephonyOverview>("/api/admin/telephony/overview");
+
+export const listTelephonyAccounts = (params: {
+  page?: number;
+  page_size?: number;
+  q?: string;
+  kyc_status?: string;
+  status?: string;
+} = {}) =>
+  req<Paged<TelephonyAccount>>(`/api/admin/telephony/accounts${qsOf(params)}`);
+
+export const getTelephonyAccount = (id: string) =>
+  req<TelephonyAccountDetail>(`/api/admin/telephony/accounts/${id}`);
+
+export const syncTelephonyAccount = (id: string) =>
+  req<TelephonyAccountDetail>(`/api/admin/telephony/accounts/${id}/sync`, {
+    method: "POST",
+  });
+
+export const allocateTelephonyWallet = (
+  id: string,
+  amount: number,
+  description = "Operator allocation",
+) =>
+  req<TelephonyAccount>(`/api/admin/telephony/accounts/${id}/allocate-wallet`, {
+    method: "POST",
+    body: JSON.stringify({ amount, description }),
+  });
+
+export const setTelephonyAccountStatus = (
+  id: string,
+  status: "active" | "suspended",
+) =>
+  req<TelephonyAccount>(`/api/admin/telephony/accounts/${id}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+
+export const listTelephonyNumbers = (params: {
+  page?: number;
+  page_size?: number;
+  q?: string;
+  status?: string;
+  user_id?: string;
+} = {}) =>
+  req<Paged<TelephonyNumber>>(`/api/admin/telephony/numbers${qsOf(params)}`);
+
+export const retryTelephonyNumber = (id: string) =>
+  req<TelephonyNumber>(`/api/admin/telephony/numbers/${id}/retry-provision`, {
+    method: "POST",
+  });
+
+export const syncTelephonyInbound = (id: string) =>
+  req<TelephonyNumber>(`/api/admin/telephony/numbers/${id}/sync-inbound`, {
+    method: "POST",
+  });
+
+export const setTelephonyNumberStatus = (
+  id: string,
+  status: "active" | "suspended",
+) =>
+  req<TelephonyNumber>(`/api/admin/telephony/numbers/${id}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+
+export interface ManualNumberBody {
+  user_id: string;
+  number: string;
+  livekit_outbound_trunk_id?: string;
+  livekit_inbound_trunk_id?: string;
+  dial_prefix?: string;
+  channels?: number;
+  expires_at?: string;
+}
+
+export const createManualTelephonyNumber = (body: ManualNumberBody) =>
+  req<TelephonyNumber>("/api/admin/telephony/numbers/manual", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const listTelephonyPurchases = (params: {
+  page?: number;
+  page_size?: number;
+  state?: string;
+} = {}) =>
+  req<Paged<TelephonyPurchase>>(`/api/admin/telephony/purchases${qsOf(params)}`);
+
 export { BASE };

@@ -196,6 +196,15 @@ export default function AgentsPage() {
                         />
                         <span className="mx-0.5 hidden h-4 w-px bg-border sm:inline-block" />
                         <MetaChip
+                          icon={PhoneCall}
+                          text={
+                            a.phone_number
+                              ? `${a.purpose || "outbound"} · ${a.phone_number}`
+                              : `${a.purpose || "outbound"} · no number`
+                          }
+                          className="border-indigo-500/20 bg-indigo-500/10 capitalize text-indigo-700 dark:text-indigo-400"
+                        />
+                        <MetaChip
                           icon={MemoryStick}
                           text={a.memory_enabled ? "Memory" : "No memory"}
                           className={

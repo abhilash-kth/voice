@@ -9,6 +9,7 @@ import {
   PhoneCall,
   Megaphone,
   Bot,
+  Phone,
   Wallet,
   History,
   LogOut,
@@ -31,6 +32,7 @@ const WORKSPACE_NAV: NavItem[] = [
   { href: "/call", label: "Live Call", icon: PhoneCall },
   { href: "/campaigns", label: "Campaigns", icon: Megaphone },
   { href: "/agents", label: "Agents", icon: Bot },
+  { href: "/phone-numbers", label: "Phone Numbers", icon: Phone },
   { href: "/calls", label: "Call History", icon: History },
 ];
 

@@ -81,6 +81,11 @@ export interface Agent {
     announce_text?: string;
     end_after_announcement?: boolean;
     fallback_response?: string;
+    // outbound | inbound | both — chosen at creation; gates SIP calls/campaigns
+    purpose?: "outbound" | "inbound" | "both";
+    phone_number_id?: string | null;
+    phone_number?: string | null;
+    telephony_warning?: string;
     providers: {
         llm: { id: string; config: Record<string, unknown> };
         stt: { id: string; config: Record<string, unknown> };

@@ -30,10 +30,11 @@ from . import telephony
 from . import campaign_runner
 from .db import init, shutdown
 from .admin import routes as admin_routes
-from .services import config_store
+from .services import config_store, telephony_settings
 from .routes import (auth_routes, catalog_routes, agents_routes,
                      calls_routes, campaigns_routes, billing_routes,
-                     setup_routes, subscription_routes, contact_routes)
+                     setup_routes, subscription_routes, contact_routes,
+                     telephony_routes)
 
 logger = logging.getLogger("voice-agent-saas-api")
 
@@ -49,6 +50,10 @@ async def lifespan(app):
         await config_store.init()
     except Exception as e:
         logger.warning(f"dynamic config init failed (code defaults in effect): {e!r}")
+    try:
+        await telephony_settings.init()
+    except Exception as e:
+        logger.warning(f"telephony settings init failed (env fallback in effect): {e!r}")
     try:
         from .services import catalog_service as _catalog_service
         await _catalog_service.seed_credentials_from_env()
@@ -137,6 +142,7 @@ app.include_router(campaigns_routes.router)
 app.include_router(billing_routes.router)
 app.include_router(subscription_routes.router)
 app.include_router(contact_routes.router)
+app.include_router(telephony_routes.router)
 
 # Credentialed-cookie sessions require explicit origins (browsers reject "*"
 # with credentials) — and an explicit allowlist is better hygiene anyway.

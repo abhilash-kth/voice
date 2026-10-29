@@ -49,6 +49,9 @@ model User {
   agents        Agent[]
   calls         Call[]
   transactions  Transaction[]
+  voiceLinkAccount VoiceLinkAccount?
+  phoneNumbers  PhoneNumber[]
+  phonePurchases PhonePurchase[]
 }
 
 // --------------------------------------------------------------------------
@@ -82,10 +85,21 @@ model Agent {
   providers         String  @default("{}")
   // Serialized JSON: {"text","documents[]","system_prompt","faq[]"}
   knowledge         String  @default("{}")
+  // Customer-selected calling purpose: outbound | inbound | both.
+  // Outbound PSTN calls/campaigns require outbound|both; inbound DID
+  // dispatch requires inbound|both. Existing agents default to outbound.
+  callDirection     String  @default("outbound")
+  // Optional purchased DID assigned to this agent. The backend derives the
+  // LiveKit trunk + caller ID from this row; customers never enter trunk IDs.
+  phoneNumberId     String?
   createdAt         String  @default("")
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phoneNumber PhoneNumber? @relation(fields: [phoneNumberId], references: [id], onDelete: SetNull)
   calls Call[]
+
+  @@index([phoneNumberId])
+  @@index([userId, callDirection])
 }
 
 // --------------------------------------------------------------------------
@@ -275,6 +289,37 @@ model BillingConfig {
 }
 
 // --------------------------------------------------------------------------
+// Telephony marketplace operator configuration (single-row "global" record)
+// Managed from Super Admin -> Telephony -> Settings. VoiceLink secrets are
+// Fernet ciphertext + masked display only. Env values are used only to seed
+// this row on first use and as an emergency fallback if the DB is unavailable.
+// --------------------------------------------------------------------------
+model TelephonyConfig {
+  id                         String  @id @default("global")
+  defaultSipTrunkId          String  @default("")
+  voicelinkApiBaseUrl        String  @default("https://app.voicelink.co.in/api/v1")
+  voicelinkApiTokenEnc       String  @default("")
+  voicelinkApiTokenMasked    String  @default("")
+  voicelinkUsername          String  @default("")
+  voicelinkPasswordEnc       String  @default("")
+  voicelinkPasswordMasked    String  @default("")
+  voicelinkSipHost           String  @default("sip.voicelink.co.in")
+  voicelinkSipPort           Int     @default(3300)
+  voicelinkTechPrefix        String  @default("45454")
+  voicelinkTransportType     Int     @default(1)
+  voicelinkAudioFormats      String  @default("alaw,ulaw")
+  voicelinkWalletBypass      Boolean @default(false)
+  voicelinkKycTermsUrl       String  @default("")
+  voicelinkKycRedirectHosts  String  @default("")
+  kycFinalizeVerified        Boolean @default(false)
+  livekitSipHost             String  @default("")
+  livekitSipPort             Int     @default(5060)
+  frontendUrl                String  @default("http://localhost:3000")
+  publicApiUrl               String  @default("")
+  updatedAt                  String  @default("")
+}
+
+// --------------------------------------------------------------------------
 // Monthly subscription: one row per user, snapshots their entitled plan.
 // Prices are taken from BillingConfig/PlanTier AT PURCHASE time (Super-Admin
 // price changes only affect future purchases/renewals).
@@ -346,4 +391,118 @@ model ContactMessage {
   createdAt String @default("")
 
   @@index([createdAt])
+}
+
+// --------------------------------------------------------------------------
+// Self-service telephony marketplace (VoiceLink-backed).
+//
+// One hidden VoiceLink client per SaaS customer. Customers only see their
+// KYC status, wallet and phone numbers; provider client ids, SIP passwords
+// and LiveKit trunk ids stay server-side (SIP password is Fernet-encrypted).
+// --------------------------------------------------------------------------
+model VoiceLinkAccount {
+  id                 String @id @default(cuid())
+  userId             String @unique
+  providerResellerId String @default("")
+  clientId           String @unique
+  username           String @default("")
+  email              String @default("")
+  name               String @default("")
+  phone              String @default("")
+  status             String @default("active") // active | suspended | error
+  kycStatus          String @default("not_started") // not_started | in_progress | submitted | verified | rejected | unknown
+  kycStep            String @default("register")
+  // Sanitized JSON progress only (booleans/step). Never store PAN/Aadhaar/GST
+  // numbers, document URLs or uploaded files here.
+  kycMeta            String @default("{}")
+  walletBalance      Float  @default(0)
+  channelsAllocated  Int    @default(0)
+  channelsAvailable  Int    @default(0)
+  lastError          String @default("")
+  lastSyncedAt       String @default("")
+  createdAt          String @default("")
+  updatedAt          String @default("")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phoneNumbers PhoneNumber[]
+  purchases    PhonePurchase[]
+
+  @@index([kycStatus])
+  @@index([status])
+}
+
+model PhoneNumber {
+  id                      String  @id @default(cuid())
+  userId                  String
+  voiceLinkAccountId      String?
+  number                  String  @unique // E.164, e.g. +919429399159
+  countryCode             String  @default("+91")
+  status                  String  @default("provisioning") // provisioning | active | failed | suspended | released
+  provisioningStep        String  @default("created")
+  source                  String  @default("voicelink") // voicelink | manual
+  channels                Int     @default(1)
+  monthlyRate             Float   @default(0)
+  expiresAt               String  @default("")
+  providerDidId           String  @default("")
+  providerPurchaseId      String  @default("")
+  sipUsername             String  @default("")
+  // Fernet ciphertext from services/crypto.py. Never returned by any API.
+  sipPasswordEnc          String  @default("")
+  sipPasswordMasked       String  @default("")
+  voiceLinkTrunkId        String  @default("")
+  voiceLinkRoutingId      String  @default("")
+  livekitOutboundTrunkId  String  @default("")
+  livekitInboundTrunkId   String  @default("")
+  livekitDispatchRuleId   String  @default("")
+  // Agent currently targeted by the LiveKit inbound dispatch rule (snapshot;
+  // the assignment source of truth is Agent.phoneNumberId + purpose).
+  inboundAgentId          String?
+  dialPrefix              String  @default("")
+  lastError               String  @default("")
+  // Sanitized provider metadata (ids/rates only, no secrets).
+  meta                    String  @default("{}")
+  createdAt               String  @default("")
+  updatedAt               String  @default("")
+
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account   VoiceLinkAccount? @relation(fields: [voiceLinkAccountId], references: [id], onDelete: SetNull)
+  agents    Agent[]
+  purchases PhonePurchase[]
+
+  @@index([userId, status])
+  @@index([voiceLinkAccountId])
+}
+
+// Durable DID checkout intent: created before the provider lock so a double
+// click, timeout or crash can never silently create a second paid order.
+model PhonePurchase {
+  id                 String  @id @default(cuid())
+  userId             String
+  voiceLinkAccountId String
+  phoneNumberId      String?
+  providerDidId      String  @default("")
+  number             String  @default("")
+  months             Int     @default(1)
+  channels           Int     @default(1)
+  providerOrderId    String  @default("")
+  providerPurchaseId String  @default("")
+  quoteTotal         Float   @default(0)
+  monthlyRate        Float   @default(0)
+  customerCharge     Float   @default(0)
+  // draft | quoted | confirming | purchased | assigned | provisioning |
+  // active | failed | needs_review | expired
+  state              String  @default("draft")
+  idempotencyKey     String
+  error              String  @default("")
+  expiresAt          String  @default("")
+  createdAt          String  @default("")
+  updatedAt          String  @default("")
+
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account     VoiceLinkAccount @relation(fields: [voiceLinkAccountId], references: [id], onDelete: Cascade)
+  phoneNumber PhoneNumber?     @relation(fields: [phoneNumberId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, state])
+  @@index([voiceLinkAccountId, state])
 }

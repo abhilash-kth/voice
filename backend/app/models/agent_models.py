@@ -1,10 +1,14 @@
 """Agent configuration + knowledge base models."""
 from __future__ import annotations
 
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Literal
 from pydantic import BaseModel, Field
 
 from .providers import ProviderSelection
+
+# Customer-selected calling purpose. Outbound PSTN/campaigns require
+# "outbound"|"both"; inbound DID dispatch requires "inbound"|"both".
+CallPurpose = Literal["outbound", "inbound", "both"]
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +59,10 @@ class AgentConfig(BaseModel):
     fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
     no_response_timeout_seconds: int = 30
     no_response_message: str = "I did not hear a response, so I will end the call now. Thank you for calling."
+    purpose: CallPurpose = "outbound"
+    phone_number_id: Optional[str] = None
+    # Display-only E.164 of the assigned number (filled by list endpoints).
+    phone_number: Optional[str] = None
 
 
 class AgentCreate(BaseModel):
@@ -80,6 +88,10 @@ class AgentCreate(BaseModel):
     fallback_response: str = "Sorry, there is a temporary technical problem. Please try again shortly."
     no_response_timeout_seconds: int = 30
     no_response_message: str = "I did not hear a response, so I will end the call now. Thank you for calling."
+    # REQUIRED at creation: the customer must choose what this agent is for.
+    purpose: CallPurpose
+    # Optional purchased DID (PhoneNumber.id) owned by the same user.
+    phone_number_id: Optional[str] = Field(None, max_length=64)
 
 
 class AgentUpdate(BaseModel):
@@ -103,3 +115,6 @@ class AgentUpdate(BaseModel):
     fallback_response: Optional[str] = None
     no_response_timeout_seconds: Optional[int] = None
     no_response_message: Optional[str] = None
+    purpose: Optional[CallPurpose] = None
+    # Present-but-null clears the assigned number (route uses model_fields_set).
+    phone_number_id: Optional[str] = Field(None, max_length=64)

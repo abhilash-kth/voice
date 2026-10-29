@@ -1,0 +1,235 @@
+# Telephony marketplace runbook
+
+## What is implemented
+
+- Agent creation requires **Purpose**: Outbound, Inbound, or Both.
+- An agent may be assigned one active purchased number.
+- Outbound calls/campaigns are blocked for inbound-only agents on both the
+  frontend and backend.
+- For an assigned number, the backend derives the LiveKit trunk, caller ID and
+  VoiceLink dial prefix; the browser cannot override them.
+- Customers use **Phone Numbers** in the workspace to start managed phone
+  setup, complete KYC, move calling balance, browse/quote/buy a DID and retry
+  activation.
+- Provisioning creates the VoiceLink SIP trunk/routing, the LiveKit outbound
+  trunk, a per-DID LiveKit inbound trunk and a trunk-scoped dispatch rule.
+  SIP passwords are encrypted server-side; customer APIs omit provider/trunk
+  identifiers and SIP credentials entirely, while Super Admin sees trunk IDs
+  and only a masked password.
+- Super Admin has **Telephony** for provider status, accounts/KYC, numbers,
+  trunk/provisioning state, purchases, sync/retry, suspension and registering
+  an already-provisioned DID manually. Its **Settings** tab stores the
+  VoiceLink/SIP marketplace configuration in the `TelephonyConfig` database
+  row (token/password encrypted), so telephony no longer needs
+  `backend/.env` edits.
+- `backend/app/agents/*` is untouched. Inbound dispatch uses the metadata
+  contract the existing worker already parses.
+
+## 1. VS Code setup (Windows PowerShell)
+
+Stop any already-running backend/worker/frontend terminals first (`Ctrl+C`).
+Open the repository root in VS Code and open **Terminal → New Terminal**
+(PowerShell). Make sure this implementation is present:
+
+```powershell
+Test-Path backend\app\services\telephony_settings.py   # must print True
+git status --short
+```
+
+Create/activate the backend virtual environment and install dependencies:
+
+```powershell
+cd backend
+if (!(Test-Path .venv)) { py -m venv .venv }
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+If PowerShell blocks `Activate.ps1`, run
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once in that
+terminal and activate again. If `py` is not recognized, use
+`python -m venv .venv` when creating the environment.
+
+In `backend/.env`, keep only the one-time bootstrap values that must exist
+before the database/panel can start: `DATABASE_URL`, `JWT_SECRET`,
+`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (shared with the
+worker), and `ADMIN_CONFIG_ENC_KEY`. If the encryption key is blank, generate
+one once and paste the output into `.env` (do not regenerate it later without
+a key-rotation plan, and never share it):
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Apply the Prisma schema and regenerate the Python client. This creates the
+marketplace tables plus the new `TelephonyConfig` table:
+
+```powershell
+python -m prisma db push --schema schema.prisma
+python -m prisma generate --schema schema.prisma
+python -c "from prisma_client import Prisma; print(hasattr(Prisma(), 'telephonyconfig'))"
+```
+
+The last command must print `True`. If `backend/.env` points at the
+production/Neon `DATABASE_URL`, `db push` changes that production database;
+the schema change here is additive, but run it deliberately.
+
+Then install/check both frontends in PowerShell:
+
+```powershell
+cd ..\frontend
+npm install
+npx tsc --noEmit
+cd ..\super-admin
+npm install
+npx tsc --noEmit
+```
+
+Start each process in its own VS Code terminal:
+
+```powershell
+# Terminal 1 — backend (cwd: backend, venv active)
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Terminal 2 — worker (cwd: backend, venv active)
+python -m app.agents.worker
+
+# Terminal 3 — customer app (cwd: frontend)
+npm run dev
+
+# Terminal 4 — Super Admin (cwd: super-admin)
+npm run dev
+```
+
+Check `http://localhost:8000/api/health`, customer app on `:3000`, and Super
+Admin on `:3002`.
+
+## 2. Configure telephony in Super Admin (not `.env`)
+
+Log in to Super Admin and open **Telephony → Settings**.
+
+- If telephony values already existed in `backend/.env`, opening this tab
+  seeds them once into the `TelephonyConfig` database row (secrets encrypted). Verify
+  the fields, click **Save settings**, then **Test saved connection**.
+- On a new install, fill the panel directly:
+  - VoiceLink API base URL: `https://app.voicelink.co.in/api/v1`
+  - API token (preferred, without `Bearer `) **or** fallback
+    username/password
+  - VoiceLink SIP: `sip.voicelink.co.in`, port `3300`
+  - Public LiveKit SIP: your Oracle SIP hostname, port `5060`
+  - Tech prefix `45454`, transport `1 (UDP)`, audio formats `alaw,ulaw`
+  - Optional default fallback trunk: the existing working `ST_...` trunk
+  - Wallet bypass: **off**; client KYC final-submit: **off** until VoiceLink
+    confirms the endpoint honours `client_id`
+  - Customer app URL: `http://localhost:3000` locally or the production
+    customer origin; Public API URL: blank locally or the production API
+    origin behind a proxy
+  - KYC terms URL / extra DigiLocker hosts: only when VoiceLink supplies them
+- Click **Save settings**, then **Test saved connection**. The test reads the
+  reseller profile and returns no credential.
+- After a successful test, the old telephony lines may be removed/commented
+  from `backend/.env`; restart the backend once to prove it now boots from
+  the database row. Later panel-only changes need no restart (other backend
+  instances pick them up within the 15-second settings cache).
+
+Secret fields are write-only. The panel shows only configured/masked state;
+leave a secret blank to keep it, type a new one to rotate it, or tick its
+clear box to remove it.
+
+For a real DigiLocker test, the panel's Public API URL (or request origin)
+must be publicly reachable because VoiceLink redirects the browser to:
+
+```text
+<PUBLIC_API_URL>/api/telephony/kyc/return
+```
+
+That endpoint redirects to `<FRONTEND_URL>/phone-numbers?kyc=returned`; the
+page then re-polls authoritative provider KYC status. A redirect alone never
+marks Aadhaar verified.
+
+Only bootstrap values remain in `.env`: `DATABASE_URL`, `JWT_SECRET`,
+`ADMIN_CONFIG_ENC_KEY(S)`, CORS/startup values, and the LiveKit server
+URL/API key/API secret used by both backend and the frozen voice worker.
+The panel cannot securely store the encryption key that encrypts itself, and
+the worker must know its LiveKit server before it can receive calls.
+
+## 3. Register the existing single-tenant DID (optional, do this first)
+
+This makes the already-working number selectable in the new agent form without
+buying another number:
+
+1. Open Super Admin → **Telephony → Manual number**.
+2. Select the customer who owns the line.
+3. Number: the existing E.164 DID from your deployment notes
+4. LiveKit outbound trunk: the existing working `ST_...` trunk for that DID
+5. Carrier tech prefix: `45454`
+6. Channels: `2`
+7. Expiry: `2026-10-31` (or the current provider expiry)
+8. Leave the inbound trunk blank unless a separate per-DID inbound trunk has
+   already been created.
+9. Register it, then edit/create an agent, choose **Outbound** or **Both**,
+   and assign the number.
+
+## 4. End-to-end test order
+
+1. Start backend, frontend, Super Admin and the existing LiveKit/SIP stack.
+2. Customer: open `/phone-numbers`, start phone setup and complete KYC.
+3. Add app-wallet funds; optionally move funds to calling balance.
+4. Search → Get price → accept auto-renew → Confirm purchase.
+5. Wait for the owned number to become **active**; use **Retry activation** if
+   a provider/LiveKit step reports an error.
+6. Create an agent, select purpose **Both**, assign the number and save.
+7. Test one outbound SIP call; then call the DID from an external phone for
+   inbound.
+8. Check Super Admin → Telephony for account, KYC, purchase, provisioning
+   step and trunk IDs. The SIP password should appear only masked/configured.
+
+## 5. Backend tests
+
+The disposable test database is SQLite, so the test run temporarily
+generates the Prisma client from a SQLite copy of the schema. In the backend
+PowerShell terminal (venv active):
+
+```powershell
+(Get-Content schema.prisma -Raw) -replace 'provider = "postgresql"', 'provider = "sqlite"' |
+  Set-Content schema.sqlite.prisma -Encoding utf8
+$env:DATABASE_URL = "file:./data/test.db"
+python -m prisma db push --schema schema.sqlite.prisma
+python -m prisma generate --schema schema.sqlite.prisma
+python -m pip install pytest pytest-asyncio   # only if pytest is missing
+python -m pytest tests/test_telephony_marketplace.py tests/test_contact.py -v
+Remove-Item Env:DATABASE_URL
+python -m prisma generate --schema schema.prisma
+```
+
+The final `generate` is required before starting the Postgres/Neon backend
+again. In a Git Bash/WSL checkout, `bash scripts/run-tests.sh
+tests/test_telephony_marketplace.py tests/test_contact.py -v` does the SQLite
+setup/test part; still regenerate from `schema.prisma` afterwards.
+
+## Known provider gates — do not guess these
+
+- The panel's **VoiceLink confirmed client KYC final-submit** switch must
+  stay off until VoiceLink confirms in writing that final-submit honours the
+  per-customer `client_id`. Completed steps remain saved; the UI explains
+  the gate instead of risking a tenant-level submission.
+- Transport code `1` assumes the inferred SDK mapping `1=UDP`. Confirm it
+  against a live VoiceLink trunk readback before changing it in the panel.
+- The code surfaces an error if VoiceLink does not honour/return the SIP
+  password needed for the LiveKit trunk. Confirm that behaviour with one
+  controlled purchase before opening self-service broadly.
+- Confirm trial-plan DID/channel entitlements and whether many client trunks
+  may safely share `sip.voicelink.co.in:3300` and the same LiveKit SIP host.
+- Wallet-bypass semantics must be confirmed with VoiceLink before enabling
+  that panel switch.
+
+## Security notes
+
+- Rotate the previously exposed LiveKit API secret and VoiceLink SIP password
+  before production, updating LiveKit server/SIP, backend, CLI and the
+  VoiceLink/LiveKit trunk credentials together.
+- Restrict public SIP exposure where the carrier supports source allowlisting;
+  keep RTP/firewall rules intentional and document any change.
+- Never paste reseller tokens, SIP passwords or identity documents into logs,
+  tickets or chat.

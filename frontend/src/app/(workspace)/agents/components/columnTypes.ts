@@ -12,6 +12,8 @@ export interface LeftState {
   name: string; greeting: string; fallbackResponse: string;
   noResponseTimeout: number; noResponseMessage: string;
   mode: string; announceText: string; endAfterAnnouncement: boolean;
+  purpose: string; phoneNumberId: string;
+  phoneNumbers: { id: string; number: string; status: string }[];
   personality: string; language: string; gender: string;
   memoryEnabled: boolean; recordingEnabled: boolean; maxConcurrency: number;
   knowledgeText: string; systemPrompt: string; faq: FaqItem[];
@@ -27,6 +29,8 @@ export interface LeftSetters {
   setNoResponseTimeout: (v: number) => void;
   setNoResponseMessage: (v: string) => void;
   setMode: (v: string) => void;
+  setPurpose: (v: string) => void;
+  setPhoneNumberId: (v: string) => void;
   setAnnounceText: (v: string) => void;
   setEndAfterAnnouncement: (v: boolean) => void;
   setPersonality: (v: string) => void;

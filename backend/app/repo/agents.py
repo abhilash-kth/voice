@@ -34,6 +34,8 @@ def _agent_dict(a: Any) -> dict:
         "no_response_message": getattr(a, "noResponseMessage", "") or "I did not hear a response, so I will end the call now. Thank you for calling.",
         "providers": _load_dict(a.providers),
         "knowledge": _load_dict(a.knowledge),
+        "purpose": getattr(a, "callDirection", "outbound") or "outbound",
+        "phone_number_id": getattr(a, "phoneNumberId", None) or None,
         "created_at": a.createdAt,
     }
 
@@ -77,6 +79,8 @@ async def create_agent(user_id: str, data: dict) -> dict:
             "noResponseMessage": data.get("no_response_message", "I did not hear a response, so I will end the call now. Thank you for calling."),
             "providers": _dump(data.get("providers", {})),
             "knowledge": _dump(data.get("knowledge", {})),
+            "callDirection": data.get("purpose") or "outbound",
+            "phoneNumberId": data.get("phone_number_id") or None,
         }
     )
     return _agent_dict(a)
@@ -92,6 +96,7 @@ async def update_agent(agent_id: str, user_id: str, patch: dict) -> Optional[dic
         "memory_enabled": "memoryEnabled",
         "recording_enabled": "recordingEnabled", "max_concurrency": "maxConcurrency",
         "enabled": "enabled", "agent_mode": "agentMode", "announce_text": "announceText", "fallback_response": "fallbackResponse", "no_response_timeout_seconds": "noResponseTimeoutSeconds", "no_response_message": "noResponseMessage",
+        "purpose": "callDirection", "phone_number_id": "phoneNumberId",
     }
     for k, v in patch.items():
         if k in mapping:

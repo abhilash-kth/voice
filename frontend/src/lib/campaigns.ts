@@ -16,7 +16,8 @@ export interface Campaign {
     agent_id: string;
     name: string;
     concurrency: number;
-    sip_trunk_id: string;
+    phone_number_id?: string;
+    caller_id?: string;
     phone_column: string;
     created_at: string;
     status: "paused" | "running" | "done";

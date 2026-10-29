@@ -121,6 +121,14 @@ export default function useCallSession() {
       return setErr("Loading your agents — one moment before starting a call.");
     if (!agentId) return setErr("Select an agent first.");
     if (!selectedAgent) return setErr("Selected agent not found.");
+    if (
+      mode === "sip" &&
+      !["outbound", "both"].includes(selectedAgent.purpose || "outbound")
+    ) {
+      return setErr(
+        "This agent is inbound-only. Choose an outbound or both-purpose agent to place a phone call.",
+      );
+    }
     if (mode === "sip" && !phone)
       return setErr("Enter a phone number for SIP calling.");
 
@@ -163,7 +171,10 @@ export default function useCallSession() {
         agent_id: agentId,
         mode,
         phone: mode === "sip" ? phone : undefined,
-        sip_trunk_id: trunkId || undefined,
+        // An assigned purchased number's trunk is backend-managed.
+        sip_trunk_id: selectedAgent.phone_number_id
+          ? undefined
+          : trunkId || undefined,
       });
 
       console.log(`[ROOM_CREATED] room=${res.room} call_id=${res.call_id}`);

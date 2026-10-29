@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { MessageSquare, Megaphone, Trash2, FileText, Plus } from "lucide-react";
 import CostEstimate from "./CostEstimate";
 import { Toggle } from "./ProviderOptions";
@@ -78,6 +79,74 @@ export default function LeftColumn({
                   Announcement
                 </button>
               </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>
+                Call purpose <span className="text-destructive">*</span>
+              </Label>
+              <div className="grid grid-cols-3 gap-1 rounded-md bg-muted/40 p-1">
+                {(
+                  [
+                    ["outbound", "Outbound"],
+                    ["inbound", "Inbound"],
+                    ["both", "Both"],
+                  ] as const
+                ).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => set.setPurpose(value)}
+                    className={cn(
+                      "flex h-9 items-center justify-center rounded-sm text-xs font-semibold transition-all",
+                      v.purpose === value
+                        ? "bg-background text-foreground shadow-sm ring-1 ring-border"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                {v.purpose === "inbound"
+                  ? "Receives calls on its assigned number. Cannot place calls or run campaigns."
+                  : v.purpose === "both"
+                    ? "Places calls/campaigns and receives calls on its assigned number."
+                    : v.purpose === "outbound"
+                      ? "Places phone calls and runs campaigns. Does not receive inbound calls."
+                      : "Required — choose what this agent is for."}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Assigned phone number (optional)</Label>
+              <select
+                value={v.phoneNumberId}
+                onChange={(e) => set.setPhoneNumberId(e.target.value)}
+                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              >
+                <option value="">No number (browser / default trunk)</option>
+                {v.phoneNumbers.map((n) => (
+                  <option key={n.id} value={n.id}>
+                    {n.number}
+                    {n.status !== "active" ? ` (${n.status})` : ""}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                {v.phoneNumbers.length === 0 ? (
+                  <>
+                    No active numbers yet. Buy one on the{" "}
+                    <Link className="text-primary underline" href="/phone-numbers">
+                      Phone Numbers
+                    </Link>{" "}
+                    page.
+                  </>
+                ) : (
+                  "Outbound calls use this number as caller ID; inbound calls to it reach this agent when purpose allows."
+                )}
+              </p>
             </div>
 
             {v.mode !== "announcement" && (

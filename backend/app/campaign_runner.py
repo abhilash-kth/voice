@@ -75,6 +75,7 @@ async def reconcile_and_dispatch(cmp: dict) -> None:
     # If the agent's config broke since the campaign started (key rotated,
     # model retired), every dial would crash the worker and fail the call.
     # Pause loudly instead of burning wallet credits lead by lead.
+    agent_rec = None
     try:
         from . import preflight as _pf
         agent_rec = await repo.get_agent(cmp["agent_id"], user_id)
@@ -89,6 +90,30 @@ async def reconcile_and_dispatch(cmp: dict) -> None:
     except Exception as e:
         logger.warning(f"campaign {cid}: preflight check failed: {e}")
 
+    # Purpose + trunk are re-resolved from the agent on EVERY tick: switching
+    # an agent to inbound-only, unassigning/suspending its number, or
+    # disabling it pauses the campaign before the next dial.
+    from .services.telephony_policy import (TelephonyError, carrier_dial_number,
+                                            normalize_destination,
+                                            resolve_outbound)
+    try:
+        if agent_rec is None:
+            agent_rec = await repo.get_agent(agent_id, user_id)
+        if not agent_rec or not agent_rec.get("enabled", True):
+            campaign_store.set_status(user_id, cid, "paused")
+            logger.error(f"campaign {cid}: PAUSED — agent missing or disabled")
+            return
+        outbound_route = await resolve_outbound(
+            agent_rec, user_id, sip_trunk_id or "")
+    except TelephonyError as e:
+        campaign_store.set_status(user_id, cid, "paused")
+        logger.error(f"campaign {cid}: PAUSED — {e}")
+        return
+    except Exception as e:
+        campaign_store.set_status(user_id, cid, "paused")
+        logger.error(f"campaign {cid}: PAUSED — outbound route check failed: {e}")
+        return
+
     queued = [l for l in c["leads"] if l["status"] == "queued"]
     calling_now = len([l for l in c["leads"] if l["status"] == "calling"])
     free = max(0, c["concurrency"] - calling_now)
@@ -96,10 +121,11 @@ async def reconcile_and_dispatch(cmp: dict) -> None:
 
     for lead in to_dispatch:
         data = lead["data"] or {}
-        phone = leadfile.build_phone(data, phone_column)
-        if not phone:
+        raw_phone = leadfile.build_phone(data, phone_column)
+        if not raw_phone:
             campaign_store.update_lead(cid, lead["index"], {"status": "failed", "error": "no phone"})
             continue
+        phone = normalize_destination(raw_phone)
         try:
             call = await repo.create_call({
                 "user_id": user_id,
@@ -109,7 +135,11 @@ async def reconcile_and_dispatch(cmp: dict) -> None:
                 "status": "planned",
             })
             result = await telephony.create_sip_call(
-                agent_id, phone, sip_trunk_id, call["id"], user_id, lead_data=data,
+                agent_id, phone, outbound_route.get("sip_trunk_id") or sip_trunk_id,
+                call["id"], user_id, lead_data=data,
+                sip_call_to=carrier_dial_number(
+                    phone, outbound_route.get("dial_prefix") or ""),
+                sip_number=outbound_route.get("caller_id") or None,
             )
             await repo.update_call(call["id"], {"room": result.get("room", "")})
             campaign_store.update_lead(cid, lead["index"], {"status": "calling", "call_id": call["id"]})

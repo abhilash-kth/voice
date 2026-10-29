@@ -51,7 +51,9 @@ async def _wipe_db():
     # live_client's lifespan teardown disconnects the shared client; be robust.
     await init()
     db = get_prisma()
-    for table in ("transaction", "call", "agent", "adminauditlog", "providercredential",
+    for table in ("transaction", "call", "agent", "phonepurchase", "phonenumber",
+                  "voicelinkaccount", "telephonyconfig", "adminauditlog",
+                  "providercredential",
                   "catalogmodel", "provider", "billingconfig", "contactmessage", "user"):
         await getattr(db, table).delete_many()
 
@@ -64,9 +66,11 @@ async def app_db():
     await init()
     await _wipe_db()
     # Fresh in-process config snapshot per test session
-    from app.services import config_store
+    from app.services import config_store, telephony_settings, voicelink_client
 
     config_store._reset_for_tests()
+    telephony_settings.invalidate_cache()
+    voicelink_client.reset_auth_cache()
     yield
     await shutdown()
 
@@ -75,9 +79,11 @@ async def app_db():
 async def clean_db(app_db):
     """Wipe all tables before every test function."""
     await _wipe_db()
-    from app.services import config_store
+    from app.services import config_store, telephony_settings, voicelink_client
 
     config_store._reset_for_tests()
+    telephony_settings.invalidate_cache()
+    voicelink_client.reset_auth_cache()
     yield
 
 

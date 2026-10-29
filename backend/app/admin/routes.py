@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..services import admin_service, catalog_service, config_store
-from . import credential_routes, deps, plan_routes, schemas
+from . import credential_routes, deps, plan_routes, schemas, telephony_routes
 
 router = APIRouter(
     prefix="/api/admin",
@@ -28,6 +28,7 @@ ADMIN = Depends(deps.get_super_admin)
 # Parent prefix + dependencies apply to the included routes as well.
 router.include_router(credential_routes.router)
 router.include_router(plan_routes.router)
+router.include_router(telephony_routes.router)
 
 
 def _err(e: Exception) -> HTTPException:

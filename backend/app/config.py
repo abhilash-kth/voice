@@ -28,6 +28,21 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    if raw.lower() in ("true", "yes", "on"):
+        return 1
+    if raw.lower() in ("false", "no", "off"):
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -102,7 +117,56 @@ ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", str(60 * 24 * 7)))
 # Agent behaviour
 # ---------------------------------------------------------------------------
 ALLOW_BROWSER_CALL = os.getenv("ALLOW_BROWSER_CALL", "true").lower() == "true"
+# Seed/fallback only; runtime reads TelephonyConfig.defaultSipTrunkId.
 DEFAULT_SIP_TRUNK_ID = os.getenv("SIP_TRUNK_ID", "")
+
+# ---------------------------------------------------------------------------
+# Self-service telephony marketplace (VoiceLink reseller API + LiveKit SIP)
+# ---------------------------------------------------------------------------
+# PANEL-MANAGED AT RUNTIME: services/telephony_settings.py reads the
+# TelephonyConfig DB row managed from Super Admin -> Telephony -> Settings.
+# The env values below only seed that row on first use (and act as an
+# emergency fallback if the row is unavailable). Once the panel row exists,
+# changing these env values has no effect on the marketplace.
+# Reseller API. Prefer a long-lived Sanctum token; username/password login is
+# the fallback. These credentials are operator-only and never leave the API.
+VOICELINK_API_BASE_URL = os.getenv(
+    "VOICELINK_API_BASE_URL", "https://app.voicelink.co.in/api/v1").rstrip("/")
+VOICELINK_API_TOKEN = (
+    os.getenv("VOICELINK_API_TOKEN", "") or os.getenv("VOICELINK_AUTH_TOKEN", "")
+).strip()
+VOICELINK_USERNAME = os.getenv("VOICELINK_USERNAME", "")
+VOICELINK_PASSWORD = os.getenv("VOICELINK_PASSWORD", "")
+VOICELINK_SIP_HOST = os.getenv("VOICELINK_SIP_HOST", "sip.voicelink.co.in")
+VOICELINK_SIP_PORT = _env_int("VOICELINK_SIP_PORT", 3300)
+# Carrier tech prefix prepended to the dialled digits on this reseller
+# account (proven format: <prefix><91><10-digit>). Stored per number too.
+VOICELINK_TECH_PREFIX = os.getenv("VOICELINK_TECH_PREFIX", "45454")
+VOICELINK_TRANSPORT_TYPE = _env_int("VOICELINK_TRANSPORT_TYPE", 1)  # 1=UDP
+VOICELINK_AUDIO_FORMATS = [
+    f.strip() for f in os.getenv("VOICELINK_AUDIO_FORMATS", "alaw,ulaw").split(",") if f.strip()
+]
+VOICELINK_WALLET_BYPASS = _env_int("VOICELINK_WALLET_BYPASS", 0)
+VOICELINK_KYC_TERMS_URL = os.getenv("VOICELINK_KYC_TERMS_URL", "")
+VOICELINK_KYC_REDIRECT_HOSTS = [
+    h.strip().lower()
+    for h in os.getenv("VOICELINK_KYC_REDIRECT_HOSTS", "").split(",") if h.strip()
+]
+# VoiceLink's documented final-submit lists no client_id parameter. Keep this
+# OFF until VoiceLink confirms in writing that final-submit acts only on the
+# supplied client_id; earlier KYC steps are explicitly client-scoped.
+VOICELINK_CLIENT_KYC_FINALIZE_VERIFIED = (
+    os.getenv("VOICELINK_CLIENT_KYC_FINALIZE_VERIFIED", "0") == "1"
+)
+# Public SIP destination VoiceLink trunks point at (our LiveKit SIP service).
+LIVEKIT_SIP_HOST = os.getenv("LIVEKIT_SIP_HOST", "kvoice.duckdns.org")
+LIVEKIT_SIP_PORT = _env_int("LIVEKIT_SIP_PORT", 5060)
+# Browser-facing URLs used for the DigiLocker return redirect.
+FRONTEND_URL = (
+    os.getenv("FRONTEND_URL", "") or os.getenv("APP_PUBLIC_URL", "")
+    or "http://localhost:3000"
+).rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "").rstrip("/")
 # Recording (LiveKit Egress). Set these for self-hosted recording.
 EGRESS_ENABLED = os.getenv("EGRESS_ENABLED", "true").lower() == "true"
 EGRESS_S3_BUCKET = os.getenv("EGRESS_S3_BUCKET", "")       # e.g. voice-recordings

@@ -382,7 +382,9 @@ Browser calls need nothing. To dial a real number:
 1. Create a Telnyx/Twilio account and provision a number.
 2. Create a **LiveKit SIP trunk** that routes to your carrier
    (`livekit-server` + `lk` CLI / API). Note the `trunk_id`.
-3. Set `SIP_TRUNK_ID` in `backend/.env` (or pass it per call).
+3. For the legacy single-trunk fallback, set the default trunk in
+   **Super Admin → Telephony → Settings** (purchased numbers derive their own
+   trunk automatically). See `docs/telephony-marketplace.md`.
 4. In the UI choose **SIP**, enter `+91...`, and **Dial Number**.
 
 `backend/app/telephony.py` (LiveKit v1) creates the room with an **agent dispatch**
