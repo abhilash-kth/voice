@@ -391,6 +391,20 @@ class TestUsersAndAudit:
 
 
 class TestWallet:
+    async def test_update_many_count_accepts_prisma_python_int(self, clean_db):
+        from app.repo.wallet import _updated_count
+
+        class Batch:
+            count = 3
+
+        # Prisma Client Python returns int; JS-style {count}/BatchPayload
+        # shapes are accepted defensively. Treating int 1 as 0 caused a
+        # successful wallet CAS to be retried and then raise RuntimeError.
+        assert _updated_count(1) == 1
+        assert _updated_count({"count": 2}) == 2
+        assert _updated_count(Batch()) == 3
+        assert _updated_count(None) == 0
+
     async def test_recharge_and_deduct_atomic(self, clean_db):
         u = await repo.create_user("w@t.dev", "W", auth.hash_password("pw"))
         w = await repo.recharge(u["id"], 250.0)

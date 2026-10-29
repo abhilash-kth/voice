@@ -168,10 +168,22 @@ app.add_middleware(
 async def global_exception_handler(request, exc):
     logger.exception("Unhandled server error: %s", exc)
     from fastapi.responses import JSONResponse
+    # ServerErrorMiddleware (which invokes this handler) runs outside
+    # CORSMiddleware, so add credential-compatible CORS headers here. A
+    # wildcard origin is invalid for credentialed browser fetches and made
+    # real 500 responses surface to the frontend only as "Failed to fetch".
+    origin = request.headers.get("origin")
+    headers = {}
+    if origin in _cors_origins:
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
     return JSONResponse(
         status_code=500,
         content={"detail": str(exc)},
-        headers={"Access-Control-Allow-Origin": "*"},
+        headers=headers,
     )
 
 

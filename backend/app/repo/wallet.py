@@ -8,6 +8,23 @@ from .. import billing as billing_mod
 from .common import _load_dict, _ts
 
 
+def _updated_count(result: object) -> int:
+    """Normalize a Prisma ``update_many`` result to an affected-row count.
+
+    Prisma Client Python returns a plain ``int``. The old wallet code read
+    ``result.count`` (the JavaScript BatchPayload shape), so every successful
+    compare-and-set looked like zero rows were updated. ``deduct`` then
+    retried against the already-reduced balance and raised RuntimeError
+    without writing its spend ledger row. Accept the JS/dict shapes too so
+    this stays robust if the generated client changes.
+    """
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict):
+        return int(result.get("count") or 0)
+    return int(getattr(result, "count", 0) or 0)
+
+
 # ---------------------------------------------------------------------------
 # Wallet / usage
 # ---------------------------------------------------------------------------
@@ -79,7 +96,7 @@ async def deduct(user_id: str, amount: float, note: str = "") -> dict:
             where={"id": user_id, "walletBalance": old_balance},
             data={"walletBalance": new_balance},
         )
-        if getattr(res, "count", 0) == 0:
+        if _updated_count(res) == 0:
             continue
         try:
             await db.transaction.create(
@@ -148,7 +165,7 @@ async def deduct_exact(user_id: str, amount: float, note: str = "") -> dict:
         res = await db.user.update_many(
             where={"id": user_id, "walletBalance": old_balance},
             data={"walletBalance": new_balance})
-        if getattr(res, "count", 0) == 0:
+        if _updated_count(res) == 0:
             continue
         try:
             await db.transaction.create(
