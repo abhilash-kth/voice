@@ -331,7 +331,7 @@ def _settings_from_record(record: dict) -> TelephonySettings:
             record.get("voicelink_kyc_redirect_hosts") or "", []),
         kyc_finalize_verified=bool(record.get("kyc_finalize_verified")),
         livekit_sip_host=_safe(
-            lambda v: _clean_host(v, "LiveKit SIP host", allow_blank=True),
+            lambda v: _clean_livekit_sip_host(v, allow_blank=True),
             record.get("livekit_sip_host"), ""),
         livekit_sip_port=int(record.get("livekit_sip_port") or 5060),
         frontend_url=_safe(

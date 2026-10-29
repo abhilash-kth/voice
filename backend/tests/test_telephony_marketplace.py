@@ -461,7 +461,7 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
         "voicelink_kyc_terms_url": "",
         "voicelink_kyc_redirect_hosts": "id.example.com",
         "kyc_finalize_verified": False,
-        "livekit_sip_host": "sip.example.com",
+        "livekit_sip_host": "c{client_id}.sip.example.com",
         "livekit_sip_port": 5060,
         "frontend_url": "https://agents.example.com",
         "public_api_url": "",
@@ -471,6 +471,9 @@ def test_super_admin_telephony_settings_view_never_exposes_secrets(
     assert settings.voicelink_api_token == "vl-token-1234567890"
     assert settings.voicelink_password == "vl-password-9876"
     assert settings.voicelink_shared_trunk_password == "shared-trunk-secret"
+    assert settings.livekit_sip_host == "c{client_id}.sip.example.com"
+    assert settings_svc.resolve_livekit_sip_host(
+        settings.livekit_sip_host, "42") == "c42.sip.example.com"
     view = settings_svc.public_view(settings)
     rendered = repr(view)
     assert view["configured"] is True
