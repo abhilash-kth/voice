@@ -3,8 +3,10 @@
 Only the backend talks to VoiceLink. The reseller token/password, provider
 client ids and SIP credentials never reach a browser. Response handling is
 defensive: VoiceLink wraps payloads as ``{"status": true, "data": ...}``,
-redirects are never followed with credentials attached, and KYC/OTP error
-bodies are never echoed back (they can contain identity details).
+redirects are never followed with credentials attached, and raw KYC/OTP
+error bodies are never echoed back. For KYC validation failures we expose
+only allowlisted field messages after redacting anything that looks like a
+submitted identity value.
 """
 from __future__ import annotations
 
@@ -107,6 +109,79 @@ def _provider_message(payload: Any) -> str:
     return ""
 
 
+_KYC_FIELD_LABELS = {
+    "client_id": "Phone account",
+    "term_and_condition": "Terms acceptance",
+    "account_type": "Account type",
+    "full_name": "Full legal name",
+    "business_name": "Business name",
+    "email": "Email",
+    "phone": "Contact number",
+    "billing_address": "Billing address",
+    "state": "State",
+    "city": "City",
+    "pincode": "Postal code",
+    "pan_number": "PAN",
+    "pan_holder_name": "PAN holder name",
+    "gst_number": "GSTIN",
+    "document": "Document",
+    "document_type": "Document type",
+    "redirect_url": "Verification return URL",
+    "username": "Email account",
+    "otp": "Email code",
+}
+
+
+def _safe_validation_message(payload: Any) -> str:
+    """Return up to three sanitized KYC field-validation messages.
+
+    VoiceLink/Laravel normally returns field names plus rule text such as
+    "The full name field is required."  We deliberately do not return the
+    raw response or top-level message.  As a second line of defence, redact
+    quoted fragments, email addresses, URLs, PAN/GSTIN-shaped values, long
+    digit runs and long opaque tokens in case a custom provider message ever
+    echoes a submitted value.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    errors = payload.get("errors")
+    if not isinstance(errors, dict):
+        data = payload.get("data")
+        errors = data.get("errors") if isinstance(data, dict) else None
+    if not isinstance(errors, dict):
+        return ""
+
+    details: list[str] = []
+    for field, raw in errors.items():
+        label = _KYC_FIELD_LABELS.get(str(field).split(".", 1)[0])
+        if not label:
+            continue
+        if isinstance(raw, list):
+            raw = raw[0] if raw else ""
+        if isinstance(raw, dict):
+            raw = raw.get("message") or ""
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        msg = re.sub(r"\s+", " ", raw).strip()
+        msg = re.sub(r"(['\"]).*?\1", "[redacted]", msg)
+        msg = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[redacted]", msg)
+        msg = re.sub(r"https?://\S+", "[redacted]", msg)
+        msg = re.sub(
+            r"\b\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b",
+            "[redacted]", msg, flags=re.IGNORECASE)
+        msg = re.sub(
+            r"\b[A-Z]{5}\d{4}[A-Z]\b", "[redacted]", msg,
+            flags=re.IGNORECASE)
+        msg = re.sub(r"\+?\d[\d ()-]{7,}\d", "[redacted]", msg)
+        msg = re.sub(r"\b[A-Za-z0-9_-]{24,}\b", "[redacted]", msg)
+        msg = msg.strip()[:180]
+        if msg:
+            details.append(f"{label}: {msg}")
+        if len(details) == 3:
+            break
+    return "; ".join(details)
+
+
 async def request(method: str, path: str, *, json: Any = None,
                   params: Optional[dict] = None, data: Optional[dict] = None,
                   files: Optional[dict] = None, _retried: bool = False) -> Any:
@@ -147,17 +222,32 @@ async def request(method: str, path: str, *, json: Any = None,
     sensitive = ("kyc" in path) or ("otp" in path)
     if resp.status_code >= 400:
         if sensitive:
-            msg = (f"VoiceLink rejected the verification request "
-                   f"(HTTP {resp.status_code}). Check the details and try again.")
+            detail = _safe_validation_message(payload)
+            if detail:
+                logger.warning(
+                    "VoiceLink verification validation failed: %s", detail)
+                msg = (f"VoiceLink rejected the verification request "
+                       f"(HTTP {resp.status_code}): {detail}")
+            else:
+                msg = (f"VoiceLink rejected the verification request "
+                       f"(HTTP {resp.status_code}). Check the details and "
+                       "try again.")
         else:
             msg = _provider_message(payload) or f"VoiceLink HTTP {resp.status_code}"
         raise VoiceLinkError(msg, resp.status_code,
                              uncertain=(resp.status_code >= 500
                                         and method.upper() != "GET"))
     if isinstance(payload, dict) and payload.get("status") is False:
-        msg = ("VoiceLink rejected the verification request."
-               if sensitive else (_provider_message(payload)
-                                  or "VoiceLink rejected the request."))
+        if sensitive:
+            detail = _safe_validation_message(payload)
+            if detail:
+                logger.warning(
+                    "VoiceLink verification validation failed: %s", detail)
+            msg = (f"VoiceLink rejected the verification request: {detail}"
+                   if detail else
+                   "VoiceLink rejected the verification request.")
+        else:
+            msg = _provider_message(payload) or "VoiceLink rejected the request."
         raise VoiceLinkError(msg, 400)
     if isinstance(payload, dict) and "data" in payload:
         return payload["data"]

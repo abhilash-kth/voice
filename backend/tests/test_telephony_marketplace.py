@@ -85,6 +85,41 @@ def test_voicelink_phone_payload_is_digits_only():
         _indian_phone_forms("12345")
 
 
+def test_kyc_step1_payload_and_safe_provider_validation():
+    from types import SimpleNamespace
+
+    from app.services.telephony_account import _kyc_register_fields
+    from app.services.voicelink_client import _safe_validation_message
+
+    body = SimpleNamespace(
+        account_type="individual", full_name="Fixture Person",
+        phone="+919876543210", billing_address="Synthetic test address",
+        state="Kerala", city="Kochi", pincode="682001", business_name="")
+    assert _kyc_register_fields(body, "customer@example.test") == {
+        "term_and_condition": "1",
+        "account_type": "individual",
+        "full_name": "Fixture Person",
+        "phone": "919876543210",
+        "billing_address": "Synthetic test address",
+        "state": "Kerala",
+        "city": "Kochi",
+        "pincode": "682001",
+        "email": "customer@example.test",
+    }
+
+    detail = _safe_validation_message({"errors": {
+        "full_name": [
+            "The full name field is invalid for ABCDE1234F, "
+            "+919876543210 and customer@example.test."],
+        "unknown_secret": ["must not be returned"],
+    }})
+    assert detail.startswith("Full legal name: The full name field is invalid")
+    assert "ABCDE1234F" not in detail
+    assert "919876543210" not in detail
+    assert "customer@example.test" not in detail
+    assert "must not be returned" not in detail
+
+
 def test_manual_number_update_body_and_effective_concurrency():
     from app.routes.calls_routes import _effective_concurrency
 

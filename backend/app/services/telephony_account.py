@@ -335,6 +335,37 @@ def _req(value: str, label: str) -> str:
     return v
 
 
+def _kyc_register_fields(body, account_email: str = "") -> dict:
+    """Build VoiceLink KYC Step 1 fields from the customer-safe body.
+
+    VoiceLink's Step 1 contract defines the terms flag as a string; send
+    "1" (the provider form's accepted checkbox value), not JSON true.  The
+    endpoint also accepts the managed client's email, which is already
+    known server-side from account setup, so include it without asking the
+    customer to type it again.  Phone stays in VoiceLink's digits-only form.
+    """
+    phone = _req(body.phone, "Contact number")
+    # Accept 10-digit, 91XXXXXXXXXX and +91XXXXXXXXXX input, but send
+    # VoiceLink its digits-only provider format (see _indian_phone_forms).
+    phone, _stored_phone = _indian_phone_forms(phone)
+    if not re.fullmatch(r"\d{6}", body.pincode or ""):
+        raise TelephonyError("Enter a six-digit postal code.", 400)
+    fields = {
+        "term_and_condition": "1", "account_type": body.account_type,
+        "full_name": _req(body.full_name, "Full legal name"),
+        "phone": phone,
+        "billing_address": _req(body.billing_address, "Billing address"),
+        "state": _req(body.state, "State"), "city": _req(body.city, "City"),
+        "pincode": body.pincode,
+    }
+    email = str(account_email or "").strip()
+    if email:
+        fields["email"] = email
+    if body.account_type == "business":
+        fields["business_name"] = _req(body.business_name, "Business name")
+    return fields
+
+
 def validate_digilocker_redirect(value: Any, settings=None) -> str:
     if not isinstance(value, str) or len(value) > 4096:
         raise TelephonyError("DigiLocker redirect is unavailable.", 503)
@@ -379,22 +410,7 @@ async def act_kyc(user_id: str, body, redirect_url: str) -> dict:
                 "Review and accept the verification terms to continue.", 400)
         if body.account_type not in ("individual", "business"):
             raise TelephonyError("Choose individual or business verification.", 400)
-        phone = _req(body.phone, "Contact number")
-        # Accept 10-digit, 91XXXXXXXXXX and +91XXXXXXXXXX input, but send
-        # VoiceLink its digits-only provider format (see _indian_phone_forms).
-        phone, _stored_phone = _indian_phone_forms(phone)
-        if not re.fullmatch(r"\d{6}", body.pincode or ""):
-            raise TelephonyError("Enter a six-digit postal code.", 400)
-        fields = {
-            "term_and_condition": True, "account_type": body.account_type,
-            "full_name": _req(body.full_name, "Full legal name"),
-            "phone": phone,
-            "billing_address": _req(body.billing_address, "Billing address"),
-            "state": _req(body.state, "State"), "city": _req(body.city, "City"),
-            "pincode": body.pincode,
-        }
-        if body.account_type == "business":
-            fields["business_name"] = _req(body.business_name, "Business name")
+        fields = _kyc_register_fields(body, account.get("email") or "")
         await vl.kyc_step1(client_id, fields)
     elif action == "pan":
         pan = (body.pan_number or "").strip().upper()
