@@ -244,10 +244,15 @@ export const updateBilling = (patch: Partial<BillingConfig>) =>
 export interface UsageRow {
   id: string;
   user_id: string;
+  user_name: string;
+  user_email: string;
   agent_id: string;
   mode: string;
   status: string;
   started_at: string;
+  ended_at: string;
+  phone: string;
+  room: string;
   duration_seconds: number;
   stt_seconds: number;
   llm_input_tokens: number;
@@ -258,6 +263,15 @@ export interface UsageRow {
   profit_inr: number;
 }
 export const listUsage = () => req<{ items: UsageRow[] }>("/api/admin/usage");
+export interface AdminEndCallResult {
+  ok: boolean;
+  call_id: string;
+  status: string;
+  already_ended: boolean;
+  room_deleted: boolean;
+}
+export const endAdminCall = (id: string) =>
+  req<AdminEndCallResult>(`/api/admin/calls/${id}/end`, { method: "POST" });
 
 export interface AuditLog {
   id: string;

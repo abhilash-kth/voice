@@ -233,6 +233,15 @@ async def usage(admin=ADMIN):
     return {"items": await admin_service.usage_rows()}
 
 
+@router.post("/calls/{call_id}/end")
+async def end_call(call_id: str, admin=ADMIN):
+    """Force-end an active or stale call; audited by the service layer."""
+    try:
+        return await admin_service.end_call_admin(call_id, admin=admin)
+    except Exception as e:
+        raise _err(e)
+
+
 @router.get("/audit-logs")
 async def audit_logs(admin=ADMIN, page: int = Query(1, ge=1),
                      page_size: int = Query(50, ge=1, le=200),

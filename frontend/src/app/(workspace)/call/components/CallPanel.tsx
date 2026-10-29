@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "@livekit/components-styles";
-import { Agent } from "@/lib/index";
+import { Agent, getCall } from "@/lib/index";
 import CallSetupForm from "@/app/(workspace)/call/components/CallSetupForm";
 import CallStage from "@/app/(workspace)/call/components/CallStage";
 import useCallSession from "../hooks/useCallSession";
@@ -46,14 +46,64 @@ export default function CallPanel({
     setCallState,
     setErr,
     setSession,
+    activeMode,
+    finishSipCall,
     GoStart,
-    endBrowserCall,
+    endCurrentCall,
     handleAnnouncementFinished,
     handleRoomDisconnected,
   } = useCallSession();
 
   const { callEndedMsg, setCallEndedMsg, clearCallSummary, fetchCallSummary } =
     useCallSummary({ onStarted, setCallState, setErr });
+
+  const fetchCallSummaryRef = useRef(fetchCallSummary);
+  useEffect(() => {
+    fetchCallSummaryRef.current = fetchCallSummary;
+  }, [fetchCallSummary]);
+
+  const finishedSipCallRef = useRef("");
+
+  // SIP participants are not connected to this browser, so LiveKit disconnect
+  // events cannot tell this page when the phone call ends. Poll the backend
+  // call record and transition to the same summary flow used by browser calls.
+  useEffect(() => {
+    if (
+      activeMode !== "sip" ||
+      !callId ||
+      session ||
+      callState !== "connected"
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const checkSipCall = async () => {
+      try {
+        const call = await getCall(callId);
+        if (
+          cancelled ||
+          (call.status !== "completed" && call.status !== "failed") ||
+          finishedSipCallRef.current === callId
+        ) {
+          return;
+        }
+        finishedSipCallRef.current = callId;
+        finishSipCall();
+        await fetchCallSummaryRef.current(callId);
+      } catch {
+        // A temporary backend/network error should not end a live phone call;
+        // the next poll (or the visible End call button) can still reconcile it.
+      }
+    };
+
+    void checkSipCall();
+    const timer = window.setInterval(() => void checkSipCall(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeMode, callId, callState, finishSipCall, session]);
 
   const { agentId, selected, handleAgentSelect } = useAgentSelection({
     agents,
@@ -90,14 +140,15 @@ export default function CallPanel({
     });
   }
 
-  const handleEndCall = () => endBrowserCall(fetchCallSummary);
+  const handleEndCall = () => endCurrentCall(fetchCallSummary);
 
   const isCallActive =
-    (callState === "connecting" ||
+    activeMode !== null ||
+    ((callState === "connecting" ||
       callState === "waiting_for_agent" ||
       callState === "connected" ||
       callState === "ending") &&
-    session !== null;
+      session !== null);
 
   return (
     <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(320px,0.85fr)_minmax(0,1.35fr)] 2xl:gap-6">
@@ -128,7 +179,7 @@ export default function CallPanel({
         callState={callState}
         callEndedMsg={callEndedMsg}
         err={err}
-        mode={mode}
+        mode={activeMode ?? mode}
         selected={selected}
         callId={callId}
         agentWaitSeconds={agentWaitSeconds}

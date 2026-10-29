@@ -49,6 +49,7 @@ from .admin_billing import (
 from .admin_analytics import (
     stats_overview,
     usage_rows,
+    end_call_admin,
     _load,
 )
 
@@ -60,5 +61,5 @@ __all__ = [
     "delete_provider", "_model_public", "list_models", "get_model", "create_model",
     "update_model", "delete_model",
     "get_billing", "update_billing",
-    "stats_overview", "usage_rows", "_load",
+    "stats_overview", "usage_rows", "end_call_admin", "_load",
 ]

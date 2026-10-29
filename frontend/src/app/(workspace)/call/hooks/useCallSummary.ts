@@ -53,6 +53,7 @@ export default function useCallSummary({
               call.usage !== null &&
               (call.usage as any).error) ||
             "the agent worker could not start the call";
+          setCallEndedMsg("");
           setErr("Call failed: " + reason);
           setCallState("error");
           onStarted();

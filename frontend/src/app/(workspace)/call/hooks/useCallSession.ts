@@ -24,6 +24,9 @@ export default function useCallSession() {
     room: string;
   } | null>(null);
   const [callId, setCallId] = useState("");
+  // SIP calls have no browser LiveKit session, so track their mode explicitly.
+  // Without this, a completed SIP call looked "connected" forever in local state.
+  const [activeMode, setActiveMode] = useState<"browser" | "sip" | null>(null);
 
   // Tracks start progress, user-facing errors, and agent wait time.
   const [busy, setBusy] = useState(false);
@@ -33,6 +36,15 @@ export default function useCallSession() {
   // Refs prevent duplicate disconnect handling and remember the end reason.
   const isDisconnectingRef = useRef(false);
   const callEndReasonRef = useRef<string | null>(null);
+
+  // Used when backend polling learns that a SIP call reached a terminal state.
+  const finishSipCall = useCallback(() => {
+    setSession(null);
+    setActiveMode(null);
+    setCallState("ended");
+    isDisconnectingRef.current = false;
+    callEndReasonRef.current = null;
+  }, []);
 
   // Polls for worker failure while the browser waits for the agent to join.
   useEffect(() => {
@@ -52,6 +64,7 @@ export default function useCallSession() {
         /* backend error on cleanup is fine — the state reset below still works */
       }
       setSession(null);
+      setActiveMode(null);
       window.setTimeout(() => {
         isDisconnectingRef.current = false;
       }, 800);
@@ -109,12 +122,50 @@ export default function useCallSession() {
     clearCallSummary();
     setErr("");
     if (isDisconnectingRef.current) return;
-    if (
+
+    let previousCallActive =
+      activeMode !== null ||
+      session !== null ||
       callState === "connecting" ||
       callState === "waiting_for_agent" ||
       callState === "connected" ||
-      session !== null
+      callState === "ending";
+
+    // A SIP call happens outside this browser tab. Before claiming it is still
+    // active, reconcile the local flag with the backend call record. This also
+    // recovers if the periodic SIP status poll was interrupted.
+    if (
+      previousCallActive &&
+      activeMode === "sip" &&
+      callId &&
+      !session &&
+      callState === "connected"
     ) {
+      setBusy(true);
+      try {
+        const current = await getCall(callId);
+        if (current.status === "completed") {
+          previousCallActive = false;
+          finishSipCall();
+        } else if (current.status === "failed") {
+          const reason =
+            (typeof current.usage === "object" &&
+              current.usage !== null &&
+              (current.usage as { error?: string }).error) ||
+            "the previous SIP call failed";
+          setActiveMode(null);
+          setCallState("error");
+          setErr(`Call failed: ${reason}. You can start a new call.`);
+          return;
+        }
+      } catch {
+        // Keep the guard closed while the backend state is unknown.
+      } finally {
+        if (previousCallActive) setBusy(false);
+      }
+    }
+
+    if (previousCallActive) {
       return setErr("A call is already active. End the current call first.");
     }
     if (!agentsReady)
@@ -138,6 +189,7 @@ export default function useCallSession() {
     );
 
     setBusy(true);
+    setActiveMode(mode);
     setCallState("connecting");
 
     try {
@@ -162,6 +214,7 @@ export default function useCallSession() {
           console.error(`[CALL_ERROR] ${errMsg}`);
           setErr(errMsg);
           setCallState("error");
+          setActiveMode(null);
           setBusy(false);
           return;
         }
@@ -182,8 +235,11 @@ export default function useCallSession() {
 
       if (mode === "sip") {
         onStarted();
+        setSession(null);
         setCallState("connected");
-        setCallEndedMsg("SIP call dispatched — agent is dialing");
+        // Do not use callEndedMsg here: it represents a finished call. The SIP
+        // status poll owns the transition to the ended/summary state.
+        setCallEndedMsg("");
         setBusy(false);
         return;
       }
@@ -194,6 +250,7 @@ export default function useCallSession() {
         console.error(`[CALL_ERROR] ${errMsg}`);
         setErr(errMsg);
         setCallState("error");
+        setActiveMode(null);
         setBusy(false);
         return;
       }
@@ -209,13 +266,14 @@ export default function useCallSession() {
       console.error(`[CALL_ERROR] ${errMsg}`);
       setErr(`Agent failed to start: ${errMsg}`);
       setCallState("error");
+      setActiveMode(null);
     } finally {
       setBusy(false);
     }
   }
 
-  // Ends the active call and starts summary polling after cleanup.
-  async function endBrowserCall(fetchCallSummary: (callId: string) => Promise<void>) {
+  // Ends either a browser or SIP call and starts summary polling after cleanup.
+  async function endCurrentCall(fetchCallSummary: (callId: string) => Promise<void>) {
     if (isDisconnectingRef.current) return;
     isDisconnectingRef.current = true;
     callEndReasonRef.current = "user_ended";
@@ -239,6 +297,7 @@ export default function useCallSession() {
       );
       setTimeout(() => {
         setSession(null);
+        setActiveMode(null);
         setCallState("ended");
         isDisconnectingRef.current = false;
         callEndReasonRef.current = null;
@@ -312,6 +371,7 @@ export default function useCallSession() {
       setCallState("ending");
       setTimeout(() => {
         setSession(null);
+        setActiveMode(null);
         setCallState("ended");
         isDisconnectingRef.current = false;
         callEndReasonRef.current = null;
@@ -335,8 +395,12 @@ export default function useCallSession() {
     agentWaitSeconds,
     isDisconnectingRef,
     callEndReasonRef,
+    activeMode,
+    finishSipCall,
     GoStart,
-    endBrowserCall,
+    endCurrentCall,
+    // Backwards-compatible alias for older imports.
+    endBrowserCall: endCurrentCall,
     handleAnnouncementFinished,
     handleRoomDisconnected,
   };

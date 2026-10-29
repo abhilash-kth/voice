@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   RefreshCw,
   Clock,
@@ -9,11 +9,15 @@ import {
   TrendingUp,
   Info,
   PhoneCall,
+  PhoneOff,
+  Loader2,
+  AlertCircle,
+  CheckCircle2,
 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import PageHeader from "@/components/PageHeader";
 import { StateBox } from "@/components/StateBox";
-import { listUsage, type UsageRow } from "@/lib/api";
+import { endAdminCall, listUsage, type UsageRow } from "@/lib/api";
 import { fmtDateTime, fmtDuration, fmtINR, shortId } from "@/lib/format";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -40,7 +44,48 @@ export default function UsagePage() {
       const r = await listUsage();
       return r.items;
     },
+    refetchInterval: 10000,
   });
+
+  const queryClient = useQueryClient();
+  const [notice, setNotice] = useState("");
+  const [actionError, setActionError] = useState("");
+  const endCallMutation = useMutation({
+    mutationFn: endAdminCall,
+    onMutate: () => {
+      setNotice("");
+      setActionError("");
+    },
+    onSuccess: async (result) => {
+      setNotice(
+        result.already_ended
+          ? `Call ${shortId(result.call_id)} was already ${result.status}.`
+          : `Call ${shortId(result.call_id)} ended and marked ${result.status}.`,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["usage"] });
+    },
+    onError: (mutationError) => {
+      setActionError(
+        mutationError instanceof Error
+          ? mutationError.message
+          : "Could not end this call.",
+      );
+    },
+  });
+  const endingCallId = endCallMutation.isPending
+    ? String(endCallMutation.variables || "")
+    : "";
+
+  const handleEndCall = (row: UsageRow) => {
+    const destination = row.phone ? ` to ${row.phone}` : "";
+    if (
+      window.confirm(
+        `End this ${row.status} ${row.mode || "voice"} call${destination}? If it is still live, its LiveKit room will be disconnected. If it is stale, its status will be corrected so the customer can start another call.`,
+      )
+    ) {
+      endCallMutation.mutate(row.id);
+    }
+  };
 
   const totals = useMemo(
     () =>
@@ -113,6 +158,18 @@ export default function UsagePage() {
             />
           </div>
         )}
+        {notice && (
+          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{notice}</span>
+          </div>
+        )}
+        {actionError && (
+          <div className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2.5 text-sm font-medium text-destructive">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{actionError}</span>
+          </div>
+        )}
       </div>
 
       {/* Table fills remaining viewport */}
@@ -157,6 +214,9 @@ export default function UsagePage() {
                       Mode
                     </TableHead>
                     <TableHead className="h-9 px-4 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Status
+                    </TableHead>
+                    <TableHead className="h-9 px-4 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                       Duration
                     </TableHead>
                     <TableHead className="h-9 px-4 text-right text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -177,23 +237,39 @@ export default function UsagePage() {
                     <TableHead className="h-9 px-4 text-right text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                       Profit
                     </TableHead>
+                    <TableHead className="h-9 px-4 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Action
+                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {items.map((r) => {
                     const profitPositive = r.profit_inr >= 0;
+                    const isActiveCall =
+                      r.status === "planned" || r.status === "in-progress";
+                    const isEndingCall = endingCallId === r.id;
                     return (
                       <TableRow
                         key={r.id}
                         className="border-b border-border/40 transition-colors hover:bg-muted/20"
                       >
                         <TableCell className="whitespace-nowrap px-4 py-2.5 text-xs tabular-nums text-muted-foreground">
-                          {fmtDateTime(r.started_at)}
+                          <p>{fmtDateTime(r.started_at)}</p>
+                          {r.phone && (
+                            <p className="mt-0.5 font-mono text-[11px] text-foreground/80">
+                              {r.phone}
+                            </p>
+                          )}
                         </TableCell>
                         <TableCell className="px-4 py-2.5">
-                          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">
-                            {shortId(r.user_id)}
-                          </code>
+                          <p className="max-w-[180px] truncate text-xs font-medium text-foreground">
+                            {r.user_name || r.user_email || shortId(r.user_id)}
+                          </p>
+                          {(r.user_name || r.user_email) && (
+                            <p className="mt-0.5 max-w-[180px] truncate font-mono text-[11px] text-muted-foreground">
+                              {r.user_email || shortId(r.user_id)}
+                            </p>
+                          )}
                         </TableCell>
                         <TableCell className="px-4 py-2.5">
                           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">
@@ -207,6 +283,9 @@ export default function UsagePage() {
                           >
                             {r.mode || "voice"}
                           </Badge>
+                        </TableCell>
+                        <TableCell className="whitespace-nowrap px-4 py-2.5">
+                          <CallStatusBadge status={r.status} />
                         </TableCell>
                         <TableCell className="px-4 py-2.5 text-xs font-medium tabular-nums text-foreground">
                           {fmtDuration(r.duration_seconds)}
@@ -244,6 +323,27 @@ export default function UsagePage() {
                           {profitPositive ? "+" : ""}
                           {fmtINR(r.profit_inr)}
                         </TableCell>
+                        <TableCell className="whitespace-nowrap px-4 py-2.5">
+                          {isActiveCall ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="destructive"
+                              className="h-8 gap-1.5 text-xs"
+                              disabled={isEndingCall}
+                              onClick={() => handleEndCall(r)}
+                            >
+                              {isEndingCall ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <PhoneOff className="h-3.5 w-3.5" />
+                              )}
+                              {isEndingCall ? "Ending…" : "End call"}
+                            </Button>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
                       </TableRow>
                     );
                   })}
@@ -264,13 +364,35 @@ export default function UsagePage() {
                 </span>{" "}
                 = providers charged.{" "}
                 <span className="font-medium text-foreground">Profit</span> =
-                billed − cost.
+                billed − cost. For a planned/in-progress row,{" "}
+                <span className="font-medium text-foreground">End call</span>{" "}
+                disconnects a live room or corrects a stale active status.
               </p>
             </div>
           </div>
         </StateBox>
       </div>
     </div>
+  );
+}
+
+function CallStatusBadge({ status }: { status: string }) {
+  const className =
+    status === "completed"
+      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+      : status === "failed"
+        ? "border-rose-500/25 bg-rose-500/10 text-rose-700 dark:text-rose-400"
+        : status === "planned" || status === "in-progress"
+          ? "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+          : "border-border/60 bg-muted/40 text-muted-foreground";
+
+  return (
+    <Badge
+      variant="outline"
+      className={`h-5 px-2 text-[10px] font-semibold capitalize ${className}`}
+    >
+      {(status || "unknown").replace("-", " ")}
+    </Badge>
   );
 }
 

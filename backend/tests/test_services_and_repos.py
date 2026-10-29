@@ -244,6 +244,53 @@ class TestCallLifecycle:
         by_room = {r["room"]: r["status"] for r in await repo.list_calls(u["id"], a["id"])}
         assert by_room["ghost"] == "failed"
 
+    async def test_super_admin_can_end_active_or_stale_calls(self, seeded, monkeypatch):
+        u = await repo.create_user("lc4@t.dev", "LC4", auth.hash_password("pw"))
+        a = await repo.create_agent(u["id"], {"name": "A4"})
+        active = await repo.create_call({
+            "user_id": u["id"], "agent_id": a["id"], "mode": "sip",
+            "room": "admin-end-active", "status": "in-progress",
+            "phone": "+918114402203",
+        })
+        planned = await repo.create_call({
+            "user_id": u["id"], "agent_id": a["id"], "mode": "sip",
+            "room": "admin-end-planned", "status": "planned",
+            "phone": "+918114402204",
+        })
+
+        ended_rooms = []
+
+        async def fake_end_room(room):
+            ended_rooms.append(room)
+            return True
+
+        monkeypatch.setattr(
+            "app.services.admin_analytics.end_active_room", fake_end_room)
+        admin = {"id": "admin-1", "email": "admin@test.dev"}
+
+        out = await admin_service.end_call_admin(active["id"], admin=admin)
+        assert out == {
+            "ok": True, "call_id": active["id"], "status": "completed",
+            "already_ended": False, "room_deleted": True,
+        }
+        out = await admin_service.end_call_admin(planned["id"], admin=admin)
+        assert out["status"] == "failed"
+        assert ended_rooms == ["admin-end-active", "admin-end-planned"]
+
+        by_room = {r["room"]: r for r in await repo.list_calls(u["id"], a["id"])}
+        assert by_room["admin-end-active"]["status"] == "completed"
+        assert by_room["admin-end-active"]["ended_at"]
+        assert by_room["admin-end-planned"]["status"] == "failed"
+        assert "Super Admin" in by_room["admin-end-planned"]["usage"]["error"]
+
+        again = await admin_service.end_call_admin(active["id"], admin=admin)
+        assert again["already_ended"] is True
+        assert ended_rooms == ["admin-end-active", "admin-end-planned"]
+
+        logs = await admin_service.list_audit_logs(action="call_ended")
+        assert {i["target_id"] for i in logs["items"]} == {
+            active["id"], planned["id"]}
+
 
 class TestUsersAndAudit:
     async def test_role_guard_refuses_demote_last_admin(self, seeded):

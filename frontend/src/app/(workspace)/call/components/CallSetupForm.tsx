@@ -83,8 +83,10 @@ export default function CallSetupForm({
         ? "Connecting…"
         : callState === "waiting_for_agent"
           ? "Waiting for agent…"
-          : isCallActive
-            ? "Call connected"
+          : callState === "ending"
+            ? "Ending call…"
+            : isCallActive
+              ? "Call connected"
             : mode === "browser"
               ? "Start voice call"
               : "Dial number";
@@ -93,6 +95,7 @@ export default function CallSetupForm({
     busy ||
     callState === "connecting" ||
     callState === "waiting_for_agent" ||
+    callState === "ending" ||
     (!agentsReady && callState === "idle");
   const inboundOnly =
     selected != null &&
@@ -352,12 +355,13 @@ export default function CallSetupForm({
           </div>
         )}
 
-        {mode === "sip" && callId && !session && (
+        {mode === "sip" && callId && !session && isCallActive && (
           <div className="flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
             <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>
-              SIP call dispatched. The agent is dialing. Check Call History for
-              transcripts.
+              {callState === "ending"
+                ? "Ending the SIP call…"
+                : "SIP call in progress. Hang up on the phone or use End call here; this page will update automatically when it finishes."}
             </span>
           </div>
         )}

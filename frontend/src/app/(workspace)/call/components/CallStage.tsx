@@ -124,6 +124,39 @@ function EmptyStage({
     );
   }
 
+  if (
+    mode === "sip" &&
+    (callState === "connecting" ||
+      callState === "connected" ||
+      callState === "ending")
+  ) {
+    return (
+      <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-500/20 bg-emerald-500/10 text-emerald-600 shadow-sm dark:text-emerald-400">
+          <PhoneCall className="h-7 w-7 animate-pulse" />
+        </div>
+        <div className="space-y-2">
+          <p className="text-lg font-semibold tracking-tight text-foreground">
+            {callState === "ending"
+              ? "Ending SIP call"
+              : callState === "connecting"
+                ? "Dialing SIP call"
+                : "SIP call in progress"}
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            The agent is connected through the phone network. Hang up on the
+            phone or use <span className="font-medium text-foreground">End call</span>{" "}
+            on the left; this screen updates automatically when the call ends.
+          </p>
+        </div>
+        <div className="flex items-center justify-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/5 px-3 py-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+          Live phone call
+        </div>
+      </div>
+    );
+  }
+
   if (mode === "browser") {
     return (
       <div className="mx-auto flex max-w-md flex-col items-center gap-5 px-4 text-center">
