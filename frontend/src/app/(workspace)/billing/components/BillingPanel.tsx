@@ -18,7 +18,7 @@ interface Tx {
 }
 
 export default function BillingPanel() {
-  const { data, error, isPending } = useQuery({
+  const { data, error, isPending, refetch } = useQuery({
     queryKey: ["usage", "wallet-balance"],
     queryFn: async () => {
       const [u, w] = await Promise.all([getUsage(), getWallet()]);
@@ -96,7 +96,10 @@ export default function BillingPanel() {
       <MyPlan />
 
       {/* subcription card */}
-      <SubscriptionPanel />
+      <SubscriptionPanel
+        walletBalance={balance}
+        onChanged={() => void refetch()}
+      />
 
       {/* recent transactions */}
       <RecentTransactions transactions={transactions} />

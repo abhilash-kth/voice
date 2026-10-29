@@ -259,9 +259,16 @@ async def purchase(user_id: str, *, capacity_tier_id: str = "",
         capacity_tier=tier, extra_channels=extra_channel_count,
         telephony=telephony, kb_packs=packs,
         channel_price=channel_price, telephony_rent=telephony_rent)
-    if monthly > 0 and await _wallet_balance(user_id) < monthly:
-        raise SubscriptionError(
-            f"Insufficient wallet balance (needs ₹{monthly:.2f}). Recharge first.")
+    if monthly > 0:
+        balance = await _wallet_balance(user_id)
+        if balance < monthly:
+            logger.warning(
+                "Subscription purchase blocked for user=%s: wallet balance "
+                "₹%.2f is below monthly total ₹%.2f",
+                user_id, balance, monthly)
+            raise SubscriptionError(
+                f"Insufficient wallet balance (has ₹{balance:.2f}, "
+                f"needs ₹{monthly:.2f}). Recharge first.")
 
     now = _now()
     agent_limit = (tier or {}).get("units", 0)

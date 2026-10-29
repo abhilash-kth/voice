@@ -441,8 +441,8 @@ async def test_subscription_purchase_stores_plan_and_kb_amounts(normal_user):
 
     _, user = normal_user
     db = get_prisma()
-    await db.user.update(
-        where={"id": user["id"]}, data={"walletBalance": 10_000})
+    topped_up = await repo.recharge(user["id"], 9000)
+    assert topped_up["balance"] == 9000
     capacity = await db.plantier.create(data={
         "kind": "capacity", "label": f"3 agents {user['id']}",
         "units": 3, "faqs": 0, "pricePerMonth": 4999,
@@ -462,7 +462,7 @@ async def test_subscription_purchase_stores_plan_and_kb_amounts(normal_user):
     # as ₹0/month merely because _plan_dict uses snake_case price keys.
     assert entitlement["monthly_total"] == 5999
     wallet = await repo.get_wallet(user["id"])
-    assert wallet["balance"] == 4001
+    assert wallet["balance"] == 3001
 
 
 async def test_paid_same_number_channel_upgrade_updates_did_and_plan(

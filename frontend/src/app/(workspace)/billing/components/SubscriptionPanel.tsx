@@ -56,8 +56,10 @@ function FieldHelp({ label, help }: { label: string; help: string }) {
 
 export default function SubscriptionPanel({
   onChanged,
+  walletBalance,
 }: {
   onChanged?: () => void;
+  walletBalance?: number;
 }) {
   const [info, setInfo] = useState<SubscriptionInfo | null>(null);
   const [agents, setAgents] = useState(0);
@@ -97,6 +99,18 @@ export default function SubscriptionPanel({
   }, []);
 
   useEffect(load, [load]);
+
+  // A failed purchase used to leave its insufficient-balance banner on
+  // screen even after AddBalance successfully recharged the same wallet.
+  // The parent owns/refetches the wallet, so a balance change clears only
+  // that now-stale error; a fresh Buy click still uses the backend check.
+  useEffect(() => {
+    setErr((current) =>
+      current.toLowerCase().includes("insufficient wallet balance")
+        ? ""
+        : current,
+    );
+  }, [walletBalance]);
 
   if (loading && !info)
     return (
@@ -357,6 +371,11 @@ export default function SubscriptionPanel({
                 /month
               </span>
             </p>
+            {typeof walletBalance === "number" && (
+              <p className="mt-1 text-[11px] tabular-nums text-muted-foreground">
+                Wallet balance ₹{walletBalance.toFixed(2)}
+              </p>
+            )}
           </div>
 
           <Button

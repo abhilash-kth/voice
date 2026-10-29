@@ -212,7 +212,7 @@ async def get_wallet(user=Depends(auth.get_current_user)):
 async def recharge(body: Recharge, user=Depends(auth.get_current_user)):
     if body.add_amount <= 0:
         raise HTTPException(400, "Recharge amount must be positive")
-    out = await repo.recharge(user.id, body.add_amount)
+    await repo.recharge(user.id, body.add_amount)
     # A fresh top-up may be exactly what a past_due monthly plan was waiting
     # for — settle it immediately instead of on the hourly sweep.
     try:
@@ -220,7 +220,10 @@ async def recharge(body: Recharge, user=Depends(auth.get_current_user)):
         await subscription_service.retry_after_recharge(user.id)
     except Exception:
         pass
-    return out
+    # Return the post-retry wallet: settling a past-due plan may already
+    # have spent part of this top-up, and callers must not see a stale ₹9000
+    # balance when the database balance is now lower.
+    return await repo.get_wallet(user.id)
 
 
 # ---------------------------------------------------------------------------
