@@ -108,6 +108,14 @@ def test_plan_channels_pricing_and_purchase_body():
         capacity_tier=None, extra_channels=2, telephony=False,
         kb_packs=[], channel_price=250, telephony_rent=0) == 500
 
+    # Regression: plan_tiers._plan_dict() returns `price_per_month`, while
+    # the old pricing code looked only for `pricePerMonth` and therefore
+    # stored purchased agent/KB plans with monthly_total=0.
+    assert subscriptions.price_selection(
+        capacity_tier={"price_per_month": 4999}, extra_channels=0,
+        telephony=False, kb_packs=[{"price_per_month": 1000}],
+        channel_price=250, telephony_rent=0) == 5999
+
     body = PurchaseBody(channels=3)
     assert body.channels == 3
     with pytest.raises(ValidationError):
@@ -391,6 +399,18 @@ async def test_super_admin_subscription_crud_reflects_in_customer_view(
     assert created["monthly_total"] == 4999
     assert created["renews_at"].startswith("2026-11-19")
 
+    # The Super Admin Edit form loads this exact stored row through the
+    # single-subscription endpoint helper before allowing edits.
+    from app.admin.plan_routes import _subscription_item_for_user
+
+    item = await _subscription_item_for_user(user["id"])
+    assert item is not None
+    assert item["agent_limit"] == 3
+    assert item["plan_channels"] == 2
+    assert item["kb_extra_chars"] == 10_000
+    assert item["kb_extra_faqs"] == 20
+    assert item["monthly_total"] == 4999
+
     with pytest.raises(subscriptions.SubscriptionError):
         await subscriptions.admin_create_subscription(user["id"])
 
@@ -403,10 +423,46 @@ async def test_super_admin_subscription_crud_reflects_in_customer_view(
     assert updated["channels"] == 4
     assert updated["monthly_total"] == 5999
 
+    # A blank renewal date in an update preserves the stored DB date.
+    updated = await subscriptions.admin_update_subscription(
+        user["id"], renews_at="")
+    assert updated is not None
+    assert updated["renews_at"].startswith("2026-11-19")
+
     assert await subscriptions.admin_delete_subscription(user["id"]) is True
     deleted = await subscriptions.get_subscription(user["id"])
     assert deleted["status"] == "inactive"
     assert deleted["agent_limit"] == 0
+
+
+async def test_subscription_purchase_stores_plan_and_kb_amounts(normal_user):
+    from app.db import get_prisma
+    from app.services import subscription_service as subscriptions
+
+    _, user = normal_user
+    db = get_prisma()
+    await db.user.update(
+        where={"id": user["id"]}, data={"walletBalance": 10_000})
+    capacity = await db.plantier.create(data={
+        "kind": "capacity", "label": f"3 agents {user['id']}",
+        "units": 3, "faqs": 0, "pricePerMonth": 4999,
+        "enabled": True, "sortOrder": 0, "createdAt": ""})
+    pack = await db.plantier.create(data={
+        "kind": "kb_pack", "label": f"KB {user['id']}",
+        "units": 10_000, "faqs": 20, "pricePerMonth": 1000,
+        "enabled": True, "sortOrder": 0, "createdAt": ""})
+
+    entitlement = await subscriptions.purchase(
+        user["id"], capacity_tier_id=capacity.id,
+        kb_pack_ids=[pack.id], channels=1)
+    assert entitlement["agent_limit"] == 3
+    assert entitlement["kb_char_limit"] == 30_000
+    assert entitlement["kb_faq_limit"] == 70
+    # This is the screenshot regression: purchased plans must not be stored
+    # as ₹0/month merely because _plan_dict uses snake_case price keys.
+    assert entitlement["monthly_total"] == 5999
+    wallet = await repo.get_wallet(user["id"])
+    assert wallet["balance"] == 4001
 
 
 async def test_paid_same_number_channel_upgrade_updates_did_and_plan(

@@ -214,10 +214,18 @@ plan-selected VoiceLink channels, telephony-rented flag, extra KB
 characters/FAQs, monthly renewal total, and renewal date. These are stored
 in the same `Subscription` row read by the customer's **Billing → Your
 current plan** dashboard, which shows the effective channels plus the
-plan/provider/number breakdown. Manual admin edits do not charge or refund
+plan/provider/number breakdown. Clicking **Edit** freshly reads that
+customer's stored DB row, including monthly total and extra KB/FAQ values,
+before opening the form. Manual admin edits do not charge or refund
 the wallet immediately; `monthly_total` is the amount future renewals use.
 Deleting a subscription makes the customer dashboard show no active plan.
 Every admin mutation is audit-logged.
+
+Older purchased subscriptions may show a stored monthly total of ₹0 because
+plan/KB prices were once read with the wrong key during purchase. That is
+fixed for new purchases. For an old row, Edit prefills a suggested monthly
+total only when the stored agent/KB allowances match exactly one current
+plan/KB price; review it and click Save once to store the corrected amount.
 
 The channel column is the effective maximum of plan-selected channels,
 VoiceLink-account allocated channels, and the highest active DID's channels.

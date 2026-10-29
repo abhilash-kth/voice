@@ -160,14 +160,26 @@ def price_selection(*, capacity_tier: Optional[Dict[str, Any]],
               else int(extra_lines or 0))
     per_channel = float(
         channel_price if channel_price is not None else line_price or 0)
+
+    def plan_price(plan: Optional[Dict[str, Any]]) -> float:
+        if not plan:
+            return 0.0
+        # plan_tiers._plan_dict() returns snake_case API fields. Accept the
+        # legacy camelCase key too: using only `pricePerMonth` silently
+        # priced every purchased capacity/KB plan at ₹0.
+        value = plan.get("price_per_month")
+        if value is None:
+            value = plan.get("pricePerMonth")
+        return float(value or 0)
+
     total = 0.0
     if capacity_tier:
-        total += float(capacity_tier.get("pricePerMonth") or 0)
+        total += plan_price(capacity_tier)
     total += max(extras, 0) * per_channel
     if telephony:
         total += float(telephony_rent or 0)
     for p in kb_packs:
-        total += float(p.get("pricePerMonth") or 0)
+        total += plan_price(p)
     return round(total, 2)
 
 
@@ -280,7 +292,9 @@ async def purchase(user_id: str, *, capacity_tier_id: str = "",
 
 
 def _admin_renews_at(value: Optional[str], fallback: str = "") -> str:
-    raw = (value if value is not None else fallback or "").strip()
+    # An omitted/blank date in an update must preserve the DB value rather
+    # than silently moving the customer's renewal date.
+    raw = (value or fallback or "").strip()
     if not raw:
         return _iso(_now() + timedelta(days=SUBSCRIPTION_DAYS))
     if len(raw) == 10:  # date input from the admin panel
@@ -358,16 +372,17 @@ async def admin_update_subscription(user_id: str,
     if not existing:
         return None
     await db.subscription.update(
-        where={"userId": user_id},
+        where={"id": existing.id},
         data=_admin_subscription_data(fields, existing))
     return await get_subscription(user_id)
 
 
 async def admin_delete_subscription(user_id: str) -> bool:
     db = get_prisma()
-    if not await db.subscription.find_unique(where={"userId": user_id}):
+    existing = await db.subscription.find_unique(where={"userId": user_id})
+    if not existing:
         return False
-    await db.subscription.delete(where={"userId": user_id})
+    await db.subscription.delete(where={"id": existing.id})
     return True
 
 
@@ -378,7 +393,7 @@ async def record_paid_channel_upgrade(user_id: str, target_channels: int,
     existing = await db.subscription.find_unique(where={"userId": user_id})
     if not existing or existing.status != "active":
         raise SubscriptionError("An active subscription is required")
-    await db.subscription.update(where={"userId": user_id}, data={
+    await db.subscription.update(where={"id": existing.id}, data={
         "concurrencyLines": max(int(existing.concurrencyLines or 1),
                                 int(target_channels)),
         "monthlyTotal": round(float(existing.monthlyTotal or 0)

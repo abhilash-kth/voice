@@ -93,18 +93,27 @@ export interface SubscriptionCreate {
 export type SubscriptionPatch = Partial<Omit<SubscriptionCreate, "user_id">>;
 export const listSubscriptions = () =>
     req<{ items: SubscriptionRow[] }>("/api/admin/subscriptions");
+export const getAdminSubscription = (userId: string) =>
+    req<SubscriptionRow>(
+        `/api/admin/subscriptions/${encodeURIComponent(userId)}`,
+    );
 export const createSubscription = (body: SubscriptionCreate) =>
     req<SubscriptionRow>("/api/admin/subscriptions", {
         method: "POST",
         body: JSON.stringify(body),
     });
 export const updateSubscription = (userId: string, patch: SubscriptionPatch) =>
-    req<SubscriptionRow>(`/api/admin/subscriptions/${userId}`, {
-        method: "PUT",
-        body: JSON.stringify(patch),
-    });
+    req<SubscriptionRow>(
+        `/api/admin/subscriptions/${encodeURIComponent(userId)}`,
+        {
+            method: "PUT",
+            body: JSON.stringify(patch),
+        },
+    );
 export const deleteSubscription = (userId: string) =>
-    req<void>(`/api/admin/subscriptions/${userId}`, { method: "DELETE" });
+    req<void>(`/api/admin/subscriptions/${encodeURIComponent(userId)}`, {
+        method: "DELETE",
+    });
 
 // ---- per-call rate preview (used by the Billing-page calculator) ----------
 // Mirrors the customer /api/cost-preview response fields the UI needs.

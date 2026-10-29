@@ -4,6 +4,7 @@ subscriber list. Split from admin routes.py (≤300-line rule); mounted under
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,6 +15,7 @@ from . import deps, schemas
 
 router = APIRouter()
 ADMIN = Depends(deps.get_super_admin)
+logger = logging.getLogger("voice-agent-saas-admin")
 
 
 @router.get("/plans")
@@ -80,14 +82,33 @@ def _subscription_item(row, *, user_name: str = "", user_email: str = "",
 
 
 async def _subscription_item_for_user(user_id: str):
+    """Freshly read one subscription row for the admin edit form/response.
+
+    Telephony joins only enrich the effective-channel breakdown. They must
+    not make an otherwise successful subscription read/save fail, so those
+    lookups are best-effort here.
+    """
     db = get_prisma()
     row = await db.subscription.find_unique(where={"userId": user_id})
     if not row:
         return None
-    user = await db.user.find_unique(where={"id": user_id})
-    account = await db.voicelinkaccount.find_unique(where={"userId": user_id})
-    numbers = await db.phonenumber.find_many(
-        where={"userId": user_id, "status": "active"})
+    user = None
+    account = None
+    numbers = []
+    try:
+        user = await db.user.find_unique(where={"id": user_id})
+    except Exception as e:
+        logger.debug("subscription user lookup skipped: %r", e)
+    try:
+        account = await db.voicelinkaccount.find_unique(
+            where={"userId": user_id})
+    except Exception as e:
+        logger.debug("subscription VoiceLink lookup skipped: %r", e)
+    try:
+        numbers = await db.phonenumber.find_many(
+            where={"userId": user_id, "status": "active"})
+    except Exception as e:
+        logger.debug("subscription phone-number lookup skipped: %r", e)
     return _subscription_item(
         row,
         user_name=(user.name or "") if user else "",
@@ -126,6 +147,20 @@ async def list_subscriptions(admin=ADMIN):
         for r in rows]}
 
 
+@router.get("/subscriptions/{user_id}")
+async def get_subscription(user_id: str, admin=ADMIN):
+    """One customer's exact stored subscription values for Edit.
+
+    The panel calls this when Edit is clicked instead of trusting a
+    previously loaded table row, so amount/agent/KB/channel fields always
+    start from the current DB row.
+    """
+    item = await _subscription_item_for_user(user_id)
+    if not item:
+        raise HTTPException(404, "Subscription not found")
+    return item
+
+
 @router.post("/subscriptions", status_code=201)
 async def create_subscription(body: schemas.SubscriptionCreateBody, admin=ADMIN):
     db = get_prisma()
@@ -154,11 +189,15 @@ async def update_subscription(user_id: str,
     try:
         updated = await subscription_service.admin_update_subscription(
             user_id, **body.model_dump(exclude_none=True))
+        item = await _subscription_item_for_user(user_id)
     except subscription_service.SubscriptionError as e:
         raise HTTPException(400, str(e))
-    if updated is None:
+    except Exception as e:
+        logger.exception("admin subscription update failed for %s", user_id)
+        raise HTTPException(
+            500, f"Could not save this subscription: {e}") from None
+    if updated is None or item is None:
         raise HTTPException(404, "Subscription not found")
-    item = await _subscription_item_for_user(user_id)
     await admin_service.audit(
         admin, "subscription_updated", target_type="subscription",
         target_id=user_id, detail=body.model_dump(exclude_none=True))

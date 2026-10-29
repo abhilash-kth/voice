@@ -17,6 +17,7 @@ import {
   createSubscription,
   deletePlan,
   deleteSubscription,
+  getAdminSubscription,
   getBilling,
   listPlans,
   listSubscriptions,
@@ -189,6 +190,80 @@ export default function PlansPage() {
       },
     }));
 
+  const suggestedMonthlyTotal = (row: SubscriptionRow) => {
+    if (Number(row.monthly_total || 0) > 0) return Number(row.monthly_total);
+
+    // Older purchased rows can have monthly_total=0 because plan prices
+    // were not stored correctly. Only prefill when the stored agent/KB
+    // allowances identify exactly one current DB plan price; never guess
+    // between multiple plans with the same allowance.
+    let total = 0;
+    if (row.agent_limit > 0) {
+      const prices = Array.from(
+        new Set(
+          plans
+            .filter(
+              (plan) =>
+                plan.kind === "capacity" && plan.units === row.agent_limit,
+            )
+            .map((plan) => Number(plan.price_per_month || 0)),
+        ),
+      );
+      if (prices.length !== 1) return 0;
+      total += prices[0];
+    }
+
+    const kbChars = row.kb_extra_chars ?? row.kb_char_limit ?? 0;
+    const kbFaqs = row.kb_extra_faqs ?? row.kb_faq_limit ?? 0;
+    if (kbChars > 0 || kbFaqs > 0) {
+      const prices = Array.from(
+        new Set(
+          plans
+            .filter(
+              (plan) =>
+                plan.kind === "kb_pack" &&
+                plan.units === kbChars &&
+                plan.faqs === kbFaqs,
+            )
+            .map((plan) => Number(plan.price_per_month || 0)),
+        ),
+      );
+      if (prices.length !== 1) return 0;
+      total += prices[0];
+    }
+
+    total +=
+      Math.max(Number(row.plan_channels ?? row.channels ?? 1) - 1, 0) *
+      toNum(linePrice);
+    if (row.telephony_rented) total += toNum(teleRent);
+    return Math.round(total * 100) / 100;
+  };
+
+  const startEditSubscription = (row: SubscriptionRow) => {
+    if (editingSubscription === row.user_id) {
+      setEditingSubscription("");
+      return;
+    }
+    void run(async () => {
+      // Always start Edit from a fresh single-row DB read, not from a
+      // possibly stale table row.
+      const fresh = await getAdminSubscription(row.user_id);
+      setSubs((current) =>
+        current.map((item) => (item.user_id === fresh.user_id ? fresh : item)),
+      );
+      const form = subscriptionToForm(fresh);
+      const suggested = suggestedMonthlyTotal(fresh);
+      if (Number(fresh.monthly_total || 0) <= 0 && suggested > 0) {
+        form.monthly_total = suggested;
+      }
+      setSubscriptionEdits((current) => ({
+        ...current,
+        [fresh.user_id]: form,
+      }));
+      setEditingSubscription(fresh.user_id);
+    }, "Subscription loaded from DB ✓");
+  };
+
   const addSubscription = () =>
     run(async () => {
       await createSubscription(newSubscription);
@@ -199,7 +274,7 @@ export default function PlansPage() {
   const saveSubscription = (row: SubscriptionRow) =>
     run(async () => {
       const form = editedSubscription(row);
-      await updateSubscription(row.user_id, {
+      const saved = await updateSubscription(row.user_id, {
         status: form.status,
         agent_limit: Math.trunc(form.agent_limit),
         channels: Math.trunc(form.channels),
@@ -209,6 +284,11 @@ export default function PlansPage() {
         monthly_total: Number(form.monthly_total),
         renews_at: form.renews_at,
       });
+      // Reflect the backend's saved DB row immediately; the full reload
+      // below is only a refresh and must not be the sole proof of saving.
+      setSubs((current) =>
+        current.map((item) => (item.user_id === saved.user_id ? saved : item)),
+      );
       setEditingSubscription("");
       setSubscriptionEdits((current) => {
         const next = { ...current };
@@ -779,25 +859,19 @@ export default function PlansPage() {
                         <td className="px-3 py-3">
                           <div className="flex justify-end gap-2">
                             <Button
+                              type="button"
                               size="sm"
                               variant="outline"
                               disabled={busy}
-                              onClick={() => {
-                                setSubscriptionEdit(
-                                  subscription,
-                                  subscriptionToForm(subscription),
-                                );
-                                setEditingSubscription(
-                                  editingSubscription === subscription.user_id
-                                    ? ""
-                                    : subscription.user_id,
-                                );
-                              }}
+                              onClick={() =>
+                                startEditSubscription(subscription)
+                              }
                             >
                               <Pencil className="mr-1.5 h-3.5 w-3.5" />
                               Edit
                             </Button>
                             <Button
+                              type="button"
                               size="sm"
                               variant="outline"
                               className="text-destructive hover:text-destructive"
@@ -819,22 +893,45 @@ export default function PlansPage() {
                                       Edit subscription
                                     </h3>
                                     <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                                      Saved values are read by the customer
-                                      Billing dashboard on its next refresh.
-                                      Editing plan channels does not change a
-                                      DID’s own carrier channels; use Telephony
-                                      for a manual number or the customer’s
-                                      paid channel upgrade for a purchased
-                                      number.
+                                      These fields were loaded from this
+                                      customer’s current subscription row in
+                                      the DB. Saved values are read by the
+                                      customer Billing dashboard on its next
+                                      refresh. Editing plan channels does not
+                                      change a DID’s own carrier channels; use
+                                      Telephony for a manual number or the
+                                      customer’s paid channel upgrade for a
+                                      purchased number.
                                     </p>
+                                    {Number(subscription.monthly_total || 0) <=
+                                      0 &&
+                                      Number(
+                                        editedSubscription(subscription)
+                                          .monthly_total || 0,
+                                      ) > 0 && (
+                                        <p className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+                                          The stored DB monthly total is ₹0.
+                                          The amount in the form is prefilled
+                                          from the matching agent/KB/channel
+                                          prices in the DB. Review it before
+                                          saving; Save will store it as the
+                                          subscription’s monthly total.
+                                        </p>
+                                      )}
                                   </div>
                                   {renderSubscriptionFields(
                                     editedSubscription(subscription),
                                     (patch) =>
                                       setSubscriptionEdit(subscription, patch),
                                   )}
+                                  {err && (
+                                    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm font-medium text-destructive">
+                                      Could not save: {err}
+                                    </div>
+                                  )}
                                   <div className="flex flex-wrap gap-2">
                                     <Button
+                                      type="button"
                                       size="sm"
                                       disabled={busy}
                                       onClick={() =>
@@ -842,9 +939,12 @@ export default function PlansPage() {
                                       }
                                     >
                                       <Save className="mr-2 h-3.5 w-3.5" />
-                                      Save subscription
+                                      {busy
+                                        ? "Saving…"
+                                        : "Save subscription"}
                                     </Button>
                                     <Button
+                                      type="button"
                                       size="sm"
                                       variant="outline"
                                       disabled={busy}
