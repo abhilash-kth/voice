@@ -73,6 +73,31 @@ def _client_channels(row: dict) -> int:
     return 0
 
 
+def _indian_phone_forms(phone: str = "") -> tuple[str, str]:
+    """Return ``(VoiceLink digits, stored/display E.164)`` for an Indian mobile.
+
+    Customers naturally enter ``+91XXXXXXXXXX``. VoiceLink's client-create
+    validator is a digits-only rule (``digits_between``-style: it rejects the
+    ``+`` with "The phone field must be between 7 and 15 digits"), so the
+    provider payload must use ``91XXXXXXXXXX``. We keep ``+91...`` locally
+    because the rest of the app displays/compares E.164 numbers. An empty
+    optional setup phone stays empty; a supplied non-Indian number is
+    rejected here with a clear message instead of VoiceLink's generic one.
+    """
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if not digits:
+        return "", ""
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        digits = "91" + digits
+    elif len(digits) != 12 or not digits.startswith("91"):
+        raise TelephonyError(
+            "Enter a 10-digit Indian mobile number, optionally with "
+            "country code 91.", 400)
+    return digits, f"+{digits}"
+
+
 async def require_account(user_id: str) -> dict:
     account = await repo.get_account_by_user(user_id)
     if not account:
@@ -92,6 +117,7 @@ async def setup_account(user_id: str, email: str, name: str = "",
     existing = await repo.get_account_by_user(user_id)
     if existing:
         return await sync_account(existing)
+    provider_phone, stored_phone = _indian_phone_forms(phone)
     # Channels selected with the monthly plan are the target allocation for
     # the new provider client. If the reseller pool cannot cover all of them
     # yet, start with what is available; a later DID quote buys the missing
@@ -119,7 +145,7 @@ async def setup_account(user_id: str, email: str, name: str = "",
         account = await repo.create_account(user_id, {
             "provider_reseller_id": profile["id"], "client_id": client_id,
             "username": str(by_email.get("username") or ""),
-            "email": email, "name": name or email, "phone": phone,
+            "email": email, "name": name or email, "phone": stored_phone,
             "channels_allocated": _client_channels(by_email),
         })
         return await sync_account(account)
@@ -154,8 +180,8 @@ async def setup_account(user_id: str, email: str, name: str = "",
         "wallet_balance": 0,
         "wallet_bypass": int(settings.voicelink_wallet_bypass),
     }
-    if phone:
-        payload["phone"] = phone
+    if provider_phone:
+        payload["phone"] = provider_phone
     if profile["plan_type"] == "unlimited":
         payload["plan_type"] = "unlimited"
     else:
@@ -179,7 +205,7 @@ async def setup_account(user_id: str, email: str, name: str = "",
     account = await repo.create_account(user_id, {
         "provider_reseller_id": profile["id"], "client_id": client_id,
         "username": payload["username"], "email": email, "name": display,
-        "phone": phone, "channels_allocated": initial_channels,
+        "phone": stored_phone, "channels_allocated": initial_channels,
     })
     return await sync_account(account)
 
@@ -354,15 +380,9 @@ async def act_kyc(user_id: str, body, redirect_url: str) -> dict:
         if body.account_type not in ("individual", "business"):
             raise TelephonyError("Choose individual or business verification.", 400)
         phone = _req(body.phone, "Contact number")
-        digits = re.sub(r"\D", "", phone)
-        # Accept 10-digit, 91XXXXXXXXXX and +91XXXXXXXXXX forms only.
-        if len(digits) == 10:
-            phone = "+91" + digits
-        elif len(digits) == 12 and digits.startswith("91"):
-            phone = "+" + digits
-        else:
-            raise TelephonyError(
-                "Enter an Indian contact number with country code 91.", 400)
+        # Accept 10-digit, 91XXXXXXXXXX and +91XXXXXXXXXX input, but send
+        # VoiceLink its digits-only provider format (see _indian_phone_forms).
+        phone, _stored_phone = _indian_phone_forms(phone)
         if not re.fullmatch(r"\d{6}", body.pincode or ""):
             raise TelephonyError("Enter a six-digit postal code.", 400)
         fields = {

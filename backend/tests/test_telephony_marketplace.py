@@ -68,6 +68,23 @@ def test_destination_and_carrier_dial_normalization():
     )
 
 
+def test_voicelink_phone_payload_is_digits_only():
+    from app.services.telephony_account import _indian_phone_forms
+    from app.services.telephony_policy import TelephonyError
+
+    # Screenshot regression: the customer entered +91XXXXXXXXXX and
+    # VoiceLink rejected the '+' because its phone rule accepts digits only.
+    assert _indian_phone_forms("+918114402203") == (
+        "918114402203", "+918114402203")
+    assert _indian_phone_forms("81144 02203") == (
+        "918114402203", "+918114402203")
+    assert _indian_phone_forms("08114402203") == (
+        "918114402203", "+918114402203")
+    assert _indian_phone_forms("") == ("", "")
+    with pytest.raises(TelephonyError):
+        _indian_phone_forms("12345")
+
+
 def test_manual_number_update_body_and_effective_concurrency():
     from app.routes.calls_routes import _effective_concurrency
 
