@@ -462,8 +462,8 @@ export function TelephonySettingsForm({
             placeholder: "45454",
           }, "Dial format is prefix + 91 + 10-digit number.")}
           {textField("Public LiveKit SIP host", "livekit_sip_host", {
-            placeholder: "kvoice.duckdns.org",
-          }, "Hostname/IP only—no scheme or port. VoiceLink trunks point here.")}
+            placeholder: "c{client_id}.kvoice.duckdns.org",
+          }, "Hostname/IP only—no scheme or port. Use {client_id} for a per-client wildcard DNS alias because VoiceLink requires a unique host and will not route a DID through another client's trunk.")}
           {textField("Public LiveKit SIP port", "livekit_sip_port", {
             required: true,
             type: "number",
@@ -501,7 +501,7 @@ export function TelephonySettingsForm({
             "Existing shared VoiceLink trunk username",
             "voicelink_shared_trunk_username",
             { autoComplete: "off" },
-            "Copy from the one existing VoiceLink trunk that already points to the Public LiveKit SIP host. This is not the API login username.",
+            "Legacy fallback only for an existing trunk owned by the same VoiceLink client as the DID. This is not the API login username; cross-client trunks cannot be reused.",
           )}
           <Field
             label="Existing shared VoiceLink trunk SIP password"

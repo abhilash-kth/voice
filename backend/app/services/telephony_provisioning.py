@@ -58,6 +58,20 @@ async def _ensure_credentials(phone: dict) -> tuple[str, str]:
     return username, password
 
 
+async def _rotate_credentials(phone: dict) -> tuple[str, str]:
+    username = "trunk_" + secrets.token_hex(6)
+    password = _new_password()
+    enc, masked = encrypt_secret(password)
+    await repo.update_phone_number(phone["id"], {
+        "sip_username": username,
+        "sip_password_enc": enc,
+        "sip_password_masked": masked,
+    })
+    phone["sip_username"] = username
+    phone["_sip_password_enc"] = enc
+    return username, password
+
+
 def _record(data: dict) -> dict:
     for key in ("trunk", "sip_trunk", "routing", "call_routing", "data"):
         if isinstance(data.get(key), dict):
@@ -110,16 +124,15 @@ def _resolve_trunk_credentials(row: dict, settings, *,
 
 
 def _find_voicelink_trunk(rows: list[dict], *, trunk_name: str, username: str,
-                          host: str, client_id: str,
-                          shared: bool = False) -> Optional[dict]:
-    """Find this DID's trunk, else the one trunk VoiceLink allows per host."""
+                          host: str, client_id: str) -> Optional[dict]:
+    """Find a trunk owned by this client for its resolved LiveKit host."""
     usable: list[dict] = []
     wanted_host = _trunk_host(host)
     for row in rows:
         if not vl.id_of(row, "id", "trunk_id", "sip_trunk_id"):
             continue
         owner = vl.id_of(row, "client_id")
-        if not shared and owner and owner != str(client_id):
+        if owner and owner != str(client_id):
             continue
         usable.append(row)
         if str(row.get("trunk_name") or row.get("name") or "") == trunk_name \
@@ -131,8 +144,16 @@ def _find_voicelink_trunk(rows: list[dict], *, trunk_name: str, username: str,
                 host_rows[0] if host_rows else None)
 
 
-async def _sync_voicelink_trunk(found: dict, settings, *, exact: bool,
-                                username: str, password: str) -> dict:
+def _find_trunk_by_id(rows: list[dict], trunk_id: str) -> Optional[dict]:
+    for row in rows:
+        if vl.id_of(row, "id", "trunk_id", "sip_trunk_id") == str(trunk_id):
+            return row
+    return None
+
+
+async def _sync_voicelink_trunk(found: dict, settings, *, target_host: str,
+                                exact: bool, username: str,
+                                password: str) -> dict:
     """Repoint/activate a reused trunk without rotating shared credentials."""
     trunk_id = vl.id_of(found, "id", "trunk_id", "sip_trunk_id")
     try:
@@ -142,8 +163,7 @@ async def _sync_voicelink_trunk(found: dict, settings, *, exact: bool,
         port_matches = False
     transport = found.get("transport_type")
     needs_update = (
-        _trunk_host(found.get("sip_server_host"))
-        != _trunk_host(settings.livekit_sip_host)
+        _trunk_host(found.get("sip_server_host")) != _trunk_host(target_host)
         or not port_matches
         or (transport not in (None, "")
             and str(transport) != str(settings.voicelink_transport_type))
@@ -154,7 +174,7 @@ async def _sync_voicelink_trunk(found: dict, settings, *, exact: bool,
         "trunk_name": str(found.get("trunk_name") or found.get("name")
                           or "voxura-livekit"),
         "status": 1,
-        "sip_server_host": settings.livekit_sip_host,
+        "sip_server_host": target_host,
         "sip_server_port": settings.livekit_sip_port,
         "transport_type": settings.voicelink_transport_type,
         "audio_format": list(settings.voicelink_audio_formats),
@@ -227,6 +247,11 @@ async def provision_number(phone_id: str,
             "Telephony -> Settings.", 503))
 
     client_id = account["client_id"]
+    try:
+        target_host = telephony_settings.resolve_livekit_sip_host(
+            settings.livekit_sip_host, client_id)
+    except TelephonyError as e:
+        await _fail(phone_id, "config_missing", e)
     step = "credentials"
     await repo.update_phone_number(phone_id, {
         "status": "provisioning", "provisioning_step": step, "last_error": ""})
@@ -235,21 +260,49 @@ async def provision_number(phone_id: str,
 
         # 1) VoiceLink SIP trunk -> our LiveKit SIP service.
         step = "voicelink_trunk"
-        if not phone.get("voice_link_trunk_id"):
-            trunk_name = f"voxura-{_short(phone_id)}"
-            found = _find_voicelink_trunk(
-                await vl.list_sip_trunks(client_id), trunk_name=trunk_name,
-                username=username, host=settings.livekit_sip_host,
-                client_id=client_id)
-            if found is None:
-                # VoiceLink permits one trunk per SIP server host across the
-                # reseller account. A trunk already targeting our configured
-                # LiveKit SIP host is therefore the platform trunk to reuse,
-                # even when VoiceLink records it under another managed client.
-                found = _find_voicelink_trunk(
-                    await vl.list_sip_trunks(), trunk_name=trunk_name,
-                    username=username, host=settings.livekit_sip_host,
-                    client_id=client_id, shared=True)
+        trunk_name = f"voxura-{_short(phone_id)}"
+        client_rows = await vl.list_sip_trunks(client_id)
+        stored_id = str(phone.get("voice_link_trunk_id") or "")
+        stored_client_row = _find_trunk_by_id(client_rows, stored_id) \
+            if stored_id else None
+        stored_row = stored_client_row
+        if stored_id and stored_row is None:
+            stored_row = _find_trunk_by_id(
+                await vl.list_sip_trunks(), stored_id)
+        trunk_replaced = False
+        if stored_id and stored_row:
+            owner = vl.id_of(stored_row, "client_id")
+            dedicated = str(
+                stored_row.get("trunk_name") or stored_row.get("name") or ""
+            ) == trunk_name
+            replace_stored = bool(owner and owner != str(client_id)) or (
+                _trunk_host(stored_row.get("sip_server_host"))
+                != _trunk_host(target_host) and not dedicated)
+            if replace_stored:
+                if phone.get("livekit_outbound_trunk_id") \
+                        or phone.get("livekit_inbound_trunk_id"):
+                    raise TelephonyError(
+                        "The saved VoiceLink trunk does not belong to this "
+                        "number's VoiceLink client, but LiveKit trunks were "
+                        "already created with its credentials. Operator "
+                        "repair is required before retrying activation.", 409)
+                logger.warning(
+                    "[PROVISION_TRUNK_REPLACE] phone=%s target_host=%s "
+                    "reason=%s", phone_id, _trunk_host(target_host),
+                    "owner_mismatch"
+                    if owner and owner != str(client_id)
+                    else "host_mismatch")
+                trunk_replaced = True
+                phone["voice_link_trunk_id"] = ""
+                phone["voice_link_routing_id"] = ""
+                stored_id = ""
+                stored_row = None
+                username, password = await _rotate_credentials(phone)
+
+        if not phone.get("voice_link_trunk_id") or stored_row is not None:
+            found = stored_row or _find_voicelink_trunk(
+                client_rows, trunk_name=trunk_name, username=username,
+                host=target_host, client_id=client_id)
             exact_reuse = bool(found and (
                 str(found.get("trunk_name") or found.get("name") or "")
                 == trunk_name
@@ -287,24 +340,38 @@ async def provision_number(phone_id: str,
                     logger.info(
                         "[PROVISION_TRUNK_REUSE] phone=%s host=%s "
                         "same_client=%s credential_source=%s", phone_id,
-                        _trunk_host(settings.livekit_sip_host),
+                        _trunk_host(target_host),
                         vl.id_of(found, "client_id") in ("", str(client_id)),
                         credential_source)
                 found = await _sync_voicelink_trunk(
-                    found, settings, exact=exact_reuse,
-                    username=resolved_username, password=resolved_password)
+                    found, settings, target_host=target_host,
+                    exact=exact_reuse, username=resolved_username,
+                    password=resolved_password)
             if found is None:
-                found = _record(await vl.create_sip_trunk({
-                    "trunk_name": trunk_name,
-                    "sip_server_host": settings.livekit_sip_host,
-                    "sip_server_port": settings.livekit_sip_port,
-                    "transport_type": settings.voicelink_transport_type,
-                    "audio_format": list(settings.voicelink_audio_formats),
-                    "username": username,
-                    "registration_password": password,
-                    "status": 1,
-                    "client_id": vl.int_id(client_id),
-                }))
+                try:
+                    found = _record(await vl.create_sip_trunk({
+                        "trunk_name": trunk_name,
+                        "sip_server_host": target_host,
+                        "sip_server_port": settings.livekit_sip_port,
+                        "transport_type": settings.voicelink_transport_type,
+                        "audio_format": list(settings.voicelink_audio_formats),
+                        "username": username,
+                        "registration_password": password,
+                        "status": 1,
+                        "client_id": vl.int_id(client_id),
+                    }))
+                except Exception as e:
+                    if "sip server host is already in use" \
+                            not in str(e).lower():
+                        raise
+                    raise TelephonyError(
+                        "VoiceLink already has a trunk for this LiveKit "
+                        "host, but that trunk cannot be used for this "
+                        "number's VoiceLink client. Configure Public "
+                        "LiveKit SIP host with a per-client wildcard "
+                        "alias such as c{client_id}.your-sip-domain in "
+                        "Super Admin -> Telephony -> Settings, save, then "
+                        "retry. Do not buy another number.", 409) from None
             trunk_id = vl.id_of(found, "id", "trunk_id", "sip_trunk_id")
             if not trunk_id:
                 raise TelephonyError(
@@ -312,6 +379,8 @@ async def provision_number(phone_id: str,
                     "Retry activation to reconcile.", 502)
             patch = {"voice_link_trunk_id": trunk_id,
                      "provisioning_step": "voicelink_trunk_ready"}
+            if trunk_replaced:
+                patch["voice_link_routing_id"] = ""
             if _trunk_username(found) and _trunk_username(found) != username:
                 username = _trunk_username(found)
                 patch["sip_username"] = username

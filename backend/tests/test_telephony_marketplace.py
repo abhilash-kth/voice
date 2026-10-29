@@ -69,7 +69,8 @@ def test_destination_and_carrier_dial_normalization():
 
 
 def test_voicelink_trunk_reuse_matches_unique_sip_host():
-    from app.services.telephony_provisioning import _find_voicelink_trunk
+    from app.services.telephony_provisioning import (
+        _find_trunk_by_id, _find_voicelink_trunk)
 
     rows = [
         {"id": 11, "client_id": 99, "trunk_name": "manual",
@@ -82,10 +83,13 @@ def test_voicelink_trunk_reuse_matches_unique_sip_host():
     assert _find_voicelink_trunk(
         rows, trunk_name="voxura-new", username="trunk_new",
         host="sip.example.com", client_id="42") is None
-    shared = _find_voicelink_trunk(
+
+    rows.append({"id": 15, "client_id": 42, "trunk_name": "client-host",
+                  "sip_server_host": "sip.example.com", "status": 1})
+    same_client = _find_voicelink_trunk(
         rows, trunk_name="voxura-new", username="trunk_new",
-        host="sip.example.com", client_id="42", shared=True)
-    assert shared["id"] == 12
+        host="sip.example.com", client_id="42")
+    assert same_client["id"] == 15
 
     rows.append({"id": 14, "client_id": 42, "username": "trunk_new",
                   "sip_server_host": "old.example.com", "status": 1})
@@ -93,6 +97,7 @@ def test_voicelink_trunk_reuse_matches_unique_sip_host():
         rows, trunk_name="voxura-new", username="trunk_new",
         host="sip.example.com", client_id="42")
     assert exact["id"] == 14
+    assert _find_trunk_by_id(rows, "12")["client_id"] == 99
 
 
 def test_voicelink_shared_trunk_credentials_fallback_is_guarded():
@@ -505,6 +510,16 @@ def test_telephony_settings_patch_validates_and_encrypts(telephony_crypto):
     assert patch["voicelink_audio_formats"] == "alaw,ulaw"
     assert patch["voicelink_kyc_redirect_hosts"] == "id.example.com"
     assert patch["livekit_sip_host"] == "sip.example.com"
+
+    alias_patch = settings_svc._normalize_patch({
+        "livekit_sip_host": "C{CLIENT_ID}.SIP.Example.com",
+    })
+    assert alias_patch["livekit_sip_host"] == "c{client_id}.sip.example.com"
+    assert settings_svc.resolve_livekit_sip_host(
+        alias_patch["livekit_sip_host"], "42") == "c42.sip.example.com"
+    with pytest.raises(policy.TelephonyError):
+        settings_svc._normalize_patch({
+            "livekit_sip_host": "c{phone_id}.sip.example.com"})
 
     with pytest.raises(policy.TelephonyError):
         settings_svc._normalize_patch({

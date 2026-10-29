@@ -105,6 +105,40 @@ def _clean_host(value: Any, label: str, *, allow_blank: bool = False) -> str:
     return host
 
 
+LIVEKIT_SIP_HOST_PLACEHOLDER = "{client_id}"
+
+
+def _clean_livekit_sip_host(value: Any, *, allow_blank: bool = False) -> str:
+    """Validate a LiveKit SIP host, optionally with one {client_id} alias."""
+    host = str(value or "").strip().lower().rstrip(".")
+    if not host:
+        if allow_blank:
+            return ""
+        raise TelephonyError("LiveKit SIP host is required.", 400)
+    placeholder_count = host.count(LIVEKIT_SIP_HOST_PLACEHOLDER)
+    without_placeholder = host.replace(LIVEKIT_SIP_HOST_PLACEHOLDER, "")
+    if placeholder_count > 1 or "{" in without_placeholder \
+            or "}" in without_placeholder:
+        raise TelephonyError(
+            "LiveKit SIP host may contain only one {client_id} placeholder.",
+            400)
+    _clean_host(host.replace(LIVEKIT_SIP_HOST_PLACEHOLDER, "client123"),
+                "LiveKit SIP host")
+    return host
+
+
+def resolve_livekit_sip_host(value: Any, client_id: Any) -> str:
+    """Resolve the per-client LiveKit SIP host alias used for VoiceLink."""
+    template = _clean_livekit_sip_host(value, allow_blank=True)
+    if not template:
+        return ""
+    label = re.sub(r"[^a-z0-9-]", "-", str(client_id or "").strip().lower())
+    label = re.sub(r"-+", "-", label).strip("-")[:32].strip("-") or "client"
+    return _clean_host(
+        template.replace(LIVEKIT_SIP_HOST_PLACEHOLDER, label),
+        "LiveKit SIP host")
+
+
 def _clean_url(value: Any, label: str, *, allow_http: bool = False,
                allow_blank: bool = False, default: str = "") -> str:
     raw = str(value or "").strip().rstrip("/")
@@ -228,7 +262,7 @@ def env_fallback_settings() -> TelephonySettings:
         kyc_finalize_verified=bool(
             config.VOICELINK_CLIENT_KYC_FINALIZE_VERIFIED),
         livekit_sip_host=_safe(
-            lambda v: _clean_host(v, "LiveKit SIP host", allow_blank=True),
+            lambda v: _clean_livekit_sip_host(v, allow_blank=True),
             config.LIVEKIT_SIP_HOST, ""),
         livekit_sip_port=int(config.LIVEKIT_SIP_PORT or 5060),
         frontend_url=_safe(
@@ -558,8 +592,8 @@ def _normalize_patch(patch: dict) -> dict:
     if "kyc_finalize_verified" in patch:
         out["kyc_finalize_verified"] = bool(patch["kyc_finalize_verified"])
     if "livekit_sip_host" in patch:
-        out["livekit_sip_host"] = _clean_host(
-            patch.get("livekit_sip_host"), "LiveKit SIP host", allow_blank=True)
+        out["livekit_sip_host"] = _clean_livekit_sip_host(
+            patch.get("livekit_sip_host"), allow_blank=True)
     if "livekit_sip_port" in patch:
         out["livekit_sip_port"] = int(patch["livekit_sip_port"])
     if "frontend_url" in patch:

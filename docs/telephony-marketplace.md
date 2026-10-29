@@ -11,10 +11,10 @@
 - Customers use **Phone Numbers** in the workspace to start managed phone
   setup, complete KYC, move calling balance, browse/quote/buy a DID and retry
   activation.
-- Provisioning creates or reuses the one VoiceLink SIP trunk allowed for the
-  configured LiveKit SIP host, then creates per-DID VoiceLink routing, the
-  LiveKit outbound trunk, a per-DID LiveKit inbound trunk and a trunk-scoped
-  dispatch rule.
+- Provisioning creates or reuses a VoiceLink SIP trunk owned by the DID's
+  VoiceLink client at that client's resolved LiveKit SIP host alias, then
+  creates per-DID VoiceLink routing, the LiveKit outbound trunk, a per-DID
+  LiveKit inbound trunk and a trunk-scoped dispatch rule.
   SIP passwords are encrypted server-side; customer APIs omit provider/trunk
   identifiers and SIP credentials entirely, while Super Admin sees trunk IDs
   and only a masked password.
@@ -119,11 +119,14 @@ Log in to Super Admin and open **Telephony → Settings**.
   - API token (preferred, without `Bearer `) **or** fallback
     username/password
   - VoiceLink SIP: `sip.voicelink.co.in`, port `3300`
-  - Public LiveKit SIP: your Oracle SIP hostname, port `5060`
-  - If VoiceLink already has its one allowed trunk for that LiveKit host,
-    copy that existing trunk's SIP username/password into **Existing shared
-    VoiceLink trunk username/password** because VoiceLink's trunk-list API
-    may omit the password. Do not use the VoiceLink API-login credentials.
+  - Public LiveKit SIP: a per-client wildcard alias such as
+    `c{client_id}.kvoice.duckdns.org`, port `5060`. Every generated alias
+    must resolve to the same Oracle LiveKit SIP server. VoiceLink allows
+    only one trunk per host and rejects routing through another client's
+    trunk, so do not use one fixed host for multiple VoiceLink clients.
+  - **Existing shared VoiceLink trunk username/password** is only a legacy
+    fallback for an existing trunk owned by the same VoiceLink client as
+    the DID when VoiceLink's trunk-list API omits its password.
   - Tech prefix `45454`, transport `1 (UDP)`, audio formats `alaw,ulaw`
   - Optional default fallback trunk: the existing working `ST_...` trunk
   - Wallet bypass: **off**; client KYC final-submit: **off** until VoiceLink
@@ -307,16 +310,16 @@ setup/test part; still regenerate from `schema.prisma` afterwards.
   the gate instead of risking a tenant-level submission.
 - Transport code `1` assumes the inferred SDK mapping `1=UDP`. Confirm it
   against a live VoiceLink trunk readback before changing it in the panel.
-- VoiceLink's trunk-list response may omit the existing trunk's SIP
-  password. In that case activation stops until the operator copies the
-  existing trunk's credentials into the panel's SIP routing fields; it does
-  not rotate the shared trunk password automatically.
+- VoiceLink's trunk-list response may omit a same-client trunk's SIP
+  password. In that legacy case activation stops until the operator copies
+  that trunk's credentials into the panel's SIP routing fields; it does not
+  rotate the trunk password automatically.
 - Confirm trial-plan DID/channel entitlements. VoiceLink allows only one
-  trunk per SIP server host, so activation reuses the existing trunk that
-  already points at the configured LiveKit SIP host; confirm shared-trunk
-  call billing/client attribution with VoiceLink before broad self-service.
-  That trunk's **Peer Monitoring** toggle must be ON in the VoiceLink portal
-  because the API cannot set it.
+  trunk per SIP server host and routing rejects another client's trunk, so
+  the panel host should use `{client_id}` with wildcard DNS to give each
+  VoiceLink client a unique alias for the same LiveKit SIP server. Each
+  resulting trunk's **Peer Monitoring** toggle must be ON in the VoiceLink
+  portal because the API cannot set it.
 - Wallet-bypass semantics must be confirmed with VoiceLink before enabling
   that panel switch.
 
