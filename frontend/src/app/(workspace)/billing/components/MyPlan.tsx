@@ -188,7 +188,7 @@ export default function MyPlan() {
                 )}
               >
                 {isActive
-                  ? "Workspace allocation for agents, concurrency, knowledge base, and billing cycle."
+                  ? "Workspace allocation for agents, VoiceLink channels, knowledge base, and billing cycle."
                   : isPastDue
                     ? "Payment is past due — recharge to restore full workspace capabilities."
                     : "Purchase a monthly plan below to unlock agents and voice calling."}
@@ -230,8 +230,8 @@ export default function MyPlan() {
             />
             <Metric
               icon={Layers}
-              label="Concurrent Lines"
-              value={String(ent.concurrency_lines)}
+              label="VoiceLink Channels"
+              value={String(ent.channels ?? ent.concurrency_lines ?? 1)}
               solid
             />
             <Metric
@@ -266,8 +266,8 @@ export default function MyPlan() {
             </div>
             <p className="leading-relaxed">
               {isPastDue
-                ? "Monthly payment is due. Recharge your wallet to keep calling lines and building agents active."
-                : 'No active plan found. Use "Change / extend your plan" below to configure capacity, lines, telephony, and KB packs.'}
+                ? "Monthly payment is due. Recharge your wallet to keep calling channels and building agents active."
+                : 'No active plan found. Use "Change / extend your plan" below to configure capacity, VoiceLink channels, telephony, and KB packs.'}
             </p>
           </div>
         )}

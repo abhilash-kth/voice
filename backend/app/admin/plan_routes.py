@@ -48,17 +48,43 @@ async def delete_plan(pid: str, admin=ADMIN):
 
 @router.get("/subscriptions")
 async def list_subscriptions(admin=ADMIN):
-    """All customer subscriptions with the subscriber's name/email (read-only)."""
+    """All customer subscriptions with effective channel capacity."""
     db = get_prisma()
     rows = await db.subscription.find_many(order={"updatedAt": "desc"}, take=500)
     uids = list({r.userId for r in rows})
     users = await db.user.find_many(where={"id": {"in": uids}}) if uids else []
     uname = {u.id: (u.name or "") for u in users}
     uemail = {u.id: (u.email or "") for u in users}
-    return {"items": [{
-        "user_id": r.userId, "user_name": uname.get(r.userId, ""), "user_email": uemail.get(r.userId, ""),
-        "status": r.status, "agent_limit": r.agentLimit or 0,
-        "concurrency_lines": r.concurrencyLines or 1, "telephony_rented": bool(r.telephonyRented),
-        "kb_char_limit": r.kbCharLimit or 0, "kb_faq_limit": r.kbFaqLimit or 0,
-        "monthly_total": float(r.monthlyTotal or 0), "renews_at": r.renewsAt or "",
-    } for r in rows]}
+    accounts = (await db.voicelinkaccount.find_many(
+        where={"userId": {"in": uids}}) if uids else [])
+    allocated = {a.userId: int(a.channelsAllocated or 0) for a in accounts}
+    numbers = (await db.phonenumber.find_many(
+        where={"userId": {"in": uids}, "status": "active"}) if uids else [])
+    number_channels: dict[str, int] = {}
+    for number in numbers:
+        number_channels[number.userId] = max(
+            number_channels.get(number.userId, 0),
+            int(number.channels or 1))
+
+    items = []
+    for r in rows:
+        plan_channels = max(1, int(r.concurrencyLines or 1))
+        channels = max(plan_channels, allocated.get(r.userId, 0),
+                       number_channels.get(r.userId, 0))
+        items.append({
+            "user_id": r.userId, "user_name": uname.get(r.userId, ""),
+            "user_email": uemail.get(r.userId, ""),
+            "status": r.status, "agent_limit": r.agentLimit or 0,
+            "channels": channels,
+            "plan_channels": plan_channels,
+            "allocated_channels": allocated.get(r.userId, 0),
+            "number_channels": number_channels.get(r.userId, 0),
+            # Legacy alias for older admin clients; UI now says Channels.
+            "concurrency_lines": channels,
+            "telephony_rented": bool(r.telephonyRented),
+            "kb_char_limit": r.kbCharLimit or 0,
+            "kb_faq_limit": r.kbFaqLimit or 0,
+            "monthly_total": float(r.monthlyTotal or 0),
+            "renews_at": r.renewsAt or "",
+        })
+    return {"items": items}

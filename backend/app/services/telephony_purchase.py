@@ -126,10 +126,23 @@ async def create_quote(user_id: str, body) -> dict:
             "Finish or let support resolve your existing number purchase "
             "before reserving another number.", 409)
 
+    requested_channels = int(body.channels)
+    if "channels" not in getattr(body, "model_fields_set", set()):
+        # Plan-first flow: channels selected on Billing become this DID's
+        # default channel count. An explicitly supplied value still wins so
+        # a customer can buy extra provider channels with this order.
+        try:
+            from . import subscription_service
+            entitlement = await subscription_service.get_subscription(user_id)
+            requested_channels = max(
+                1, int(entitlement.get("plan_channels") or 1))
+        except Exception as e:
+            logger.debug("plan channel default lookup skipped: %r", e)
+
     purchase = await repo.create_purchase({
         "user_id": user_id, "voice_link_account_id": account["id"],
         "provider_did_id": str(body.did_id), "number": number,
-        "months": int(body.months), "channels": int(body.channels),
+        "months": int(body.months), "channels": requested_channels,
         "idempotency_key": body.idempotency_key, "state": "draft"})
     try:
         locked = await vl.lock_did(str(body.did_id), int(body.months))
@@ -149,7 +162,7 @@ async def create_quote(user_id: str, body) -> dict:
         purchase = await repo.update_purchase(purchase["id"], {
             "provider_order_id": order_id, "monthly_rate": monthly}) or purchase
 
-        wanted = int(body.channels)
+        wanted = requested_channels
         allocated = int(account.get("channels_allocated") or 0)
         if wanted > allocated:
             profile = accounts.safe_profile(await vl.profile())

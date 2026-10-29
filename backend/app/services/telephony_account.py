@@ -92,6 +92,18 @@ async def setup_account(user_id: str, email: str, name: str = "",
     existing = await repo.get_account_by_user(user_id)
     if existing:
         return await sync_account(existing)
+    # Channels selected with the monthly plan are the target allocation for
+    # the new provider client. If the reseller pool cannot cover all of them
+    # yet, start with what is available; a later DID quote buys the missing
+    # provider channels inside that order.
+    desired_channels = 1
+    try:
+        from . import subscription_service
+        entitlement = await subscription_service.get_subscription(user_id)
+        desired_channels = max(
+            1, int(entitlement.get("plan_channels") or 1))
+    except Exception:
+        pass
     profile = safe_profile(await vl.profile())
     clients = await vl.clients()
     by_email = next(
@@ -123,6 +135,8 @@ async def setup_account(user_id: str, email: str, name: str = "",
         raise TelephonyError(
             "No unallocated calling channel is available right now. "
             "Contact support.", 409)
+    initial_channels = min(
+        desired_channels, int(profile["channels_available"] or 1))
 
     settings = await telephony_settings.get_settings()
     display = (name or email.split("@")[0]).strip()
@@ -135,7 +149,8 @@ async def setup_account(user_id: str, email: str, name: str = "",
         # Sent only to VoiceLink; never stored or shown. Customers complete
         # KYC here and never need the provider portal password.
         "password": secrets.token_urlsafe(32),
-        "is_active": 1, "channel_count": 1, "negative_threshold": 0,
+        "is_active": 1, "channel_count": initial_channels,
+        "negative_threshold": 0,
         "wallet_balance": 0,
         "wallet_bypass": int(settings.voicelink_wallet_bypass),
     }
@@ -164,7 +179,7 @@ async def setup_account(user_id: str, email: str, name: str = "",
     account = await repo.create_account(user_id, {
         "provider_reseller_id": profile["id"], "client_id": client_id,
         "username": payload["username"], "email": email, "name": display,
-        "phone": phone, "channels_allocated": 1,
+        "phone": phone, "channels_allocated": initial_channels,
     })
     return await sync_account(account)
 

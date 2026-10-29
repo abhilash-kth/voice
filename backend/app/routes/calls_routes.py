@@ -27,13 +27,20 @@ logger = logging.getLogger("voice-agent-saas-api")
 router = APIRouter(tags=["calls"])
 
 
-def _effective_concurrency(agent_limit: int, plan_lines: int,
+def _effective_concurrency(agent_limit: int, workspace_channels: int,
                            phone_channels: Optional[int]) -> int:
-    """Smallest applicable concurrent-call ceiling for one start request."""
-    limits = [max(1, int(agent_limit or 1)), max(1, int(plan_lines or 1))]
+    """Concurrent-call ceiling for one SIP start request.
+
+    An assigned DID's own purchased/manual channels are authoritative for
+    calls on that DID. The plan-selected/workspace channel entitlement is
+    only the fallback for the legacy shared-trunk path with no assigned DID;
+    it is no longer a second, separate cap on a number that already has
+    channels.
+    """
+    agent_cap = max(1, int(agent_limit or 1))
     if phone_channels is not None:
-        limits.append(max(1, int(phone_channels or 1)))
-    return min(limits)
+        return min(agent_cap, max(1, int(phone_channels or 1)))
+    return min(agent_cap, max(1, int(workspace_channels or 1)))
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +119,8 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
             logger.warning("Error auto-cleaning prior browser calls: %s", e)
 
     agent_limit = max(1, int(rec.get("max_concurrency") or 1))
-    plan_lines = agent_limit
+    plan_channels = agent_limit
+    workspace_channels = agent_limit
     phone_channels: Optional[int] = None
     phone_active = 0
     effective_limit = agent_limit
@@ -125,12 +133,14 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         try:
             from ..services import subscription_service
             subscription = await subscription_service.get_subscription(user.id)
-            plan_lines = max(
-                1, int(subscription.get("concurrency_lines") or agent_limit))
+            plan_channels = max(
+                1, int(subscription.get("plan_channels") or agent_limit))
+            workspace_channels = max(
+                1, int(subscription.get("channels") or plan_channels))
         except Exception as e:
-            logger.debug("plan concurrency lookup skipped: %r", e)
+            logger.debug("channel entitlement lookup skipped: %r", e)
         effective_limit = _effective_concurrency(
-            agent_limit, plan_lines, phone_channels)
+            agent_limit, workspace_channels, phone_channels)
 
         phone_number_id = route_for_limit.get("phone_number_id")
         if phone_number_id:
@@ -168,16 +178,18 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         active = await repo.count_live_calls(agent_id, active_rooms=live_rooms)
 
     # The configured limit is enforced for BOTH browser and SIP starts. For
-    # SIP, the effective ceiling is the smallest of the agent limit, the
-    # workspace plan lines, and the assigned DID's channels.
+    # SIP on an assigned DID, the effective ceiling is the smaller of the
+    # agent limit and that DID's channels; plan-selected channels are not a
+    # second cap on the same purchased capacity.
     if active >= effective_limit:
         if mode == "sip":
             detail = (
-                f"Concurrency limit reached: {active} live call(s) "
-                f"(agent limit {agent_limit}, plan lines {plan_lines}"
+                f"Channel limit reached: {active} live call(s) "
+                f"(agent limit {agent_limit}, workspace channels "
+                f"{workspace_channels}"
                 + (f", assigned-number channels {phone_channels}"
                    if phone_channels is not None else "")
-                + "). Wait for a call to end or increase the applicable limit.")
+                + "). Wait for a call to end or increase the applicable channels.")
         else:
             detail = (
                 f"This agent is already on {active} live call(s) "
@@ -249,7 +261,8 @@ async def start_call(body: dict, user=Depends(auth.get_current_user)):
         "limit": effective_limit,
         "remaining": max(effective_limit - active - 1, 0),
         "agent_limit": agent_limit,
-        "plan_lines": plan_lines,
+        "plan_channels": plan_channels,
+        "workspace_channels": workspace_channels,
         "phone_channels": phone_channels,
         "phone_active_calls": (phone_active + 1) if mode == "sip" else 0,
     }

@@ -18,6 +18,10 @@ router = APIRouter(tags=["subscription"])
 
 class PurchaseBody(BaseModel):
     capacity_tier_id: str = ""
+    # Preferred: total VoiceLink channels selected with the plan.
+    channels: int | None = Field(default=None, ge=1, le=1000)
+    # Compatibility: quantities beyond the one included channel.
+    extra_channels: int | None = Field(default=None, ge=0, le=999)
     extra_lines: int = Field(0, ge=0, le=1000)
     telephony: bool = False
     kb_pack_ids: list[str] = Field(default_factory=list, max_length=20)
@@ -31,6 +35,9 @@ async def get_subscription(user=Depends(auth.get_current_user)):
     return {
         "entitlement": ent,
         "prices": {
+            "channel_price_per_month": float(
+                b.get("concurrency_line_price_per_month") or 0),
+            # Legacy alias for older clients.
             "line_price_per_month": float(b.get("concurrency_line_price_per_month") or 0),
             "telephony_rent_per_month": float(b.get("telephony_rent_per_month") or 0),
         },
@@ -41,7 +48,8 @@ async def get_subscription(user=Depends(auth.get_current_user)):
         "base_limits": {
             "kb_chars": subscription_service.BASE_KB_CHARS,
             "faqs": subscription_service.BASE_FAQS,
-            "concurrency_lines": subscription_service.FREE_LINES,
+            "channels": subscription_service.INCLUDED_CHANNELS,
+            "concurrency_lines": subscription_service.INCLUDED_CHANNELS,
         },
     }
 
@@ -52,6 +60,7 @@ async def purchase(body: PurchaseBody, user=Depends(auth.get_current_user)):
     try:
         ent = await subscription_service.purchase(
             user.id, capacity_tier_id=body.capacity_tier_id,
+            channels=body.channels, extra_channels=body.extra_channels,
             extra_lines=body.extra_lines, telephony=body.telephony,
             kb_pack_ids=body.kb_pack_ids)
     except subscription_service.SubscriptionError as e:

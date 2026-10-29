@@ -55,7 +55,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     editing?.phone_number_id || "",
   );
   const [phoneNumbers, setPhoneNumbers] = useState<
-    { id: string; number: string; status: string }[]
+    { id: string; number: string; status: string; channels: number }[]
   >([]);
   useEffect(() => {
     let cancelled = false;
@@ -67,7 +67,12 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
             .filter(
               (n) => n.status === "active" || n.id === editing?.phone_number_id,
             )
-            .map((n) => ({ id: n.id, number: n.number, status: n.status })),
+            .map((n) => ({
+              id: n.id,
+              number: n.number,
+              status: n.status,
+              channels: Math.max(1, Number(n.channels || 1)),
+            })),
         );
       })
       .catch(() => {
@@ -100,6 +105,15 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
   const [maxConcurrency, setMaxConcurrency] = useState(
     editing?.max_concurrency ?? 1,
   );
+  const handlePhoneNumberChange = (id: string) => {
+    setPhoneNumberId(id);
+    const phone = phoneNumbers.find((n) => n.id === id);
+    // A newly assigned DID's purchased channels become the sensible default
+    // agent capacity; the user can still lower it below the channel count.
+    if (phone && maxConcurrency < phone.channels) {
+      setMaxConcurrency(phone.channels);
+    }
+  };
   const [knowledgeText, setKnowledgeText] = useState(
     editing?.knowledge?.text || "",
   );
@@ -383,7 +397,7 @@ export default function AgentConfigForm({ catalog, editing, onDone }: Props) {
     setNoResponseMessage,
     setMode,
     setPurpose,
-    setPhoneNumberId,
+    setPhoneNumberId: handlePhoneNumberChange,
     setAnnounceText,
     setEndAfterAnnouncement,
     setPersonality,

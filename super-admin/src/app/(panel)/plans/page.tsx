@@ -163,14 +163,14 @@ export default function PlansPage() {
             <Card className="border-border/60 shadow-sm">
               <CardHeader className="border-b border-border/60 pb-4">
                 <CardTitle className="text-sm font-semibold">
-                  Concurrency and telephony (₹ / month)
+                  VoiceLink channels and telephony (₹ / month)
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4 pt-5">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field
-                    label="Extra concurrent line ₹/month"
-                    hint="The first line is free; each extra line costs this per month."
+                    label="Extra VoiceLink channel ₹/month"
+                    hint="The first channel is included when a customer buys a plan; each additional selected channel costs this per month."
                   >
                     <Input
                       className="h-9 tabular-nums"
@@ -449,7 +449,7 @@ export default function PlansPage() {
                         Agents
                       </th>
                       <th className="px-3 py-2 text-right font-medium">
-                        Lines
+                        Channels
                       </th>
                       <th className="px-3 py-2 font-medium">Telephony</th>
                       <th className="px-3 py-2 text-right font-medium">
@@ -494,7 +494,8 @@ export default function PlansPage() {
                           {subscription.agent_limit}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums">
-                          {subscription.concurrency_lines}
+                          {subscription.channels ??
+                            subscription.concurrency_lines}
                         </td>
                         <td className="px-3 py-3">
                           {subscription.telephony_rented ? "Rented" : "—"}

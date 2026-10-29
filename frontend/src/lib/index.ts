@@ -197,7 +197,8 @@ export const startCall = (body: {
             limit: number;
             remaining: number;
             agent_limit: number;
-            plan_lines: number;
+            plan_channels: number;
+            workspace_channels: number;
             phone_channels: number | null;
             phone_active_calls: number;
         };

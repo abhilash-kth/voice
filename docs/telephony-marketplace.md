@@ -184,23 +184,35 @@ agent has an active call.
 ## 4. End-to-end test order
 
 1. Start backend, frontend, Super Admin and the existing LiveKit/SIP stack.
-2. Customer: open `/phone-numbers`, start phone setup and complete KYC.
-3. Add app-wallet funds; optionally move funds to calling balance.
-4. Search → Get price → accept auto-renew → Confirm purchase.
-5. Wait for the owned number to become **active**; use **Retry activation** if
+2. Super Admin → **Plans**: create/verify the agent plan and KB packs, then
+   set **Extra VoiceLink channel ₹/month**. The first channel is included;
+   this price applies to each additional total channel selected on Billing.
+3. Customer → **Billing**: buy the agent plan, select the total
+   **VoiceLink channels**, and select any extra KB/FAQ packs.
+4. Customer: open `/phone-numbers`, start phone setup and complete business
+   KYC verification.
+5. Add app-wallet funds; optionally move funds to calling balance.
+6. Search → verify **Channels** (it defaults to the plan-selected total) →
+   Get price → accept auto-renew → Confirm purchase. If more channels are
+   entered here, the VoiceLink quote buys/prices the missing provider
+   channels with that DID order.
+7. Wait for the owned number to become **active**; use **Retry activation** if
    a provider/LiveKit step reports an error.
-6. Create an agent, select purpose **Both**, assign the number and save.
-7. Test one outbound SIP call; then call the DID from an external phone for
+8. Create an agent, select purpose **Both**, assign the number and save.
+   Selecting a multi-channel number raises the form's default max
+   concurrency to that channel count.
+9. Test one outbound SIP call; then call the DID from an external phone for
    inbound.
-8. Check Super Admin → Telephony for account, KYC, purchase, provisioning
-   step and trunk IDs. The SIP password should appear only masked/configured.
+10. Check Super Admin → Telephony for account, KYC, purchase, provisioning
+    step and trunk IDs. The SIP password should appear only masked/configured.
 
 ### Phone hangup + concurrent SIP calls
 
-For a two-call test, all three limits must be at least `2`: the agent's
-**Max concurrent calls**, the workspace plan's concurrency lines, and the
-assigned DID's **Channels** (edit the manual number in Super Admin if it is
-still `1`). Then, on the customer Call page:
+For a two-call test, the assigned DID's **Channels** and the agent's
+**Max concurrent calls** must both be at least `2`. There is no longer a
+separate plan "lines" blocker: channels selected with the plan, bought with
+the DID, allocated on the VoiceLink account, or set on a manual DID all feed
+the same effective channel entitlement. Then, on the customer Call page:
 
 1. Dial the first mobile number in SIP mode and answer it.
 2. The button changes to **Dial another number (1/2)**; enter a second

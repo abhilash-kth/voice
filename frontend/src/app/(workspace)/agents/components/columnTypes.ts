@@ -13,7 +13,7 @@ export interface LeftState {
   noResponseTimeout: number; noResponseMessage: string;
   mode: string; announceText: string; endAfterAnnouncement: boolean;
   purpose: string; phoneNumberId: string;
-  phoneNumbers: { id: string; number: string; status: string }[];
+  phoneNumbers: { id: string; number: string; status: string; channels: number }[];
   personality: string; language: string; gender: string;
   memoryEnabled: boolean; recordingEnabled: boolean; maxConcurrency: number;
   knowledgeText: string; systemPrompt: string; faq: FaqItem[];

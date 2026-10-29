@@ -67,7 +67,7 @@ export default function SubscriptionPanel({
   const [loading, setLoading] = useState(true);
 
   const [tierId, setTierId] = useState("");
-  const [extraLines, setExtraLines] = useState(0);
+  const [totalChannels, setTotalChannels] = useState(1);
   const [telephony, setTelephony] = useState(false);
   const [packIds, setPackIds] = useState<string[]>([]);
 
@@ -76,6 +76,19 @@ export default function SubscriptionPanel({
     Promise.all([getSubscription(), listAgents()])
       .then(([s, a]) => {
         setInfo(s);
+        setTotalChannels((current) =>
+          current === 1
+            ? Math.max(
+                1,
+                Number(
+                  s.entitlement.plan_channels ||
+                    s.entitlement.channels ||
+                    s.entitlement.concurrency_lines ||
+                    1,
+                ),
+              )
+            : current,
+        );
         setAgents((a as { agents: unknown[] }).agents?.length || 0);
         setErr("");
       })
@@ -102,7 +115,10 @@ export default function SubscriptionPanel({
       </div>
     );
 
-  const linePrice = info.prices.line_price_per_month;
+  const channelPrice =
+    info.prices.channel_price_per_month ??
+    info.prices.line_price_per_month ??
+    0;
   const teleRent = info.prices.telephony_rent_per_month;
   const chosenTier: PlanOption | undefined = info.plans.capacity.find(
     (t) => t.id === tierId,
@@ -110,7 +126,7 @@ export default function SubscriptionPanel({
   const chosenPacks = info.plans.kb_packs.filter((p) => packIds.includes(p.id));
   const monthly =
     (chosenTier?.price_per_month || 0) +
-    Math.max(extraLines, 0) * linePrice +
+    Math.max(totalChannels - 1, 0) * channelPrice +
     (telephony ? teleRent : 0) +
     chosenPacks.reduce((s, p) => s + p.price_per_month, 0);
 
@@ -121,13 +137,12 @@ export default function SubscriptionPanel({
     try {
       await purchaseSubscription({
         capacity_tier_id: tierId,
-        extra_lines: Math.max(0, Math.trunc(extraLines)),
+        channels: Math.max(1, Math.trunc(totalChannels)),
         telephony,
         kb_pack_ids: packIds,
       });
       setMsg("Plan activated ✅ — you can build agents and call now.");
       setTierId("");
-      setExtraLines(0);
       setTelephony(false);
       setPackIds([]);
       load();
@@ -151,7 +166,7 @@ export default function SubscriptionPanel({
               Choose a plan and add-ons
             </h2>
             <p className="mt-1 break-words text-xs leading-relaxed text-muted-foreground">
-              Set your agent capacity, call capacity, and optional services.
+              Set your agent capacity, VoiceLink channels, and optional services.
             </p>
           </div>
         </header>
@@ -159,10 +174,11 @@ export default function SubscriptionPanel({
         <div className="rounded-xl border border-border bg-muted/30 p-3 sm:p-4">
           <div className="mb-3">
             <h3 className="text-sm font-semibold text-foreground">
-              Agent plan and call capacity
+              Agent plan and VoiceLink channels
             </h3>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              Choose a base plan, then add simultaneous call capacity if needed.
+              Choose a base plan and the total simultaneous-call channels
+              to use when purchasing and assigning a phone number.
             </p>
           </div>
 
@@ -207,25 +223,31 @@ export default function SubscriptionPanel({
             <div className="min-w-0 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
                 <Label
-                  htmlFor="extra-concurrent-lines"
+                  htmlFor="voicelink-channels"
                   className="text-xs font-medium text-muted-foreground"
                 >
-                  Additional simultaneous call lines
+                  VoiceLink channels (total)
                 </Label>
                 <FieldHelp
-                  label="Additional simultaneous call lines"
-                  help={`Each additional line lets one more call happen at the same time. The first line is included; each additional line costs ₹${linePrice}/month.`}
+                  label="VoiceLink channels"
+                  help={`One channel carries one simultaneous phone call. The first channel is included; each additional channel costs ₹${channelPrice}/month. This total becomes the default channel count when you buy a number after KYC.`}
                 />
               </div>
 
               <Input
-                id="extra-concurrent-lines"
+                id="voicelink-channels"
                 type="number"
-                min={0}
-                value={extraLines}
-                onChange={(e) => setExtraLines(Number(e.target.value))}
+                min={1}
+                max={1000}
+                value={totalChannels}
+                onChange={(e) => setTotalChannels(Number(e.target.value))}
                 className="h-9 bg-background tabular-nums"
               />
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                {Math.max(totalChannels - 1, 0)} additional × ₹
+                {channelPrice}/month. Calls on an assigned number are
+                capped by that number&apos;s purchased channels.
+              </p>
             </div>
           </div>
         </div>

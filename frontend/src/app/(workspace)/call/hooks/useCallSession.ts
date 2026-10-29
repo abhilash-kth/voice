@@ -232,8 +232,8 @@ export default function useCallSession() {
       }
       if (currentSipCalls.length >= sipLimit) {
         return failStart(
-          `Concurrency limit reached (${currentSipCalls.length}/${sipLimit}). ` +
-            "End a SIP call or increase the agent/plan/number concurrency first.");
+          `Channel limit reached (${currentSipCalls.length}/${sipLimit}). ` +
+            "End a SIP call or increase the agent limit / assigned number channels first.");
       }
     }
 

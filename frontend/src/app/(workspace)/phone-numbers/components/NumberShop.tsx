@@ -51,7 +51,17 @@ export default function NumberShop({
   const [didType, setDidType] = useState("2");
   const [query, setQuery] = useState("");
   const [months, setMonths] = useState(1);
-  const [channels, setChannels] = useState(1);
+  const [channels, setChannels] = useState(() =>
+    Math.min(
+      20,
+      Math.max(
+        1,
+        Number(overview.plan_channels || 1),
+        Number(overview.account?.channels_allocated || 0),
+      ),
+    ),
+  );
+  const channelsTouched = useRef(false);
   const [results, setResults] = useState<AvailableNumber[]>([]);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
@@ -67,6 +77,20 @@ export default function NumberShop({
   useEffect(() => {
     setPurchase(overview.latest_purchase);
   }, [overview.latest_purchase]);
+
+  useEffect(() => {
+    if (channelsTouched.current) return;
+    setChannels(
+      Math.min(
+        20,
+        Math.max(
+          1,
+          Number(overview.plan_channels || 1),
+          Number(overview.account?.channels_allocated || 0),
+        ),
+      ),
+    );
+  }, [overview.plan_channels, overview.account?.channels_allocated]);
 
   const types =
     overview.provider?.did_type_rates &&
@@ -236,9 +260,18 @@ export default function NumberShop({
             max={20}
             value={channels}
             disabled={busy}
-            onChange={(e) => setChannels(Number(e.target.value))}
+            onChange={(e) => {
+              channelsTouched.current = true;
+              setChannels(Number(e.target.value));
+            }}
             className="h-9 bg-background tabular-nums"
           />
+          <p className="text-[10px] leading-relaxed text-muted-foreground">
+            Plan includes {Math.max(1, Number(overview.plan_channels || 1))};
+            provider account has{" "}
+            {Number(overview.account?.channels_allocated || 0)} allocated.
+            Extra channels are priced in the provider quote.
+          </p>
         </div>
       </div>
       <Button

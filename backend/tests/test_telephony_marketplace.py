@@ -80,11 +80,38 @@ def test_manual_number_update_body_and_effective_concurrency():
     with pytest.raises(ValidationError):
         ManualNumberUpdateBody(sip_password="never-accept-this")
 
-    # The smallest of agent max, plan lines, and DID channels wins.
-    assert _effective_concurrency(5, 2, 3) == 2
+    # An assigned DID's purchased channels are authoritative; the old
+    # separate plan-lines value must not shrink them a second time.
+    assert _effective_concurrency(5, 1, 3) == 3
     assert _effective_concurrency(5, 4, 2) == 2
     assert _effective_concurrency(1, 4, 2) == 1
+    # Legacy shared-trunk calls still use the workspace channel entitlement.
     assert _effective_concurrency(3, 4, None) == 3
+    assert _effective_concurrency(5, 2, None) == 2
+
+
+def test_plan_channels_pricing_and_purchase_body():
+    from app.routes.subscription_routes import PurchaseBody
+    from app.services import subscription_service as subscriptions
+
+    # Channels granted by plan selection, VoiceLink allocation, a purchased
+    # DID, or a manual DID are one entitlement—the highest grant wins.
+    assert subscriptions.effective_channel_count(1, 0, 0) == 1
+    assert subscriptions.effective_channel_count(1, 2, 0) == 2
+    assert subscriptions.effective_channel_count(1, 0, 3) == 3
+    assert subscriptions.effective_channel_count(
+        1, 0, 0, phone_channels=2) == 2
+
+    # The Super Admin's per-extra-channel monthly price replaces the former
+    # extra-line price: two channels beyond the included first cost 2 x ₹250.
+    assert subscriptions.price_selection(
+        capacity_tier=None, extra_channels=2, telephony=False,
+        kb_packs=[], channel_price=250, telephony_rent=0) == 500
+
+    body = PurchaseBody(channels=3)
+    assert body.channels == 3
+    with pytest.raises(ValidationError):
+        PurchaseBody(channels=0)
 
 
 def test_customer_views_hide_provider_ids_trunks_and_sip_secrets():
@@ -290,6 +317,35 @@ async def test_assigned_number_derives_trunk_and_ignores_requested_one(normal_us
         "phone_number": "+919429399159",
         "phone_channels": 1,
     }
+
+
+async def test_assigned_did_channels_override_legacy_one_line_plan(normal_user):
+    from app.services import subscription_service as subscriptions
+
+    _, user = normal_user
+    phone = await _active_phone(user["id"])
+    phone = await repo.update_phone_number(
+        phone["id"], {"channels": 2}) or phone
+
+    entitlement = await subscriptions.get_subscription(user["id"])
+    assert entitlement["plan_channels"] == 1
+    assert entitlement["number_channels"] == 2
+    assert entitlement["channels"] == 2
+
+    # The exact regression from the UI: DID has 2 channels, old plan row has
+    # 1, and saving the agent at max_concurrency=2 must now be allowed.
+    await subscriptions.ensure_concurrency_allowed(
+        user["id"], 2, phone_number_id=phone["id"])
+    with pytest.raises(subscriptions.SubscriptionError):
+        await subscriptions.ensure_concurrency_allowed(
+            user["id"], 3, phone_number_id=phone["id"])
+
+    # Plan-first flow: selecting three total channels on Billing stores that
+    # target for the later KYC/DID purchase and raises the workspace cap.
+    purchased = await subscriptions.purchase(user["id"], channels=3)
+    assert purchased["plan_channels"] == 3
+    assert purchased["channels"] == 3
+    await subscriptions.ensure_concurrency_allowed(user["id"], 3)
 
 
 async def test_super_admin_can_edit_and_delete_only_manual_numbers(normal_user):

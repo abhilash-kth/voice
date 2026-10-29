@@ -29,6 +29,8 @@ export default function LeftColumn({
   v: LeftState;
   set: LeftSetters;
 }) {
+  const selectedPhone = v.phoneNumbers.find((n) => n.id === v.phoneNumberId);
+
   return (
     <div className="space-y-8">
       {/* ── SECTION 1: Identity & Mode ── */}
@@ -129,7 +131,7 @@ export default function LeftColumn({
                 <option value="">No number (browser / default trunk)</option>
                 {v.phoneNumbers.map((n) => (
                   <option key={n.id} value={n.id}>
-                    {n.number}
+                    {n.number} · {n.channels} channel{n.channels === 1 ? "" : "s"}
                     {n.status !== "active" ? ` (${n.status})` : ""}
                   </option>
                 ))}
@@ -143,6 +145,8 @@ export default function LeftColumn({
                     </Link>{" "}
                     page.
                   </>
+                ) : selectedPhone ? (
+                  `Outbound calls use this number as caller ID. It has ${selectedPhone.channels} purchased channel${selectedPhone.channels === 1 ? "" : "s"} for simultaneous SIP calls.`
                 ) : (
                   "Outbound calls use this number as caller ID; inbound calls to it reach this agent when purpose allows."
                 )}
@@ -261,6 +265,11 @@ export default function LeftColumn({
                 onChange={(e) => set.setMaxConcurrency(Number(e.target.value))}
                 className="bg-background tabular-nums"
               />
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                {selectedPhone
+                  ? `SIP calls on ${selectedPhone.number} are capped by its ${selectedPhone.channels} channel${selectedPhone.channels === 1 ? "" : "s"}.`
+                  : "Assign a phone number above to use its purchased VoiceLink channels for SIP concurrency."}
+              </p>
               <div className="pt-1">
                 <CostEstimate
                   mode={v.mode}

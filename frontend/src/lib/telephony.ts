@@ -67,6 +67,8 @@ export interface PhonePurchase {
 
 export interface TelephonyOverview {
   configured: boolean;
+  plan_channels?: number;
+  effective_channels?: number;
   provider: {
     did_type_rates: { type_id: string; name: string; monthly_rate: number }[];
     monthly_channel_rate: number;

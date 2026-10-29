@@ -141,14 +141,13 @@ async def create_agent(body: AgentCreate, user=Depends(auth.get_current_user)):
         # (Saved agents that already use one keep running — see voice pipeline.)
         if prov.get("enabled") is False:
             raise HTTPException(400, f"Provider {sel.id} is disabled by the administrator for {kind}")
-    # Monthly-plan entitlements: active subscription + agent-slot headroom,
-    # and the agent's max concurrency must fit the purchased lines.
+    # Monthly-plan entitlements: active subscription + agent-slot headroom.
+    # Validate the assigned DID before the channel check so channels bought
+    # with that DID (or manually allocated to it) count toward this agent.
     from ..services import subscription_service
     try:
         current = len(await repo.list_agents(user.id))
         await subscription_service.ensure_agent_creation_allowed(user.id, current)
-        await subscription_service.ensure_concurrency_allowed(
-            user.id, int(getattr(body, "max_concurrency", 1) or 1))
     except subscription_service.SubscriptionError as e:
         raise HTTPException(402, str(e)) from None
     # Purpose is required by the schema; an assigned number must be this
@@ -156,8 +155,13 @@ async def create_agent(body: AgentCreate, user=Depends(auth.get_current_user)):
     try:
         await validate_agent_phone_assignment(
             user.id, body.purpose, body.phone_number_id)
+        await subscription_service.ensure_concurrency_allowed(
+            user.id, int(getattr(body, "max_concurrency", 1) or 1),
+            phone_number_id=body.phone_number_id)
     except TelephonyError as e:
         raise HTTPException(e.status_code, str(e)) from None
+    except subscription_service.SubscriptionError as e:
+        raise HTTPException(402, str(e)) from None
     rec = await repo.create_agent(user.id, body.model_dump())
     _cache_agent(rec)
     warning = await _sync_agent_numbers(user.id, rec.get("phone_number_id"))
@@ -190,7 +194,8 @@ async def update_agent(agent_id: str, body: AgentUpdate, user=Depends(auth.get_c
         from ..services import subscription_service
         try:
             await subscription_service.ensure_concurrency_allowed(
-                user.id, int(patch["max_concurrency"] or 1))
+                user.id, int(patch["max_concurrency"] or 1),
+                phone_number_id=effective_phone)
         except subscription_service.SubscriptionError as e:
             raise HTTPException(402, str(e)) from None
     rec = await repo.update_agent(agent_id, user.id, patch)

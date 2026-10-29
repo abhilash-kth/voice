@@ -17,6 +17,7 @@ from fastapi.responses import RedirectResponse
 from .. import auth, repo
 from ..models.telephony_models import (AccountSetupBody, AllocateWalletBody,
                                        ConfirmBody, KycActionBody, QuoteBody)
+from ..services import subscription_service
 from ..services import telephony_account as accounts
 from ..services import telephony_provisioning as provisioning
 from ..services import telephony_purchase as purchases
@@ -108,6 +109,7 @@ async def overview(user=Depends(auth.get_current_user)):
     settings = await telephony_settings.get_settings()
     account = await repo.get_account_by_user(user.id)
     numbers = await repo.list_phone_numbers(user.id)
+    entitlement = await subscription_service.get_subscription(user.id)
     latest = await purchases.purchase_view(await repo.latest_purchase(user.id))
     provider = None
     provider_error = ""
@@ -123,6 +125,8 @@ async def overview(user=Depends(auth.get_current_user)):
         "configured": settings.configured,
         "provider": provider,
         "provider_error": provider_error,
+        "plan_channels": entitlement.get("plan_channels") or 1,
+        "effective_channels": entitlement.get("channels") or 1,
         "account": _public_account(account),
         "kyc": _kyc_from_account(account, settings) if account else None,
         "numbers": [_public_phone(n) for n in numbers],

@@ -17,7 +17,7 @@ export interface BillingConfig {
     misc_fee_per_min: number;
     concurrency_addons: { up_to: number; addon_per_min: number }[];
     // Monthly subscription economics (see Plans page / customer Billing).
-    concurrency_line_price_per_month: number; // ₹/month per EXTRA concurrent line
+    concurrency_line_price_per_month: number; // legacy key: ₹/month per EXTRA VoiceLink channel
     telephony_rent_per_month: number;         // ₹/month telephony/number rent
     // Per-mode minimum customer ₹/min on the rate card.
     assistant_min_per_min: number;
@@ -60,7 +60,11 @@ export interface SubscriptionRow {
     user_email: string;
     status: string;
     agent_limit: number;
-    concurrency_lines: number;
+    channels: number;
+    plan_channels: number;
+    allocated_channels: number;
+    number_channels: number;
+    concurrency_lines?: number;
     telephony_rented: boolean;
     kb_char_limit: number;
     kb_faq_limit: number;
