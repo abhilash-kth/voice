@@ -89,7 +89,8 @@ def test_kyc_step1_payload_and_safe_provider_validation():
     from types import SimpleNamespace
 
     from app.services.telephony_account import _kyc_register_fields
-    from app.services.voicelink_client import _safe_validation_message
+    from app.services.voicelink_client import (
+        _safe_error_shape, _safe_validation_message)
 
     body = SimpleNamespace(
         account_type="individual", full_name="Fixture Person",
@@ -118,6 +119,25 @@ def test_kyc_step1_payload_and_safe_provider_validation():
     assert "919876543210" not in detail
     assert "customer@example.test" not in detail
     assert "must not be returned" not in detail
+
+    # Current VoiceLink portal prerequisites may be returned either as a
+    # field error or only as a top-level business-rule message. Expose the
+    # missing step in our wording, but never the raw provider value/text.
+    assert _safe_validation_message({"errors": {
+        "live_photo": ["The live photo field is required."]}}).startswith(
+            "Live photo:")
+    reason = _safe_validation_message({
+        "message": "Please verify email for customer@example.test first."})
+    assert "Email verification" in reason
+    assert "customer@example.test" not in reason
+    assert "already verified" in _safe_validation_message({
+        "message": "Email already verified."})
+    shape = _safe_error_shape({
+        "status": False, "message": "do not log this value",
+        "errors": {"mystery_field": ["also do not log this value"]}})
+    assert "mystery_field" in shape
+    assert "do not log this value" not in shape
+    assert "also do not log this value" not in shape
 
 
 def test_digilocker_redirect_allowlist_includes_official_hosts():

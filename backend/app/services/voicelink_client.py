@@ -129,57 +129,217 @@ _KYC_FIELD_LABELS = {
     "redirect_url": "Verification return URL",
     "username": "Email account",
     "otp": "Email code",
+    # VoiceLink's current portal KYC can also gate final submission on these
+    # provider-side prerequisites. Labels only name the missing step; the
+    # provider's message text is still redacted below.
+    "email_verified": "Email verification",
+    "is_email_verified": "Email verification",
+    "email_verification": "Email verification",
+    "live_photo": "Live photo",
+    "live_photo_verified": "Live photo",
+    "photo": "Live photo",
+    "photo_verified": "Live photo",
+    "kyc_photo": "Live photo",
+    "profile_photo": "Live photo",
+    "selfie": "Live photo",
+    "signature": "Signature",
+    "digital_signature": "Signature",
+    "signature_image": "Signature",
+    "agreement": "Agreement",
+    "agreement_accepted": "Agreement",
+    "agreement_reacceptance_required": "Agreement",
+    "terms_accepted": "Terms acceptance",
+    "latitude": "Location",
+    "longitude": "Location",
+    "location": "Location",
+    "geo_location": "Location",
+    "current_step": "Verification step",
+    "step": "Verification step",
+    "steps": "Verification steps",
+    "kyc_status": "Verification status",
+    "status": "Verification status",
+    "is_complete": "Verification completion",
+    "documents": "Supporting documents",
+    "pan_document": "PAN document",
+    "aadhaar_document": "Aadhaar document",
+    "gst_document": "GST document",
+    "address_proof": "Address proof",
+    "identity_proof": "Identity proof",
+    "kyc": "Verification",
+    "final_submit": "Final submission",
 }
 
 
+def _redact_provider_text(raw: str) -> str:
+    msg = re.sub(r"\s+", " ", raw).strip()
+    msg = re.sub(r"(['\"]).*?\1", "[redacted]", msg)
+    msg = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[redacted]", msg)
+    msg = re.sub(r"https?://\S+", "[redacted]", msg)
+    msg = re.sub(
+        r"\b\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b",
+        "[redacted]", msg, flags=re.IGNORECASE)
+    msg = re.sub(
+        r"\b[A-Z]{5}\d{4}[A-Z]\b", "[redacted]", msg,
+        flags=re.IGNORECASE)
+    msg = re.sub(r"\+?\d[\d ()-]{7,}\d", "[redacted]", msg)
+    msg = re.sub(r"\b[A-Za-z0-9_-]{24,}\b", "[redacted]", msg)
+    return msg.strip()[:180]
+
+
+def _safe_top_level_reason(payload: dict) -> str:
+    """Classify a provider business-rule message without echoing its text.
+
+    Final-submit and email-OTP failures often have only a top-level
+    ``message`` (for example, a still-missing live photo or an already
+    verified email), rather than Laravel's field ``errors`` object. We map
+    only recognizable prerequisite keywords to our own wording, so no raw
+    provider text—and therefore no echoed identity/account value—is logged
+    or returned.
+    """
+    texts: list[str] = []
+    containers = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        containers.append(data)
+    elif isinstance(data, str):
+        texts.append(data)
+    for item in containers:
+        for key in ("message", "error", "detail"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+    text = " ".join(texts).lower()
+    if not text:
+        return ""
+    if "already" in text and ("verif" in text or "confirm" in text):
+        return ("Email verification: VoiceLink reports that this email is "
+                "already verified or no new code is needed.")
+    if "otp" in text and "expired" in text:
+        return "Email code: The code has expired; request a new one."
+    if "otp" in text and ("invalid" in text or "incorrect" in text):
+        return "Email code: The code is invalid."
+    if "too many" in text or "try again after" in text or "wait" in text:
+        return "Email code: Wait before requesting another code."
+    if ("user not found" in text or "account not found" in text
+            or "username" in text and ("not found" in text
+                                        or "does not exist" in text)):
+        return ("Email account: VoiceLink could not find the managed "
+                "account for email confirmation.")
+    if ("live photo" in text or "selfie" in text or "photo capture" in text
+            or "kyc photo" in text or "profile photo" in text):
+        return ("Live photo: VoiceLink still requires its live-photo "
+                "verification step.")
+    if "signature" in text:
+        return ("Signature: VoiceLink still requires its signature step.")
+    if "agreement" in text or ("terms" in text and "accept" in text):
+        return ("Agreement: VoiceLink still requires agreement/terms "
+                "acceptance.")
+    if "latitude" in text or "longitude" in text or "location" in text:
+        return ("Location: VoiceLink still requires its location step.")
+    if "email" in text and ("verif" in text or "confirm" in text):
+        return ("Email verification: VoiceLink still requires the managed "
+                "account email to be verified.")
+    if "gst" in text:
+        return "GSTIN: VoiceLink still requires GST verification or its document."
+    if "pan" in text:
+        return "PAN: VoiceLink still requires PAN verification or its document."
+    if "aadhaar" in text or "aadhar" in text:
+        return ("Aadhaar: VoiceLink still requires Aadhaar verification or "
+                "its document.")
+    if "document" in text:
+        return "Supporting documents: VoiceLink reports a document is still required."
+    if "client_id" in text or "client id" in text:
+        return ("Final submission: VoiceLink did not accept the "
+                "client-scoped final submission.")
+    if ("complete all" in text or "incomplete" in text
+            or "pending" in text and "step" in text):
+        return ("Verification steps: VoiceLink reports that one or more "
+                "required steps are still incomplete.")
+    return ""
+
+
+def _safe_error_shape(payload: Any) -> str:
+    """Return response key/field names only, never any response values."""
+    def keys(value: Any) -> list[str]:
+        if not isinstance(value, dict):
+            return []
+        return [str(k) for k in value
+                if re.fullmatch(r"[A-Za-z0-9_-]{1,50}", str(k))][:15]
+
+    if not isinstance(payload, dict):
+        return f"payload_type={type(payload).__name__}"
+    data = payload.get("data")
+    errors = payload.get("errors")
+    if not isinstance(errors, (dict, list)) and isinstance(data, dict):
+        errors = data.get("errors")
+    fields = keys(errors)
+    if isinstance(errors, list):
+        fields = [str(item.get("field") or item.get("key") or "")
+                  for item in errors if isinstance(item, dict)]
+        fields = [f for f in fields
+                  if re.fullmatch(r"[A-Za-z0-9_.-]{1,50}", f)][:15]
+    return (f"keys={keys(payload)} data_type={type(data).__name__} "
+            f"data_keys={keys(data)} error_fields={fields}")
+
+
 def _safe_validation_message(payload: Any) -> str:
-    """Return up to three sanitized KYC field-validation messages.
+    """Return up to three sanitized KYC/OTP validation details.
 
     VoiceLink/Laravel normally returns field names plus rule text such as
-    "The full name field is required."  We deliberately do not return the
-    raw response or top-level message.  As a second line of defence, redact
-    quoted fragments, email addresses, URLs, PAN/GSTIN-shaped values, long
-    digit runs and long opaque tokens in case a custom provider message ever
-    echoes a submitted value.
+    "The full name field is required." We expose only allowlisted field
+    messages after redacting anything that looks like a submitted identity
+    value. If there is no usable field error, a keyword-classified
+    prerequisite (live photo, email verification, and similar) may be
+    returned in our own wording; the raw provider message is never echoed.
     """
     if not isinstance(payload, dict):
         return ""
     errors = payload.get("errors")
-    if not isinstance(errors, dict):
+    if not isinstance(errors, (dict, list)):
         data = payload.get("data")
         errors = data.get("errors") if isinstance(data, dict) else None
-    if not isinstance(errors, dict):
-        return ""
 
     details: list[str] = []
-    for field, raw in errors.items():
-        label = _KYC_FIELD_LABELS.get(str(field).split(".", 1)[0])
-        if not label:
-            continue
+
+    def add(label: str, raw: Any) -> None:
+        if len(details) >= 3:
+            return
         if isinstance(raw, list):
             raw = raw[0] if raw else ""
         if isinstance(raw, dict):
-            raw = raw.get("message") or ""
+            raw = raw.get("message") or raw.get("error") or ""
         if not isinstance(raw, str) or not raw.strip():
-            continue
-        msg = re.sub(r"\s+", " ", raw).strip()
-        msg = re.sub(r"(['\"]).*?\1", "[redacted]", msg)
-        msg = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[redacted]", msg)
-        msg = re.sub(r"https?://\S+", "[redacted]", msg)
-        msg = re.sub(
-            r"\b\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b",
-            "[redacted]", msg, flags=re.IGNORECASE)
-        msg = re.sub(
-            r"\b[A-Z]{5}\d{4}[A-Z]\b", "[redacted]", msg,
-            flags=re.IGNORECASE)
-        msg = re.sub(r"\+?\d[\d ()-]{7,}\d", "[redacted]", msg)
-        msg = re.sub(r"\b[A-Za-z0-9_-]{24,}\b", "[redacted]", msg)
-        msg = msg.strip()[:180]
+            return
+        msg = _redact_provider_text(raw)
         if msg:
             details.append(f"{label}: {msg}")
-        if len(details) == 3:
-            break
-    return "; ".join(details)
+
+    if isinstance(errors, dict):
+        for field, raw in errors.items():
+            label = _KYC_FIELD_LABELS.get(str(field).split(".", 1)[0])
+            if label:
+                add(label, raw)
+            if len(details) == 3:
+                break
+    elif isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, dict):
+                field = str(item.get("field") or item.get("key") or "")
+                label = _KYC_FIELD_LABELS.get(field.split(".", 1)[0])
+                if label:
+                    add(label, item.get("message") or item.get("error"))
+            elif isinstance(item, str):
+                # A bare string has no trustworthy field name; classify it
+                # like a top-level business message rather than echoing it.
+                reason = _safe_top_level_reason({"message": item})
+                if reason and reason not in details:
+                    details.append(reason)
+            if len(details) == 3:
+                break
+
+    if details:
+        return "; ".join(details)
+    return _safe_top_level_reason(payload)
 
 
 async def request(method: str, path: str, *, json: Any = None,
@@ -225,10 +385,15 @@ async def request(method: str, path: str, *, json: Any = None,
             detail = _safe_validation_message(payload)
             if detail:
                 logger.warning(
-                    "VoiceLink verification validation failed: %s", detail)
+                    "VoiceLink verification validation failed: path=%s %s",
+                    path, detail)
                 msg = (f"VoiceLink rejected the verification request "
                        f"(HTTP {resp.status_code}): {detail}")
             else:
+                logger.warning(
+                    "VoiceLink verification rejection shape: path=%s "
+                    "http_status=%s %s",
+                    path, resp.status_code, _safe_error_shape(payload))
                 msg = (f"VoiceLink rejected the verification request "
                        f"(HTTP {resp.status_code}). Check the details and "
                        "try again.")
@@ -242,7 +407,13 @@ async def request(method: str, path: str, *, json: Any = None,
             detail = _safe_validation_message(payload)
             if detail:
                 logger.warning(
-                    "VoiceLink verification validation failed: %s", detail)
+                    "VoiceLink verification validation failed: path=%s %s",
+                    path, detail)
+            else:
+                logger.warning(
+                    "VoiceLink verification rejection shape: path=%s "
+                    "provider_status=false %s",
+                    path, _safe_error_shape(payload))
             msg = (f"VoiceLink rejected the verification request: {detail}"
                    if detail else
                    "VoiceLink rejected the verification request.")
